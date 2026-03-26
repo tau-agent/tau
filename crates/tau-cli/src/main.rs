@@ -419,6 +419,35 @@ async fn interactive_loop(
     Ok(())
 }
 
+fn pct(b: Option<&tau::auth::UsageBucket>) -> String {
+    match b.and_then(|b| b.utilization) {
+        Some(u) => format!("{:.0}%", u),
+        None => "?".into(),
+    }
+}
+
+/// Parse ISO 8601 reset timestamp → "Thu 04:00 (3d 14h 15m)".
+fn format_resets(resets_at: &str) -> String {
+    use chrono::{DateTime, Local};
+    let Ok(dt) = DateTime::parse_from_rfc3339(resets_at) else {
+        return resets_at.to_string();
+    };
+    let local: DateTime<Local> = dt.into();
+    let secs = local
+        .signed_duration_since(Local::now())
+        .num_seconds()
+        .max(0);
+    let d = secs / 86400;
+    let h = (secs % 86400) / 3600;
+    let m = (secs % 3600) / 60;
+    let relative = match (d, h) {
+        (0, 0) => format!("{}m", m),
+        (0, _) => format!("{}h {}m", h, m),
+        _ => format!("{}d {}h {}m", d, h, m),
+    };
+    format!("{} ({})", local.format("%a %H:%M"), relative)
+}
+
 async fn print_subscription_usage(client: &mut tau::client::Client) {
     client
         .send(&tau::protocol::Request::GetSubscriptionUsage)
@@ -428,29 +457,22 @@ async fn print_subscription_usage(client: &mut tau::client::Client) {
     client
         .recv_streaming(|resp| {
             if let tau::protocol::Response::SubscriptionUsage { usage } = resp {
-                fn pct(b: Option<&tau::auth::UsageBucket>) -> String {
-                    match b.and_then(|b| b.utilization) {
-                        Some(u) => format!("{:.0}%", u * 100.0),
-                        None => "?".into(),
-                    }
-                }
-                fn resets(b: Option<&tau::auth::UsageBucket>) -> String {
-                    b.and_then(|b| b.resets_at.as_deref())
-                        .unwrap_or("?")
-                        .to_string()
-                }
                 let fh = usage.five_hour.as_ref();
                 let sd = usage.seven_day.as_ref();
+                let resets = fh
+                    .and_then(|b| b.resets_at.as_deref())
+                    .map(format_resets)
+                    .unwrap_or_else(|| "?".into());
                 println!(
-                    "usage:    5h {}/100%  7d {}/100%  resets {}",
+                    "usage:    5h {}  7d {}  resets {}",
                     pct(fh),
                     pct(sd),
-                    resets(fh)
+                    resets
                 );
                 if let (Some(sonnet), Some(opus)) = (&usage.seven_day_sonnet, &usage.seven_day_opus)
                 {
                     println!(
-                        "          sonnet 7d {}  opus 7d {}",
+                        "          sonnet {}  opus {}",
                         pct(Some(sonnet)),
                         pct(Some(opus))
                     );

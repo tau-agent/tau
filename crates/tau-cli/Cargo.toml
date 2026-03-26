@@ -13,5 +13,6 @@ path = "src/main.rs"
 [dependencies]
 tau.workspace = true
 smol.workspace = true
+chrono.workspace = true
 clap.workspace = true
 rustyline.workspace = true
