@@ -18,7 +18,7 @@ enum Commands {
         #[arg(short, long)]
         session: Option<String>,
         /// Model name
-        #[arg(long, default_value = "claude-sonnet-4-20250514")]
+        #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
     },
     /// Log in to an LLM provider (OAuth)
@@ -420,17 +420,16 @@ async fn handle_slash_command(
 
         "/model" | "/models" => {
             if args.is_empty() {
-                // List available models
-                client.send(&tau::protocol::Request::ListModels).await?;
+                // Get current model first, then list
                 let current_info = get_session_info(client, session_id).await.ok();
-                let current_model = current_info.as_ref().map(|i| i.model.as_str());
+                let current_model_id = current_info.map(|i| i.model);
 
                 client.send(&tau::protocol::Request::ListModels).await?;
                 client
                     .recv_streaming(|resp| {
                         if let tau::protocol::Response::Models { models } = resp {
                             for m in models {
-                                let marker = if current_model == Some(m.id.as_str()) {
+                                let marker = if current_model_id.as_deref() == Some(m.id.as_str()) {
                                     " *"
                                 } else {
                                     ""

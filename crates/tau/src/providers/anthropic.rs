@@ -647,7 +647,75 @@ fn map_stop_reason(reason: &str) -> StopReason {
 pub fn models() -> Vec<Model> {
     vec![
         Model {
-            id: "claude-sonnet-4-20250514".into(),
+            id: "claude-sonnet-4-6".into(),
+            name: "Claude Sonnet 4.6".into(),
+            api: API_ID.into(),
+            provider: "anthropic".into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            reasoning: true,
+            cost: ModelCost {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+            },
+            context_window: 1_000_000,
+            max_tokens: 64_000,
+            headers: Default::default(),
+        },
+        Model {
+            id: "claude-opus-4-6".into(),
+            name: "Claude Opus 4.6".into(),
+            api: API_ID.into(),
+            provider: "anthropic".into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            reasoning: true,
+            cost: ModelCost {
+                input: 5.0,
+                output: 25.0,
+                cache_read: 0.5,
+                cache_write: 6.25,
+            },
+            context_window: 1_000_000,
+            max_tokens: 128_000,
+            headers: Default::default(),
+        },
+        Model {
+            id: "claude-sonnet-4-5".into(),
+            name: "Claude Sonnet 4.5".into(),
+            api: API_ID.into(),
+            provider: "anthropic".into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            reasoning: true,
+            cost: ModelCost {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+            },
+            context_window: 200_000,
+            max_tokens: 64_000,
+            headers: Default::default(),
+        },
+        Model {
+            id: "claude-opus-4-5".into(),
+            name: "Claude Opus 4.5".into(),
+            api: API_ID.into(),
+            provider: "anthropic".into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            reasoning: true,
+            cost: ModelCost {
+                input: 5.0,
+                output: 25.0,
+                cache_read: 0.5,
+                cache_write: 6.25,
+            },
+            context_window: 200_000,
+            max_tokens: 64_000,
+            headers: Default::default(),
+        },
+        Model {
+            id: "claude-sonnet-4-6".into(),
             name: "Claude Sonnet 4".into(),
             api: API_ID.into(),
             provider: "anthropic".into(),
@@ -660,41 +728,24 @@ pub fn models() -> Vec<Model> {
                 cache_write: 3.75,
             },
             context_window: 200_000,
-            max_tokens: 16_384,
+            max_tokens: 64_000,
             headers: Default::default(),
         },
         Model {
-            id: "claude-opus-4-20250514".into(),
-            name: "Claude Opus 4".into(),
+            id: "claude-haiku-4-5".into(),
+            name: "Claude Haiku 4.5".into(),
             api: API_ID.into(),
             provider: "anthropic".into(),
             base_url: DEFAULT_BASE_URL.into(),
             reasoning: true,
             cost: ModelCost {
-                input: 15.0,
-                output: 75.0,
-                cache_read: 1.5,
-                cache_write: 18.75,
+                input: 1.0,
+                output: 5.0,
+                cache_read: 0.1,
+                cache_write: 1.25,
             },
             context_window: 200_000,
-            max_tokens: 32_768,
-            headers: Default::default(),
-        },
-        Model {
-            id: "claude-3-5-haiku-20241022".into(),
-            name: "Claude 3.5 Haiku".into(),
-            api: API_ID.into(),
-            provider: "anthropic".into(),
-            base_url: DEFAULT_BASE_URL.into(),
-            reasoning: false,
-            cost: ModelCost {
-                input: 0.8,
-                output: 4.0,
-                cache_read: 0.08,
-                cache_write: 1.0,
-            },
-            context_window: 200_000,
-            max_tokens: 8_192,
+            max_tokens: 64_000,
             headers: Default::default(),
         },
     ]
@@ -710,7 +761,7 @@ mod tests {
 
     /// Helper: build a request body and return the parsed JSON.
     fn build(context: &Context, options: &StreamOptions) -> serde_json::Value {
-        let model = models().into_iter().next().unwrap(); // Sonnet 4
+        let model = models().into_iter().next().unwrap(); // Sonnet 4.6
         build_request_body(&model, context, options).unwrap()
     }
 
@@ -775,7 +826,7 @@ mod tests {
                 Message::Assistant(AssistantMessage::empty(
                     "anthropic-messages",
                     "anthropic",
-                    "claude-sonnet-4-20250514",
+                    "claude-sonnet-4-6",
                 )),
                 Message::User(UserMessage::text("second")),
             ],
@@ -814,7 +865,7 @@ mod tests {
                     let mut a = AssistantMessage::empty(
                         "anthropic-messages",
                         "anthropic",
-                        "claude-sonnet-4-20250514",
+                        "claude-sonnet-4-6",
                     );
                     a.content.push(AssistantContent::ToolCall(ToolCall {
                         id: "tc1".into(),
