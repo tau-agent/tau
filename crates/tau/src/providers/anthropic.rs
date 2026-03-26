@@ -366,6 +366,53 @@ fn run_stream(
 }
 
 // ---------------------------------------------------------------------------
+// Cache control
+// ---------------------------------------------------------------------------
+
+fn cache_control_value() -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
+/// Add `cache_control` to the last content block of the last user message.
+/// This creates a cache breakpoint at the conversation history boundary so the
+/// entire prefix (system prompt + earlier turns) can be served from cache.
+fn add_cache_breakpoint_to_last_user_message(messages: &mut [serde_json::Value]) {
+    // Walk backwards to find the last user message
+    let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    else {
+        return;
+    };
+
+    let Some(content) = last_user.get_mut("content") else {
+        return;
+    };
+
+    match content {
+        // String content → promote to block array with cache_control
+        serde_json::Value::String(text) => {
+            let text = text.clone();
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": cache_control_value(),
+            }]);
+        }
+        // Array content → add cache_control to last block
+        serde_json::Value::Array(blocks) => {
+            if let Some(last_block) = blocks.last_mut()
+                && let Some(obj) = last_block.as_object_mut()
+            {
+                obj.insert("cache_control".into(), cache_control_value());
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request building
 // ---------------------------------------------------------------------------
 
@@ -409,6 +456,10 @@ fn build_request_body(
         }
     }
 
+    // Add cache breakpoint to the last user message so the entire
+    // conversation prefix is eligible for Anthropic's prompt caching.
+    add_cache_breakpoint_to_last_user_message(&mut messages);
+
     let max_tokens = options
         .max_tokens
         .unwrap_or((model.max_tokens / 3).max(1024));
@@ -431,18 +482,23 @@ fn build_request_body(
         let mut system_blocks = vec![serde_json::json!({
             "type": "text",
             "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-            "cache_control": {"type": "ephemeral"},
+            "cache_control": cache_control_value(),
         })];
         if let Some(ref prompt) = context.system_prompt {
             system_blocks.push(serde_json::json!({
                 "type": "text",
                 "text": prompt,
-                "cache_control": {"type": "ephemeral"},
+                "cache_control": cache_control_value(),
             }));
         }
         body["system"] = serde_json::json!(system_blocks);
     } else if let Some(ref prompt) = context.system_prompt {
-        body["system"] = serde_json::json!(prompt);
+        // Non-OAuth: system prompt as block array with cache breakpoint
+        body["system"] = serde_json::json!([{
+            "type": "text",
+            "text": prompt,
+            "cache_control": cache_control_value(),
+        }]);
     }
 
     if let Some(temp) = options.temperature {
@@ -642,4 +698,159 @@ pub fn models() -> Vec<Model> {
             headers: Default::default(),
         },
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a request body and return the parsed JSON.
+    fn build(context: &Context, options: &StreamOptions) -> serde_json::Value {
+        let model = models().into_iter().next().unwrap(); // Sonnet 4
+        build_request_body(&model, context, options).unwrap()
+    }
+
+    fn simple_context(system: Option<&str>, user_text: &str) -> Context {
+        Context {
+            system_prompt: system.map(String::from),
+            messages: vec![Message::User(UserMessage::text(user_text))],
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn system_prompt_has_cache_control_non_oauth() {
+        let body = build(
+            &simple_context(Some("Be helpful."), "hi"),
+            &StreamOptions::default(),
+        );
+        let system = body.get("system").unwrap();
+        let blocks = system.as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"], "Be helpful.");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn system_prompt_has_cache_control_oauth() {
+        let opts = StreamOptions {
+            api_key: Some("sk-ant-oat-fake-token".into()),
+            ..Default::default()
+        };
+        let body = build(&simple_context(Some("Be helpful."), "hi"), &opts);
+        let system = body.get("system").unwrap();
+        let blocks = system.as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0]["text"].as_str().unwrap().contains("Claude Code"));
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["text"], "Be helpful.");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn last_user_message_gets_cache_breakpoint_string() {
+        let body = build(
+            &simple_context(None, "hello world"),
+            &StreamOptions::default(),
+        );
+        let messages = body["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        // String content should be promoted to block array
+        let content = last["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "hello world");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn last_user_message_gets_cache_breakpoint_multi_turn() {
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage::text("first")),
+                Message::Assistant(AssistantMessage::empty(
+                    "anthropic-messages",
+                    "anthropic",
+                    "claude-sonnet-4-20250514",
+                )),
+                Message::User(UserMessage::text("second")),
+            ],
+            tools: Vec::new(),
+        };
+        let body = build(&ctx, &StreamOptions::default());
+        let messages = body["messages"].as_array().unwrap();
+
+        // First user message should NOT have cache_control
+        let first_content = &messages[0]["content"];
+        if let Some(arr) = first_content.as_array() {
+            for block in arr {
+                assert!(block.get("cache_control").is_none());
+            }
+        } else {
+            // Still a string — no cache_control possible on strings
+            assert!(first_content.is_string());
+        }
+
+        // Last user message (index 2) should have cache_control
+        let last = messages.last().unwrap();
+        let content = last["content"].as_array().unwrap();
+        assert_eq!(
+            content.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn tool_result_message_gets_cache_breakpoint() {
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage::text("use the tool")),
+                Message::Assistant({
+                    let mut a = AssistantMessage::empty(
+                        "anthropic-messages",
+                        "anthropic",
+                        "claude-sonnet-4-20250514",
+                    );
+                    a.content.push(AssistantContent::ToolCall(ToolCall {
+                        id: "tc1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"cmd": "ls"}),
+                    }));
+                    a
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "tc1".into(),
+                    tool_name: "bash".into(),
+                    content: vec![ToolResultContent::Text(TextContent {
+                        text: "file1 file2".into(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 0,
+                }),
+            ],
+            tools: Vec::new(),
+        };
+        let body = build(&ctx, &StreamOptions::default());
+        let messages = body["messages"].as_array().unwrap();
+
+        // The tool result becomes a user message with tool_result blocks.
+        // It's the last user-role message, so it should get cache_control.
+        let last_user = messages.iter().rev().find(|m| m["role"] == "user").unwrap();
+        let content = last_user["content"].as_array().unwrap();
+        let last_block = content.last().unwrap();
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn no_system_prompt_means_no_system_field() {
+        let body = build(&simple_context(None, "hi"), &StreamOptions::default());
+        assert!(body.get("system").is_none());
+    }
 }
