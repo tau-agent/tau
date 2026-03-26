@@ -39,6 +39,8 @@ pub enum Request {
     Login { provider: String },
     /// Query authentication status.
     AuthStatus,
+    /// Fetch subscription usage (OAuth only, cached 5 min).
+    GetSubscriptionUsage,
     /// Shut down the server.
     Shutdown,
 }
@@ -68,6 +70,10 @@ pub enum Response {
     LoginSuccess { provider: String },
     /// Authentication status.
     AuthStatus { providers: Vec<String> },
+    /// Subscription usage data.
+    SubscriptionUsage {
+        usage: crate::auth::SubscriptionUsage,
+    },
     /// Success (generic ack).
     Ok,
     /// Error.

@@ -90,6 +90,8 @@ fn model_info(m: &Model) -> ModelInfo {
 // Server state
 // ---------------------------------------------------------------------------
 
+const USAGE_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+
 struct State {
     db: Db,
     registry: ProviderRegistry,
@@ -97,6 +99,8 @@ struct State {
     default_model: Model,
     /// All known models (for /model listing).
     all_models: Vec<Model>,
+    /// Cached subscription usage (value, fetched_at_ms).
+    usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -154,6 +158,7 @@ pub async fn run(
         auth: AuthStorage::open_default(),
         default_model,
         all_models,
+        usage_cache: None,
     }));
 
     loop {
@@ -467,6 +472,60 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     st.auth.list().unwrap_or_default()
                 };
                 send(&mut writer, &Response::AuthStatus { providers }).await?;
+            }
+            Request::GetSubscriptionUsage => {
+                // Check cache, fetch if stale
+                let cache_result = {
+                    let st = state.lock().unwrap();
+                    let now = crate::types::timestamp_ms();
+                    if let Some((ref usage, fetched_at)) = st.usage_cache {
+                        if now.saturating_sub(fetched_at) < USAGE_CACHE_TTL_MS {
+                            Some(Ok(usage.clone()))
+                        } else {
+                            None // stale
+                        }
+                    } else {
+                        None // not yet fetched
+                    }
+                };
+
+                let result = if let Some(cached) = cache_result {
+                    cached
+                } else {
+                    // Fetch outside the lock
+                    let token = {
+                        let st = state.lock().unwrap();
+                        st.auth.get_api_key("anthropic")
+                    };
+                    match token {
+                        Ok(Some(tok)) if crate::auth::is_oauth_token(&tok) => {
+                            smol::unblock(move || crate::auth::fetch_subscription_usage(&tok)).await
+                        }
+                        _ => Err(crate::Error::NoApiKey(
+                            "subscription usage requires OAuth login".into(),
+                        )),
+                    }
+                };
+
+                match result {
+                    Ok(usage) => {
+                        // Update cache
+                        {
+                            let mut st = state.lock().unwrap();
+                            st.usage_cache = Some((usage.clone(), crate::types::timestamp_ms()));
+                        }
+                        send(&mut writer, &Response::SubscriptionUsage { usage }).await?;
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
             Request::Shutdown => {
                 send(&mut writer, &Response::Ok).await?;

@@ -526,3 +526,79 @@ fn percent_decode(s: &str) -> String {
 pub fn is_oauth_token(key: &str) -> bool {
     key.starts_with("sk-ant-oat")
 }
+
+// ---------------------------------------------------------------------------
+// Subscription usage
+// ---------------------------------------------------------------------------
+
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct UsageBucket {
+    /// 0.0–1.0 utilization, or None if unknown.
+    pub utilization: Option<f64>,
+    /// When this bucket resets (ISO 8601).
+    pub resets_at: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct SubscriptionUsage {
+    pub five_hour: Option<UsageBucket>,
+    pub seven_day: Option<UsageBucket>,
+    pub seven_day_sonnet: Option<UsageBucket>,
+    pub seven_day_opus: Option<UsageBucket>,
+    pub extra_usage_enabled: bool,
+    pub extra_usage_monthly_limit: Option<f64>,
+    pub extra_usage_used_credits: Option<f64>,
+}
+
+/// Fetch subscription usage from the Anthropic API.
+/// `token` must be a valid OAuth access token.
+pub fn fetch_subscription_usage(token: &str) -> crate::Result<SubscriptionUsage> {
+    let data: serde_json::Value = ureq::get(USAGE_URL)
+        .header("authorization", &format!("Bearer {}", token))
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("content-type", "application/json")
+        .call()
+        .map_err(|e| crate::Error::Http(format!("usage API: {}", e)))?
+        .body_mut()
+        .read_json()
+        .map_err(|e| crate::Error::Parse(format!("usage response: {}", e)))?;
+
+    fn bucket(v: &serde_json::Value) -> Option<UsageBucket> {
+        if v.is_null() {
+            return None;
+        }
+        Some(UsageBucket {
+            utilization: v.get("utilization").and_then(|u| u.as_f64()),
+            resets_at: v
+                .get("resets_at")
+                .and_then(|r| r.as_str())
+                .map(String::from),
+        })
+    }
+
+    let extra = data.get("extra_usage");
+    Ok(SubscriptionUsage {
+        five_hour: bucket(data.get("five_hour").unwrap_or(&serde_json::Value::Null)),
+        seven_day: bucket(data.get("seven_day").unwrap_or(&serde_json::Value::Null)),
+        seven_day_sonnet: bucket(
+            data.get("seven_day_sonnet")
+                .unwrap_or(&serde_json::Value::Null),
+        ),
+        seven_day_opus: bucket(
+            data.get("seven_day_opus")
+                .unwrap_or(&serde_json::Value::Null),
+        ),
+        extra_usage_enabled: extra
+            .and_then(|e| e.get("is_enabled"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        extra_usage_monthly_limit: extra
+            .and_then(|e| e.get("monthly_limit"))
+            .and_then(|v| v.as_f64()),
+        extra_usage_used_credits: extra
+            .and_then(|e| e.get("used_credits"))
+            .and_then(|v| v.as_f64()),
+    })
+}

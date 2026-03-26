@@ -419,6 +419,58 @@ async fn interactive_loop(
     Ok(())
 }
 
+async fn print_subscription_usage(client: &mut tau::client::Client) {
+    client
+        .send(&tau::protocol::Request::GetSubscriptionUsage)
+        .await
+        .ok();
+
+    client
+        .recv_streaming(|resp| {
+            if let tau::protocol::Response::SubscriptionUsage { usage } = resp {
+                fn pct(b: Option<&tau::auth::UsageBucket>) -> String {
+                    match b.and_then(|b| b.utilization) {
+                        Some(u) => format!("{:.0}%", u * 100.0),
+                        None => "?".into(),
+                    }
+                }
+                fn resets(b: Option<&tau::auth::UsageBucket>) -> String {
+                    b.and_then(|b| b.resets_at.as_deref())
+                        .unwrap_or("?")
+                        .to_string()
+                }
+                let fh = usage.five_hour.as_ref();
+                let sd = usage.seven_day.as_ref();
+                println!(
+                    "usage:    5h {}/100%  7d {}/100%  resets {}",
+                    pct(fh),
+                    pct(sd),
+                    resets(fh)
+                );
+                if let (Some(sonnet), Some(opus)) = (&usage.seven_day_sonnet, &usage.seven_day_opus)
+                {
+                    println!(
+                        "          sonnet 7d {}  opus 7d {}",
+                        pct(Some(sonnet)),
+                        pct(Some(opus))
+                    );
+                }
+                if usage.extra_usage_enabled
+                    && let (Some(used), Some(limit)) = (
+                        usage.extra_usage_used_credits,
+                        usage.extra_usage_monthly_limit,
+                    )
+                {
+                    println!("          extra: ${:.2}/${:.2} used", used, limit);
+                }
+            } else if let tau::protocol::Response::Error { message } = resp {
+                eprintln!("usage:    unavailable ({})", message);
+            }
+        })
+        .await
+        .ok();
+}
+
 /// Handle a slash command. Returns Ok(true) if the loop should exit.
 async fn handle_slash_command(
     client: &mut tau::client::Client,
@@ -442,6 +494,10 @@ async fn handle_slash_command(
                 info.stats.user_messages, info.stats.assistant_messages, info.stats.tool_calls
             );
             println!("tokens:   {}", tau::protocol::format_stats(&info.stats));
+
+            if info.stats.is_subscription {
+                print_subscription_usage(client).await;
+            }
         }
 
         "/model" | "/models" => {
