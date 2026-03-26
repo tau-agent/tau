@@ -220,8 +220,29 @@ async fn send_and_print(
                 tau::StreamEvent::TextDelta { delta, .. } => {
                     print!("{}", delta);
                 }
-                tau::StreamEvent::Done { .. } => {
+                tau::StreamEvent::Done { message, .. } => {
                     println!();
+                    // Show per-turn usage
+                    let u = &message.usage;
+                    let mut parts = Vec::new();
+                    if u.input > 0 {
+                        parts.push(format!("↑{}", tau::protocol::format_tokens(u.input)));
+                    }
+                    if u.output > 0 {
+                        parts.push(format!("↓{}", tau::protocol::format_tokens(u.output)));
+                    }
+                    if u.cache_read > 0 {
+                        parts.push(format!("R{}", tau::protocol::format_tokens(u.cache_read)));
+                    }
+                    if u.cache_write > 0 {
+                        parts.push(format!("W{}", tau::protocol::format_tokens(u.cache_write)));
+                    }
+                    if u.cost.total > 0.0 {
+                        parts.push(format!("${:.4}", u.cost.total));
+                    }
+                    if !parts.is_empty() {
+                        eprintln!("[{}]", parts.join(" "));
+                    }
                 }
                 tau::StreamEvent::Error { error, .. } => {
                     if let Some(ref msg) = error.error_message {
@@ -358,10 +379,8 @@ async fn cmd_sessions_list() -> tau::Result<()> {
                     println!("no sessions");
                 } else {
                     for s in sessions {
-                        println!(
-                            "{}\t{}\t{}\t{} msgs",
-                            s.id, s.provider, s.model, s.message_count
-                        );
+                        let stats = tau::protocol::format_stats(&s.stats);
+                        println!("{}\t{}/{}\t{}", s.id, s.provider, s.model, stats);
                     }
                 }
             }

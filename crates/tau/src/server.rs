@@ -10,7 +10,7 @@ use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use smol::Async;
 
 use crate::auth::{AuthCredential, AuthStorage};
-use crate::protocol::{Request, Response, SessionInfo};
+use crate::protocol::{Request, Response, SessionInfo, SessionStats, TokenStats};
 use crate::provider::ProviderRegistry;
 use crate::types::*;
 
@@ -23,6 +23,7 @@ struct Session {
     model: Model,
     system_prompt: Option<String>,
     messages: Vec<Message>,
+    is_subscription: bool,
 }
 
 impl Session {
@@ -32,6 +33,55 @@ impl Session {
             model: self.model.id.clone(),
             provider: self.model.provider.clone(),
             message_count: self.messages.len(),
+            stats: self.stats(),
+        }
+    }
+
+    fn stats(&self) -> SessionStats {
+        let mut user_messages = 0usize;
+        let mut assistant_messages = 0usize;
+        let mut tool_calls = 0usize;
+        let mut tool_results = 0usize;
+        let mut tokens = TokenStats::default();
+        let mut cost = 0.0f64;
+        let mut last_input_tokens: Option<u64> = None;
+
+        for msg in &self.messages {
+            match msg {
+                Message::User(_) => user_messages += 1,
+                Message::Assistant(a) => {
+                    assistant_messages += 1;
+                    for c in &a.content {
+                        if matches!(c, AssistantContent::ToolCall(_)) {
+                            tool_calls += 1;
+                        }
+                    }
+                    tokens.input += a.usage.input;
+                    tokens.output += a.usage.output;
+                    tokens.cache_read += a.usage.cache_read;
+                    tokens.cache_write += a.usage.cache_write;
+                    cost += a.usage.cost.total;
+
+                    // Track last successful assistant's input tokens as context estimate
+                    if a.stop_reason != StopReason::Error && a.stop_reason != StopReason::Aborted {
+                        last_input_tokens =
+                            Some(a.usage.input + a.usage.cache_read + a.usage.cache_write);
+                    }
+                }
+                Message::ToolResult(_) => tool_results += 1,
+            }
+        }
+
+        SessionStats {
+            user_messages,
+            assistant_messages,
+            tool_calls,
+            tool_results,
+            tokens,
+            cost,
+            is_subscription: self.is_subscription,
+            context_window: self.model.context_window,
+            context_tokens: last_input_tokens,
         }
     }
 }
@@ -68,7 +118,6 @@ pub fn socket_path() -> PathBuf {
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".tau").join("tau.sock")
     } else {
-        // Fallback: use pid-based path (XDG_RUNTIME_DIR and HOME should always be set on Linux)
         PathBuf::from("/tmp")
             .join(format!("tau-{}", std::process::id()))
             .join("tau.sock")
@@ -87,7 +136,6 @@ pub async fn run(registry: ProviderRegistry, default_model: Model) -> crate::Res
     let sock = socket_path();
     prepare_socket_dir(&sock)?;
 
-    // Clean up stale socket
     if sock.exists() {
         std::fs::remove_file(&sock).ok();
     }
@@ -95,7 +143,6 @@ pub async fn run(registry: ProviderRegistry, default_model: Model) -> crate::Res
     let listener = Async::<UnixListener>::bind(&sock)
         .map_err(|e| crate::Error::Io(format!("bind {}: {}", sock.display(), e)))?;
 
-    // Write PID file
     let pid = std::process::id();
     std::fs::write(pid_path(), pid.to_string())
         .map_err(|e| crate::Error::Io(format!("write pidfile: {}", e)))?;
@@ -169,6 +216,13 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     let mut st = state.lock().unwrap();
                     let id = st.new_session_id();
                     let model = st.default_model.clone();
+                    // Check if using OAuth subscription
+                    let is_subscription = st
+                        .auth
+                        .get(&model.provider)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|c| matches!(c, AuthCredential::Oauth(_)));
                     st.sessions.insert(
                         id.clone(),
                         Session {
@@ -176,6 +230,7 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                             model,
                             system_prompt,
                             messages: Vec::new(),
+                            is_subscription,
                         },
                     );
                     id
@@ -183,7 +238,6 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 send(&mut writer, &Response::SessionCreated { session_id: id }).await?;
             }
             Request::Chat { session_id, text } => {
-                // Extract what we need from state, then release lock
                 let chat_data = {
                     let mut st = state.lock().unwrap();
                     if let Some(session) = st.sessions.get_mut(&session_id) {
@@ -311,7 +365,6 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 send(&mut writer, &Response::SessionDeleted).await?;
             }
             Request::Login { provider } => {
-                // Login runs in a blocking thread (it does HTTP + waits for callback)
                 let result = smol::unblock(move || {
                     if provider == "anthropic" {
                         crate::auth::login_anthropic()
@@ -369,7 +422,6 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
             }
             Request::Shutdown => {
                 send(&mut writer, &Response::Ok).await?;
-                // Clean up and exit
                 let sock = socket_path();
                 std::fs::remove_file(&sock).ok();
                 std::fs::remove_file(pid_path()).ok();
