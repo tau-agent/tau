@@ -325,7 +325,7 @@ pub enum StreamEvent {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn timestamp_ms() -> u64 {
+pub fn timestamp_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

@@ -21,6 +21,12 @@ enum Commands {
         #[arg(long, default_value = "claude-sonnet-4-20250514")]
         model: String,
     },
+    /// Log in to an LLM provider (OAuth)
+    Login {
+        /// Provider name
+        #[arg(default_value = "anthropic")]
+        provider: String,
+    },
     /// Manage the tau server
     Server {
         #[command(subcommand)]
@@ -30,6 +36,11 @@ enum Commands {
     Sessions {
         #[command(subcommand)]
         action: SessionAction,
+    },
+    /// Manage authentication
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
     },
 }
 
@@ -58,6 +69,17 @@ enum SessionAction {
     },
 }
 
+#[derive(Subcommand)]
+enum AuthAction {
+    /// Show authentication status
+    Status,
+    /// Log out from a provider
+    Logout {
+        /// Provider name
+        provider: String,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -78,6 +100,9 @@ async fn run(cli: Cli) -> tau::Result<()> {
         } => {
             cmd_chat(message, session).await?;
         }
+        Commands::Login { provider } => {
+            cmd_login(&provider).await?;
+        }
         Commands::Server { action } => match action {
             ServerAction::Start { foreground } => {
                 cmd_server_start(foreground).await?;
@@ -97,6 +122,17 @@ async fn run(cli: Cli) -> tau::Result<()> {
                 cmd_sessions_delete(&id).await?;
             }
         },
+        Commands::Auth { action } => match action {
+            AuthAction::Status => {
+                cmd_auth_status().await?;
+            }
+            AuthAction::Logout { provider } => {
+                // Direct file operation, no server needed
+                let auth = tau::auth::AuthStorage::open_default();
+                auth.remove(&provider)?;
+                eprintln!("logged out from {}", provider);
+            }
+        },
     }
     Ok(())
 }
@@ -104,6 +140,30 @@ async fn run(cli: Cli) -> tau::Result<()> {
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
+
+async fn cmd_login(provider: &str) -> tau::Result<()> {
+    // Login runs directly in the CLI process (needs to open browser + wait for callback).
+    // We don't go through the server because the callback server binds a port locally.
+    eprintln!("Logging in to {}...", provider);
+
+    let provider = provider.to_string();
+    let creds = smol::unblock(move || {
+        if provider == "anthropic" {
+            tau::auth::login_anthropic()
+        } else {
+            Err(tau::Error::Io(format!(
+                "unknown OAuth provider: {}",
+                provider
+            )))
+        }
+    })
+    .await?;
+
+    let auth = tau::auth::AuthStorage::open_default();
+    auth.set("anthropic", tau::auth::AuthCredential::Oauth(creds))?;
+    eprintln!("Login successful! Credentials saved.");
+    Ok(())
+}
 
 async fn cmd_chat(message: Option<String>, session_id: Option<String>) -> tau::Result<()> {
     let mut client = tau::client::Client::connect_or_start().await?;
@@ -260,6 +320,31 @@ fn cmd_server_status() {
     } else {
         eprintln!("server not running");
     }
+}
+
+async fn cmd_auth_status() -> tau::Result<()> {
+    let auth = tau::auth::AuthStorage::open_default();
+    let providers = auth.list()?;
+    if providers.is_empty() {
+        println!("not logged in to any providers");
+        println!("run `tau login` to authenticate");
+    } else {
+        for p in &providers {
+            let status = match auth.get(p)? {
+                Some(tau::auth::AuthCredential::Oauth(creds)) => {
+                    if creds.is_expired() {
+                        "oauth (expired, will auto-refresh)"
+                    } else {
+                        "oauth (valid)"
+                    }
+                }
+                Some(tau::auth::AuthCredential::ApiKey { .. }) => "api key",
+                None => "none",
+            };
+            println!("{}\t{}", p, status);
+        }
+    }
+    Ok(())
 }
 
 async fn cmd_sessions_list() -> tau::Result<()> {

@@ -18,3 +18,7 @@ thiserror = "2"
 futures = "0.3"
 ureq = { version = "2", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.9"
+fs2 = "0.4"

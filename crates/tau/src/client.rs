@@ -86,7 +86,9 @@ impl Client {
                 | Response::Ok
                 | Response::SessionCreated { .. }
                 | Response::SessionDeleted
-                | Response::Sessions { .. } => true,
+                | Response::Sessions { .. }
+                | Response::LoginSuccess { .. }
+                | Response::AuthStatus { .. } => true,
             };
             on_response(&resp);
             if is_terminal {

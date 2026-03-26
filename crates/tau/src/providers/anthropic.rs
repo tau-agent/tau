@@ -80,10 +80,31 @@ fn run_stream(
 ) -> crate::Result<()> {
     let url = format!("{}/v1/messages", ctx.base_url.trim_end_matches('/'));
 
-    let resp = ureq::post(&url)
-        .set("x-api-key", ctx.api_key)
+    let is_oauth = crate::auth::is_oauth_token(ctx.api_key);
+    let mut req = ureq::post(&url)
         .set("content-type", "application/json")
         .set("anthropic-version", "2023-06-01")
+        .set("accept", "application/json");
+
+    if is_oauth {
+        // OAuth: Bearer auth + Claude Code identity headers
+        req = req
+            .set("authorization", &format!("Bearer {}", ctx.api_key))
+            .set(
+                "anthropic-beta",
+                "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+            )
+            .set("user-agent", "claude-cli/2.1.75")
+            .set("x-app", "cli")
+            .set("anthropic-dangerous-direct-browser-access", "true");
+    } else {
+        // API key auth
+        req = req
+            .set("x-api-key", ctx.api_key)
+            .set("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
+    }
+
+    let resp = req
         .send_json(body)
         .map_err(|e: ureq::Error| crate::Error::Http(e.to_string()))?;
 
@@ -399,7 +420,28 @@ fn build_request_body(
         "stream": true,
     });
 
-    if let Some(ref prompt) = context.system_prompt {
+    let is_oauth = options
+        .api_key
+        .as_deref()
+        .map(crate::auth::is_oauth_token)
+        .unwrap_or(false);
+
+    if is_oauth {
+        // OAuth: must include Claude Code identity as first system block
+        let mut system_blocks = vec![serde_json::json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "cache_control": {"type": "ephemeral"},
+        })];
+        if let Some(ref prompt) = context.system_prompt {
+            system_blocks.push(serde_json::json!({
+                "type": "text",
+                "text": prompt,
+                "cache_control": {"type": "ephemeral"},
+            }));
+        }
+        body["system"] = serde_json::json!(system_blocks);
+    } else if let Some(ref prompt) = context.system_prompt {
         body["system"] = serde_json::json!(prompt);
     }
 

@@ -9,6 +9,7 @@ use futures::StreamExt;
 use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use smol::Async;
 
+use crate::auth::{AuthCredential, AuthStorage};
 use crate::protocol::{Request, Response, SessionInfo};
 use crate::provider::ProviderRegistry;
 use crate::types::*;
@@ -42,6 +43,7 @@ impl Session {
 struct State {
     sessions: HashMap<String, Session>,
     registry: ProviderRegistry,
+    auth: AuthStorage,
     default_model: Model,
     next_session_id: u64,
 }
@@ -103,6 +105,7 @@ pub async fn run(registry: ProviderRegistry, default_model: Model) -> crate::Res
     let state: SharedState = Arc::new(Mutex::new(State {
         sessions: HashMap::new(),
         registry,
+        auth: AuthStorage::open_default(),
         default_model,
         next_session_id: 0,
     }));
@@ -193,12 +196,12 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                             tools: Vec::new(),
                         };
                         let model = session.model.clone();
-                        Some((context, model, StreamOptions::default()))
+                        Some((context, model))
                     } else {
                         None
                     }
                 };
-                let Some((context, model, options)) = chat_data else {
+                let Some((context, model)) = chat_data else {
                     send(
                         &mut writer,
                         &Response::Error {
@@ -207,6 +210,43 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     )
                     .await?;
                     continue;
+                };
+
+                // Resolve API key (auto-refreshes OAuth tokens)
+                let api_key = {
+                    let st = state.lock().unwrap();
+                    st.auth.get_api_key(&model.provider)
+                };
+                let api_key = match api_key {
+                    Ok(Some(key)) => key,
+                    Ok(None) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!(
+                                    "no API key for {}. Run `tau login` to authenticate.",
+                                    model.provider
+                                ),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("auth error: {}", e),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+
+                let options = StreamOptions {
+                    api_key: Some(api_key),
+                    ..Default::default()
                 };
 
                 let stream_result = {
@@ -269,6 +309,63 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     st.sessions.remove(&session_id);
                 }
                 send(&mut writer, &Response::SessionDeleted).await?;
+            }
+            Request::Login { provider } => {
+                // Login runs in a blocking thread (it does HTTP + waits for callback)
+                let result = smol::unblock(move || {
+                    if provider == "anthropic" {
+                        crate::auth::login_anthropic()
+                    } else {
+                        Err(crate::Error::Io(format!(
+                            "unknown OAuth provider: {}",
+                            provider
+                        )))
+                    }
+                })
+                .await;
+
+                match result {
+                    Ok(creds) => {
+                        let provider_name = "anthropic".to_string();
+                        let save_result = {
+                            let st = state.lock().unwrap();
+                            st.auth.set(&provider_name, AuthCredential::Oauth(creds))
+                        };
+                        if let Err(e) = save_result {
+                            send(
+                                &mut writer,
+                                &Response::Error {
+                                    message: format!("failed to save credentials: {}", e),
+                                },
+                            )
+                            .await?;
+                        } else {
+                            send(
+                                &mut writer,
+                                &Response::LoginSuccess {
+                                    provider: provider_name,
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("login failed: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Request::AuthStatus => {
+                let providers = {
+                    let st = state.lock().unwrap();
+                    st.auth.list().unwrap_or_default()
+                };
+                send(&mut writer, &Response::AuthStatus { providers }).await?;
             }
             Request::Shutdown => {
                 send(&mut writer, &Response::Ok).await?;

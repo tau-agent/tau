@@ -26,6 +26,10 @@ pub enum Request {
     ListSessions,
     /// Delete a session.
     DeleteSession { session_id: String },
+    /// Start OAuth login for a provider.
+    Login { provider: String },
+    /// Query authentication status.
+    AuthStatus,
     /// Shut down the server.
     Shutdown,
 }
@@ -45,6 +49,10 @@ pub enum Response {
     SessionDeleted,
     /// Streaming event from the LLM.
     Stream { event: Box<StreamEvent> },
+    /// OAuth login succeeded.
+    LoginSuccess { provider: String },
+    /// Authentication status.
+    AuthStatus { providers: Vec<String> },
     /// Success (generic ack).
     Ok,
     /// Error.
