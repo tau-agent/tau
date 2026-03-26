@@ -1,0 +1,16 @@
+[package]
+name = "tau-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LLM agent CLI"
+
+[[bin]]
+name = "tau"
+path = "src/main.rs"
+
+[dependencies]
+tau.workspace = true
+smol.workspace = true
+clap.workspace = true
