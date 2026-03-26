@@ -457,33 +457,25 @@ async fn print_subscription_usage(client: &mut tau::client::Client) {
     client
         .recv_streaming(|resp| {
             if let tau::protocol::Response::SubscriptionUsage { usage } = resp {
-                let fh = usage.five_hour.as_ref();
-                let sd = usage.seven_day.as_ref();
-                let resets = fh
-                    .and_then(|b| b.resets_at.as_deref())
-                    .map(format_resets)
-                    .unwrap_or_else(|| "?".into());
-                println!(
-                    "usage:    5h {}  7d {}  resets {}",
-                    pct(fh),
-                    pct(sd),
-                    resets
-                );
-                if let (Some(sonnet), Some(opus)) = (&usage.seven_day_sonnet, &usage.seven_day_opus)
-                {
-                    println!(
-                        "          sonnet {}  opus {}",
-                        pct(Some(sonnet)),
-                        pct(Some(opus))
-                    );
+                fn bucket_line(label: &str, indent: bool, b: Option<&tau::auth::UsageBucket>) {
+                    let prefix = if indent { "          " } else { "usage:    " };
+                    let resets = b
+                        .and_then(|b| b.resets_at.as_deref())
+                        .map(format_resets)
+                        .unwrap_or_else(|| "?".into());
+                    println!("{}{:<8} {:<6} resets {}", prefix, label, pct(b), resets,);
                 }
+                bucket_line("5h", false, usage.five_hour.as_ref());
+                bucket_line("7d", true, usage.seven_day.as_ref());
+                bucket_line("sonnet", true, usage.seven_day_sonnet.as_ref());
+                bucket_line("opus", true, usage.seven_day_opus.as_ref());
                 if usage.extra_usage_enabled
                     && let (Some(used), Some(limit)) = (
                         usage.extra_usage_used_credits,
                         usage.extra_usage_monthly_limit,
                     )
                 {
-                    println!("          extra: ${:.2}/${:.2} used", used, limit);
+                    println!("          extra ${:.2}/${:.2}", used, limit);
                 }
             } else if let tau::protocol::Response::Error { message } = resp {
                 eprintln!("usage:    unavailable ({})", message);
