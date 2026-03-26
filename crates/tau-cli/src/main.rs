@@ -398,7 +398,7 @@ async fn handle_slash_command(
     client: &mut tau::client::Client,
     session_id: &str,
     line: &str,
-    totals: &UsageTotals,
+    _totals: &UsageTotals,
 ) -> tau::Result<bool> {
     let (cmd, args) = line.split_once(' ').unwrap_or((line, ""));
     let args = args.trim();
@@ -416,11 +416,6 @@ async fn handle_slash_command(
                 info.stats.user_messages, info.stats.assistant_messages, info.stats.tool_calls
             );
             println!("tokens:   {}", tau::protocol::format_stats(&info.stats));
-            // Also show live cumulative from this CLI session
-            if totals.input > 0 || totals.output > 0 {
-                print!("session:  ");
-                totals.display();
-            }
         }
 
         "/model" | "/models" => {
