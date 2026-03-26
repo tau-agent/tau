@@ -191,21 +191,72 @@ async fn cmd_chat(message: Option<String>, session_id: Option<String>) -> tau::R
         created_id.ok_or_else(|| tau::Error::Io("failed to create session".into()))?
     };
 
+    let mut totals = UsageTotals::default();
+
     if let Some(text) = message {
         // One-shot mode
-        send_and_print(&mut client, &session_id, &text).await?;
+        send_and_print(&mut client, &session_id, &text, &mut totals).await?;
     } else {
         // Interactive mode
-        interactive_loop(&mut client, &session_id).await?;
+        interactive_loop(&mut client, &session_id, &mut totals).await?;
     }
 
     Ok(())
+}
+
+/// Cumulative usage accumulator for a chat session.
+#[derive(Default)]
+struct UsageTotals {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost: f64,
+}
+
+impl UsageTotals {
+    fn add(&mut self, usage: &tau::Usage) {
+        self.input += usage.input;
+        self.output += usage.output;
+        self.cache_read += usage.cache_read;
+        self.cache_write += usage.cache_write;
+        self.cost += usage.cost.total;
+    }
+
+    fn display(&self) {
+        let mut parts = Vec::new();
+        if self.input > 0 {
+            parts.push(format!("↑{}", tau::protocol::format_tokens(self.input)));
+        }
+        if self.output > 0 {
+            parts.push(format!("↓{}", tau::protocol::format_tokens(self.output)));
+        }
+        if self.cache_read > 0 {
+            parts.push(format!(
+                "R{}",
+                tau::protocol::format_tokens(self.cache_read)
+            ));
+        }
+        if self.cache_write > 0 {
+            parts.push(format!(
+                "W{}",
+                tau::protocol::format_tokens(self.cache_write)
+            ));
+        }
+        if self.cost > 0.0 {
+            parts.push(format!("${:.4}", self.cost));
+        }
+        if !parts.is_empty() {
+            eprintln!("[{}]", parts.join(" "));
+        }
+    }
 }
 
 async fn send_and_print(
     client: &mut tau::client::Client,
     session_id: &str,
     text: &str,
+    totals: &mut UsageTotals,
 ) -> tau::Result<()> {
     client
         .send(&tau::protocol::Request::Chat {
@@ -222,27 +273,8 @@ async fn send_and_print(
                 }
                 tau::StreamEvent::Done { message, .. } => {
                     println!();
-                    // Show per-turn usage
-                    let u = &message.usage;
-                    let mut parts = Vec::new();
-                    if u.input > 0 {
-                        parts.push(format!("↑{}", tau::protocol::format_tokens(u.input)));
-                    }
-                    if u.output > 0 {
-                        parts.push(format!("↓{}", tau::protocol::format_tokens(u.output)));
-                    }
-                    if u.cache_read > 0 {
-                        parts.push(format!("R{}", tau::protocol::format_tokens(u.cache_read)));
-                    }
-                    if u.cache_write > 0 {
-                        parts.push(format!("W{}", tau::protocol::format_tokens(u.cache_write)));
-                    }
-                    if u.cost.total > 0.0 {
-                        parts.push(format!("${:.4}", u.cost.total));
-                    }
-                    if !parts.is_empty() {
-                        eprintln!("[{}]", parts.join(" "));
-                    }
+                    totals.add(&message.usage);
+                    totals.display();
                 }
                 tau::StreamEvent::Error { error, .. } => {
                     if let Some(ref msg) = error.error_message {
@@ -261,7 +293,11 @@ async fn send_and_print(
     Ok(())
 }
 
-async fn interactive_loop(client: &mut tau::client::Client, session_id: &str) -> tau::Result<()> {
+async fn interactive_loop(
+    client: &mut tau::client::Client,
+    session_id: &str,
+    totals: &mut UsageTotals,
+) -> tau::Result<()> {
     use std::io::Write;
 
     loop {
@@ -280,7 +316,7 @@ async fn interactive_loop(client: &mut tau::client::Client, session_id: &str) ->
             break;
         }
 
-        send_and_print(client, session_id, line).await?;
+        send_and_print(client, session_id, line, totals).await?;
     }
 
     Ok(())
