@@ -1,6 +1,5 @@
 //! Unix socket server — manages sessions and streams LLM responses.
 
-use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,79 +9,69 @@ use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use smol::Async;
 
 use crate::auth::{AuthCredential, AuthStorage};
+use crate::db::{Db, StoredSession};
 use crate::protocol::{Request, Response, SessionInfo, SessionStats, TokenStats};
 use crate::provider::ProviderRegistry;
 use crate::types::*;
 
 // ---------------------------------------------------------------------------
-// Session
+// Compute stats from a message list
 // ---------------------------------------------------------------------------
 
-struct Session {
-    id: String,
-    model: Model,
-    system_prompt: Option<String>,
-    messages: Vec<Message>,
-    is_subscription: bool,
-}
+fn compute_stats(messages: &[Message], model: &Model, is_subscription: bool) -> SessionStats {
+    let mut user_messages = 0usize;
+    let mut assistant_messages = 0usize;
+    let mut tool_calls = 0usize;
+    let mut tool_results = 0usize;
+    let mut tokens = TokenStats::default();
+    let mut cost = 0.0f64;
+    let mut last_input_tokens: Option<u64> = None;
 
-impl Session {
-    fn info(&self) -> SessionInfo {
-        SessionInfo {
-            id: self.id.clone(),
-            model: self.model.id.clone(),
-            provider: self.model.provider.clone(),
-            message_count: self.messages.len(),
-            stats: self.stats(),
+    for msg in messages {
+        match msg {
+            Message::User(_) => user_messages += 1,
+            Message::Assistant(a) => {
+                assistant_messages += 1;
+                for c in &a.content {
+                    if matches!(c, AssistantContent::ToolCall(_)) {
+                        tool_calls += 1;
+                    }
+                }
+                tokens.input += a.usage.input;
+                tokens.output += a.usage.output;
+                tokens.cache_read += a.usage.cache_read;
+                tokens.cache_write += a.usage.cache_write;
+                cost += a.usage.cost.total;
+
+                if a.stop_reason != StopReason::Error && a.stop_reason != StopReason::Aborted {
+                    last_input_tokens =
+                        Some(a.usage.input + a.usage.cache_read + a.usage.cache_write);
+                }
+            }
+            Message::ToolResult(_) => tool_results += 1,
         }
     }
 
-    fn stats(&self) -> SessionStats {
-        let mut user_messages = 0usize;
-        let mut assistant_messages = 0usize;
-        let mut tool_calls = 0usize;
-        let mut tool_results = 0usize;
-        let mut tokens = TokenStats::default();
-        let mut cost = 0.0f64;
-        let mut last_input_tokens: Option<u64> = None;
+    SessionStats {
+        user_messages,
+        assistant_messages,
+        tool_calls,
+        tool_results,
+        tokens,
+        cost,
+        is_subscription,
+        context_window: model.context_window,
+        context_tokens: last_input_tokens,
+    }
+}
 
-        for msg in &self.messages {
-            match msg {
-                Message::User(_) => user_messages += 1,
-                Message::Assistant(a) => {
-                    assistant_messages += 1;
-                    for c in &a.content {
-                        if matches!(c, AssistantContent::ToolCall(_)) {
-                            tool_calls += 1;
-                        }
-                    }
-                    tokens.input += a.usage.input;
-                    tokens.output += a.usage.output;
-                    tokens.cache_read += a.usage.cache_read;
-                    tokens.cache_write += a.usage.cache_write;
-                    cost += a.usage.cost.total;
-
-                    // Track last successful assistant's input tokens as context estimate
-                    if a.stop_reason != StopReason::Error && a.stop_reason != StopReason::Aborted {
-                        last_input_tokens =
-                            Some(a.usage.input + a.usage.cache_read + a.usage.cache_write);
-                    }
-                }
-                Message::ToolResult(_) => tool_results += 1,
-            }
-        }
-
-        SessionStats {
-            user_messages,
-            assistant_messages,
-            tool_calls,
-            tool_results,
-            tokens,
-            cost,
-            is_subscription: self.is_subscription,
-            context_window: self.model.context_window,
-            context_tokens: last_input_tokens,
-        }
+fn session_info(stored: &StoredSession, messages: &[Message]) -> SessionInfo {
+    SessionInfo {
+        id: stored.id.clone(),
+        model: stored.model.id.clone(),
+        provider: stored.model.provider.clone(),
+        message_count: messages.len(),
+        stats: compute_stats(messages, &stored.model, stored.is_subscription),
     }
 }
 
@@ -91,18 +80,10 @@ impl Session {
 // ---------------------------------------------------------------------------
 
 struct State {
-    sessions: HashMap<String, Session>,
+    db: Db,
     registry: ProviderRegistry,
     auth: AuthStorage,
     default_model: Model,
-    next_session_id: u64,
-}
-
-impl State {
-    fn new_session_id(&mut self) -> String {
-        self.next_session_id += 1;
-        format!("s{}", self.next_session_id)
-    }
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -147,14 +128,14 @@ pub async fn run(registry: ProviderRegistry, default_model: Model) -> crate::Res
     std::fs::write(pid_path(), pid.to_string())
         .map_err(|e| crate::Error::Io(format!("write pidfile: {}", e)))?;
 
+    let db = Db::open_default()?;
     eprintln!("tau server listening on {}", sock.display());
 
     let state: SharedState = Arc::new(Mutex::new(State {
-        sessions: HashMap::new(),
+        db,
         registry,
         auth: AuthStorage::open_default(),
         default_model,
-        next_session_id: 0,
     }));
 
     loop {
@@ -213,60 +194,56 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 system_prompt,
             } => {
                 let id = {
-                    let mut st = state.lock().unwrap();
-                    let id = st.new_session_id();
+                    let st = state.lock().unwrap();
                     let model = st.default_model.clone();
-                    // Check if using OAuth subscription
                     let is_subscription = st
                         .auth
                         .get(&model.provider)
                         .ok()
                         .flatten()
                         .is_some_and(|c| matches!(c, AuthCredential::Oauth(_)));
-                    st.sessions.insert(
-                        id.clone(),
-                        Session {
-                            id: id.clone(),
-                            model,
-                            system_prompt,
-                            messages: Vec::new(),
-                            is_subscription,
-                        },
-                    );
+                    let id = st.db.next_session_id()?;
+                    let stored = StoredSession {
+                        id: id.clone(),
+                        model,
+                        system_prompt,
+                        is_subscription,
+                        created_at: crate::types::timestamp_ms(),
+                    };
+                    st.db.create_session(&stored)?;
                     id
                 };
                 send(&mut writer, &Response::SessionCreated { session_id: id }).await?;
             }
             Request::Chat { session_id, text } => {
+                // Load session + messages from DB, append user message
                 let chat_data = {
-                    let mut st = state.lock().unwrap();
-                    if let Some(session) = st.sessions.get_mut(&session_id) {
-                        session
-                            .messages
-                            .push(Message::User(UserMessage::text(&text)));
-                        let context = Context {
-                            system_prompt: session.system_prompt.clone(),
-                            messages: session.messages.clone(),
-                            tools: Vec::new(),
-                        };
-                        let model = session.model.clone();
-                        Some((context, model))
-                    } else {
-                        None
+                    let st = state.lock().unwrap();
+                    match st.db.get_session(&session_id) {
+                        Ok(Some(stored)) => {
+                            let user_msg = Message::User(UserMessage::text(&text));
+                            st.db.append_message(&session_id, &user_msg)?;
+                            let messages = st.db.get_messages(&session_id)?;
+                            let context = Context {
+                                system_prompt: stored.system_prompt.clone(),
+                                messages,
+                                tools: Vec::new(),
+                            };
+                            Ok((context, stored.model))
+                        }
+                        Ok(None) => Err(format!("session not found: {}", session_id)),
+                        Err(e) => Err(format!("db error: {}", e)),
                     }
                 };
-                let Some((context, model)) = chat_data else {
-                    send(
-                        &mut writer,
-                        &Response::Error {
-                            message: format!("session not found: {}", session_id),
-                        },
-                    )
-                    .await?;
-                    continue;
+                let (context, model) = match chat_data {
+                    Ok(data) => data,
+                    Err(msg) => {
+                        send(&mut writer, &Response::Error { message: msg }).await?;
+                        continue;
+                    }
                 };
 
-                // Resolve API key (auto-refreshes OAuth tokens)
+                // Resolve API key
                 let api_key = {
                     let st = state.lock().unwrap();
                     st.auth.get_api_key(&model.provider)
@@ -342,25 +319,29 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     .await?;
                 }
 
-                // Store assistant message in session
+                // Persist assistant message
                 if let Some(msg) = final_message {
-                    let mut st = state.lock().unwrap();
-                    if let Some(session) = st.sessions.get_mut(&session_id) {
-                        session.messages.push(msg);
-                    }
+                    let st = state.lock().unwrap();
+                    st.db.append_message(&session_id, &msg)?;
                 }
             }
             Request::ListSessions => {
-                let sessions: Vec<SessionInfo> = {
+                let sessions = {
                     let st = state.lock().unwrap();
-                    st.sessions.values().map(|s| s.info()).collect()
+                    let stored = st.db.list_sessions()?;
+                    let mut infos = Vec::with_capacity(stored.len());
+                    for s in &stored {
+                        let messages = st.db.get_messages(&s.id)?;
+                        infos.push(session_info(s, &messages));
+                    }
+                    infos
                 };
                 send(&mut writer, &Response::Sessions { sessions }).await?;
             }
             Request::DeleteSession { session_id } => {
                 {
-                    let mut st = state.lock().unwrap();
-                    st.sessions.remove(&session_id);
+                    let st = state.lock().unwrap();
+                    st.db.delete_session(&session_id)?;
                 }
                 send(&mut writer, &Response::SessionDeleted).await?;
             }
