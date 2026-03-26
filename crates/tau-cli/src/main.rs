@@ -465,10 +465,18 @@ async fn print_subscription_usage(client: &mut tau::client::Client) {
                         .unwrap_or_else(|| "?".into());
                     println!("{}{:<8} {:<6} resets {}", prefix, label, pct(b), resets,);
                 }
-                bucket_line("5h", false, usage.five_hour.as_ref());
-                bucket_line("7d", true, usage.seven_day.as_ref());
-                bucket_line("sonnet", true, usage.seven_day_sonnet.as_ref());
-                bucket_line("opus", true, usage.seven_day_opus.as_ref());
+                let mut first = true;
+                for (label, bucket) in [
+                    ("5h", &usage.five_hour),
+                    ("7d", &usage.seven_day),
+                    ("sonnet", &usage.seven_day_sonnet),
+                    ("opus", &usage.seven_day_opus),
+                ] {
+                    if bucket.is_some() {
+                        bucket_line(label, !first, bucket.as_ref());
+                        first = false;
+                    }
+                }
                 if usage.extra_usage_enabled
                     && let (Some(used), Some(limit)) = (
                         usage.extra_usage_used_credits,
