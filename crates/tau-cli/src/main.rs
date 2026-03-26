@@ -355,25 +355,51 @@ async fn send_and_print(
     Ok(())
 }
 
+fn history_path() -> std::path::PathBuf {
+    if let Ok(data) = std::env::var("XDG_DATA_HOME") {
+        std::path::PathBuf::from(data)
+            .join("tau")
+            .join("history.txt")
+    } else if let Ok(home) = std::env::var("HOME") {
+        std::path::PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("tau")
+            .join("history.txt")
+    } else {
+        std::path::PathBuf::from("/tmp").join("tau-history.txt")
+    }
+}
+
 async fn interactive_loop(
     client: &mut tau::client::Client,
     session_id: &str,
     totals: &mut UsageTotals,
 ) -> tau::Result<()> {
-    use std::io::Write;
+    let hist = history_path();
+    if let Some(parent) = hist.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let mut rl = rustyline::DefaultEditor::new()
+        .map_err(|e| tau::Error::Io(format!("readline init: {}", e)))?;
+    let _ = rl.load_history(&hist);
 
     loop {
-        print!("tau> ");
-        std::io::stdout().flush().ok();
-
-        let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
-            break; // EOF
-        }
+        let line = match rl.readline("tau> ") {
+            Ok(line) => line,
+            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(e) => return Err(tau::Error::Io(format!("readline: {}", e))),
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
+
+        rl.add_history_entry(line)
+            .map_err(|e| tau::Error::Io(format!("history: {}", e)))?;
+        let _ = rl.save_history(&hist);
 
         // Handle slash commands
         if line.starts_with('/') {

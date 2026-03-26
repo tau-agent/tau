@@ -14,3 +14,4 @@ path = "src/main.rs"
 tau.workspace = true
 smol.workspace = true
 clap.workspace = true
+rustyline.workspace = true
