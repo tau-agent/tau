@@ -192,6 +192,19 @@ impl Db {
         Ok(())
     }
 
+    /// Update the model for a session.
+    pub fn update_model(&self, session_id: &str, model: &crate::types::Model) -> crate::Result<()> {
+        let model_json =
+            serde_json::to_string(model).map_err(|e| crate::Error::Parse(e.to_string()))?;
+        self.conn
+            .execute(
+                "UPDATE sessions SET model_json = ?1 WHERE id = ?2",
+                params![model_json, session_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("update model: {}", e)))?;
+        Ok(())
+    }
+
     /// Get the next session id (max numeric suffix + 1).
     pub fn next_session_id(&self) -> crate::Result<String> {
         let max: Option<String> = self

@@ -54,6 +54,8 @@ enum ServerAction {
     },
     /// Stop the server
     Stop,
+    /// Restart the server
+    Restart,
     /// Check server status
     Status,
 }
@@ -110,6 +112,9 @@ async fn run(cli: Cli) -> tau::Result<()> {
             ServerAction::Stop => {
                 cmd_server_stop().await?;
             }
+            ServerAction::Restart => {
+                cmd_server_restart().await?;
+            }
             ServerAction::Status => {
                 cmd_server_status();
             }
@@ -127,7 +132,6 @@ async fn run(cli: Cli) -> tau::Result<()> {
                 cmd_auth_status().await?;
             }
             AuthAction::Logout { provider } => {
-                // Direct file operation, no server needed
                 let auth = tau::auth::AuthStorage::open_default();
                 auth.remove(&provider)?;
                 eprintln!("logged out from {}", provider);
@@ -138,12 +142,78 @@ async fn run(cli: Cli) -> tau::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Cumulative usage tracking
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct UsageTotals {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    cost: f64,
+    /// Context window size from model.
+    context_window: u64,
+    /// Context tokens from last successful response.
+    context_tokens: Option<u64>,
+    /// Whether using OAuth subscription.
+    is_subscription: bool,
+}
+
+impl UsageTotals {
+    fn add(&mut self, usage: &tau::Usage) {
+        self.input += usage.input;
+        self.output += usage.output;
+        self.cache_read += usage.cache_read;
+        self.cache_write += usage.cache_write;
+        self.cost += usage.cost.total;
+        // Context estimate: last response's total input (fresh + cached)
+        self.context_tokens = Some(usage.input + usage.cache_read + usage.cache_write);
+    }
+
+    fn display(&self) {
+        use tau::protocol::format_tokens;
+        let mut parts = Vec::new();
+        if self.input > 0 {
+            parts.push(format!("↑{}", format_tokens(self.input)));
+        }
+        if self.output > 0 {
+            parts.push(format!("↓{}", format_tokens(self.output)));
+        }
+        if self.cache_read > 0 {
+            parts.push(format!("R{}", format_tokens(self.cache_read)));
+        }
+        if self.cache_write > 0 {
+            parts.push(format!("W{}", format_tokens(self.cache_write)));
+        }
+        if self.cost > 0.0 {
+            if self.is_subscription {
+                parts.push(format!("${:.4} (sub)", self.cost));
+            } else {
+                parts.push(format!("${:.4}", self.cost));
+            }
+        }
+        if self.context_window > 0 {
+            let ctx = match self.context_tokens {
+                Some(t) => {
+                    let pct = (t as f64 / self.context_window as f64) * 100.0;
+                    format!("{:.1}%/{}", pct, format_tokens(self.context_window))
+                }
+                None => format!("?/{}", format_tokens(self.context_window)),
+            };
+            parts.push(ctx);
+        }
+        if !parts.is_empty() {
+            eprintln!("[{}]", parts.join(" "));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
 async fn cmd_login(provider: &str) -> tau::Result<()> {
-    // Login runs directly in the CLI process (needs to open browser + wait for callback).
-    // We don't go through the server because the callback server binds a port locally.
     eprintln!("Logging in to {}...", provider);
 
     let provider = provider.to_string();
@@ -168,7 +238,6 @@ async fn cmd_login(provider: &str) -> tau::Result<()> {
 async fn cmd_chat(message: Option<String>, session_id: Option<String>) -> tau::Result<()> {
     let mut client = tau::client::Client::connect_or_start().await?;
 
-    // Create or reuse session
     let session_id = if let Some(id) = session_id {
         id
     } else {
@@ -191,64 +260,57 @@ async fn cmd_chat(message: Option<String>, session_id: Option<String>) -> tau::R
         created_id.ok_or_else(|| tau::Error::Io("failed to create session".into()))?
     };
 
+    // Initialize totals with session info (for context_window, is_subscription)
     let mut totals = UsageTotals::default();
+    if let Ok(info) = get_session_info(&mut client, &session_id).await {
+        totals.context_window = info.stats.context_window;
+        totals.is_subscription = info.stats.is_subscription;
+        // If resuming an existing session, seed totals from stored stats
+        totals.input = info.stats.tokens.input;
+        totals.output = info.stats.tokens.output;
+        totals.cache_read = info.stats.tokens.cache_read;
+        totals.cache_write = info.stats.tokens.cache_write;
+        totals.cost = info.stats.cost;
+        totals.context_tokens = info.stats.context_tokens;
+    }
 
     if let Some(text) = message {
-        // One-shot mode
         send_and_print(&mut client, &session_id, &text, &mut totals).await?;
     } else {
-        // Interactive mode
         interactive_loop(&mut client, &session_id, &mut totals).await?;
     }
 
     Ok(())
 }
 
-/// Cumulative usage accumulator for a chat session.
-#[derive(Default)]
-struct UsageTotals {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-    cost: f64,
-}
+async fn get_session_info(
+    client: &mut tau::client::Client,
+    session_id: &str,
+) -> tau::Result<tau::protocol::SessionInfo> {
+    client
+        .send(&tau::protocol::Request::GetSessionInfo {
+            session_id: session_id.to_string(),
+        })
+        .await?;
 
-impl UsageTotals {
-    fn add(&mut self, usage: &tau::Usage) {
-        self.input += usage.input;
-        self.output += usage.output;
-        self.cache_read += usage.cache_read;
-        self.cache_write += usage.cache_write;
-        self.cost += usage.cost.total;
-    }
+    let mut info = None;
+    let mut error = None;
+    client
+        .recv_streaming(|resp| match resp {
+            tau::protocol::Response::SessionInfo { info: i } => {
+                info = Some(i.clone());
+            }
+            tau::protocol::Response::Error { message } => {
+                error = Some(message.clone());
+            }
+            _ => {}
+        })
+        .await?;
 
-    fn display(&self) {
-        let mut parts = Vec::new();
-        if self.input > 0 {
-            parts.push(format!("↑{}", tau::protocol::format_tokens(self.input)));
-        }
-        if self.output > 0 {
-            parts.push(format!("↓{}", tau::protocol::format_tokens(self.output)));
-        }
-        if self.cache_read > 0 {
-            parts.push(format!(
-                "R{}",
-                tau::protocol::format_tokens(self.cache_read)
-            ));
-        }
-        if self.cache_write > 0 {
-            parts.push(format!(
-                "W{}",
-                tau::protocol::format_tokens(self.cache_write)
-            ));
-        }
-        if self.cost > 0.0 {
-            parts.push(format!("${:.4}", self.cost));
-        }
-        if !parts.is_empty() {
-            eprintln!("[{}]", parts.join(" "));
-        }
+    match (info, error) {
+        (Some(i), _) => Ok(i),
+        (_, Some(e)) => Err(tau::Error::Io(e)),
+        _ => Err(tau::Error::Io("no response".into())),
     }
 }
 
@@ -312,8 +374,17 @@ async fn interactive_loop(
         if line.is_empty() {
             continue;
         }
-        if line == "/quit" || line == "/exit" {
-            break;
+
+        // Handle slash commands
+        if line.starts_with('/') {
+            match handle_slash_command(client, session_id, line, totals).await {
+                Ok(true) => break, // /quit
+                Ok(false) => continue,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    continue;
+                }
+            }
         }
 
         send_and_print(client, session_id, line, totals).await?;
@@ -321,6 +392,110 @@ async fn interactive_loop(
 
     Ok(())
 }
+
+/// Handle a slash command. Returns Ok(true) if the loop should exit.
+async fn handle_slash_command(
+    client: &mut tau::client::Client,
+    session_id: &str,
+    line: &str,
+    totals: &UsageTotals,
+) -> tau::Result<bool> {
+    let (cmd, args) = line.split_once(' ').unwrap_or((line, ""));
+    let args = args.trim();
+
+    match cmd {
+        "/quit" | "/exit" => return Ok(true),
+
+        "/status" => {
+            let info = get_session_info(client, session_id).await?;
+            println!("session:  {}", info.id);
+            println!("provider: {}", info.provider);
+            println!("model:    {}", info.model);
+            println!(
+                "messages: {} user, {} assistant, {} tool calls",
+                info.stats.user_messages, info.stats.assistant_messages, info.stats.tool_calls
+            );
+            println!("tokens:   {}", tau::protocol::format_stats(&info.stats));
+            // Also show live cumulative from this CLI session
+            if totals.input > 0 || totals.output > 0 {
+                print!("session:  ");
+                totals.display();
+            }
+        }
+
+        "/model" | "/models" => {
+            if args.is_empty() {
+                // List available models
+                client.send(&tau::protocol::Request::ListModels).await?;
+                let current_info = get_session_info(client, session_id).await.ok();
+                let current_model = current_info.as_ref().map(|i| i.model.as_str());
+
+                client.send(&tau::protocol::Request::ListModels).await?;
+                client
+                    .recv_streaming(|resp| {
+                        if let tau::protocol::Response::Models { models } = resp {
+                            for m in models {
+                                let marker = if current_model == Some(m.id.as_str()) {
+                                    " *"
+                                } else {
+                                    ""
+                                };
+                                println!(
+                                    "  {}{}\t{}\t{}K ctx",
+                                    m.id,
+                                    marker,
+                                    m.provider,
+                                    m.context_window / 1000,
+                                );
+                            }
+                        }
+                    })
+                    .await?;
+            } else {
+                // Set model
+                client
+                    .send(&tau::protocol::Request::SetModel {
+                        session_id: session_id.to_string(),
+                        model_id: args.to_string(),
+                    })
+                    .await?;
+                client
+                    .recv_streaming(|resp| match resp {
+                        tau::protocol::Response::ModelChanged { model } => {
+                            eprintln!("model changed to {}", model.id);
+                        }
+                        tau::protocol::Response::Error { message } => {
+                            eprintln!("error: {}", message);
+                        }
+                        _ => {}
+                    })
+                    .await?;
+            }
+        }
+
+        "/help" => {
+            println!("commands:");
+            println!("  /status        show session info and stats");
+            println!("  /model         list available models");
+            println!("  /model <id>    switch to a different model");
+            println!("  /help          show this help");
+            println!("  /quit          exit");
+        }
+
+        _ => {
+            eprintln!(
+                "unknown command: {}. Type /help for available commands.",
+                cmd
+            );
+        }
+    }
+
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// Server commands
+// ---------------------------------------------------------------------------
 
 async fn cmd_server_start(foreground: bool) -> tau::Result<()> {
     if tau::server::is_running() {
@@ -331,31 +506,37 @@ async fn cmd_server_start(foreground: bool) -> tau::Result<()> {
     if foreground {
         let mut registry = tau::ProviderRegistry::new();
         registry.register(Box::new(tau::providers::anthropic::Anthropic));
-        let default_model = tau::providers::anthropic::models()
-            .into_iter()
-            .next()
-            .expect("at least one model");
-        tau::server::run(registry, default_model).await?;
+        let all_models = tau::providers::anthropic::models();
+        let default_model = all_models.first().expect("at least one model").clone();
+        tau::server::run(registry, default_model, all_models).await?;
     } else {
-        let exe = std::env::current_exe().map_err(|e| tau::Error::Io(e.to_string()))?;
-        let child = std::process::Command::new(exe)
-            .args(["server", "start", "--foreground"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| tau::Error::Io(format!("spawn: {}", e)))?;
-        eprintln!("server started (pid {})", child.id());
+        spawn_server_daemon()?;
+    }
+    Ok(())
+}
 
+fn spawn_server_daemon() -> tau::Result<()> {
+    let exe = std::env::current_exe().map_err(|e| tau::Error::Io(e.to_string()))?;
+    let child = std::process::Command::new(exe)
+        .args(["server", "start", "--foreground"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| tau::Error::Io(format!("spawn: {}", e)))?;
+    eprintln!("server started (pid {})", child.id());
+
+    // Wait for ready
+    smol::block_on(async {
         for _ in 0..50 {
             smol::Timer::after(std::time::Duration::from_millis(100)).await;
             if tau::server::is_running() {
                 eprintln!("server ready at {}", tau::server::socket_path().display());
-                return Ok(());
+                return;
             }
         }
         eprintln!("warning: server may not have started");
-    }
+    });
     Ok(())
 }
 
@@ -368,6 +549,23 @@ async fn cmd_server_stop() -> tau::Result<()> {
     client.send(&tau::protocol::Request::Shutdown).await?;
     client.recv_streaming(|_| {}).await?;
     eprintln!("server stopped");
+    Ok(())
+}
+
+async fn cmd_server_restart() -> tau::Result<()> {
+    if tau::server::is_running() {
+        let mut client = tau::client::Client::connect().await?;
+        client.send(&tau::protocol::Request::Shutdown).await?;
+        client.recv_streaming(|_| {}).await?;
+        // Wait for socket to go away
+        for _ in 0..50 {
+            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+            if !tau::server::is_running() {
+                break;
+            }
+        }
+    }
+    spawn_server_daemon()?;
     Ok(())
 }
 

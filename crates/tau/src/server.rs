@@ -10,7 +10,7 @@ use smol::Async;
 
 use crate::auth::{AuthCredential, AuthStorage};
 use crate::db::{Db, StoredSession};
-use crate::protocol::{Request, Response, SessionInfo, SessionStats, TokenStats};
+use crate::protocol::{ModelInfo, Request, Response, SessionInfo, SessionStats, TokenStats};
 use crate::provider::ProviderRegistry;
 use crate::types::*;
 
@@ -75,6 +75,17 @@ fn session_info(stored: &StoredSession, messages: &[Message]) -> SessionInfo {
     }
 }
 
+fn model_info(m: &Model) -> ModelInfo {
+    ModelInfo {
+        id: m.id.clone(),
+        name: m.name.clone(),
+        provider: m.provider.clone(),
+        reasoning: m.reasoning,
+        context_window: m.context_window,
+        max_tokens: m.max_tokens,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server state
 // ---------------------------------------------------------------------------
@@ -84,6 +95,8 @@ struct State {
     registry: ProviderRegistry,
     auth: AuthStorage,
     default_model: Model,
+    /// All known models (for /model listing).
+    all_models: Vec<Model>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -113,7 +126,11 @@ pub fn pid_path() -> PathBuf {
 }
 
 /// Run the server (blocking). Call from `smol::block_on`.
-pub async fn run(registry: ProviderRegistry, default_model: Model) -> crate::Result<()> {
+pub async fn run(
+    registry: ProviderRegistry,
+    default_model: Model,
+    all_models: Vec<Model>,
+) -> crate::Result<()> {
     let sock = socket_path();
     prepare_socket_dir(&sock)?;
 
@@ -136,6 +153,7 @@ pub async fn run(registry: ProviderRegistry, default_model: Model) -> crate::Res
         registry,
         auth: AuthStorage::open_default(),
         default_model,
+        all_models,
     }));
 
     loop {
@@ -215,8 +233,28 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 };
                 send(&mut writer, &Response::SessionCreated { session_id: id }).await?;
             }
+            Request::GetSessionInfo { session_id } => {
+                let result = {
+                    let st = state.lock().unwrap();
+                    match st.db.get_session(&session_id) {
+                        Ok(Some(stored)) => {
+                            let messages = st.db.get_messages(&session_id)?;
+                            Ok(session_info(&stored, &messages))
+                        }
+                        Ok(None) => Err(format!("session not found: {}", session_id)),
+                        Err(e) => Err(format!("db error: {}", e)),
+                    }
+                };
+                match result {
+                    Ok(info) => {
+                        send(&mut writer, &Response::SessionInfo { info }).await?;
+                    }
+                    Err(msg) => {
+                        send(&mut writer, &Response::Error { message: msg }).await?;
+                    }
+                }
+            }
             Request::Chat { session_id, text } => {
-                // Load session + messages from DB, append user message
                 let chat_data = {
                     let st = state.lock().unwrap();
                     match st.db.get_session(&session_id) {
@@ -243,7 +281,6 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     }
                 };
 
-                // Resolve API key
                 let api_key = {
                     let st = state.lock().unwrap();
                     st.auth.get_api_key(&model.provider)
@@ -298,7 +335,6 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     }
                 };
 
-                // Stream events to client
                 let mut final_message = None;
                 while let Ok(event) = rx.recv().await {
                     match &event {
@@ -319,7 +355,6 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     .await?;
                 }
 
-                // Persist assistant message
                 if let Some(msg) = final_message {
                     let st = state.lock().unwrap();
                     st.db.append_message(&session_id, &msg)?;
@@ -344,6 +379,38 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     st.db.delete_session(&session_id)?;
                 }
                 send(&mut writer, &Response::SessionDeleted).await?;
+            }
+            Request::ListModels => {
+                let models = {
+                    let st = state.lock().unwrap();
+                    st.all_models.iter().map(model_info).collect::<Vec<_>>()
+                };
+                send(&mut writer, &Response::Models { models }).await?;
+            }
+            Request::SetModel {
+                session_id,
+                model_id,
+            } => {
+                let result = {
+                    let st = state.lock().unwrap();
+                    if let Some(model) = st.all_models.iter().find(|m| m.id == model_id) {
+                        st.db.update_model(&session_id, model)?;
+                        Ok(model_info(model))
+                    } else {
+                        Err(format!(
+                            "unknown model: {}. Use /model to list available models.",
+                            model_id
+                        ))
+                    }
+                };
+                match result {
+                    Ok(info) => {
+                        send(&mut writer, &Response::ModelChanged { model: info }).await?;
+                    }
+                    Err(msg) => {
+                        send(&mut writer, &Response::Error { message: msg }).await?;
+                    }
+                }
             }
             Request::Login { provider } => {
                 let result = smol::unblock(move || {

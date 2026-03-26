@@ -22,10 +22,19 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         system_prompt: Option<String>,
     },
+    /// Get info about a specific session.
+    GetSessionInfo { session_id: String },
     /// List sessions.
     ListSessions,
     /// Delete a session.
     DeleteSession { session_id: String },
+    /// List available models.
+    ListModels,
+    /// Change model for a session.
+    SetModel {
+        session_id: String,
+        model_id: String,
+    },
     /// Start OAuth login for a provider.
     Login { provider: String },
     /// Query authentication status.
@@ -43,10 +52,16 @@ pub enum Request {
 pub enum Response {
     /// Session was created.
     SessionCreated { session_id: String },
+    /// Info about a single session.
+    SessionInfo { info: SessionInfo },
     /// List of sessions.
     Sessions { sessions: Vec<SessionInfo> },
     /// Session deleted.
     SessionDeleted,
+    /// Available models.
+    Models { models: Vec<ModelInfo> },
+    /// Model changed.
+    ModelChanged { model: ModelInfo },
     /// Streaming event from the LLM.
     Stream { event: Box<StreamEvent> },
     /// OAuth login succeeded.
@@ -66,6 +81,16 @@ pub struct SessionInfo {
     pub provider: String,
     pub message_count: usize,
     pub stats: SessionStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub provider: String,
+    pub reasoning: bool,
+    pub context_window: u64,
+    pub max_tokens: u64,
 }
 
 /// Cumulative session usage statistics.

@@ -85,8 +85,11 @@ impl Client {
                 Response::Error { .. }
                 | Response::Ok
                 | Response::SessionCreated { .. }
+                | Response::SessionInfo { .. }
                 | Response::SessionDeleted
                 | Response::Sessions { .. }
+                | Response::Models { .. }
+                | Response::ModelChanged { .. }
                 | Response::LoginSuccess { .. }
                 | Response::AuthStatus { .. } => true,
             };
