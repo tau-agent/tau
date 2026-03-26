@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use fs2::FileExt;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -179,14 +179,13 @@ fn exchange_code(
         "code_verifier": verifier,
     });
 
-    let resp = ureq::post(TOKEN_URL)
-        .set("content-type", "application/json")
-        .set("accept", "application/json")
+    let data: serde_json::Value = ureq::post(TOKEN_URL)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
         .send_json(&body)
-        .map_err(|e: ureq::Error| crate::Error::Http(format!("token exchange: {}", e)))?;
-
-    let data: serde_json::Value = resp
-        .into_json()
+        .map_err(|e| crate::Error::Http(format!("token exchange: {}", e)))?
+        .body_mut()
+        .read_json()
         .map_err(|e| crate::Error::Parse(format!("token response: {}", e)))?;
 
     let access = data["access_token"]
@@ -220,14 +219,13 @@ pub fn refresh_token(refresh_token: &str) -> crate::Result<OAuthCredentials> {
         "refresh_token": refresh_token,
     });
 
-    let resp = ureq::post(TOKEN_URL)
-        .set("content-type", "application/json")
-        .set("accept", "application/json")
+    let data: serde_json::Value = ureq::post(TOKEN_URL)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
         .send_json(&body)
-        .map_err(|e: ureq::Error| crate::Error::Http(format!("token refresh: {}", e)))?;
-
-    let data: serde_json::Value = resp
-        .into_json()
+        .map_err(|e| crate::Error::Http(format!("token refresh: {}", e)))?
+        .body_mut()
+        .read_json()
         .map_err(|e| crate::Error::Parse(format!("refresh response: {}", e)))?;
 
     let access = data["access_token"]

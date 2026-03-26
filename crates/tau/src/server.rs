@@ -226,7 +226,7 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                         model,
                         system_prompt,
                         is_subscription,
-                        created_at: crate::types::timestamp_ms(),
+                        created_at: crate::types::timestamp_ms() as i64,
                     };
                     st.db.create_session(&stored)?;
                     id

@@ -82,33 +82,33 @@ fn run_stream(
 
     let is_oauth = crate::auth::is_oauth_token(ctx.api_key);
     let mut req = ureq::post(&url)
-        .set("content-type", "application/json")
-        .set("anthropic-version", "2023-06-01")
-        .set("accept", "application/json");
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header("accept", "application/json");
 
     if is_oauth {
         // OAuth: Bearer auth + Claude Code identity headers
         req = req
-            .set("authorization", &format!("Bearer {}", ctx.api_key))
-            .set(
+            .header("authorization", &format!("Bearer {}", ctx.api_key))
+            .header(
                 "anthropic-beta",
                 "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
             )
-            .set("user-agent", "claude-cli/2.1.75")
-            .set("x-app", "cli")
-            .set("anthropic-dangerous-direct-browser-access", "true");
+            .header("user-agent", "claude-cli/2.1.75")
+            .header("x-app", "cli")
+            .header("anthropic-dangerous-direct-browser-access", "true");
     } else {
         // API key auth
         req = req
-            .set("x-api-key", ctx.api_key)
-            .set("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
+            .header("x-api-key", ctx.api_key)
+            .header("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
     }
 
-    let resp = req
+    let mut resp = req
         .send_json(body)
-        .map_err(|e: ureq::Error| crate::Error::Http(e.to_string()))?;
+        .map_err(|e| crate::Error::Http(e.to_string()))?;
 
-    let reader = BufReader::new(resp.into_reader());
+    let reader = BufReader::new(resp.body_mut().as_reader());
     let mut output = AssistantMessage::empty(ctx.api_id, ctx.provider_name, ctx.model_id);
     tx.send_blocking(StreamEvent::Start {
         partial: output.clone(),

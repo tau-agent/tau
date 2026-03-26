@@ -17,7 +17,7 @@ pub struct StoredSession {
     pub model: Model,
     pub system_prompt: Option<String>,
     pub is_subscription: bool,
-    pub created_at: u64,
+    pub created_at: i64,
 }
 
 pub struct Db {
@@ -233,7 +233,7 @@ impl Db {
     pub fn append_message(&self, session_id: &str, message: &Message) -> crate::Result<()> {
         let json =
             serde_json::to_string(message).map_err(|e| crate::Error::Parse(e.to_string()))?;
-        let now = crate::types::timestamp_ms();
+        let now = crate::types::timestamp_ms() as i64;
         self.conn
             .execute(
                 "INSERT INTO messages (session_id, message_json, created_at) VALUES (?1, ?2, ?3)",
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn list_sessions_ordered() {
         let db = Db::open_memory().unwrap();
-        for (id, ts) in [("s2", 2000u64), ("s1", 1000), ("s3", 3000)] {
+        for (id, ts) in [("s2", 2000i64), ("s1", 1000), ("s3", 3000)] {
             db.create_session(&StoredSession {
                 id: id.into(),
                 model: test_model(),

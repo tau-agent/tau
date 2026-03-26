@@ -16,11 +16,11 @@ smol = "2"
 async-trait = "0.1"
 thiserror = "2"
 futures = "0.3"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
-rustyline = "15"
-rusqlite = { version = "0.35", features = ["bundled"] }
-sha2 = "0.10"
+rustyline = "17"
+rusqlite = { version = "0.39", features = ["bundled"] }
+sha2 = "0.11"
 base64 = "0.22"
-rand = "0.9"
+rand = "0.10"
 fs2 = "0.4"
