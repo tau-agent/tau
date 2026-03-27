@@ -379,7 +379,14 @@ impl App {
 
     fn handle_server_response(&mut self, response: Response) {
         match response {
-            Response::Stream { event } => self.handle_stream_event(*event),
+            Response::Stream { event } => {
+                // If we receive stream events while in Input mode,
+                // another client is chatting — switch to streaming view.
+                if self.mode == AppMode::Input {
+                    self.mode = AppMode::Streaming;
+                }
+                self.handle_stream_event(*event);
+            }
             Response::AgentDone => {
                 self.mode = AppMode::Input;
                 self.scroll_offset = 0;

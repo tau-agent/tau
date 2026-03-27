@@ -48,6 +48,9 @@ pub enum Request {
     GetSubscriptionUsage,
     /// Get message history for a session.
     GetMessages { session_id: String },
+    /// Subscribe to live events on a session (for multi-client).
+    /// The connection stays open and receives Stream/AgentDone/Cancelled events.
+    Subscribe { session_id: String },
     /// Cancel an in-progress chat (agent loop) for a session.
     CancelChat { session_id: String },
     /// Shut down the server.

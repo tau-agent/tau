@@ -104,6 +104,25 @@ impl Client {
         }
         Ok(())
     }
+    /// Read all responses indefinitely (no terminal detection).
+    /// Used for long-lived subscription connections.
+    pub async fn recv_lines<F>(&mut self, mut on_response: F) -> crate::Result<()>
+    where
+        F: FnMut(&Response),
+    {
+        let reader = BufReader::new(&mut *self.stream);
+        let mut lines = reader.lines();
+        while let Some(line) = lines.next().await {
+            let line = line.map_err(|e: std::io::Error| crate::Error::Io(e.to_string()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let resp: Response =
+                serde_json::from_str(&line).map_err(|e| crate::Error::Parse(e.to_string()))?;
+            on_response(&resp);
+        }
+        Ok(())
+    }
 }
 
 /// Spawn the server as a background daemon process.

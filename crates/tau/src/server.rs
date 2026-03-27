@@ -129,6 +129,9 @@ struct State {
     usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
     /// Per-session cancel flags.  Set by CancelChat, cleared on Chat start.
     cancel_flags: HashMap<String, Arc<AtomicBool>>,
+    /// Per-session broadcast subscribers.
+    /// Other clients watching a session receive streamed responses.
+    subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -260,6 +263,7 @@ pub async fn run() -> crate::Result<()> {
         all_models,
         usage_cache: None,
         cancel_flags: HashMap::new(),
+        subscribers: HashMap::new(),
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -513,6 +517,7 @@ async fn handle_client(
                         &model,
                         &mut context,
                         &cwd,
+                        &session_id,
                         &mut writer,
                     )
                     .await;
@@ -553,6 +558,7 @@ async fn handle_client(
                     &model,
                     &mut context,
                     &cwd,
+                    &session_id,
                     &mut writer,
                 )
                 .await;
@@ -604,9 +610,13 @@ async fn handle_client(
                 }
 
                 if was_cancelled {
-                    send(&mut writer, &Response::Cancelled).await?;
+                    let resp = Response::Cancelled;
+                    broadcast_to_subscribers(&state, &session_id, &resp);
+                    send(&mut writer, &resp).await?;
                 } else {
-                    send(&mut writer, &Response::AgentDone).await?;
+                    let resp = Response::AgentDone;
+                    broadcast_to_subscribers(&state, &session_id, &resp);
+                    send(&mut writer, &resp).await?;
                 }
 
                 if shutdown.is_shutting_down() {
@@ -619,6 +629,45 @@ async fn handle_client(
                     .await
                     .ok();
                 }
+            }
+            Request::Subscribe { session_id } => {
+                // Register this client as a subscriber for the session.
+                // The connection stays open — we forward events via the channel.
+                // No ack is sent; the client waits for Stream/AgentDone/Cancelled.
+                let (tx, rx) = smol::channel::bounded::<Response>(256);
+                {
+                    let mut st = state.lock().unwrap();
+                    st.subscribers
+                        .entry(session_id.clone())
+                        .or_default()
+                        .push(tx);
+                }
+
+                // Forward events until the channel closes or client disconnects.
+                loop {
+                    let resp = {
+                        let recv_fut = rx.recv();
+                        let shutdown_fut = shutdown_rx.recv();
+                        match futures::future::select(
+                            std::pin::pin!(recv_fut),
+                            std::pin::pin!(shutdown_fut),
+                        )
+                        .await
+                        {
+                            futures::future::Either::Left((Ok(resp), _)) => resp,
+                            futures::future::Either::Left((Err(_), _)) => break, // channel closed
+                            futures::future::Either::Right((Ok(msg), _)) => {
+                                send(&mut writer, &msg).await.ok();
+                                break;
+                            }
+                            futures::future::Either::Right((Err(_), _)) => break,
+                        }
+                    };
+                    if send(&mut writer, &resp).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+                break; // Subscribe consumes the connection
             }
             Request::GetMessages { session_id } => {
                 let messages = {
@@ -839,6 +888,7 @@ async fn handle_client(
 // ---------------------------------------------------------------------------
 
 /// Run an agent loop turn: resolve API key, stream, forward events, return new messages.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     state: &SharedState,
     shutdown: &ShutdownHandle,
@@ -846,6 +896,7 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     model: &Model,
     context: &mut Context,
     cwd: &str,
+    session_id: &str,
     writer: &mut W,
 ) -> crate::Result<Vec<Message>> {
     let api_key = {
@@ -906,15 +957,15 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
         result
     });
 
+    let state_clone = state.clone();
+    let session_id_owned = session_id.to_string();
     let forward_handle = async {
         while let Ok(event) = event_rx.recv().await {
-            send(
-                writer,
-                &Response::Stream {
-                    event: Box::new(event),
-                },
-            )
-            .await?;
+            let resp = Response::Stream {
+                event: Box::new(event),
+            };
+            broadcast_to_subscribers(&state_clone, &session_id_owned, &resp);
+            send(writer, &resp).await?;
         }
         Ok::<(), crate::Error>(())
     };
@@ -1024,6 +1075,18 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Broadcast a response to all subscribers of a session.
+/// Removes disconnected subscribers.
+fn broadcast_to_subscribers(state: &SharedState, session_id: &str, resp: &Response) {
+    let mut st = state.lock().unwrap();
+    if let Some(subs) = st.subscribers.get_mut(session_id) {
+        subs.retain(|tx| tx.try_send(resp.clone()).is_ok());
+        if subs.is_empty() {
+            st.subscribers.remove(session_id);
+        }
+    }
+}
 
 async fn send<W: futures::io::AsyncWrite + Unpin>(
     writer: &mut W,

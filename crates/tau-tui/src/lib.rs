@@ -94,6 +94,29 @@ async fn run_inner(
     // Event loop merges terminal + server + tick
     let event_loop = EventLoop::new(server_rx);
 
+    // Subscribe to session events (for multi-client support).
+    // This background connection receives events from other clients' Chat requests.
+    let sub_tx = server_tx.clone();
+    let sub_session_id = app.session_id.clone();
+    smol::spawn(async move {
+        if let Ok(mut client) = Client::connect().await
+            && client
+                .send(&Request::Subscribe {
+                    session_id: sub_session_id,
+                })
+                .await
+                .is_ok()
+        {
+            // Read lines indefinitely (subscriber connection stays open).
+            let _ = client
+                .recv_lines(|resp| {
+                    let _ = sub_tx.try_send(resp.clone());
+                })
+                .await;
+        }
+    })
+    .detach();
+
     // Initial draw
     terminal
         .draw(|f| ui::draw(f, &app, &app.theme))

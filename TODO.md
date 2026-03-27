@@ -8,7 +8,7 @@
 
 ## Session Continuity
 
-- [ ] **Restore messages on session resume**: when resuming a session (`tau chat -s <id>`), fetch and display previous messages so the conversation continues where it left off. Needs a protocol request to retrieve message history from the server.
+- [x] **Restore messages on session resume**: fetches message history via GetMessages request on startup.
 
 ## Local TUI Settings
 
@@ -16,8 +16,6 @@
 
 ## Multi-Client Sessions
 
-- [ ] **Multiple connections to one session**: currently breaks when two clients connect to the same session. This would be a great feature — multiple TUI instances viewing/interacting with the same session in real time.
-  - Server needs to broadcast stream events to all connected clients on a session
-  - Clients need to handle messages they didn't send (new message arrives while idle)
-  - Locking/coordination: only one client should be able to send at a time, or handle concurrent sends gracefully
-  - Could enable pair-programming / monitoring use cases
+- [x] **Multiple connections to one session**: server broadcasts stream events to all subscribed clients. TUI subscribes on startup via long-lived connection.
+  - [ ] Locking: concurrent sends not yet coordinated (last writer wins)
+  - [ ] User message display: subscriber doesn't see the user message that triggered the response
