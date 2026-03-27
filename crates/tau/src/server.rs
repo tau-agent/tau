@@ -2,6 +2,7 @@
 
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -129,6 +130,44 @@ struct State {
 
 type SharedState = Arc<Mutex<State>>;
 
+/// Shutdown coordination shared across all tasks.
+#[derive(Clone)]
+struct ShutdownHandle {
+    /// Set to true when shutdown is requested.
+    flag: Arc<AtomicBool>,
+    /// Number of in-flight agent loops.
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl ShutdownHandle {
+    fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    fn request_shutdown(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    fn enter(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn leave(&self) {
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn active_count(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -197,19 +236,62 @@ pub async fn run() -> crate::Result<()> {
         usage_cache: None,
     }));
 
+    let shutdown = ShutdownHandle::new();
+
+    // Spawn a task that closes the listener when shutdown is requested.
+    // This unblocks the accept() call below.
+    let shutdown_watcher = shutdown.clone();
+    let sock_clone = sock.clone();
+    smol::spawn(async move {
+        while !shutdown_watcher.is_shutting_down() {
+            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+        }
+        // Connect to ourselves to unblock accept()
+        let _ = Async::<UnixStream>::connect(&sock_clone).await;
+    })
+    .detach();
+
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .map_err(|e| crate::Error::Io(e.to_string()))?;
+
+        if shutdown.is_shutting_down() {
+            break;
+        }
+
         let state = state.clone();
+        let shutdown_handle = shutdown.clone();
         smol::spawn(async move {
-            if let Err(e) = handle_client(stream, state).await {
+            if let Err(e) = handle_client(stream, state, shutdown_handle).await {
                 eprintln!("client error: {}", e);
             }
         })
         .detach();
     }
+
+    // Wait for in-flight agent loops to finish (up to 60s)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while shutdown.active_count() > 0 && std::time::Instant::now() < deadline {
+        eprintln!(
+            "waiting for {} in-flight request(s)...",
+            shutdown.active_count()
+        );
+        smol::Timer::after(std::time::Duration::from_secs(1)).await;
+    }
+    if shutdown.active_count() > 0 {
+        eprintln!(
+            "timeout: {} request(s) still in flight, exiting anyway",
+            shutdown.active_count()
+        );
+    }
+
+    // Cleanup
+    std::fs::remove_file(&sock).ok();
+    std::fs::remove_file(pid_path()).ok();
+    eprintln!("tau server stopped");
+    Ok(())
 }
 
 /// Check if a server is already running by trying to connect.
@@ -221,7 +303,11 @@ pub fn is_running() -> bool {
 // Client handler
 // ---------------------------------------------------------------------------
 
-async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::Result<()> {
+async fn handle_client(
+    stream: Async<UnixStream>,
+    state: SharedState,
+    shutdown: ShutdownHandle,
+) -> crate::Result<()> {
     let reader = BufReader::new(&stream);
     let mut writer = &stream;
     let mut lines = reader.lines();
@@ -324,6 +410,16 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 }
             }
             Request::Chat { session_id, text } => {
+                if shutdown.is_shutting_down() {
+                    send(
+                        &mut writer,
+                        &Response::Error {
+                            message: "server is shutting down".into(),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
                 let chat_data = {
                     let st = state.lock().unwrap();
                     match st.db.get_session(&session_id) {
@@ -390,7 +486,11 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 // Run agent loop on a blocking thread, forwarding events via channel
                 let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
                 let tool_defs = crate::tools::default_tools();
-                let agent_config = crate::agent::AgentConfig::default();
+                let shutdown_flag = shutdown.flag.clone();
+                let agent_config = crate::agent::AgentConfig {
+                    should_stop: Some(Box::new(move || shutdown_flag.load(Ordering::Relaxed))),
+                    ..Default::default()
+                };
 
                 let registry_clone = {
                     let st = state.lock().unwrap();
@@ -402,8 +502,10 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 let options_clone = options;
                 let cwd_clone = cwd;
 
+                let in_flight = shutdown.clone();
                 let agent_handle = smol::unblock(move || {
-                    crate::agent::run(
+                    in_flight.enter();
+                    let result = crate::agent::run(
                         &registry_clone,
                         &model_clone,
                         &mut context_clone,
@@ -414,7 +516,9 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                         Box::new(move |event| {
                             let _ = event_tx.send_blocking(event);
                         }),
-                    )
+                    );
+                    in_flight.leave();
+                    result
                 });
 
                 // Forward events to client
@@ -662,11 +766,9 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 }
             }
             Request::Shutdown => {
+                shutdown.request_shutdown();
                 send(&mut writer, &Response::Ok).await?;
-                let sock = socket_path();
-                std::fs::remove_file(&sock).ok();
-                std::fs::remove_file(pid_path()).ok();
-                std::process::exit(0);
+                return Ok(());
             }
         }
     }

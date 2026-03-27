@@ -15,6 +15,8 @@ pub struct AgentConfig {
     pub max_retries: usize,
     /// Base delay for retry backoff in milliseconds.
     pub retry_base_ms: u64,
+    /// Optional shutdown check — if returns true, stop after current turn.
+    pub should_stop: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl Default for AgentConfig {
@@ -23,6 +25,7 @@ impl Default for AgentConfig {
             max_turns: 50,
             max_retries: 5,
             retry_base_ms: 1000,
+            should_stop: None,
         }
     }
 }
@@ -106,7 +109,13 @@ pub fn run(
             context.messages.push(Message::ToolResult(result));
         }
 
-        // Check if this was the last turn
+        // Check if we should stop (shutdown or max turns)
+        if config.should_stop.as_ref().is_some_and(|f| f()) {
+            return Ok(AgentResult {
+                new_messages,
+                max_turns_reached: false,
+            });
+        }
         if turn + 1 >= config.max_turns {
             return Ok(AgentResult {
                 new_messages,
