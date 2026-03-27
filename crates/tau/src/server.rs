@@ -245,13 +245,24 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
 
         match req {
             Request::CreateSession {
-                model: _model_name,
-                provider: _provider_name,
+                model: model_id,
+                provider: provider_name,
                 system_prompt,
             } => {
-                let id = {
+                let result = {
                     let st = state.lock().unwrap();
-                    let model = st.default_model.clone();
+                    // Find requested model, or fall back to default
+                    let model = match (&model_id, &provider_name) {
+                        (Some(mid), Some(prov)) => st
+                            .all_models
+                            .iter()
+                            .find(|m| m.id == *mid && m.provider == *prov)
+                            .cloned(),
+                        (Some(mid), None) => st.all_models.iter().find(|m| m.id == *mid).cloned(),
+                        _ => None,
+                    }
+                    .unwrap_or_else(|| st.default_model.clone());
+
                     let is_subscription = st
                         .auth
                         .get(&model.provider)
@@ -267,9 +278,22 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                         created_at: crate::types::timestamp_ms() as i64,
                     };
                     st.db.create_session(&stored)?;
-                    id
+                    Ok::<String, crate::Error>(id)
                 };
-                send(&mut writer, &Response::SessionCreated { session_id: id }).await?;
+                match result {
+                    Ok(id) => {
+                        send(&mut writer, &Response::SessionCreated { session_id: id }).await?;
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
             Request::GetSessionInfo { session_id } => {
                 let result = {

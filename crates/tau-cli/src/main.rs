@@ -173,9 +173,9 @@ async fn run(cli: Cli) -> tau::Result<()> {
         Commands::Chat {
             message,
             session,
-            model: _model,
+            model,
         } => {
-            cmd_chat(message, session).await?;
+            cmd_chat(message, session, &model).await?;
         }
         Commands::Login { provider } => {
             cmd_login(&provider).await?;
@@ -347,16 +347,27 @@ async fn cmd_login(provider: &str) -> tau::Result<()> {
     Ok(())
 }
 
-async fn cmd_chat(message: Option<String>, session_id: Option<String>) -> tau::Result<()> {
+async fn cmd_chat(
+    message: Option<String>,
+    session_id: Option<String>,
+    model: &str,
+) -> tau::Result<()> {
     let mut client = tau::client::Client::connect_or_start().await?;
+
+    // Parse "provider/model" syntax
+    let (provider, model_id) = if let Some(idx) = model.find('/') {
+        (Some(model[..idx].to_string()), model[idx + 1..].to_string())
+    } else {
+        (None, model.to_string())
+    };
 
     let session_id = if let Some(id) = session_id {
         id
     } else {
         client
             .send(&tau::protocol::Request::CreateSession {
-                model: None,
-                provider: None,
+                model: Some(model_id),
+                provider,
                 system_prompt: None,
             })
             .await?;
