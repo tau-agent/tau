@@ -16,6 +16,6 @@
 
 ## Multi-Client Sessions
 
-- [x] **Multiple connections to one session**: server broadcasts stream events to all subscribed clients. TUI subscribes on startup via long-lived connection.
+- [x] **Multiple connections to one session**: server broadcasts stream events + user messages to all subscribed clients. TUI subscribes on startup via long-lived connection.
   - [ ] Locking: concurrent sends not yet coordinated (last writer wins)
-  - [ ] User message display: subscriber doesn't see the user message that triggered the response
+- [x] **Steering messages**: Alt+Enter queues a message while agent is working. Auto-sends after current turn. Can type during streaming.
