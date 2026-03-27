@@ -67,7 +67,7 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    // Add working indicator if streaming, with empty line below
+    // Add working indicator if streaming
     if app.mode == AppMode::Streaming {
         let needs_indicator = !matches!(
             app.messages.last(),
@@ -79,8 +79,12 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 format!("  {} Working...", app.spinner()),
                 theme.spinner_style(),
             )));
-            all_lines.push(Line::from("")); // empty line below spinner
         }
+    }
+
+    // Always end with an empty line so there's a gap above the input field
+    if !all_lines.is_empty() {
+        all_lines.push(Line::from(""));
     }
 
     // Pad with empty lines so content is bottom-aligned (starts just above input)
