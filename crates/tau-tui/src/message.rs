@@ -106,6 +106,7 @@ impl MessageItem {
                     .add_modifier(Modifier::BOLD);
 
                 let mut lines = vec![
+                    Line::from(""),
                     Line::from(Span::styled(" ", bg_style)), // top padding
                     Line::from(vec![
                         Span::styled(format!(" {}", name), title_style),
@@ -126,6 +127,7 @@ impl MessageItem {
                     .add_modifier(Modifier::BOLD);
 
                 let mut lines = vec![
+                    Line::from(""),
                     Line::from(Span::styled(" ", bg_style)),
                     Line::from(vec![
                         Span::styled(format!(" {}", name), title_style),
@@ -146,6 +148,7 @@ impl MessageItem {
                     .add_modifier(Modifier::BOLD);
 
                 let mut lines = vec![
+                    Line::from(""),
                     Line::from(Span::styled(" ", bg_style)),
                     Line::from(vec![
                         Span::styled(format!(" {}", name), title_style),
@@ -159,13 +162,14 @@ impl MessageItem {
                 fill_bg(&mut lines, bg_style, width);
                 Text::from(lines)
             }
-            MessageItem::Status { text } => Text::from(Line::from(Span::styled(
-                format!(" {}", text),
-                theme.status_style(),
-            ))),
+            MessageItem::Status { text } => Text::from(vec![
+                Line::from(""),
+                Line::from(Span::styled(format!(" {}", text), theme.status_style())),
+            ]),
             MessageItem::Error { text } => {
                 let bg_style = theme.error_style();
                 let mut lines = vec![
+                    Line::from(""),
                     Line::from(Span::styled(" ", bg_style)),
                     Line::from(Span::styled(format!(" error: {}", text), bg_style)),
                     Line::from(Span::styled(" ", bg_style)),
