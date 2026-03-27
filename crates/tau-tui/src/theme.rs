@@ -146,11 +146,8 @@ impl Theme {
         Style::default().fg(self.dim.to_ratatui())
     }
 
-    pub fn input_border_active(&self) -> Style {
-        Style::default().fg(self.accent.to_ratatui())
-    }
-
-    pub fn input_border_inactive(&self) -> Style {
+    /// Input border (matches pi: borderMuted always).
+    pub fn input_border_style(&self) -> Style {
         Style::default().fg(self.border_muted.to_ratatui())
     }
 

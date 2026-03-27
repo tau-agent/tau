@@ -78,6 +78,7 @@ impl App {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
         textarea.set_placeholder_text("Type a message... (Ctrl+D to quit)");
+        textarea.set_placeholder_style(theme.status_style()); // dim, like pi
 
         Self {
             theme,

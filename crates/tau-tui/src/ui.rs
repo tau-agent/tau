@@ -127,16 +127,11 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_input(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let border_style = match app.mode {
-        AppMode::Input => theme.input_border_active(),
-        AppMode::Streaming => theme.input_border_inactive(),
-    };
-
-    // Only top and bottom borders, single line
+    // Only top and bottom borders, single line — borderMuted always (like pi)
     let block = Block::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_set(border::PLAIN)
-        .border_style(border_style);
+        .border_style(theme.input_border_style());
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
