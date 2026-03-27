@@ -130,20 +130,29 @@ struct State {
 
 type SharedState = Arc<Mutex<State>>;
 
+/// A sender that can deliver shutdown notifications to a connected client.
+type ClientNotifier = smol::channel::Sender<Response>;
+
 /// Shutdown coordination shared across all tasks.
 #[derive(Clone)]
 struct ShutdownHandle {
     /// Set to true when shutdown is requested.
     flag: Arc<AtomicBool>,
+    /// Whether this is a restart (clients should reconnect).
+    restart: Arc<AtomicBool>,
     /// Number of in-flight agent loops.
     in_flight: Arc<AtomicUsize>,
+    /// Registered client notifiers for broadcast.
+    clients: Arc<Mutex<Vec<ClientNotifier>>>,
 }
 
 impl ShutdownHandle {
     fn new() -> Self {
         Self {
             flag: Arc::new(AtomicBool::new(false)),
+            restart: Arc::new(AtomicBool::new(false)),
             in_flight: Arc::new(AtomicUsize::new(0)),
+            clients: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -151,8 +160,21 @@ impl ShutdownHandle {
         self.flag.load(Ordering::Relaxed)
     }
 
-    fn request_shutdown(&self) {
+    fn request_shutdown(&self, restart: bool) {
+        self.restart.store(restart, Ordering::Relaxed);
         self.flag.store(true, Ordering::Relaxed);
+        // Broadcast to all connected clients
+        let clients = self.clients.lock().unwrap();
+        let msg = Response::ServerShutdown { restart };
+        for tx in clients.iter() {
+            let _ = tx.try_send(msg.clone());
+        }
+    }
+
+    fn register_client(&self) -> smol::channel::Receiver<Response> {
+        let (tx, rx) = smol::channel::bounded(1);
+        self.clients.lock().unwrap().push(tx);
+        rx
     }
 
     fn enter(&self) {
@@ -308,12 +330,33 @@ async fn handle_client(
     state: SharedState,
     shutdown: ShutdownHandle,
 ) -> crate::Result<()> {
+    // Register for shutdown notifications
+    let shutdown_rx = shutdown.register_client();
     let reader = BufReader::new(&stream);
     let mut writer = &stream;
     let mut lines = reader.lines();
 
-    while let Some(line) = lines.next().await {
-        let line = line.map_err(|e: std::io::Error| crate::Error::Io(e.to_string()))?;
+    loop {
+        // Wait for either a request line or a shutdown notification
+        let line = {
+            let line_fut = lines.next();
+            let shutdown_fut = shutdown_rx.recv();
+
+            match futures::future::select(std::pin::pin!(line_fut), std::pin::pin!(shutdown_fut))
+                .await
+            {
+                futures::future::Either::Left((Some(line), _)) => {
+                    line.map_err(|e: std::io::Error| crate::Error::Io(e.to_string()))?
+                }
+                futures::future::Either::Left((None, _)) => break, // client disconnected
+                futures::future::Either::Right((Ok(msg), _)) => {
+                    // Shutdown notification — send to client and exit
+                    send(&mut writer, &msg).await.ok();
+                    break;
+                }
+                futures::future::Either::Right((Err(_), _)) => break,
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -582,6 +625,18 @@ async fn handle_client(
                 }
 
                 send(&mut writer, &Response::AgentDone).await?;
+
+                // If shutdown was requested during the agent loop, notify client now
+                if shutdown.is_shutting_down() {
+                    send(
+                        &mut writer,
+                        &Response::ServerShutdown {
+                            restart: shutdown.restart.load(Ordering::Relaxed),
+                        },
+                    )
+                    .await
+                    .ok();
+                }
             }
             Request::ListSessions => {
                 let sessions = {
@@ -765,8 +820,8 @@ async fn handle_client(
                     }
                 }
             }
-            Request::Shutdown => {
-                shutdown.request_shutdown();
+            Request::Shutdown { restart } => {
+                shutdown.request_shutdown(restart);
                 send(&mut writer, &Response::Ok).await?;
                 return Ok(());
             }

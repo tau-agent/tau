@@ -47,7 +47,11 @@ pub enum Request {
     /// Fetch subscription usage (OAuth only, cached 5 min).
     GetSubscriptionUsage,
     /// Shut down the server.
-    Shutdown,
+    Shutdown {
+        /// If true, server is restarting (clients should reconnect).
+        #[serde(default)]
+        restart: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +83,8 @@ pub enum Response {
     SubscriptionUsage {
         usage: crate::auth::SubscriptionUsage,
     },
+    /// Server is shutting down. Clients should reconnect if restart=true.
+    ServerShutdown { restart: bool },
     /// Agent loop completed (all turns done).
     AgentDone,
     /// Success (generic ack).

@@ -92,7 +92,8 @@ impl Client {
                 | Response::ModelChanged { .. }
                 | Response::LoginSuccess { .. }
                 | Response::AuthStatus { .. }
-                | Response::SubscriptionUsage { .. } => true,
+                | Response::SubscriptionUsage { .. }
+                | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);
             if is_terminal {

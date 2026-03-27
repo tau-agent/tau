@@ -492,6 +492,13 @@ async fn send_and_print(
             tau::protocol::Response::AgentDone => {
                 totals.display();
             }
+            tau::protocol::Response::ServerShutdown { restart } => {
+                if *restart {
+                    eprintln!("[server restarting...]");
+                } else {
+                    eprintln!("[server shutting down]");
+                }
+            }
             tau::protocol::Response::Error { message } => {
                 eprintln!("error: {}", message);
             }
@@ -554,16 +561,55 @@ async fn interactive_loop(
                 Ok(true) => break, // /quit
                 Ok(false) => continue,
                 Err(e) => {
+                    if try_reconnect(client, &e).await {
+                        continue;
+                    }
                     eprintln!("error: {}", e);
                     continue;
                 }
             }
         }
 
-        send_and_print(client, session_id, line, totals).await?;
+        match send_and_print(client, session_id, line, totals).await {
+            Ok(()) => {}
+            Err(e) => {
+                if try_reconnect(client, &e).await {
+                    // Retry the message after reconnecting
+                    if let Err(e) = send_and_print(client, session_id, line, totals).await {
+                        eprintln!("error: {}", e);
+                    }
+                } else {
+                    eprintln!("error: {}", e);
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Try to reconnect to the server after a connection error.
+/// Returns true if reconnection succeeded.
+async fn try_reconnect(client: &mut tau::client::Client, err: &tau::Error) -> bool {
+    let msg = err.to_string();
+    if !msg.contains("Broken pipe")
+        && !msg.contains("Connection refused")
+        && !msg.contains("Connection reset")
+    {
+        return false;
+    }
+    eprintln!("[connection lost, reconnecting...]");
+    // Wait a moment for the server to restart
+    for _ in 0..30 {
+        smol::Timer::after(std::time::Duration::from_millis(200)).await;
+        if let Ok(new_client) = tau::client::Client::connect_or_start().await {
+            *client = new_client;
+            eprintln!("[reconnected]");
+            return true;
+        }
+    }
+    eprintln!("[reconnection failed]");
+    false
 }
 
 fn pct(b: Option<&tau::auth::UsageBucket>) -> String {
@@ -827,7 +873,9 @@ async fn cmd_server_stop() -> tau::Result<()> {
         return Ok(());
     }
     let mut client = tau::client::Client::connect().await?;
-    client.send(&tau::protocol::Request::Shutdown).await?;
+    client
+        .send(&tau::protocol::Request::Shutdown { restart: false })
+        .await?;
     client.recv_streaming(|_| {}).await?;
     eprintln!("server stopped");
     Ok(())
@@ -836,14 +884,23 @@ async fn cmd_server_stop() -> tau::Result<()> {
 async fn cmd_server_restart() -> tau::Result<()> {
     if tau::server::is_running() {
         let mut client = tau::client::Client::connect().await?;
-        client.send(&tau::protocol::Request::Shutdown).await?;
+        client
+            .send(&tau::protocol::Request::Shutdown { restart: true })
+            .await?;
         client.recv_streaming(|_| {}).await?;
-        // Wait for socket to go away
-        for _ in 0..50 {
+        eprintln!("shutdown requested, waiting for server to exit...");
+        // Wait up to 65s (server drains for up to 60s)
+        for i in 0..650 {
             smol::Timer::after(std::time::Duration::from_millis(100)).await;
             if !tau::server::is_running() {
                 break;
             }
+            if i > 0 && i % 50 == 0 {
+                eprintln!("still waiting... ({}s)", i / 10);
+            }
+        }
+        if tau::server::is_running() {
+            return Err(tau::Error::Io("old server didn't exit within 65s".into()));
         }
     }
     spawn_server_daemon()?;
