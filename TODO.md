@@ -2,8 +2,9 @@
 
 ## UI Polish
 
-- [ ] **Working spinner**: match pi-agent's spinner style and "Working..." text exactly
+- [x] **Working spinner**: match pi-agent's spinner style and "Working..." text exactly
 - [ ] **Shift+Enter in input**: tui-textarea doesn't handle Shift+Enter for newline — wire it up or switch to a widget that does
+- [ ] **Soft line wrapping in input**: tui-textarea doesn't wrap long lines — they scroll horizontally. Need custom widget or upstream support.
 
 ## Session Continuity
 
