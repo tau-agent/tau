@@ -1,7 +1,9 @@
 //! Message items displayed in the chat viewport.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span, Text};
+
+use crate::theme::Theme;
 
 /// A single item in the chat history.
 #[derive(Debug, Clone)]
@@ -26,21 +28,13 @@ pub enum MessageItem {
 
 impl MessageItem {
     /// Render this item to ratatui `Text` for the given width.
-    pub fn to_text(&self, _width: u16) -> Text<'static> {
+    pub fn to_text(&self, _width: u16, theme: &Theme) -> Text<'static> {
         match self {
             MessageItem::User { text } => {
                 let mut lines = Vec::new();
                 lines.push(Line::from(""));
-                // User label
-                lines.push(Line::from(Span::styled(
-                    " You ",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                )));
+                lines.push(Line::from(Span::styled(" You ", theme.user_label_style())));
                 lines.push(Line::from(""));
-                // Message text with left padding
                 for line in text.lines() {
                     lines.push(Line::from(format!("  {}", line)));
                 }
@@ -49,16 +43,11 @@ impl MessageItem {
             MessageItem::Assistant { text } | MessageItem::AssistantStreaming { text } => {
                 let mut lines = Vec::new();
                 lines.push(Line::from(""));
-                // Assistant label
                 lines.push(Line::from(Span::styled(
                     " Assistant ",
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    theme.assistant_label_style(),
                 )));
                 lines.push(Line::from(""));
-                // Message text with left padding
                 for line in text.lines() {
                     lines.push(Line::from(format!("  {}", line)));
                 }
@@ -67,15 +56,13 @@ impl MessageItem {
                     && let Some(last) = lines.last_mut()
                 {
                     let mut spans = vec![last.spans.drain(..).collect::<Vec<_>>()];
-                    spans[0].push(Span::styled("▌", Style::default().fg(Color::Gray)));
+                    spans[0].push(Span::styled("▌", theme.fg(theme.muted)));
                     *last = Line::from(spans.into_iter().flatten().collect::<Vec<_>>());
                 }
                 Text::from(lines)
             }
             MessageItem::Thinking { text, done } => {
-                let style = Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC);
+                let style = theme.italic_fg(theme.thinking_text);
                 if *done && text.is_empty() {
                     return Text::from("");
                 }
@@ -89,38 +76,31 @@ impl MessageItem {
                 Text::from(lines)
             }
             MessageItem::Tool { name, preview } => {
-                let bg = Color::Rgb(30, 40, 30); // subtle green-tinted bg
-                let style = Style::default().fg(Color::Yellow).bg(bg);
-                let mut lines = Vec::new();
-                lines.push(Line::from(vec![
+                let style = theme.tool_success_style();
+                let bold_style = style.add_modifier(Modifier::BOLD);
+                Text::from(Line::from(vec![
                     Span::styled("  [tool: ", style),
-                    Span::styled(name.clone(), style.add_modifier(Modifier::BOLD)),
+                    Span::styled(name.clone(), bold_style),
                     Span::styled(format!(" {}]", preview), style),
-                ]));
-                Text::from(lines)
+                ]))
             }
             MessageItem::ToolError { name, message } => {
-                let bg = Color::Rgb(50, 25, 25); // subtle red-tinted bg
-                let style = Style::default().fg(Color::Red).bg(bg);
-                let mut lines = Vec::new();
-                lines.push(Line::from(vec![
+                let style = theme.tool_error_style();
+                let bold_style = style.add_modifier(Modifier::BOLD);
+                Text::from(Line::from(vec![
                     Span::styled("  [tool error: ", style),
-                    Span::styled(name.clone(), style.add_modifier(Modifier::BOLD)),
+                    Span::styled(name.clone(), bold_style),
                     Span::styled(format!(" {}]", message), style),
-                ]));
-                Text::from(lines)
+                ]))
             }
             MessageItem::Status { text } => Text::from(Line::from(Span::styled(
                 format!("  {}", text),
-                Style::default().fg(Color::DarkGray),
+                theme.status_style(),
             ))),
-            MessageItem::Error { text } => {
-                let bg = Color::Rgb(50, 20, 20);
-                Text::from(Line::from(Span::styled(
-                    format!("  error: {}", text),
-                    Style::default().fg(Color::Red).bg(bg),
-                )))
-            }
+            MessageItem::Error { text } => Text::from(Line::from(Span::styled(
+                format!("  error: {}", text),
+                theme.error_style(),
+            ))),
         }
     }
 }

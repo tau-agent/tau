@@ -2427,6 +2427,7 @@ dependencies = [
  "libc",
  "ratatui",
  "ratatui-textarea",
+ "serde",
  "serde_json",
  "smol",
  "tau",

@@ -3,6 +3,7 @@
 mod app;
 mod events;
 mod message;
+pub mod theme;
 mod ui;
 
 use std::io;
@@ -72,7 +73,8 @@ async fn run_inner(
     context_window: u64,
     is_subscription: bool,
 ) -> tau::Result<()> {
-    let mut app = App::new(session_id.clone(), model, provider);
+    let theme = theme::dark();
+    let mut app = App::new(session_id.clone(), model, provider, theme);
     app.totals.context_window = context_window;
     app.totals.is_subscription = is_subscription;
 
@@ -84,7 +86,7 @@ async fn run_inner(
 
     // Initial draw
     terminal
-        .draw(|f| ui::draw(f, &app))
+        .draw(|f| ui::draw(f, &app, &app.theme))
         .map_err(|e| tau::Error::Io(e.to_string()))?;
 
     // Main loop
@@ -161,7 +163,7 @@ async fn run_inner(
 
         // Draw
         terminal
-            .draw(|f| ui::draw(f, &app))
+            .draw(|f| ui::draw(f, &app, &app.theme))
             .map_err(|e| tau::Error::Io(e.to_string()))?;
     }
 

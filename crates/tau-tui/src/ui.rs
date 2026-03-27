@@ -1,8 +1,8 @@
 //! Layout and rendering.
 
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+// styles come from Theme
+use ratatui::Frame;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -11,9 +11,10 @@ use ratatui::widgets::{
 use tau::protocol::format_tokens;
 
 use crate::app::{App, AppMode};
+use crate::theme::Theme;
 
 /// Draw the full UI.
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     let area = frame.area();
 
     // Layout: header(1) | messages(flex) | stats(1) | input(dynamic)
@@ -28,10 +29,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    draw_header(frame, app, chunks[0]);
-    draw_messages(frame, app, chunks[1]);
-    draw_stats(frame, app, chunks[2]);
-    draw_input(frame, app, chunks[3]);
+    draw_header(frame, app, theme, chunks[0]);
+    draw_messages(frame, app, theme, chunks[1]);
+    draw_stats(frame, app, theme, chunks[2]);
+    draw_input(frame, app, theme, chunks[3]);
 }
 
 /// Height of the input area: textarea lines + 2 (border).
@@ -44,7 +45,7 @@ fn input_area_height(app: &App) -> u16 {
 // Header
 // ---------------------------------------------------------------------------
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let session_short = if app.session_id.len() > 8 {
         &app.session_id[..8]
     } else {
@@ -52,17 +53,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let header = Line::from(vec![
-        Span::styled(
-            " tau",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(" tau", theme.bold_fg(theme.accent)),
         Span::styled(
             format!(" · {} · {}/{}", session_short, app.provider, app.model),
-            Style::default().fg(Color::DarkGray),
+            theme.fg(theme.dim),
         ),
-        // Right-align mode indicator
+        // Flexible padding
         Span::raw(
             " ".repeat(
                 area.width
@@ -79,23 +75,20 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ),
         match app.mode {
-            AppMode::Input => Span::styled("●", Style::default().fg(Color::Green)),
-            AppMode::Streaming => Span::styled(app.spinner(), Style::default().fg(Color::Yellow)),
+            AppMode::Input => Span::styled("●", theme.fg(theme.success)),
+            AppMode::Streaming => Span::styled(app.spinner(), theme.spinner_style()),
         },
         Span::raw(" "),
     ]);
 
-    frame.render_widget(
-        Paragraph::new(header).style(Style::default().bg(Color::Rgb(30, 30, 40))),
-        area,
-    );
+    frame.render_widget(Paragraph::new(header).style(theme.header_style()), area);
 }
 
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
 
-fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if area.height == 0 {
         return;
     }
@@ -103,7 +96,7 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
     // Build all message lines
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     for msg in &app.messages {
-        let text = msg.to_text(area.width);
+        let text = msg.to_text(area.width, theme);
         for line in text.lines {
             all_lines.push(line);
         }
@@ -111,7 +104,6 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
 
     // Add working indicator if streaming
     if app.mode == AppMode::Streaming {
-        // Only add if last message isn't already a streaming one
         let needs_indicator = !matches!(
             app.messages.last(),
             Some(crate::message::MessageItem::AssistantStreaming { .. })
@@ -120,7 +112,7 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
             all_lines.push(Line::from(""));
             all_lines.push(Line::from(Span::styled(
                 format!("  {} Working...", app.spinner()),
-                Style::default().fg(Color::Yellow),
+                theme.spinner_style(),
             )));
         }
     }
@@ -152,7 +144,7 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
         let mut scrollbar_state = ScrollbarState::new(max_scroll as usize)
             .position((max_scroll - scroll.min(max_scroll)) as usize);
         frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            Scrollbar::new(ScrollbarOrientation::VerticalRight).style(theme.scrollbar_style()),
             area,
             &mut scrollbar_state,
         );
@@ -163,32 +155,34 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
 // Stats bar
 // ---------------------------------------------------------------------------
 
-fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_stats(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let totals = &app.totals;
     let mut parts = Vec::new();
+
+    let dim = theme.fg(theme.dim);
 
     if totals.input > 0 {
         parts.push(Span::styled(
             format!("↑{}", format_tokens(totals.input)),
-            Style::default().fg(Color::DarkGray),
+            dim,
         ));
     }
     if totals.output > 0 {
         parts.push(Span::styled(
             format!(" ↓{}", format_tokens(totals.output)),
-            Style::default().fg(Color::DarkGray),
+            dim,
         ));
     }
     if totals.cache_read > 0 {
         parts.push(Span::styled(
             format!(" R{}", format_tokens(totals.cache_read)),
-            Style::default().fg(Color::DarkGray),
+            dim,
         ));
     }
     if totals.cache_write > 0 {
         parts.push(Span::styled(
             format!(" W{}", format_tokens(totals.cache_write)),
-            Style::default().fg(Color::DarkGray),
+            dim,
         ));
     }
     if totals.cost > 0.0 || totals.is_subscription {
@@ -197,69 +191,48 @@ fn draw_stats(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             format!(" ${:.3}", totals.cost)
         };
-        parts.push(Span::styled(cost_str, Style::default().fg(Color::DarkGray)));
+        parts.push(Span::styled(cost_str, dim));
     }
     if totals.context_window > 0 {
         let ctx = match totals.context_tokens {
             Some(t) => {
                 let pct = (t as f64 / totals.context_window as f64) * 100.0;
-                let color = if pct > 90.0 {
-                    Color::Red
-                } else if pct > 70.0 {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                };
+                let color = theme.context_color(pct);
                 Span::styled(
                     format!(" {:.1}%/{}", pct, format_tokens(totals.context_window)),
-                    Style::default().fg(color),
+                    theme.fg(color),
                 )
             }
-            None => Span::styled(
-                format!(" ?/{}", format_tokens(totals.context_window)),
-                Style::default().fg(Color::DarkGray),
-            ),
+            None => Span::styled(format!(" ?/{}", format_tokens(totals.context_window)), dim),
         };
         parts.push(ctx);
     }
 
-    // If nothing to show, add a dim placeholder
     if parts.is_empty() {
-        parts.push(Span::styled(" ready", Style::default().fg(Color::DarkGray)));
+        parts.push(Span::styled(" ready", dim));
     }
 
-    // Prepend a space
     parts.insert(0, Span::raw(" "));
 
     let stats_line = Line::from(parts);
-    frame.render_widget(
-        Paragraph::new(stats_line).style(Style::default().bg(Color::Rgb(25, 25, 35))),
-        area,
-    );
+    frame.render_widget(Paragraph::new(stats_line).style(theme.stats_style()), area);
 }
 
 // ---------------------------------------------------------------------------
 // Input area
 // ---------------------------------------------------------------------------
 
-fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_input(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let (border_style, title_style) = match app.mode {
+        AppMode::Input => (theme.input_border_active(), theme.bold_fg(theme.accent)),
+        AppMode::Streaming => (theme.input_border_inactive(), theme.fg(theme.border_muted)),
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(match app.mode {
-            AppMode::Input => Style::default().fg(Color::Cyan),
-            AppMode::Streaming => Style::default().fg(Color::DarkGray),
-        })
-        .title(match app.mode {
-            AppMode::Input => Span::styled(
-                " tau ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            AppMode::Streaming => Span::styled(" tau ", Style::default().fg(Color::DarkGray)),
-        });
+        .border_style(border_style)
+        .title(Span::styled(" tau ", title_style));
 
-    // Render block first, then textarea inside
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(&app.textarea, inner);

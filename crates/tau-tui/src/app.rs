@@ -8,6 +8,7 @@ use tau::types::{AssistantContent, StreamEvent};
 
 use crate::events::Event;
 use crate::message::MessageItem;
+use crate::theme::Theme;
 
 /// Cumulative usage tracking (mirrored from tau-cli).
 #[derive(Default)]
@@ -44,6 +45,8 @@ pub enum AppMode {
 
 /// Application state.
 pub struct App {
+    /// Theme for rendering.
+    pub theme: Theme,
     /// Session ID we're chatting in.
     pub session_id: String,
     /// Model name for display.
@@ -71,12 +74,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session_id: String, model: String, provider: String) -> Self {
+    pub fn new(session_id: String, model: String, provider: String, theme: Theme) -> Self {
         let mut textarea = TextArea::default();
         textarea.set_cursor_line_style(ratatui::style::Style::default());
         textarea.set_placeholder_text("Type a message... (Ctrl+D to quit)");
 
         Self {
+            theme,
             session_id,
             model,
             provider,

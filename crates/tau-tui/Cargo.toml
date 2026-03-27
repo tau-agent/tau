@@ -9,6 +9,7 @@ description = "Terminal UI for tau"
 [dependencies]
 tau.workspace = true
 smol.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 ratatui = "0.30"
