@@ -121,20 +121,6 @@ impl Theme {
 
     // --- Convenience accessors for common UI elements ---
 
-    pub fn user_label_style(&self) -> Style {
-        Style::default()
-            .fg(self.user_message_text.to_ratatui())
-            .bg(self.accent.to_ratatui())
-            .add_modifier(Modifier::BOLD)
-    }
-
-    pub fn assistant_label_style(&self) -> Style {
-        Style::default()
-            .fg(self.user_message_text.to_ratatui())
-            .bg(self.border.to_ratatui())
-            .add_modifier(Modifier::BOLD)
-    }
-
     pub fn tool_success_style(&self) -> Style {
         Style::default()
             .fg(self.tool_title.to_ratatui())

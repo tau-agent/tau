@@ -398,8 +398,9 @@ impl App {
                     args_str
                 };
                 // Show pending tool call (will be replaced by ToolResult)
-                self.messages.push(MessageItem::Status {
-                    text: format!("[running: {} {}]", tool_call.name, preview),
+                self.messages.push(MessageItem::ToolPending {
+                    name: tool_call.name,
+                    preview,
                 });
             }
             StreamEvent::ToolResult {
@@ -407,10 +408,8 @@ impl App {
                 is_error,
                 preview,
             } => {
-                // Replace the "running" status with result
-                if let Some(last @ MessageItem::Status { .. }) = self.messages.last_mut()
-                    && matches!(last, MessageItem::Status { text } if text.contains("[running:"))
-                {
+                // Replace the pending tool with result
+                if let Some(last @ MessageItem::ToolPending { .. }) = self.messages.last_mut() {
                     if is_error {
                         *last = MessageItem::ToolError {
                             name: tool_name,
