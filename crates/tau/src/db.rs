@@ -205,6 +205,73 @@ impl Db {
         Ok(())
     }
 
+    /// Replace messages before `keep_from_id` with a compaction summary.
+    /// Deletes old messages and inserts the summary in a transaction.
+    pub fn compact_session(
+        &self,
+        session_id: &str,
+        summary: &str,
+        keep_from_id: i64,
+        tokens_before: u64,
+    ) -> crate::Result<()> {
+        let summary_msg = Message::CompactionSummary(crate::types::CompactionSummaryMessage {
+            summary: summary.to_string(),
+            tokens_before,
+            timestamp: crate::types::timestamp_ms(),
+        });
+        let summary_json =
+            serde_json::to_string(&summary_msg).map_err(|e| crate::Error::Parse(e.to_string()))?;
+        let now = crate::types::timestamp_ms() as i64;
+
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(|e| crate::Error::Io(e.to_string()))?;
+
+        // Delete old messages (id < keep_from_id)
+        self.conn
+            .execute(
+                "DELETE FROM messages WHERE session_id = ?1 AND id < ?2",
+                params![session_id, keep_from_id],
+            )
+            .map_err(|e| {
+                self.conn.execute_batch("ROLLBACK").ok();
+                crate::Error::Io(format!("delete old messages: {}", e))
+            })?;
+
+        // Insert compaction summary before the kept messages
+        // Use a negative id to ensure it sorts before existing messages
+        self.conn
+            .execute(
+                "INSERT INTO messages (session_id, message_json, created_at) 
+                 SELECT ?1, ?2, ?3
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM messages WHERE session_id = ?1 AND id < ?4
+                 )",
+                params![session_id, summary_json, now, keep_from_id],
+            )
+            .map_err(|e| {
+                self.conn.execute_batch("ROLLBACK").ok();
+                crate::Error::Io(format!("insert summary: {}", e))
+            })?;
+
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|e| crate::Error::Io(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Get the database row ID for a message at a given index in a session.
+    pub fn get_message_row_id(&self, session_id: &str, index: usize) -> crate::Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM messages WHERE session_id = ?1 ORDER BY id LIMIT 1 OFFSET ?2")
+            .map_err(|e| crate::Error::Io(e.to_string()))?;
+        stmt.query_row(params![session_id, index as i64], |row| row.get(0))
+            .optional()
+            .map_err(|e| crate::Error::Io(e.to_string()))
+    }
+
     /// Get the next session id (max numeric suffix + 1).
     pub fn next_session_id(&self) -> crate::Result<String> {
         let max: Option<String> = self

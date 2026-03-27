@@ -9,6 +9,7 @@ use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use smol::Async;
 
 use crate::auth::{AuthCredential, AuthStorage};
+use crate::compaction;
 use crate::config;
 use crate::db::{Db, StoredSession};
 use crate::protocol::{ModelInfo, Request, Response, SessionInfo, SessionStats, TokenStats};
@@ -50,6 +51,7 @@ fn compute_stats(messages: &[Message], model: &Model, is_subscription: bool) -> 
                 }
             }
             Message::ToolResult(_) => tool_results += 1,
+            Message::CompactionSummary(_) => {}
         }
     }
 
@@ -417,9 +419,34 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     .await?;
                 }
 
-                if let Some(msg) = final_message {
+                if let Some(ref msg) = final_message {
                     let st = state.lock().unwrap();
-                    st.db.append_message(&session_id, &msg)?;
+                    st.db.append_message(&session_id, msg)?;
+                }
+
+                // Check if compaction is needed
+                if let Some(Message::Assistant(ref assistant)) = final_message
+                    && assistant.stop_reason != StopReason::Error
+                    && assistant.stop_reason != StopReason::Aborted
+                {
+                    let should = {
+                        let st = state.lock().unwrap();
+                        let messages = st.db.get_messages(&session_id)?;
+                        let ctx_tokens = compaction::estimate_context_tokens(&messages);
+                        compaction::should_compact(
+                            ctx_tokens,
+                            model.context_window,
+                            &compaction::CompactionSettings::default(),
+                        )
+                    };
+                    if should {
+                        // Run compaction
+                        let compact_result =
+                            run_compaction(&state, &session_id, &model, &mut writer).await;
+                        if let Err(e) = compact_result {
+                            eprintln!("compaction error: {}", e);
+                        }
+                    }
                 }
             }
             Request::ListSessions => {
@@ -593,6 +620,103 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
             }
         }
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
+    state: &SharedState,
+    session_id: &str,
+    model: &Model,
+    writer: &mut W,
+) -> crate::Result<()> {
+    let settings = compaction::CompactionSettings::default();
+
+    // Load messages and find cut point
+    let (messages, cut_idx) = {
+        let st = state.lock().unwrap();
+        let messages = st.db.get_messages(session_id)?;
+        let cut = compaction::find_cut_point(&messages, settings.keep_recent_tokens);
+        (messages, cut)
+    };
+
+    if cut_idx == 0 {
+        return Ok(()); // Nothing to compact
+    }
+
+    let messages_to_summarize = &messages[..cut_idx];
+    let ctx_before = compaction::estimate_context_tokens(&messages);
+
+    // Notify client
+    send(
+        writer,
+        &Response::Error {
+            message: format!(
+                "compacting session ({} messages → summary)...",
+                messages_to_summarize.len()
+            ),
+        },
+    )
+    .await?;
+
+    // Build summarization context and call LLM
+    let summary_ctx = compaction::build_summarization_context(messages_to_summarize);
+
+    let api_key = {
+        let st = state.lock().unwrap();
+        resolve_api_key(&st.auth, &st.config, &model.provider)?
+    };
+
+    let options = StreamOptions {
+        api_key,
+        max_tokens: Some(settings.reserve_tokens),
+        ..Default::default()
+    };
+
+    let rx = {
+        let st = state.lock().unwrap();
+        st.registry.stream(model, &summary_ctx, &options)?
+    };
+
+    // Wait for summary (blocking on the channel)
+    let summary = smol::unblock({
+        let rx = rx.clone();
+        move || compaction::extract_summary(&rx)
+    })
+    .await?;
+
+    // Get the DB row ID of the first kept message
+    let keep_from_id = {
+        let st = state.lock().unwrap();
+        st.db
+            .get_message_row_id(session_id, cut_idx)?
+            .ok_or_else(|| crate::Error::Io("cut point message not found".into()))?
+    };
+
+    // Perform compaction in DB
+    {
+        let st = state.lock().unwrap();
+        st.db
+            .compact_session(session_id, &summary, keep_from_id, ctx_before)?;
+    }
+
+    let after_tokens = {
+        let st = state.lock().unwrap();
+        let messages = st.db.get_messages(session_id)?;
+        compaction::estimate_context_tokens(&messages)
+    };
+
+    send(
+        writer,
+        &Response::Error {
+            message: format!("compaction done: {} → {} tokens", ctx_before, after_tokens),
+        },
+    )
+    .await?;
 
     Ok(())
 }

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod client;
+pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod protocol;

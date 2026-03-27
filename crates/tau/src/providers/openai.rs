@@ -407,6 +407,19 @@ fn build_request_body(
                     name: Some(tr.tool_name.clone()),
                 });
             }
+            Message::CompactionSummary(cs) => {
+                let text = format!(
+                    "[Context compacted — {} tokens before compaction]\n\n{}",
+                    cs.tokens_before, cs.summary
+                );
+                messages.push(openai_types::ChatMessage {
+                    role: "user".into(),
+                    content: Some(serde_json::Value::String(text)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+            }
         }
     }
 

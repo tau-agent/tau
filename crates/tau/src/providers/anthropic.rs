@@ -366,6 +366,16 @@ fn build_request_body(
                     }]),
                 });
             }
+            Message::CompactionSummary(cs) => {
+                let text = format!(
+                    "[Context compacted — {} tokens before compaction]\n\n{}",
+                    cs.tokens_before, cs.summary
+                );
+                messages.push(ApiMessage {
+                    role: "user",
+                    content: serde_json::Value::String(text),
+                });
+            }
         }
     }
 

@@ -170,11 +170,20 @@ pub struct ToolResultMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionSummaryMessage {
+    pub summary: String,
+    /// How many tokens the context had before compaction.
+    pub tokens_before: u64,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
+    CompactionSummary(CompactionSummaryMessage),
 }
 
 // ---------------------------------------------------------------------------
