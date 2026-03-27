@@ -120,24 +120,22 @@ impl Theme {
 
     // --- Convenience accessors for common UI elements ---
 
+    /// Tool success: toolSuccessBg background only (text colors set per-span).
     pub fn tool_success_style(&self) -> Style {
-        Style::default()
-            .fg(self.tool_title.to_ratatui())
-            .bg(self.tool_success_bg.to_ratatui())
+        Style::default().bg(self.tool_success_bg.to_ratatui())
     }
 
+    /// Tool error: toolErrorBg background only (text colors set per-span).
     pub fn tool_error_style(&self) -> Style {
-        Style::default()
-            .fg(self.error.to_ratatui())
-            .bg(self.tool_error_bg.to_ratatui())
+        Style::default().bg(self.tool_error_bg.to_ratatui())
     }
 
+    /// Tool pending: toolPendingBg background only (text colors set per-span).
     pub fn tool_pending_style(&self) -> Style {
-        Style::default()
-            .fg(self.muted.to_ratatui())
-            .bg(self.tool_pending_bg.to_ratatui())
+        Style::default().bg(self.tool_pending_bg.to_ratatui())
     }
 
+    /// Error message style.
     pub fn error_style(&self) -> Style {
         Style::default()
             .fg(self.error.to_ratatui())
@@ -156,8 +154,14 @@ impl Theme {
         Style::default().fg(self.border_muted.to_ratatui())
     }
 
+    /// Spinner character style (accent color, like pi).
     pub fn spinner_style(&self) -> Style {
-        Style::default().fg(self.warning.to_ratatui())
+        Style::default().fg(self.accent.to_ratatui())
+    }
+
+    /// Spinner message text style (muted color, like pi).
+    pub fn spinner_message_style(&self) -> Style {
+        Style::default().fg(self.muted.to_ratatui())
     }
 
     pub fn scrollbar_style(&self) -> Style {

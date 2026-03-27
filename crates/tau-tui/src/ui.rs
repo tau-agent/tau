@@ -75,10 +75,11 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         );
         if needs_indicator {
             all_lines.push(Line::from(""));
-            all_lines.push(Line::from(Span::styled(
-                format!("  {} Working...", app.spinner()),
-                theme.spinner_style(),
-            )));
+            all_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(app.spinner().to_string(), theme.spinner_style()),
+                Span::styled(" Working...", theme.spinner_message_style()),
+            ]));
         }
     }
 
