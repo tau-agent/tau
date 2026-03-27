@@ -463,128 +463,93 @@ async fn handle_client(
                     .await?;
                     continue;
                 }
-                let chat_data = {
+                // Load session
+                let session_data = {
                     let st = state.lock().unwrap();
                     match st.db.get_session(&session_id) {
                         Ok(Some(stored)) => {
-                            let user_msg = Message::User(UserMessage::text(&text));
-                            st.db.append_message(&session_id, &user_msg)?;
                             let messages = st.db.get_messages(&session_id)?;
-                            let context = Context {
-                                system_prompt: stored.system_prompt.clone(),
-                                messages,
-                                tools: Vec::new(),
-                            };
-                            let cwd = stored.cwd.unwrap_or_else(|| "/tmp".to_string());
-                            Ok((context, stored.model, cwd))
+                            let cwd = stored.cwd.clone().unwrap_or_else(|| "/tmp".to_string());
+                            Ok((stored, messages, cwd))
                         }
                         Ok(None) => Err(format!("session not found: {}", session_id)),
                         Err(e) => Err(format!("db error: {}", e)),
                     }
                 };
-                let (context, model, cwd) = match chat_data {
+                let (stored, mut messages, cwd) = match session_data {
                     Ok(data) => data,
                     Err(msg) => {
                         send(&mut writer, &Response::Error { message: msg }).await?;
                         continue;
                     }
                 };
+                let model = stored.model.clone();
 
-                let api_key = {
-                    let st = state.lock().unwrap();
-                    resolve_api_key(&st.auth, &st.config, &model.provider)
-                };
-                let api_key = match api_key {
-                    Ok(Some(key)) => key,
-                    Ok(None) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: format!(
-                                    "no API key for {}. Run `tau login` to authenticate.",
-                                    model.provider
-                                ),
-                            },
-                        )
-                        .await?;
-                        continue;
+                // If session was interrupted mid-tool-call, continue first
+                if crate::agent::needs_continuation(&messages) {
+                    let mut context = Context {
+                        system_prompt: stored.system_prompt.clone(),
+                        messages: messages.clone(),
+                        tools: Vec::new(),
+                    };
+                    let cont_result = run_agent_turn(
+                        &state,
+                        &shutdown,
+                        &model,
+                        &mut context,
+                        &cwd,
+                        &session_id,
+                        &mut writer,
+                    )
+                    .await;
+                    match cont_result {
+                        Ok(new_msgs) => {
+                            let st = state.lock().unwrap();
+                            for msg in &new_msgs {
+                                st.db.append_message(&session_id, msg)?;
+                            }
+                            messages = st.db.get_messages(&session_id)?;
+                        }
+                        Err(e) => {
+                            eprintln!("continuation error: {}", e);
+                        }
                     }
-                    Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: format!("auth error: {}", e),
-                            },
-                        )
-                        .await?;
-                        continue;
-                    }
-                };
-
-                let options = StreamOptions {
-                    api_key: Some(api_key),
-                    ..Default::default()
-                };
-
-                // Run agent loop on a blocking thread, forwarding events via channel
-                let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
-                let tool_defs = crate::tools::default_tools();
-                let shutdown_flag = shutdown.flag.clone();
-                let agent_config = crate::agent::AgentConfig {
-                    should_stop: Some(Box::new(move || shutdown_flag.load(Ordering::Relaxed))),
-                    ..Default::default()
-                };
-
-                let registry_clone = {
-                    let st = state.lock().unwrap();
-                    st.registry.clone()
-                };
-
-                let model_clone = model.clone();
-                let mut context_clone = context;
-                let options_clone = options;
-                let cwd_clone = cwd;
-
-                let in_flight = shutdown.clone();
-                let agent_handle = smol::unblock(move || {
-                    in_flight.enter();
-                    let result = crate::agent::run(
-                        &registry_clone,
-                        &model_clone,
-                        &mut context_clone,
-                        &tool_defs,
-                        &options_clone,
-                        &agent_config,
-                        &cwd_clone,
-                        Box::new(move |event| {
-                            let _ = event_tx.send_blocking(event);
-                        }),
-                    );
-                    in_flight.leave();
-                    result
-                });
-
-                // Forward events to client
-                let forward_handle = async {
-                    while let Ok(event) = event_rx.recv().await {
-                        send(
-                            &mut writer,
-                            &Response::Stream {
-                                event: Box::new(event),
-                            },
-                        )
-                        .await?;
-                    }
-                    Ok::<(), crate::Error>(())
-                };
-
-                let (agent_result, forward_result) =
-                    futures::future::join(agent_handle, forward_handle).await;
-                if let Err(e) = forward_result {
-                    eprintln!("event forward error: {}", e);
                 }
-                let agent_result = match agent_result {
-                    Ok(r) => r,
+
+                // Now append user message and run the main agent loop
+                let user_msg = Message::User(UserMessage::text(&text));
+                {
+                    let st = state.lock().unwrap();
+                    st.db.append_message(&session_id, &user_msg)?;
+                }
+                messages.push(user_msg);
+
+                let context = Context {
+                    system_prompt: stored.system_prompt.clone(),
+                    messages,
+                    tools: Vec::new(),
+                };
+
+                // Run agent loop
+                let mut context = context;
+                let result = run_agent_turn(
+                    &state,
+                    &shutdown,
+                    &model,
+                    &mut context,
+                    &cwd,
+                    &session_id,
+                    &mut writer,
+                )
+                .await;
+
+                match result {
+                    Ok(new_msgs) => {
+                        let st = state.lock().unwrap();
+                        for msg in &new_msgs {
+                            st.db.append_message(&session_id, msg)?;
+                        }
+                    }
                     Err(e) => {
                         send(
                             &mut writer,
@@ -593,19 +558,12 @@ async fn handle_client(
                             },
                         )
                         .await?;
+                        send(&mut writer, &Response::AgentDone).await?;
                         continue;
-                    }
-                };
-
-                // Persist all new messages
-                {
-                    let st = state.lock().unwrap();
-                    for msg in &agent_result.new_messages {
-                        st.db.append_message(&session_id, msg)?;
                     }
                 }
 
-                // Check compaction after agent loop completes
+                // Check compaction
                 let should = {
                     let st = state.lock().unwrap();
                     let messages = st.db.get_messages(&session_id)?;
@@ -616,17 +574,14 @@ async fn handle_client(
                         &compaction::CompactionSettings::default(),
                     )
                 };
-                if should {
-                    let compact_result =
-                        run_compaction(&state, &session_id, &model, &mut writer).await;
-                    if let Err(e) = compact_result {
-                        eprintln!("compaction error: {}", e);
-                    }
+                if should
+                    && let Err(e) = run_compaction(&state, &session_id, &model, &mut writer).await
+                {
+                    eprintln!("compaction error: {}", e);
                 }
 
                 send(&mut writer, &Response::AgentDone).await?;
 
-                // If shutdown was requested during the agent loop, notify client now
                 if shutdown.is_shutting_down() {
                     send(
                         &mut writer,
@@ -834,6 +789,92 @@ async fn handle_client(
 // ---------------------------------------------------------------------------
 // Compaction
 // ---------------------------------------------------------------------------
+
+/// Run an agent loop turn: resolve API key, stream, forward events, return new messages.
+async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
+    state: &SharedState,
+    shutdown: &ShutdownHandle,
+    model: &Model,
+    context: &mut Context,
+    cwd: &str,
+    _session_id: &str,
+    writer: &mut W,
+) -> crate::Result<Vec<Message>> {
+    let api_key = {
+        let st = state.lock().unwrap();
+        resolve_api_key(&st.auth, &st.config, &model.provider)?
+    };
+    let api_key = match api_key {
+        Some(key) => key,
+        None => {
+            return Err(crate::Error::NoApiKey(model.provider.clone()));
+        }
+    };
+
+    let options = StreamOptions {
+        api_key: Some(api_key),
+        ..Default::default()
+    };
+
+    let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
+    let tool_defs = crate::tools::default_tools();
+
+    let shutdown_flag = shutdown.flag.clone();
+    let agent_config = crate::agent::AgentConfig {
+        should_stop: Some(Box::new(move || shutdown_flag.load(Ordering::Relaxed))),
+        ..Default::default()
+    };
+
+    let registry_clone = {
+        let st = state.lock().unwrap();
+        st.registry.clone()
+    };
+
+    let model_clone = model.clone();
+    let options_clone = options;
+    let cwd_clone = cwd.to_string();
+    let mut context_clone = context.clone();
+
+    let in_flight = shutdown.clone();
+    let agent_handle = smol::unblock(move || {
+        in_flight.enter();
+        let result = crate::agent::run(
+            &registry_clone,
+            &model_clone,
+            &mut context_clone,
+            &tool_defs,
+            &options_clone,
+            &agent_config,
+            &cwd_clone,
+            Box::new(move |event| {
+                let _ = event_tx.send_blocking(event);
+            }),
+        );
+        in_flight.leave();
+        result
+    });
+
+    let forward_handle = async {
+        while let Ok(event) = event_rx.recv().await {
+            send(
+                writer,
+                &Response::Stream {
+                    event: Box::new(event),
+                },
+            )
+            .await?;
+        }
+        Ok::<(), crate::Error>(())
+    };
+
+    let (agent_result, forward_result) = futures::future::join(agent_handle, forward_handle).await;
+    if let Err(e) = forward_result {
+        eprintln!("event forward error: {}", e);
+    }
+
+    let agent_result = agent_result?;
+    Ok(agent_result.new_messages)
+}
 
 async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
     state: &SharedState,

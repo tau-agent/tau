@@ -41,6 +41,13 @@ pub struct AgentResult {
 /// Callback for agent events (forwarded to client).
 pub type EventCallback = Box<dyn FnMut(StreamEvent) + Send>;
 
+/// Check if a message list needs a continuation turn.
+/// Returns true if the last message is a ToolResult — meaning the session
+/// was interrupted after tool execution but before the LLM responded.
+pub fn needs_continuation(messages: &[Message]) -> bool {
+    matches!(messages.last(), Some(Message::ToolResult(_)))
+}
+
 /// Run the agent loop.
 ///
 /// Streams LLM responses, executes tool calls, and loops until the model
@@ -408,6 +415,90 @@ mod tests {
         } else {
             panic!("expected tool result");
         }
+    }
+
+    #[test]
+    fn resume_after_interrupted_tool_call() {
+        // Simulate: session was interrupted after tool call.
+        // Context has: [user, assistant(tool_call), tool_result]
+        // On resume, the agent loop should send context to LLM to get
+        // a response to the dangling tool result.
+
+        // The mock will return text when called (the continuation response)
+        let registry = setup_registry(vec![MockResponse::Text(
+            "The tool returned some output.".into(),
+        )]);
+        let model = mock_model();
+        let tools = crate::tools::default_tools();
+
+        // Build context as if interrupted mid-session
+        let mut context = Context {
+            system_prompt: Some("You are helpful.".into()),
+            messages: vec![
+                Message::User(UserMessage::text("run echo hello")),
+                Message::Assistant({
+                    let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
+                    a.content.push(AssistantContent::ToolCall(ToolCall {
+                        id: "tc1".into(),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "echo hello"}),
+                    }));
+                    a.stop_reason = StopReason::ToolUse;
+                    a
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "tc1".into(),
+                    tool_name: "bash".into(),
+                    content: vec![ToolResultContent::Text(TextContent {
+                        text: "hello\n".into(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 0,
+                }),
+            ],
+            tools: Vec::new(),
+        };
+        let config = AgentConfig::default();
+
+        // Check that context needs continuation
+        assert!(needs_continuation(&context.messages));
+
+        // Run the agent loop — it should send the existing context
+        // (with tool result) to the LLM and get a text response
+        let result = run(
+            &registry,
+            &model,
+            &mut context,
+            &tools,
+            &StreamOptions::default(),
+            &config,
+            "/tmp",
+            Box::new(|_| {}),
+        )
+        .unwrap();
+
+        // Should get one assistant message (the continuation)
+        assert_eq!(result.new_messages.len(), 1);
+        assert!(
+            matches!(&result.new_messages[0], Message::Assistant(a) if a.text().contains("tool returned"))
+        );
+    }
+
+    #[test]
+    fn no_continuation_needed_after_assistant() {
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(AssistantMessage::empty("mock", "mock", "mock-model")),
+        ];
+        assert!(!needs_continuation(&messages));
+    }
+
+    #[test]
+    fn no_continuation_needed_empty() {
+        let messages: Vec<Message> = vec![];
+        assert!(!needs_continuation(&messages));
     }
 
     #[test]
