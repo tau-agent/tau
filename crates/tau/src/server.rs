@@ -425,8 +425,24 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     Ok::<(), crate::Error>(())
                 };
 
-                let (agent_result, _) = futures::future::join(agent_handle, forward_handle).await;
-                let agent_result = agent_result?;
+                let (agent_result, forward_result) =
+                    futures::future::join(agent_handle, forward_handle).await;
+                if let Err(e) = forward_result {
+                    eprintln!("event forward error: {}", e);
+                }
+                let agent_result = match agent_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("agent error: {}", e),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
 
                 // Persist all new messages
                 {

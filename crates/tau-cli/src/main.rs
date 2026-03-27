@@ -452,22 +452,40 @@ async fn send_and_print(
 
     client
         .recv_streaming(|resp| match resp {
-            tau::protocol::Response::Stream { event } => match event.as_ref() {
-                tau::StreamEvent::TextDelta { delta, .. } => {
-                    print!("{}", delta);
-                }
-                tau::StreamEvent::Done { message, .. } => {
-                    println!();
-                    totals.add(&message.usage);
-                    totals.display();
-                }
-                tau::StreamEvent::Error { error, .. } => {
-                    if let Some(ref msg) = error.error_message {
-                        eprintln!("\nerror: {}", msg);
+            tau::protocol::Response::Stream { event } => {
+                match event.as_ref() {
+                    tau::StreamEvent::TextDelta { delta, .. } => {
+                        print!("{}", delta);
+                        use std::io::Write;
+                        std::io::stdout().flush().ok();
                     }
+                    tau::StreamEvent::ToolcallEnd { tool_call, .. } => {
+                        let args_str = tool_call.arguments.to_string();
+                        let preview = if args_str.len() > 100 {
+                            format!("{}...", &args_str[..100])
+                        } else {
+                            args_str
+                        };
+                        eprintln!("[tool: {} {}]", tool_call.name, preview);
+                    }
+                    tau::StreamEvent::Done { message, .. } => {
+                        // Only print newline if there was text content
+                        if message.content.iter().any(
+                            |c| matches!(c, tau::AssistantContent::Text(t) if !t.text.is_empty()),
+                        ) {
+                            println!();
+                        }
+                        totals.add(&message.usage);
+                        totals.display();
+                    }
+                    tau::StreamEvent::Error { error, .. } => {
+                        if let Some(ref msg) = error.error_message {
+                            eprintln!("\nerror: {}", msg);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             tau::protocol::Response::Error { message } => {
                 eprintln!("error: {}", message);
             }
