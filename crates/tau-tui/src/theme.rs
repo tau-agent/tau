@@ -83,10 +83,6 @@ pub struct Theme {
     pub tool_error_bg: ThemeColor,
     pub tool_title: ThemeColor,
     pub tool_output: ThemeColor,
-
-    // Header/footer
-    pub header_bg: ThemeColor,
-    pub stats_bg: ThemeColor,
 }
 
 impl Theme {
@@ -149,14 +145,6 @@ impl Theme {
         Style::default().fg(self.dim.to_ratatui())
     }
 
-    pub fn header_style(&self) -> Style {
-        Style::default().bg(self.header_bg.to_ratatui())
-    }
-
-    pub fn stats_style(&self) -> Style {
-        Style::default().bg(self.stats_bg.to_ratatui())
-    }
-
     pub fn input_border_active(&self) -> Style {
         Style::default().fg(self.accent.to_ratatui())
     }
@@ -207,9 +195,6 @@ pub fn dark() -> Theme {
         tool_error_bg: ThemeColor::Rgb(0x3c, 0x28, 0x28),
         tool_title: ThemeColor::Default,
         tool_output: ThemeColor::Rgb(0x80, 0x80, 0x80),
-
-        header_bg: ThemeColor::Rgb(0x1e, 0x1e, 0x28),
-        stats_bg: ThemeColor::Rgb(0x19, 0x19, 0x23),
     }
 }
 
@@ -245,12 +230,6 @@ struct ThemeColorsJson {
     tool_error_bg: String,
     tool_title: String,
     tool_output: String,
-
-    // Optional tau-specific additions (not in pi)
-    #[serde(default)]
-    header_bg: String,
-    #[serde(default)]
-    stats_bg: String,
 }
 
 /// Load a theme from a JSON string (pi-compatible format).
@@ -281,17 +260,6 @@ pub fn from_json(json: &str) -> Result<Theme, String> {
         tool_error_bg: parse_color(&c.tool_error_bg, vars),
         tool_title: parse_color(&c.tool_title, vars),
         tool_output: parse_color(&c.tool_output, vars),
-
-        header_bg: if c.header_bg.is_empty() {
-            dark().header_bg
-        } else {
-            parse_color(&c.header_bg, vars)
-        },
-        stats_bg: if c.stats_bg.is_empty() {
-            dark().stats_bg
-        } else {
-            parse_color(&c.stats_bg, vars)
-        },
     })
 }
 

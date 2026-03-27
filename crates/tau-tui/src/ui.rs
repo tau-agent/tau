@@ -1,8 +1,8 @@
 //! Layout and rendering.
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-// styles come from Theme
 use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -17,71 +17,36 @@ use crate::theme::Theme;
 pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     let area = frame.area();
 
-    // Layout: header(1) | messages(flex) | stats(1) | input(dynamic)
-    let input_height = input_area_height(app);
+    // Layout: messages(flex) | input(dynamic) | footer(1)
+    let input_height = input_area_height(app, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),            // header
             Constraint::Min(3),               // messages
-            Constraint::Length(1),            // stats bar
             Constraint::Length(input_height), // input area
+            Constraint::Length(1),            // footer (stats left, model right)
         ])
         .split(area);
 
-    draw_header(frame, app, theme, chunks[0]);
-    draw_messages(frame, app, theme, chunks[1]);
-    draw_stats(frame, app, theme, chunks[2]);
-    draw_input(frame, app, theme, chunks[3]);
+    draw_messages(frame, app, theme, chunks[0]);
+    draw_input(frame, app, theme, chunks[1]);
+    draw_footer(frame, app, theme, chunks[2]);
 }
 
-/// Height of the input area: textarea lines + 2 (border).
-fn input_area_height(app: &App) -> u16 {
-    let lines = app.textarea.lines().len() as u16;
-    (lines + 2).clamp(3, 10)
-}
-
-// ---------------------------------------------------------------------------
-// Header
-// ---------------------------------------------------------------------------
-
-fn draw_header(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let session_short = if app.session_id.len() > 8 {
-        &app.session_id[..8]
-    } else {
-        &app.session_id
-    };
-
-    let header = Line::from(vec![
-        Span::styled(" tau", theme.bold_fg(theme.accent)),
-        Span::styled(
-            format!(" · {} · {}/{}", session_short, app.provider, app.model),
-            theme.fg(theme.dim),
-        ),
-        // Flexible padding
-        Span::raw(
-            " ".repeat(
-                area.width
-                    .saturating_sub(
-                        4 + 3
-                            + session_short.len() as u16
-                            + 3
-                            + app.provider.len() as u16
-                            + 1
-                            + app.model.len() as u16
-                            + 2,
-                    )
-                    .into(),
-            ),
-        ),
-        match app.mode {
-            AppMode::Input => Span::styled("●", theme.fg(theme.success)),
-            AppMode::Streaming => Span::styled(app.spinner(), theme.spinner_style()),
-        },
-        Span::raw(" "),
-    ]);
-
-    frame.render_widget(Paragraph::new(header).style(theme.header_style()), area);
+/// Height of the input area: visual lines (accounting for wrap) + 2 borders.
+fn input_area_height(app: &App, width: u16) -> u16 {
+    // Inner width: full width minus left/right (no side borders, but 1 char padding each side)
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let visual_lines: usize = app
+        .textarea
+        .lines()
+        .iter()
+        .map(|line| {
+            let len = line.len().max(1); // empty line = 1 visual line
+            len.div_ceil(inner_width)
+        })
+        .sum();
+    ((visual_lines as u16) + 2).clamp(3, 12)
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +67,7 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    // Add working indicator if streaming
+    // Add working indicator if streaming, with empty line below
     if app.mode == AppMode::Streaming {
         let needs_indicator = !matches!(
             app.messages.last(),
@@ -114,6 +79,7 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 format!("  {} Working...", app.spinner()),
                 theme.spinner_style(),
             )));
+            all_lines.push(Line::from("")); // empty line below spinner
         }
     }
 
@@ -152,88 +118,122 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Stats bar
+// Input area
 // ---------------------------------------------------------------------------
 
-fn draw_stats(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let totals = &app.totals;
-    let mut parts = Vec::new();
+fn draw_input(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let border_style = match app.mode {
+        AppMode::Input => theme.input_border_active(),
+        AppMode::Streaming => theme.input_border_inactive(),
+    };
 
+    // Only top and bottom borders, single line
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_set(border::PLAIN)
+        .border_style(border_style);
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(&app.textarea, inner);
+}
+
+// ---------------------------------------------------------------------------
+// Footer: stats left-aligned, model right-aligned
+// ---------------------------------------------------------------------------
+
+fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let totals = &app.totals;
     let dim = theme.fg(theme.dim);
 
+    // Build left side: stats
+    let mut left_parts: Vec<Span<'static>> = Vec::new();
+
     if totals.input > 0 {
-        parts.push(Span::styled(
+        left_parts.push(Span::styled(
             format!("↑{}", format_tokens(totals.input)),
             dim,
         ));
     }
     if totals.output > 0 {
-        parts.push(Span::styled(
-            format!(" ↓{}", format_tokens(totals.output)),
+        if !left_parts.is_empty() {
+            left_parts.push(Span::styled(" ", dim));
+        }
+        left_parts.push(Span::styled(
+            format!("↓{}", format_tokens(totals.output)),
             dim,
         ));
     }
     if totals.cache_read > 0 {
-        parts.push(Span::styled(
-            format!(" R{}", format_tokens(totals.cache_read)),
+        if !left_parts.is_empty() {
+            left_parts.push(Span::styled(" ", dim));
+        }
+        left_parts.push(Span::styled(
+            format!("R{}", format_tokens(totals.cache_read)),
             dim,
         ));
     }
     if totals.cache_write > 0 {
-        parts.push(Span::styled(
-            format!(" W{}", format_tokens(totals.cache_write)),
+        if !left_parts.is_empty() {
+            left_parts.push(Span::styled(" ", dim));
+        }
+        left_parts.push(Span::styled(
+            format!("W{}", format_tokens(totals.cache_write)),
             dim,
         ));
     }
     if totals.cost > 0.0 || totals.is_subscription {
+        if !left_parts.is_empty() {
+            left_parts.push(Span::styled(" ", dim));
+        }
         let cost_str = if totals.is_subscription {
-            format!(" ${:.3} (sub)", totals.cost)
+            format!("${:.3} (sub)", totals.cost)
         } else {
-            format!(" ${:.3}", totals.cost)
+            format!("${:.3}", totals.cost)
         };
-        parts.push(Span::styled(cost_str, dim));
+        left_parts.push(Span::styled(cost_str, dim));
     }
     if totals.context_window > 0 {
-        let ctx = match totals.context_tokens {
+        if !left_parts.is_empty() {
+            left_parts.push(Span::styled(" ", dim));
+        }
+        match totals.context_tokens {
             Some(t) => {
                 let pct = (t as f64 / totals.context_window as f64) * 100.0;
                 let color = theme.context_color(pct);
-                Span::styled(
-                    format!(" {:.1}%/{}", pct, format_tokens(totals.context_window)),
+                left_parts.push(Span::styled(
+                    format!("{:.1}%/{}", pct, format_tokens(totals.context_window)),
                     theme.fg(color),
-                )
+                ));
             }
-            None => Span::styled(format!(" ?/{}", format_tokens(totals.context_window)), dim),
-        };
-        parts.push(ctx);
+            None => {
+                left_parts.push(Span::styled(
+                    format!("?/{}", format_tokens(totals.context_window)),
+                    dim,
+                ));
+            }
+        }
     }
 
-    if parts.is_empty() {
-        parts.push(Span::styled(" ready", dim));
-    }
+    // Build right side: model name
+    let right_text = format!("{}/{}", app.provider, app.model);
+    let right_span = Span::styled(right_text.clone(), dim);
 
-    parts.insert(0, Span::raw(" "));
+    // Calculate left width
+    let left_width: usize = left_parts.iter().map(|s| s.content.len()).sum();
+    let right_width = right_text.len();
+    let w = area.width as usize;
 
-    let stats_line = Line::from(parts);
-    frame.render_widget(Paragraph::new(stats_line).style(theme.stats_style()), area);
-}
+    // Padding between left and right
+    let pad = w.saturating_sub(1 + left_width + 1 + right_width + 1);
 
-// ---------------------------------------------------------------------------
-// Input area
-// ---------------------------------------------------------------------------
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::raw(" ")); // left margin
+    spans.extend(left_parts);
+    spans.push(Span::raw(" ".repeat(pad.max(1))));
+    spans.push(right_span);
+    spans.push(Span::raw(" ")); // right margin
 
-fn draw_input(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
-    let (border_style, title_style) = match app.mode {
-        AppMode::Input => (theme.input_border_active(), theme.bold_fg(theme.accent)),
-        AppMode::Streaming => (theme.input_border_inactive(), theme.fg(theme.border_muted)),
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Span::styled(" tau ", title_style));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(&app.textarea, inner);
+    let footer_line = Line::from(spans);
+    frame.render_widget(Paragraph::new(footer_line), area);
 }

@@ -74,7 +74,7 @@ async fn run_inner(
     is_subscription: bool,
 ) -> tau::Result<()> {
     let theme = theme::dark();
-    let mut app = App::new(session_id.clone(), model, provider, theme);
+    let mut app = App::new(session_id, model, provider, theme);
     app.totals.context_window = context_window;
     app.totals.is_subscription = is_subscription;
 
@@ -99,11 +99,12 @@ async fn run_inner(
 
         // Execute action
         if let Some(action) = action {
+            let sid = app.session_id.clone();
             match action {
                 Action::SendChat(text) => {
                     send_request_and_recv(
                         Request::Chat {
-                            session_id: session_id.clone(),
+                            session_id: sid,
                             text,
                         },
                         server_tx.clone(),
@@ -112,11 +113,9 @@ async fn run_inner(
                 }
                 Action::CancelChat => {
                     // Send cancel on a fresh connection (fire-and-forget)
-                    let sid = session_id.clone();
                     smol::spawn(async move {
                         if let Ok(mut c) = Client::connect().await {
                             let _ = c.send(&Request::CancelChat { session_id: sid }).await;
-                            // Drain the response
                             let _ = c.recv_streaming(|_| {}).await;
                         }
                     })
@@ -128,7 +127,7 @@ async fn run_inner(
                 Action::SetModel(model_id) => {
                     send_request_and_recv(
                         Request::SetModel {
-                            session_id: session_id.clone(),
+                            session_id: sid,
                             model_id,
                         },
                         server_tx.clone(),
@@ -137,9 +136,7 @@ async fn run_inner(
                 }
                 Action::GetStatus => {
                     send_request_and_recv(
-                        Request::GetSessionInfo {
-                            session_id: session_id.clone(),
-                        },
+                        Request::GetSessionInfo { session_id: sid },
                         server_tx.clone(),
                     )
                     .await?;
@@ -147,7 +144,7 @@ async fn run_inner(
                 Action::SetCwd(cwd) => {
                     send_request_and_recv(
                         Request::SetCwd {
-                            session_id: session_id.clone(),
+                            session_id: sid,
                             cwd,
                         },
                         server_tx.clone(),
