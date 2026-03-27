@@ -249,9 +249,40 @@ impl App {
                 }
             }
             "/status" => Some(Action::GetStatus),
+            "/theme" | "/themes" => {
+                if args.is_empty() {
+                    // List available themes
+                    let themes = crate::theme::list_themes();
+                    for name in &themes {
+                        let marker = if self.theme.name.as_deref() == Some(name.as_str()) {
+                            " *"
+                        } else {
+                            ""
+                        };
+                        self.messages.push(MessageItem::Status {
+                            text: format!("  {}{}", name, marker),
+                        });
+                    }
+                } else {
+                    // Switch theme
+                    match crate::theme::load_by_name(args) {
+                        Ok(new_theme) => {
+                            self.theme = new_theme;
+                            self.messages.push(MessageItem::Status {
+                                text: format!("theme: {}", args),
+                            });
+                        }
+                        Err(e) => {
+                            self.messages.push(MessageItem::Error { text: e });
+                        }
+                    }
+                }
+                None
+            }
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /cwd [path] /help /quit".into(),
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /help /quit"
+                        .into(),
                 });
                 None
             }

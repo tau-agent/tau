@@ -1,0 +1,40 @@
+{
+	"name": "dark",
+	"vars": {
+		"cyan": "#00d7ff",
+		"blue": "#5f87ff",
+		"green": "#b5bd68",
+		"red": "#cc6666",
+		"yellow": "#ffff00",
+		"gray": "#808080",
+		"dimGray": "#666666",
+		"darkGray": "#505050",
+		"accent": "#8abeb7",
+		"userMsgBg": "#343541",
+		"toolPendingBg": "#282832",
+		"toolSuccessBg": "#283228",
+		"toolErrorBg": "#3c2828"
+	},
+	"colors": {
+		"accent": "accent",
+		"border": "blue",
+		"borderAccent": "cyan",
+		"borderMuted": "darkGray",
+		"success": "green",
+		"error": "red",
+		"warning": "yellow",
+		"muted": "gray",
+		"dim": "dimGray",
+		"text": "",
+		"thinkingText": "gray",
+
+		"selectedBg": "#3a3a4a",
+		"userMessageBg": "userMsgBg",
+		"userMessageText": "",
+		"toolPendingBg": "toolPendingBg",
+		"toolSuccessBg": "toolSuccessBg",
+		"toolErrorBg": "toolErrorBg",
+		"toolTitle": "",
+		"toolOutput": "gray"
+	}
+}

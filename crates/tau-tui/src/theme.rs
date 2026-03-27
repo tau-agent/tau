@@ -61,6 +61,9 @@ fn resolve_var(value: &str, vars: &HashMap<String, String>) -> String {
 /// The full theme with all named colors.
 #[derive(Debug, Clone)]
 pub struct Theme {
+    /// Theme name (for display / identification).
+    pub name: Option<String>,
+
     // Core UI
     pub accent: ThemeColor,
     pub border: ThemeColor,
@@ -175,6 +178,7 @@ impl Theme {
 /// Built-in dark theme (matching pi's dark.json).
 pub fn dark() -> Theme {
     Theme {
+        name: Some("dark".into()),
         accent: ThemeColor::Rgb(0x8a, 0xbe, 0xb7),
         border: ThemeColor::Rgb(0x5f, 0x87, 0xff),
         border_accent: ThemeColor::Rgb(0x00, 0xd7, 0xff),
@@ -198,9 +202,94 @@ pub fn dark() -> Theme {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Built-in themes (embedded at compile time)
+// ---------------------------------------------------------------------------
+
+const BUILTIN_DARK: &str = include_str!("../../../themes/dark.json");
+const BUILTIN_LIGHT: &str = include_str!("../../../themes/light.json");
+
+/// Names of built-in themes.
+const BUILTIN_NAMES: &[&str] = &["dark", "light"];
+
+/// Custom themes directory: `~/.config/tau/themes/`.
+fn custom_themes_dir() -> Option<std::path::PathBuf> {
+    if let Ok(config) = std::env::var("XDG_CONFIG_HOME") {
+        Some(std::path::PathBuf::from(config).join("tau").join("themes"))
+    } else if let Ok(home) = std::env::var("HOME") {
+        Some(
+            std::path::PathBuf::from(home)
+                .join(".config")
+                .join("tau")
+                .join("themes"),
+        )
+    } else {
+        None
+    }
+}
+
+/// List all available theme names (built-in + custom).
+pub fn list_themes() -> Vec<String> {
+    let mut names: Vec<String> = BUILTIN_NAMES.iter().map(|s| (*s).to_string()).collect();
+
+    if let Some(dir) = custom_themes_dir()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                let name = stem.to_string();
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+
+    names.sort();
+    names
+}
+
+/// Load a theme by name. Checks built-in first, then custom themes dir.
+pub fn load_by_name(name: &str) -> Result<Theme, String> {
+    // Built-in
+    match name {
+        "dark" => return from_json(BUILTIN_DARK),
+        "light" => return from_json(BUILTIN_LIGHT),
+        _ => {}
+    }
+
+    // Custom
+    if let Some(dir) = custom_themes_dir() {
+        let path = dir.join(format!("{}.json", name));
+        if path.exists() {
+            let json = std::fs::read_to_string(&path)
+                .map_err(|e| format!("read {}: {}", path.display(), e))?;
+            return from_json(&json);
+        }
+    }
+
+    Err(format!("theme '{}' not found", name))
+}
+
+/// Load a theme from a file path.
+pub fn load_from_path(path: &std::path::Path) -> Result<Theme, String> {
+    let json =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    from_json(&json)
+}
+
+// ---------------------------------------------------------------------------
+// JSON parsing
+// ---------------------------------------------------------------------------
+
 /// JSON schema for loading themes from file.
 #[derive(Debug, Deserialize)]
 struct ThemeJson {
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     vars: HashMap<String, String>,
     colors: ThemeColorsJson,
@@ -240,6 +329,7 @@ pub fn from_json(json: &str) -> Result<Theme, String> {
     let c = &theme_json.colors;
 
     Ok(Theme {
+        name: theme_json.name,
         accent: parse_color(&c.accent, vars),
         border: parse_color(&c.border, vars),
         border_accent: parse_color(&c.border_accent, vars),
@@ -303,5 +393,33 @@ mod tests {
         let t = dark();
         assert!(matches!(t.accent, ThemeColor::Rgb(0x8a, 0xbe, 0xb7)));
         assert!(matches!(t.error, ThemeColor::Rgb(0xcc, 0x66, 0x66)));
+        assert_eq!(t.name.as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn load_builtin_dark() {
+        let t = load_by_name("dark").unwrap();
+        assert_eq!(t.name.as_deref(), Some("dark"));
+        assert!(matches!(t.accent, ThemeColor::Rgb(0x8a, 0xbe, 0xb7)));
+    }
+
+    #[test]
+    fn load_builtin_light() {
+        let t = load_by_name("light").unwrap();
+        assert_eq!(t.name.as_deref(), Some("light"));
+        // light theme uses teal=#5a8080 for accent
+        assert!(matches!(t.accent, ThemeColor::Rgb(0x5a, 0x80, 0x80)));
+    }
+
+    #[test]
+    fn load_unknown_fails() {
+        assert!(load_by_name("nonexistent").is_err());
+    }
+
+    #[test]
+    fn list_includes_builtins() {
+        let themes = list_themes();
+        assert!(themes.contains(&"dark".to_string()));
+        assert!(themes.contains(&"light".to_string()));
     }
 }
