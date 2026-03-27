@@ -4,7 +4,7 @@ use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyMod
 use ratatui_textarea::TextArea;
 
 use tau::protocol::Response;
-use tau::types::{AssistantContent, StreamEvent};
+use tau::types::{AssistantContent, Message, StreamEvent, ToolResultMessage, UserContent};
 
 use crate::events::Event;
 use crate::message::MessageItem;
@@ -94,6 +94,79 @@ impl App {
                 .checked_sub(std::time::Duration::from_secs(10))
                 .unwrap(),
             server_done: false,
+        }
+    }
+
+    /// Populate message history from stored messages (for session resume).
+    pub fn restore_messages(&mut self, messages: &[Message]) {
+        for msg in messages {
+            match msg {
+                Message::User(user_msg) => {
+                    let text = user_msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        self.messages.push(MessageItem::User { text });
+                    }
+                }
+                Message::Assistant(assistant_msg) => {
+                    let text = assistant_msg
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            AssistantContent::Text(t) if !t.text.is_empty() => {
+                                Some(t.text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        self.messages.push(MessageItem::Assistant { text });
+                    }
+                    self.totals.add(&assistant_msg.usage);
+                }
+                Message::ToolResult(ToolResultMessage {
+                    tool_name,
+                    is_error,
+                    content,
+                    ..
+                }) => {
+                    let preview = content
+                        .iter()
+                        .filter_map(|c| match c {
+                            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let preview = if preview.len() > 120 {
+                        format!("{}...", &preview[..120])
+                    } else {
+                        preview
+                    };
+                    if *is_error {
+                        self.messages.push(MessageItem::ToolError {
+                            name: tool_name.clone(),
+                            message: preview,
+                        });
+                    } else {
+                        self.messages.push(MessageItem::Tool {
+                            name: tool_name.clone(),
+                            preview,
+                        });
+                    }
+                }
+                Message::CompactionSummary(_) => {
+                    // Skip compaction summaries in the UI
+                }
+            }
         }
     }
 

@@ -46,6 +46,8 @@ pub enum Request {
     AuthStatus,
     /// Fetch subscription usage (OAuth only, cached 5 min).
     GetSubscriptionUsage,
+    /// Get message history for a session.
+    GetMessages { session_id: String },
     /// Cancel an in-progress chat (agent loop) for a session.
     CancelChat { session_id: String },
     /// Shut down the server.
@@ -89,6 +91,10 @@ pub enum Response {
     ServerShutdown { restart: bool },
     /// Agent loop was cancelled by the user.
     Cancelled,
+    /// Message history for a session.
+    Messages {
+        messages: Vec<crate::types::Message>,
+    },
     /// Agent loop completed (all turns done).
     AgentDone,
     /// Success (generic ack).

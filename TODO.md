@@ -3,7 +3,7 @@
 ## UI Polish
 
 - [x] **Working spinner**: match pi-agent's spinner style and "Working..." text exactly
-- [ ] **Shift+Enter in input**: tui-textarea doesn't handle Shift+Enter for newline — wire it up or switch to a widget that does
+- [x] **Shift+Enter in input**: wired up (Alt+Enter also works). Note: Shift+Enter requires Kitty keyboard protocol support in the terminal — most terminals send it as plain Enter. Alt+Enter works universally.
 - [ ] **Soft line wrapping in input**: tui-textarea doesn't wrap long lines — they scroll horizontally. Need custom widget or upstream support.
 
 ## Session Continuity

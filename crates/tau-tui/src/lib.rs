@@ -83,6 +83,11 @@ async fn run_inner(
     app.totals.context_window = context_window;
     app.totals.is_subscription = is_subscription;
 
+    // Restore message history for session resume
+    if let Ok(messages) = fetch_messages(&app.session_id).await {
+        app.restore_messages(&messages);
+    }
+
     // Channel for server responses — background recv tasks push here.
     let (server_tx, server_rx) = channel::bounded::<Response>(256);
 
@@ -170,6 +175,27 @@ async fn run_inner(
     }
 
     Ok(())
+}
+
+/// Fetch message history for a session (blocking request/response).
+async fn fetch_messages(session_id: &str) -> tau::Result<Vec<tau::types::Message>> {
+    let mut client = Client::connect().await?;
+    client
+        .send(&Request::GetMessages {
+            session_id: session_id.to_string(),
+        })
+        .await?;
+
+    let mut messages = None;
+    client
+        .recv_streaming(|resp| {
+            if let Response::Messages { messages: msgs } = resp {
+                messages = Some(msgs.clone());
+            }
+        })
+        .await?;
+
+    messages.ok_or_else(|| tau::Error::Io("no messages response".into()))
 }
 
 /// Open a fresh connection, send a request, and spawn a background task

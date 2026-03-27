@@ -620,6 +620,13 @@ async fn handle_client(
                     .ok();
                 }
             }
+            Request::GetMessages { session_id } => {
+                let messages = {
+                    let st = state.lock().unwrap();
+                    st.db.get_messages(&session_id)?
+                };
+                send(&mut writer, &Response::Messages { messages }).await?;
+            }
             Request::CancelChat { session_id } => {
                 {
                     let mut st = state.lock().unwrap();
