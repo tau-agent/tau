@@ -470,6 +470,8 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                         eprintln!("compaction error: {}", e);
                     }
                 }
+
+                send(&mut writer, &Response::AgentDone).await?;
             }
             Request::ListSessions => {
                 let sessions = {

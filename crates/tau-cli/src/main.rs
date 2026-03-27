@@ -476,7 +476,6 @@ async fn send_and_print(
                             println!();
                         }
                         totals.add(&message.usage);
-                        totals.display();
                     }
                     tau::StreamEvent::Error { error, .. } => {
                         if let Some(ref msg) = error.error_message {
@@ -485,6 +484,9 @@ async fn send_and_print(
                     }
                     _ => {}
                 }
+            }
+            tau::protocol::Response::AgentDone => {
+                totals.display();
             }
             tau::protocol::Response::Error { message } => {
                 eprintln!("error: {}", message);

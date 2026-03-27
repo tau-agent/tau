@@ -74,6 +74,8 @@ pub enum Response {
     SubscriptionUsage {
         usage: crate::auth::SubscriptionUsage,
     },
+    /// Agent loop completed (all turns done).
+    AgentDone,
     /// Success (generic ack).
     Ok,
     /// Error.

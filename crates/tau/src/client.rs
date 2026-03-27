@@ -77,12 +77,12 @@ impl Client {
             let resp: Response =
                 serde_json::from_str(&line).map_err(|e| crate::Error::Parse(e.to_string()))?;
             let is_terminal = match &resp {
-                Response::Stream { event } => matches!(
-                    event.as_ref(),
-                    crate::types::StreamEvent::Done { .. }
-                        | crate::types::StreamEvent::Error { .. }
-                ),
-                Response::Error { .. }
+                Response::Stream { event } => {
+                    // Stream errors are terminal (agent won't continue)
+                    matches!(event.as_ref(), crate::types::StreamEvent::Error { .. })
+                }
+                Response::AgentDone
+                | Response::Error { .. }
                 | Response::Ok
                 | Response::SessionCreated { .. }
                 | Response::SessionInfo { .. }
