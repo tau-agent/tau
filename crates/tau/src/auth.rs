@@ -163,6 +163,44 @@ fn wait_for_callback(listener: &TcpListener) -> crate::Result<(String, String)> 
     Ok((code, state))
 }
 
+// ---------------------------------------------------------------------------
+// Token exchange/refresh types
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct TokenExchangeRequest {
+    grant_type: &'static str,
+    client_id: &'static str,
+    code: String,
+    state: String,
+    redirect_uri: String,
+    code_verifier: String,
+}
+
+#[derive(Serialize)]
+struct TokenRefreshRequest {
+    grant_type: &'static str,
+    client_id: &'static str,
+    refresh_token: String,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    refresh_token: String,
+    expires_in: u64,
+}
+
+impl TokenResponse {
+    fn into_credentials(self) -> OAuthCredentials {
+        OAuthCredentials {
+            access: self.access_token,
+            refresh: self.refresh_token,
+            expires: crate::types::timestamp_ms() + self.expires_in * 1000 - EXPIRY_BUFFER_MS,
+        }
+    }
+}
+
 /// Exchange authorization code for tokens.
 fn exchange_code(
     code: &str,
@@ -170,16 +208,16 @@ fn exchange_code(
     verifier: &str,
     redirect_uri: &str,
 ) -> crate::Result<OAuthCredentials> {
-    let body = serde_json::json!({
-        "grant_type": "authorization_code",
-        "client_id": CLIENT_ID,
-        "code": code,
-        "state": state,
-        "redirect_uri": redirect_uri,
-        "code_verifier": verifier,
-    });
+    let body = TokenExchangeRequest {
+        grant_type: "authorization_code",
+        client_id: CLIENT_ID,
+        code: code.to_string(),
+        state: state.to_string(),
+        redirect_uri: redirect_uri.to_string(),
+        code_verifier: verifier.to_string(),
+    };
 
-    let data: serde_json::Value = ureq::post(TOKEN_URL)
+    let resp: TokenResponse = ureq::post(TOKEN_URL)
         .header("content-type", "application/json")
         .header("accept", "application/json")
         .send_json(&body)
@@ -188,23 +226,7 @@ fn exchange_code(
         .read_json()
         .map_err(|e| crate::Error::Parse(format!("token response: {}", e)))?;
 
-    let access = data["access_token"]
-        .as_str()
-        .ok_or_else(|| crate::Error::Parse("missing access_token".into()))?
-        .to_string();
-    let refresh = data["refresh_token"]
-        .as_str()
-        .ok_or_else(|| crate::Error::Parse("missing refresh_token".into()))?
-        .to_string();
-    let expires_in = data["expires_in"]
-        .as_u64()
-        .ok_or_else(|| crate::Error::Parse("missing expires_in".into()))?;
-
-    Ok(OAuthCredentials {
-        access,
-        refresh,
-        expires: crate::types::timestamp_ms() + expires_in * 1000 - EXPIRY_BUFFER_MS,
-    })
+    Ok(resp.into_credentials())
 }
 
 // ---------------------------------------------------------------------------
@@ -212,14 +234,14 @@ fn exchange_code(
 // ---------------------------------------------------------------------------
 
 /// Refresh an expired OAuth token.
-pub fn refresh_token(refresh_token: &str) -> crate::Result<OAuthCredentials> {
-    let body = serde_json::json!({
-        "grant_type": "refresh_token",
-        "client_id": CLIENT_ID,
-        "refresh_token": refresh_token,
-    });
+pub fn refresh_token(refresh_tok: &str) -> crate::Result<OAuthCredentials> {
+    let body = TokenRefreshRequest {
+        grant_type: "refresh_token",
+        client_id: CLIENT_ID,
+        refresh_token: refresh_tok.to_string(),
+    };
 
-    let data: serde_json::Value = ureq::post(TOKEN_URL)
+    let resp: TokenResponse = ureq::post(TOKEN_URL)
         .header("content-type", "application/json")
         .header("accept", "application/json")
         .send_json(&body)
@@ -228,23 +250,7 @@ pub fn refresh_token(refresh_token: &str) -> crate::Result<OAuthCredentials> {
         .read_json()
         .map_err(|e| crate::Error::Parse(format!("refresh response: {}", e)))?;
 
-    let access = data["access_token"]
-        .as_str()
-        .ok_or_else(|| crate::Error::Parse("missing access_token".into()))?
-        .to_string();
-    let refresh = data["refresh_token"]
-        .as_str()
-        .ok_or_else(|| crate::Error::Parse("missing refresh_token".into()))?
-        .to_string();
-    let expires_in = data["expires_in"]
-        .as_u64()
-        .ok_or_else(|| crate::Error::Parse("missing expires_in".into()))?;
-
-    Ok(OAuthCredentials {
-        access,
-        refresh,
-        expires: crate::types::timestamp_ms() + expires_in * 1000 - EXPIRY_BUFFER_MS,
-    })
+    Ok(resp.into_credentials())
 }
 
 // ---------------------------------------------------------------------------
@@ -533,29 +539,43 @@ pub fn is_oauth_token(key: &str) -> bool {
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UsageBucket {
-    /// 0.0–1.0 utilization, or None if unknown.
     pub utilization: Option<f64>,
-    /// When this bucket resets (ISO 8601).
     pub resets_at: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExtraUsage {
+    #[serde(default)]
+    pub is_enabled: bool,
+    pub monthly_limit: Option<f64>,
+    pub used_credits: Option<f64>,
+}
+
+/// Raw API response from the usage endpoint.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct UsageApiResponse {
+    five_hour: Option<UsageBucket>,
+    seven_day: Option<UsageBucket>,
+    seven_day_sonnet: Option<UsageBucket>,
+    seven_day_opus: Option<UsageBucket>,
+    extra_usage: Option<ExtraUsage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SubscriptionUsage {
     pub five_hour: Option<UsageBucket>,
     pub seven_day: Option<UsageBucket>,
     pub seven_day_sonnet: Option<UsageBucket>,
     pub seven_day_opus: Option<UsageBucket>,
-    pub extra_usage_enabled: bool,
-    pub extra_usage_monthly_limit: Option<f64>,
-    pub extra_usage_used_credits: Option<f64>,
+    pub extra_usage: Option<ExtraUsage>,
 }
 
 /// Fetch subscription usage from the Anthropic API.
 /// `token` must be a valid OAuth access token.
 pub fn fetch_subscription_usage(token: &str) -> crate::Result<SubscriptionUsage> {
-    let data: serde_json::Value = ureq::get(USAGE_URL)
+    let resp: UsageApiResponse = ureq::get(USAGE_URL)
         .header("authorization", &format!("Bearer {}", token))
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("content-type", "application/json")
@@ -565,40 +585,11 @@ pub fn fetch_subscription_usage(token: &str) -> crate::Result<SubscriptionUsage>
         .read_json()
         .map_err(|e| crate::Error::Parse(format!("usage response: {}", e)))?;
 
-    fn bucket(v: &serde_json::Value) -> Option<UsageBucket> {
-        if v.is_null() {
-            return None;
-        }
-        Some(UsageBucket {
-            utilization: v.get("utilization").and_then(|u| u.as_f64()),
-            resets_at: v
-                .get("resets_at")
-                .and_then(|r| r.as_str())
-                .map(String::from),
-        })
-    }
-
-    let extra = data.get("extra_usage");
     Ok(SubscriptionUsage {
-        five_hour: bucket(data.get("five_hour").unwrap_or(&serde_json::Value::Null)),
-        seven_day: bucket(data.get("seven_day").unwrap_or(&serde_json::Value::Null)),
-        seven_day_sonnet: bucket(
-            data.get("seven_day_sonnet")
-                .unwrap_or(&serde_json::Value::Null),
-        ),
-        seven_day_opus: bucket(
-            data.get("seven_day_opus")
-                .unwrap_or(&serde_json::Value::Null),
-        ),
-        extra_usage_enabled: extra
-            .and_then(|e| e.get("is_enabled"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        extra_usage_monthly_limit: extra
-            .and_then(|e| e.get("monthly_limit"))
-            .and_then(|v| v.as_f64()),
-        extra_usage_used_credits: extra
-            .and_then(|e| e.get("used_credits"))
-            .and_then(|v| v.as_f64()),
+        five_hour: resp.five_hour,
+        seven_day: resp.seven_day,
+        seven_day_sonnet: resp.seven_day_sonnet,
+        seven_day_opus: resp.seven_day_opus,
+        extra_usage: resp.extra_usage,
     })
 }

@@ -477,11 +477,9 @@ async fn print_subscription_usage(client: &mut tau::client::Client) {
                         first = false;
                     }
                 }
-                if usage.extra_usage_enabled
-                    && let (Some(used), Some(limit)) = (
-                        usage.extra_usage_used_credits,
-                        usage.extra_usage_monthly_limit,
-                    )
+                if let Some(extra) = &usage.extra_usage
+                    && extra.is_enabled
+                    && let (Some(used), Some(limit)) = (extra.used_credits, extra.monthly_limit)
                 {
                     println!("          extra ${:.2}/${:.2}", used, limit);
                 }

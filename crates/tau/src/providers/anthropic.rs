@@ -2,6 +2,7 @@ use std::io::{BufRead, BufReader};
 
 use async_trait::async_trait;
 
+use super::anthropic_types::*;
 use crate::provider::{EventReceiver, EventSender, Provider};
 use crate::types::*;
 
@@ -37,9 +38,8 @@ impl Provider for Anthropic {
         let model_id = model.id.clone();
         let model_clone = model.clone();
 
-        // Spawn blocking HTTP + SSE parsing on a thread
         std::thread::spawn(move || {
-            let ctx = StreamContext {
+            let ctx = StreamCtx {
                 base_url: &base_url,
                 api_key: &api_key,
                 api_id: &api_id,
@@ -63,7 +63,7 @@ impl Provider for Anthropic {
     }
 }
 
-struct StreamContext<'a> {
+struct StreamCtx<'a> {
     base_url: &'a str,
     api_key: &'a str,
     api_id: &'a str,
@@ -72,12 +72,12 @@ struct StreamContext<'a> {
     model: &'a Model,
 }
 
+// ---------------------------------------------------------------------------
+// SSE stream processing
+// ---------------------------------------------------------------------------
+
 #[allow(clippy::too_many_lines)]
-fn run_stream(
-    ctx: &StreamContext<'_>,
-    body: &serde_json::Value,
-    tx: &EventSender,
-) -> crate::Result<()> {
+fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> crate::Result<()> {
     let url = format!("{}/v1/messages", ctx.base_url.trim_end_matches('/'));
 
     let is_oauth = crate::auth::is_oauth_token(ctx.api_key);
@@ -87,7 +87,6 @@ fn run_stream(
         .header("accept", "application/json");
 
     if is_oauth {
-        // OAuth: Bearer auth + Claude Code identity headers
         req = req
             .header("authorization", &format!("Bearer {}", ctx.api_key))
             .header(
@@ -98,7 +97,6 @@ fn run_stream(
             .header("x-app", "cli")
             .header("anthropic-dangerous-direct-browser-access", "true");
     } else {
-        // API key auth
         req = req
             .header("x-api-key", ctx.api_key)
             .header("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
@@ -115,9 +113,7 @@ fn run_stream(
     })
     .map_err(|_| crate::Error::ChannelClosed)?;
 
-    // Track block index → content index mapping
     let mut block_index_map: Vec<(u64, usize)> = Vec::new();
-
     let mut current_event_type = String::new();
 
     for line in reader.lines() {
@@ -133,44 +129,36 @@ fn run_stream(
         }
 
         let data = &line[6..];
-        let event: serde_json::Value =
-            serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
 
         match current_event_type.as_str() {
             "message_start" => {
-                if let Some(msg) = event.get("message") {
-                    if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
-                        output.response_id = Some(id.to_string());
-                    }
-                    if let Some(usage) = msg.get("usage") {
-                        parse_usage(usage, &mut output.usage);
-                        ctx.model.calculate_cost(&mut output.usage);
-                    }
+                let ev: MessageStartEvent =
+                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
+                output.response_id = Some(ev.message.id);
+                if let Some(usage) = ev.message.usage {
+                    usage.apply_to(&mut output.usage);
+                    ctx.model.calculate_cost(&mut output.usage);
                 }
             }
             "content_block_start" => {
-                let block_idx = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                let block = event.get("content_block");
-                let block_type = block
-                    .and_then(|b| b.get("type"))
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let ev: ContentBlockStartEvent =
+                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
 
-                match block_type {
-                    "text" => {
+                match ev.content_block {
+                    ContentBlock::Text { .. } => {
                         output.content.push(AssistantContent::Text(TextContent {
                             text: String::new(),
                             text_signature: None,
                         }));
                         let ci = output.content.len() - 1;
-                        block_index_map.push((block_idx, ci));
+                        block_index_map.push((ev.index, ci));
                         tx.send_blocking(StreamEvent::TextStart {
                             content_index: ci,
                             partial: output.clone(),
                         })
                         .map_err(|_| crate::Error::ChannelClosed)?;
                     }
-                    "thinking" => {
+                    ContentBlock::Thinking { .. } => {
                         output
                             .content
                             .push(AssistantContent::Thinking(ThinkingContent {
@@ -179,19 +167,14 @@ fn run_stream(
                                 redacted: false,
                             }));
                         let ci = output.content.len() - 1;
-                        block_index_map.push((block_idx, ci));
+                        block_index_map.push((ev.index, ci));
                         tx.send_blocking(StreamEvent::ThinkingStart {
                             content_index: ci,
                             partial: output.clone(),
                         })
                         .map_err(|_| crate::Error::ChannelClosed)?;
                     }
-                    "redacted_thinking" => {
-                        let sig = block
-                            .and_then(|b| b.get("data"))
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                    ContentBlock::RedactedThinking { data: sig } => {
                         output
                             .content
                             .push(AssistantContent::Thinking(ThinkingContent {
@@ -200,106 +183,83 @@ fn run_stream(
                                 redacted: true,
                             }));
                         let ci = output.content.len() - 1;
-                        block_index_map.push((block_idx, ci));
+                        block_index_map.push((ev.index, ci));
                         tx.send_blocking(StreamEvent::ThinkingStart {
                             content_index: ci,
                             partial: output.clone(),
                         })
                         .map_err(|_| crate::Error::ChannelClosed)?;
                     }
-                    "tool_use" => {
-                        let id = block
-                            .and_then(|b| b.get("id"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let name = block
-                            .and_then(|b| b.get("name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
+                    ContentBlock::ToolUse { id, name, .. } => {
                         output.content.push(AssistantContent::ToolCall(ToolCall {
                             id,
                             name,
                             arguments: serde_json::Value::Object(Default::default()),
                         }));
                         let ci = output.content.len() - 1;
-                        block_index_map.push((block_idx, ci));
+                        block_index_map.push((ev.index, ci));
                         tx.send_blocking(StreamEvent::ToolcallStart {
                             content_index: ci,
                             partial: output.clone(),
                         })
                         .map_err(|_| crate::Error::ChannelClosed)?;
                     }
-                    _ => {}
                 }
             }
             "content_block_delta" => {
-                let block_idx = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ev: ContentBlockDeltaEvent =
+                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
                 let ci = block_index_map
                     .iter()
-                    .find(|(bi, _)| *bi == block_idx)
+                    .find(|(bi, _)| *bi == ev.index)
                     .map(|(_, ci)| *ci);
                 let Some(ci) = ci else { continue };
 
-                if let Some(delta) = event.get("delta") {
-                    let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                    match delta_type {
-                        "text_delta" => {
-                            let text = delta.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                            if let Some(AssistantContent::Text(t)) = output.content.get_mut(ci) {
-                                t.text.push_str(text);
-                            }
-                            tx.send_blocking(StreamEvent::TextDelta {
-                                content_index: ci,
-                                delta: text.to_string(),
-                                partial: output.clone(),
-                            })
-                            .map_err(|_| crate::Error::ChannelClosed)?;
+                match ev.delta {
+                    Delta::TextDelta { text } => {
+                        if let Some(AssistantContent::Text(t)) = output.content.get_mut(ci) {
+                            t.text.push_str(&text);
                         }
-                        "thinking_delta" => {
-                            let text = delta.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
-                            if let Some(AssistantContent::Thinking(t)) = output.content.get_mut(ci)
-                            {
-                                t.thinking.push_str(text);
-                            }
-                            tx.send_blocking(StreamEvent::ThinkingDelta {
-                                content_index: ci,
-                                delta: text.to_string(),
-                                partial: output.clone(),
-                            })
-                            .map_err(|_| crate::Error::ChannelClosed)?;
+                        tx.send_blocking(StreamEvent::TextDelta {
+                            content_index: ci,
+                            delta: text,
+                            partial: output.clone(),
+                        })
+                        .map_err(|_| crate::Error::ChannelClosed)?;
+                    }
+                    Delta::ThinkingDelta { thinking } => {
+                        if let Some(AssistantContent::Thinking(t)) = output.content.get_mut(ci) {
+                            t.thinking.push_str(&thinking);
                         }
-                        "input_json_delta" => {
-                            let json_str = delta
-                                .get("partial_json")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("");
-                            tx.send_blocking(StreamEvent::ToolcallDelta {
-                                content_index: ci,
-                                delta: json_str.to_string(),
-                                partial: output.clone(),
-                            })
-                            .map_err(|_| crate::Error::ChannelClosed)?;
+                        tx.send_blocking(StreamEvent::ThinkingDelta {
+                            content_index: ci,
+                            delta: thinking,
+                            partial: output.clone(),
+                        })
+                        .map_err(|_| crate::Error::ChannelClosed)?;
+                    }
+                    Delta::InputJsonDelta { partial_json } => {
+                        tx.send_blocking(StreamEvent::ToolcallDelta {
+                            content_index: ci,
+                            delta: partial_json,
+                            partial: output.clone(),
+                        })
+                        .map_err(|_| crate::Error::ChannelClosed)?;
+                    }
+                    Delta::SignatureDelta { signature } => {
+                        if let Some(AssistantContent::Thinking(t)) = output.content.get_mut(ci) {
+                            let s = t.thinking_signature.get_or_insert_with(String::new);
+                            s.push_str(&signature);
                         }
-                        "signature_delta" => {
-                            if let Some(sig) = delta.get("signature").and_then(|s| s.as_str())
-                                && let Some(AssistantContent::Thinking(t)) =
-                                    output.content.get_mut(ci)
-                            {
-                                let s = t.thinking_signature.get_or_insert_with(String::new);
-                                s.push_str(sig);
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
             "content_block_stop" => {
-                let block_idx = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ev: ContentBlockStopEvent =
+                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
                 let ci = block_index_map
                     .iter()
-                    .find(|(bi, _)| *bi == block_idx)
+                    .find(|(bi, _)| *bi == ev.index)
                     .map(|(_, ci)| *ci);
                 let Some(ci) = ci else { continue };
 
@@ -332,13 +292,15 @@ fn run_stream(
                 }
             }
             "message_delta" => {
-                if let Some(delta) = event.get("delta")
-                    && let Some(reason) = delta.get("stop_reason").and_then(|r| r.as_str())
+                let ev: MessageDeltaEvent =
+                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
+                if let Some(delta) = ev.delta
+                    && let Some(reason) = delta.stop_reason
                 {
-                    output.stop_reason = map_stop_reason(reason);
+                    output.stop_reason = map_stop_reason(&reason);
                 }
-                if let Some(usage) = event.get("usage") {
-                    parse_usage(usage, &mut output.usage);
+                if let Some(usage) = ev.usage {
+                    usage.apply_to(&mut output.usage);
                     ctx.model.calculate_cost(&mut output.usage);
                 }
             }
@@ -354,7 +316,6 @@ fn run_stream(
         }
     }
 
-    // Stream ended without message_stop — treat as error
     output.stop_reason = StopReason::Error;
     output.error_message = Some("Stream ended unexpectedly".into());
     tx.send_blocking(StreamEvent::Error {
@@ -366,53 +327,6 @@ fn run_stream(
 }
 
 // ---------------------------------------------------------------------------
-// Cache control
-// ---------------------------------------------------------------------------
-
-fn cache_control_value() -> serde_json::Value {
-    serde_json::json!({"type": "ephemeral"})
-}
-
-/// Add `cache_control` to the last content block of the last user message.
-/// This creates a cache breakpoint at the conversation history boundary so the
-/// entire prefix (system prompt + earlier turns) can be served from cache.
-fn add_cache_breakpoint_to_last_user_message(messages: &mut [serde_json::Value]) {
-    // Walk backwards to find the last user message
-    let Some(last_user) = messages
-        .iter_mut()
-        .rev()
-        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
-    else {
-        return;
-    };
-
-    let Some(content) = last_user.get_mut("content") else {
-        return;
-    };
-
-    match content {
-        // String content → promote to block array with cache_control
-        serde_json::Value::String(text) => {
-            let text = text.clone();
-            *content = serde_json::json!([{
-                "type": "text",
-                "text": text,
-                "cache_control": cache_control_value(),
-            }]);
-        }
-        // Array content → add cache_control to last block
-        serde_json::Value::Array(blocks) => {
-            if let Some(last_block) = blocks.last_mut()
-                && let Some(obj) = last_block.as_object_mut()
-            {
-                obj.insert("cache_control".into(), cache_control_value());
-            }
-        }
-        _ => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Request building
 // ---------------------------------------------------------------------------
 
@@ -420,56 +334,47 @@ fn build_request_body(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
-) -> crate::Result<serde_json::Value> {
+) -> crate::Result<MessagesRequest> {
     let mut messages = Vec::new();
 
     for msg in &context.messages {
         match msg {
             Message::User(u) => {
-                let content = convert_user_content(&u.content);
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": content,
-                }));
+                messages.push(ApiMessage {
+                    role: "user",
+                    content: convert_user_content(&u.content),
+                });
             }
             Message::Assistant(a) => {
                 let content = convert_assistant_content(&a.content);
                 if !content.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": content,
-                    }));
+                    messages.push(ApiMessage {
+                        role: "assistant",
+                        content: serde_json::Value::Array(content),
+                    });
                 }
             }
             Message::ToolResult(tr) => {
                 let content = convert_tool_result_content(&tr.content);
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": [{
+                messages.push(ApiMessage {
+                    role: "user",
+                    content: serde_json::json!([{
                         "type": "tool_result",
                         "tool_use_id": tr.tool_call_id,
                         "content": content,
                         "is_error": tr.is_error,
-                    }],
-                }));
+                    }]),
+                });
             }
         }
     }
 
-    // Add cache breakpoint to the last user message so the entire
-    // conversation prefix is eligible for Anthropic's prompt caching.
+    // Add cache breakpoint to the last user message
     add_cache_breakpoint_to_last_user_message(&mut messages);
 
     let max_tokens = options
         .max_tokens
         .unwrap_or((model.max_tokens / 3).max(1024));
-
-    let mut body = serde_json::json!({
-        "model": model.id,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "stream": true,
-    });
 
     let is_oauth = options
         .api_key
@@ -477,58 +382,74 @@ fn build_request_body(
         .map(crate::auth::is_oauth_token)
         .unwrap_or(false);
 
-    if is_oauth {
-        // OAuth: must include Claude Code identity as first system block
-        let mut system_blocks = vec![serde_json::json!({
-            "type": "text",
-            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
-            "cache_control": cache_control_value(),
-        })];
+    let cc = Some(CacheControl::ephemeral());
+
+    let system = if is_oauth {
+        let mut blocks = vec![SystemBlock {
+            block_type: "text",
+            text: "You are Claude Code, Anthropic's official CLI for Claude.".into(),
+            cache_control: cc.clone(),
+        }];
         if let Some(ref prompt) = context.system_prompt {
-            system_blocks.push(serde_json::json!({
-                "type": "text",
-                "text": prompt,
-                "cache_control": cache_control_value(),
-            }));
+            blocks.push(SystemBlock {
+                block_type: "text",
+                text: prompt.clone(),
+                cache_control: cc.clone(),
+            });
         }
-        body["system"] = serde_json::json!(system_blocks);
-    } else if let Some(ref prompt) = context.system_prompt {
-        // Non-OAuth: system prompt as block array with cache breakpoint
-        body["system"] = serde_json::json!([{
-            "type": "text",
-            "text": prompt,
-            "cache_control": cache_control_value(),
-        }]);
-    }
+        Some(blocks)
+    } else {
+        context.system_prompt.as_ref().map(|prompt| {
+            vec![SystemBlock {
+                block_type: "text",
+                text: prompt.clone(),
+                cache_control: cc.clone(),
+            }]
+        })
+    };
 
-    if let Some(temp) = options.temperature {
-        body["temperature"] = serde_json::json!(temp);
-    }
-
-    if !context.tools.is_empty() {
-        let tools: Vec<serde_json::Value> = context
-            .tools
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.parameters,
+    let tools = if context.tools.is_empty() {
+        None
+    } else {
+        Some(
+            context
+                .tools
+                .iter()
+                .map(|t| ToolDef {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    input_schema: t.parameters.clone(),
                 })
+                .collect(),
+        )
+    };
+
+    let thinking = options.thinking_budget.map(|budget| ThinkingConfig {
+        thinking_type: "enabled",
+        budget_tokens: budget,
+    });
+
+    Ok(MessagesRequest {
+        model: model.id.clone(),
+        messages: messages
+            .into_iter()
+            .map(|m| ApiMessage {
+                role: m.role,
+                content: m.content,
             })
-            .collect();
-        body["tools"] = serde_json::json!(tools);
-    }
-
-    if let Some(budget) = options.thinking_budget {
-        body["thinking"] = serde_json::json!({
-            "type": "enabled",
-            "budget_tokens": budget,
-        });
-    }
-
-    Ok(body)
+            .collect(),
+        max_tokens,
+        stream: true,
+        system,
+        temperature: options.temperature,
+        tools,
+        thinking,
+    })
 }
+
+// ---------------------------------------------------------------------------
+// Content conversion
+// ---------------------------------------------------------------------------
 
 fn convert_user_content(content: &[UserContent]) -> serde_json::Value {
     if content.len() == 1
@@ -574,7 +495,6 @@ fn convert_assistant_content(content: &[AssistantContent]) -> Vec<serde_json::Va
                         "signature": sig,
                     }));
                 }
-                // No signature — convert to plain text
                 Some(serde_json::json!({"type": "text", "text": t.thinking}))
             }
             AssistantContent::ToolCall(tc) => Some(serde_json::json!({
@@ -611,28 +531,38 @@ fn convert_tool_result_content(content: &[ToolResultContent]) -> serde_json::Val
     serde_json::Value::Array(blocks)
 }
 
+/// Add `cache_control` to the last content block of the last user message.
+fn add_cache_breakpoint_to_last_user_message(messages: &mut [ApiMessage]) {
+    let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") else {
+        return;
+    };
+
+    match &mut last_user.content {
+        serde_json::Value::String(text) => {
+            let text = text.clone();
+            last_user.content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"},
+            }]);
+        }
+        serde_json::Value::Array(blocks) => {
+            if let Some(last_block) = blocks.last_mut()
+                && let Some(obj) = last_block.as_object_mut()
+            {
+                obj.insert(
+                    "cache_control".into(),
+                    serde_json::json!({"type": "ephemeral"}),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn parse_usage(v: &serde_json::Value, usage: &mut Usage) {
-    if let Some(n) = v.get("input_tokens").and_then(|n| n.as_u64()) {
-        usage.input = n;
-    }
-    if let Some(n) = v.get("output_tokens").and_then(|n| n.as_u64()) {
-        usage.output = n;
-    }
-    if let Some(n) = v.get("cache_read_input_tokens").and_then(|n| n.as_u64()) {
-        usage.cache_read = n;
-    }
-    if let Some(n) = v
-        .get("cache_creation_input_tokens")
-        .and_then(|n| n.as_u64())
-    {
-        usage.cache_write = n;
-    }
-    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
-}
 
 fn map_stop_reason(reason: &str) -> StopReason {
     match reason {
@@ -715,7 +645,7 @@ pub fn models() -> Vec<Model> {
             headers: Default::default(),
         },
         Model {
-            id: "claude-sonnet-4-6".into(),
+            id: "claude-sonnet-4-20250514".into(),
             name: "Claude Sonnet 4".into(),
             api: API_ID.into(),
             provider: "anthropic".into(),
@@ -759,10 +689,10 @@ pub fn models() -> Vec<Model> {
 mod tests {
     use super::*;
 
-    /// Helper: build a request body and return the parsed JSON.
     fn build(context: &Context, options: &StreamOptions) -> serde_json::Value {
-        let model = models().into_iter().next().unwrap(); // Sonnet 4.6
-        build_request_body(&model, context, options).unwrap()
+        let model = models().into_iter().next().unwrap();
+        let req = build_request_body(&model, context, options).unwrap();
+        serde_json::to_value(req).unwrap()
     }
 
     fn simple_context(system: Option<&str>, user_text: &str) -> Context {
@@ -779,8 +709,7 @@ mod tests {
             &simple_context(Some("Be helpful."), "hi"),
             &StreamOptions::default(),
         );
-        let system = body.get("system").unwrap();
-        let blocks = system.as_array().unwrap();
+        let blocks = body["system"].as_array().unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["text"], "Be helpful.");
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
@@ -793,8 +722,7 @@ mod tests {
             ..Default::default()
         };
         let body = build(&simple_context(Some("Be helpful."), "hi"), &opts);
-        let system = body.get("system").unwrap();
-        let blocks = system.as_array().unwrap();
+        let blocks = body["system"].as_array().unwrap();
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0]["text"].as_str().unwrap().contains("Claude Code"));
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
@@ -810,7 +738,6 @@ mod tests {
         );
         let messages = body["messages"].as_array().unwrap();
         let last = messages.last().unwrap();
-        // String content should be promoted to block array
         let content = last["content"].as_array().unwrap();
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["text"], "hello world");
@@ -835,18 +762,15 @@ mod tests {
         let body = build(&ctx, &StreamOptions::default());
         let messages = body["messages"].as_array().unwrap();
 
-        // First user message should NOT have cache_control
         let first_content = &messages[0]["content"];
         if let Some(arr) = first_content.as_array() {
             for block in arr {
                 assert!(block.get("cache_control").is_none());
             }
         } else {
-            // Still a string — no cache_control possible on strings
             assert!(first_content.is_string());
         }
 
-        // Last user message (index 2) should have cache_control
         let last = messages.last().unwrap();
         let content = last["content"].as_array().unwrap();
         assert_eq!(
@@ -891,8 +815,6 @@ mod tests {
         let body = build(&ctx, &StreamOptions::default());
         let messages = body["messages"].as_array().unwrap();
 
-        // The tool result becomes a user message with tool_result blocks.
-        // It's the last user-role message, so it should get cache_control.
         let last_user = messages.iter().rev().find(|m| m["role"] == "user").unwrap();
         let content = last_user["content"].as_array().unwrap();
         let last_block = content.last().unwrap();
@@ -900,8 +822,13 @@ mod tests {
     }
 
     #[test]
-    fn no_system_prompt_means_no_system_field() {
+    fn no_system_prompt_omits_system_field() {
         let body = build(&simple_context(None, "hi"), &StreamOptions::default());
-        assert!(body.get("system").is_none());
+        // system: None serializes as null with skip_serializing_if
+        let system = body.get("system");
+        assert!(
+            system.is_none() || system.unwrap().is_null(),
+            "system should be absent or null"
+        );
     }
 }
