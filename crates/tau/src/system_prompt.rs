@@ -15,4 +15,6 @@ Guidelines:
 - Show file paths clearly when working with files
 - After making changes, verify them with appropriate commands
 - If a task is ambiguous, ask for clarification before proceeding
-- For edits, use `edit` (surgical) over `write` (full rewrite) when possible"#;
+- For edits, use `edit` (surgical) over `write` (full rewrite) when possible
+- NEVER use sudo. If a command requires elevated privileges, tell the user
+- If a file write fails with permission denied, report the error — don't try workarounds"#;

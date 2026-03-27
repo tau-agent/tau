@@ -40,6 +40,9 @@ fn execute(args: serde_json::Value) -> ToolOutput {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Prevent child processes from accessing the TTY (blocks sudo, passwd, etc.)
+        .env("SUDO_ASKPASS", "/bin/false")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output();
 
     // TODO: actual timeout handling with a thread/signal
