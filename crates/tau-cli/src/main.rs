@@ -41,10 +41,79 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
+    /// Manage providers
+    Providers {
+        #[command(subcommand)]
+        action: ProviderAction,
+    },
+    /// Manage models
+    Models {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
     /// Manage authentication
     Auth {
         #[command(subcommand)]
         action: AuthAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProviderAction {
+    /// List configured providers
+    List,
+    /// Add a provider
+    Add {
+        /// Provider name
+        name: String,
+        /// API type (anthropic or openai)
+        #[arg(long)]
+        api: String,
+        /// Base URL
+        #[arg(long)]
+        base_url: String,
+        /// Inline API key (or $ENV_VAR)
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Remove a provider
+    Remove {
+        /// Provider name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// List all available models
+    List,
+    /// Add a model to a provider
+    Add {
+        /// Model ID
+        id: String,
+        /// Provider name
+        #[arg(long)]
+        provider: String,
+        /// Display name
+        #[arg(long)]
+        name: Option<String>,
+        /// Context window size
+        #[arg(long, default_value = "128000")]
+        context: u64,
+        /// Max output tokens
+        #[arg(long, default_value = "16384")]
+        max_tokens: u64,
+        /// Thinking style (none, anthropic, openai, qwen)
+        #[arg(long, default_value = "none")]
+        thinking: String,
+    },
+    /// Remove a model from a provider
+    Remove {
+        /// Model ID
+        id: String,
+        /// Provider name
+        #[arg(long)]
+        provider: String,
     },
 }
 
@@ -133,6 +202,35 @@ async fn run(cli: Cli) -> tau::Result<()> {
                 cmd_sessions_delete(&id).await?;
             }
         },
+        Commands::Providers { action } => match action {
+            ProviderAction::List => cmd_providers_list()?,
+            ProviderAction::Add {
+                name,
+                api,
+                base_url,
+                api_key,
+            } => cmd_providers_add(&name, &api, &base_url, api_key.as_deref())?,
+            ProviderAction::Remove { name } => cmd_providers_remove(&name)?,
+        },
+        Commands::Models { action } => match action {
+            ModelAction::List => cmd_models_list()?,
+            ModelAction::Add {
+                id,
+                provider,
+                name,
+                context,
+                max_tokens,
+                thinking,
+            } => cmd_models_add(
+                &id,
+                &provider,
+                name.as_deref(),
+                context,
+                max_tokens,
+                &thinking,
+            )?,
+            ModelAction::Remove { id, provider } => cmd_models_remove(&id, &provider)?,
+        },
         Commands::Auth { action } => match action {
             AuthAction::Status => {
                 cmd_auth_status().await?;
@@ -220,24 +318,32 @@ impl UsageTotals {
 // ---------------------------------------------------------------------------
 
 async fn cmd_login(provider: &str) -> tau::Result<()> {
-    eprintln!("Logging in to {}...", provider);
-
-    let provider = provider.to_string();
-    let creds = smol::unblock(move || {
-        if provider == "anthropic" {
-            tau::auth::login_anthropic()
-        } else {
-            Err(tau::Error::Io(format!(
-                "unknown OAuth provider: {}",
-                provider
-            )))
+    match provider {
+        "anthropic" => {
+            eprintln!("Logging in to Anthropic (OAuth)...");
+            let creds = smol::unblock(tau::auth::login_anthropic).await?;
+            let auth = tau::auth::AuthStorage::open_default();
+            auth.set("anthropic", tau::auth::AuthCredential::Oauth(creds))?;
+            eprintln!("Login successful! Credentials saved.");
         }
-    })
-    .await?;
-
-    let auth = tau::auth::AuthStorage::open_default();
-    auth.set("anthropic", tau::auth::AuthCredential::Oauth(creds))?;
-    eprintln!("Login successful! Credentials saved.");
+        _ => {
+            // API key login — prompt on stdin
+            use std::io::Write;
+            eprint!("API key for {}: ", provider);
+            std::io::stderr().flush().ok();
+            let mut key = String::new();
+            std::io::stdin()
+                .read_line(&mut key)
+                .map_err(|e| tau::Error::Io(e.to_string()))?;
+            let key = key.trim().to_string();
+            if key.is_empty() {
+                return Err(tau::Error::Io("empty API key".into()));
+            }
+            let auth = tau::auth::AuthStorage::open_default();
+            auth.set(provider, tau::auth::AuthCredential::ApiKey { key })?;
+            eprintln!("API key saved for {}.", provider);
+        }
+    }
     Ok(())
 }
 
@@ -606,11 +712,7 @@ async fn cmd_server_start(foreground: bool) -> tau::Result<()> {
     }
 
     if foreground {
-        let mut registry = tau::ProviderRegistry::new();
-        registry.register(Box::new(tau::providers::anthropic::Anthropic));
-        let all_models = tau::providers::anthropic::models();
-        let default_model = all_models.first().expect("at least one model").clone();
-        tau::server::run(registry, default_model, all_models).await?;
+        tau::server::run().await?;
     } else {
         spawn_server_daemon()?;
     }
@@ -734,5 +836,153 @@ async fn cmd_sessions_delete(id: &str) -> tau::Result<()> {
         .await?;
     client.recv_streaming(|_| {}).await?;
     eprintln!("deleted session {}", id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Provider / model management (edits providers.toml directly)
+// ---------------------------------------------------------------------------
+
+fn cmd_providers_list() -> tau::Result<()> {
+    let cfg = tau::config::load_config()?;
+    // Show built-in providers
+    println!("built-in:");
+    println!("  anthropic  api=anthropic  https://api.anthropic.com");
+    println!("  openai     api=openai     https://api.openai.com/v1");
+    if !cfg.providers.is_empty() {
+        println!("custom:");
+        for (name, pc) in &cfg.providers {
+            let key_info = match &pc.api_key {
+                Some(k) if k == "none" => " (no auth)",
+                Some(k) if k.starts_with('$') => &format!(" ({})", k),
+                Some(_) => " (inline key)",
+                None => "",
+            };
+            println!(
+                "  {:<12} api={:<10} {}{}",
+                name, pc.api, pc.base_url, key_info
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_providers_add(
+    name: &str,
+    api: &str,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> tau::Result<()> {
+    let mut cfg = tau::config::load_config()?;
+    cfg.providers.insert(
+        name.to_string(),
+        tau::config::ProviderConfig {
+            api: api.to_string(),
+            base_url: base_url.to_string(),
+            api_key: api_key.map(String::from),
+            models: Vec::new(),
+        },
+    );
+    tau::config::save_config(&cfg)?;
+    eprintln!("provider '{}' added. Restart server to apply.", name);
+    Ok(())
+}
+
+fn cmd_providers_remove(name: &str) -> tau::Result<()> {
+    let mut cfg = tau::config::load_config()?;
+    if cfg.providers.remove(name).is_none() {
+        eprintln!("provider '{}' not found in config", name);
+        return Ok(());
+    }
+    tau::config::save_config(&cfg)?;
+    eprintln!("provider '{}' removed. Restart server to apply.", name);
+    Ok(())
+}
+
+fn parse_thinking_style(s: &str) -> tau::Result<tau::ThinkingStyle> {
+    match s {
+        "none" => Ok(tau::ThinkingStyle::None),
+        "anthropic" => Ok(tau::ThinkingStyle::Anthropic),
+        "openai" => Ok(tau::ThinkingStyle::OpenAi),
+        "qwen" => Ok(tau::ThinkingStyle::Qwen),
+        _ => Err(tau::Error::Parse(format!(
+            "unknown thinking style: '{}'. Use: none, anthropic, openai, qwen",
+            s
+        ))),
+    }
+}
+
+fn cmd_models_list() -> tau::Result<()> {
+    let cfg = tau::config::load_config()?;
+    let models = tau::config::resolve_models(&cfg);
+    for m in &models {
+        let thinking = match m.thinking {
+            tau::ThinkingStyle::None => "",
+            tau::ThinkingStyle::Anthropic => " [anthropic]",
+            tau::ThinkingStyle::OpenAi => " [openai]",
+            tau::ThinkingStyle::Qwen => " [qwen]",
+        };
+        println!(
+            "  {:<32} {:<12} {}K ctx{}",
+            m.id,
+            m.provider,
+            m.context_window / 1000,
+            thinking,
+        );
+    }
+    Ok(())
+}
+
+fn cmd_models_add(
+    id: &str,
+    provider: &str,
+    name: Option<&str>,
+    context: u64,
+    max_tokens: u64,
+    thinking: &str,
+) -> tau::Result<()> {
+    let thinking = parse_thinking_style(thinking)?;
+    let mut cfg = tau::config::load_config()?;
+    let pc = cfg.providers.get_mut(provider).ok_or_else(|| {
+        tau::Error::Io(format!(
+            "provider '{}' not found. Add it first with `tau providers add`.",
+            provider
+        ))
+    })?;
+    // Remove existing model with same id
+    pc.models.retain(|m| m.id != id);
+    pc.models.push(tau::config::ModelConfig {
+        id: id.to_string(),
+        name: name.map(String::from),
+        context_window: context,
+        max_tokens,
+        thinking,
+        cost: tau::ModelCost::default(),
+    });
+    tau::config::save_config(&cfg)?;
+    eprintln!(
+        "model '{}' added to provider '{}'. Restart server to apply.",
+        id, provider
+    );
+    Ok(())
+}
+
+fn cmd_models_remove(id: &str, provider: &str) -> tau::Result<()> {
+    let mut cfg = tau::config::load_config()?;
+    let pc = cfg
+        .providers
+        .get_mut(provider)
+        .ok_or_else(|| tau::Error::Io(format!("provider '{}' not found", provider)))?;
+    let before = pc.models.len();
+    pc.models.retain(|m| m.id != id);
+    if pc.models.len() == before {
+        eprintln!("model '{}' not found in provider '{}'", id, provider);
+        return Ok(());
+    }
+    tau::config::save_config(&cfg)?;
+    eprintln!(
+        "model '{}' removed from provider '{}'. Restart server to apply.",
+        id, provider
+    );
     Ok(())
 }

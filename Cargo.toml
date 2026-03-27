@@ -23,6 +23,7 @@ clap_complete = { version = "4", features = ["unstable-dynamic"] }
 rustyline = "17"
 rusqlite = { version = "0.39", features = ["bundled"] }
 sha2 = "0.11"
+toml = "0.8"
 base64 = "0.22"
 rand = "0.10"
 fs2 = "0.4"

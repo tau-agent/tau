@@ -189,6 +189,22 @@ pub struct ModelCost {
     pub cache_write: f64,
 }
 
+/// How the model supports extended thinking/reasoning.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingStyle {
+    /// No thinking support.
+    #[default]
+    None,
+    /// Anthropic: budget_tokens or adaptive thinking.
+    Anthropic,
+    /// OpenAI: reasoning_effort parameter.
+    #[serde(alias = "openai")]
+    OpenAi,
+    /// Qwen (OpenAI-compat): enable_thinking: bool.
+    Qwen,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -196,7 +212,8 @@ pub struct Model {
     pub api: String,
     pub provider: String,
     pub base_url: String,
-    pub reasoning: bool,
+    #[serde(default)]
+    pub thinking: ThinkingStyle,
     pub cost: ModelCost,
     pub context_window: u64,
     pub max_tokens: u64,

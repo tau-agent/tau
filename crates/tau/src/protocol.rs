@@ -94,7 +94,7 @@ pub struct ModelInfo {
     pub id: String,
     pub name: String,
     pub provider: String,
-    pub reasoning: bool,
+    pub thinking: crate::types::ThinkingStyle,
     pub context_window: u64,
     pub max_tokens: u64,
 }

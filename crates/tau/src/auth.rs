@@ -458,7 +458,12 @@ fn env_api_key(provider: &str) -> Option<String> {
     let var = match provider {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" => "OPENAI_API_KEY",
-        _ => return None,
+        "qwen" | "dashscope" => "DASHSCOPE_API_KEY",
+        _ => {
+            // Try PROVIDER_API_KEY convention
+            let upper = provider.to_uppercase().replace('-', "_");
+            return std::env::var(format!("{}_API_KEY", upper)).ok();
+        }
     };
     std::env::var(var).ok()
 }

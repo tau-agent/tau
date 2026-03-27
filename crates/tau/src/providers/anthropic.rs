@@ -582,7 +582,7 @@ pub fn models() -> Vec<Model> {
             api: API_ID.into(),
             provider: "anthropic".into(),
             base_url: DEFAULT_BASE_URL.into(),
-            reasoning: true,
+            thinking: ThinkingStyle::Anthropic,
             cost: ModelCost {
                 input: 3.0,
                 output: 15.0,
@@ -599,7 +599,7 @@ pub fn models() -> Vec<Model> {
             api: API_ID.into(),
             provider: "anthropic".into(),
             base_url: DEFAULT_BASE_URL.into(),
-            reasoning: true,
+            thinking: ThinkingStyle::Anthropic,
             cost: ModelCost {
                 input: 5.0,
                 output: 25.0,
@@ -616,7 +616,7 @@ pub fn models() -> Vec<Model> {
             api: API_ID.into(),
             provider: "anthropic".into(),
             base_url: DEFAULT_BASE_URL.into(),
-            reasoning: true,
+            thinking: ThinkingStyle::Anthropic,
             cost: ModelCost {
                 input: 3.0,
                 output: 15.0,
@@ -633,7 +633,7 @@ pub fn models() -> Vec<Model> {
             api: API_ID.into(),
             provider: "anthropic".into(),
             base_url: DEFAULT_BASE_URL.into(),
-            reasoning: true,
+            thinking: ThinkingStyle::Anthropic,
             cost: ModelCost {
                 input: 5.0,
                 output: 25.0,
@@ -650,7 +650,7 @@ pub fn models() -> Vec<Model> {
             api: API_ID.into(),
             provider: "anthropic".into(),
             base_url: DEFAULT_BASE_URL.into(),
-            reasoning: true,
+            thinking: ThinkingStyle::Anthropic,
             cost: ModelCost {
                 input: 3.0,
                 output: 15.0,
@@ -667,7 +667,7 @@ pub fn models() -> Vec<Model> {
             api: API_ID.into(),
             provider: "anthropic".into(),
             base_url: DEFAULT_BASE_URL.into(),
-            reasoning: true,
+            thinking: ThinkingStyle::Anthropic,
             cost: ModelCost {
                 input: 1.0,
                 output: 5.0,

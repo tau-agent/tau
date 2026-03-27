@@ -9,6 +9,7 @@ use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use smol::Async;
 
 use crate::auth::{AuthCredential, AuthStorage};
+use crate::config;
 use crate::db::{Db, StoredSession};
 use crate::protocol::{ModelInfo, Request, Response, SessionInfo, SessionStats, TokenStats};
 use crate::provider::ProviderRegistry;
@@ -80,7 +81,7 @@ fn model_info(m: &Model) -> ModelInfo {
         id: m.id.clone(),
         name: m.name.clone(),
         provider: m.provider.clone(),
-        reasoning: m.reasoning,
+        thinking: m.thinking.clone(),
         context_window: m.context_window,
         max_tokens: m.max_tokens,
     }
@@ -92,10 +93,30 @@ fn model_info(m: &Model) -> ModelInfo {
 
 const USAGE_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 
+/// Resolve API key: auth.json → config provider api_key → env var.
+fn resolve_api_key(
+    auth: &AuthStorage,
+    cfg: &config::Config,
+    provider: &str,
+) -> crate::Result<Option<String>> {
+    // First try auth storage (handles OAuth refresh, env vars, etc.)
+    if let Ok(Some(key)) = auth.get_api_key(provider) {
+        return Ok(Some(key));
+    }
+    // Then try config's inline api_key
+    if let Some(pc) = cfg.providers.get(provider)
+        && let Some(key) = config::resolve_provider_api_key(pc)
+    {
+        return Ok(Some(key));
+    }
+    Ok(None)
+}
+
 struct State {
     db: Db,
     registry: ProviderRegistry,
     auth: AuthStorage,
+    config: config::Config,
     default_model: Model,
     /// All known models (for /model listing).
     all_models: Vec<Model>,
@@ -129,12 +150,23 @@ pub fn pid_path() -> PathBuf {
     p
 }
 
+/// Build registry with all known API providers.
+fn build_registry() -> ProviderRegistry {
+    let mut registry = ProviderRegistry::new();
+    registry.register(Box::new(crate::providers::anthropic::Anthropic));
+    registry.register(Box::new(crate::providers::openai::OpenAi));
+    registry
+}
+
 /// Run the server (blocking). Call from `smol::block_on`.
-pub async fn run(
-    registry: ProviderRegistry,
-    default_model: Model,
-    all_models: Vec<Model>,
-) -> crate::Result<()> {
+pub async fn run() -> crate::Result<()> {
+    let registry = build_registry();
+    let cfg = config::load_config()?;
+    let all_models = config::resolve_models(&cfg);
+    let default_model = all_models
+        .first()
+        .cloned()
+        .ok_or_else(|| crate::Error::Io("no models available".into()))?;
     let sock = socket_path();
     prepare_socket_dir(&sock)?;
 
@@ -156,6 +188,7 @@ pub async fn run(
         db,
         registry,
         auth: AuthStorage::open_default(),
+        config: cfg,
         default_model,
         all_models,
         usage_cache: None,
@@ -288,7 +321,7 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
 
                 let api_key = {
                     let st = state.lock().unwrap();
-                    st.auth.get_api_key(&model.provider)
+                    resolve_api_key(&st.auth, &st.config, &model.provider)
                 };
                 let api_key = match api_key {
                     Ok(Some(key)) => key,

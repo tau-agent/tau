@@ -311,7 +311,7 @@ mod tests {
             api: "test".into(),
             provider: "test".into(),
             base_url: "http://localhost".into(),
-            reasoning: false,
+            thinking: ThinkingStyle::None,
             cost: ModelCost {
                 input: 1.0,
                 output: 2.0,
