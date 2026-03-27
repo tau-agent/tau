@@ -11,9 +11,9 @@ tau.workspace = true
 smol.workspace = true
 serde_json.workspace = true
 futures.workspace = true
-ratatui = { version = "0.29", features = ["crossterm"] }
-crossterm = { version = "0.28", features = ["event-stream"] }
-tui-textarea = "0.7"
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
+ratatui-textarea = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

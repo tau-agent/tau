@@ -1,7 +1,7 @@
 //! Application state for the TUI.
 
 use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use tau::protocol::Response;
 use tau::types::{AssistantContent, StreamEvent};
@@ -134,7 +134,7 @@ impl App {
         match (key.code, key.modifiers) {
             // Ctrl+D on empty input: quit
             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                if self.textarea.lines().iter().all(|l| l.is_empty()) {
+                if self.textarea.lines().iter().all(|l: &String| l.is_empty()) {
                     self.should_quit = true;
                 }
                 None
