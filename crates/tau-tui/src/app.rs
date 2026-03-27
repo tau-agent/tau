@@ -472,6 +472,11 @@ impl App {
                 self.messages.push(MessageItem::Error { text: message });
                 self.mode = AppMode::Input;
             }
+            Response::UserMessage { text } => {
+                // Another client sent a message — display it
+                self.messages.push(MessageItem::User { text: text.clone() });
+                self.scroll_offset = 0;
+            }
             Response::Models { models } => {
                 for m in &models {
                     let marker = if m.id == self.model { " *" } else { "" };

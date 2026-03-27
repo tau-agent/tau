@@ -92,6 +92,7 @@ impl Client {
                 | Response::Models { .. }
                 | Response::ModelChanged { .. }
                 | Response::Messages { .. }
+                | Response::UserMessage { .. }
                 | Response::LoginSuccess { .. }
                 | Response::AuthStatus { .. }
                 | Response::SubscriptionUsage { .. }

@@ -543,6 +543,13 @@ async fn handle_client(
                 }
                 messages.push(user_msg);
 
+                // Broadcast user message to subscribers
+                broadcast_to_subscribers(
+                    &state,
+                    &session_id,
+                    &Response::UserMessage { text: text.clone() },
+                );
+
                 let context = Context {
                     system_prompt: stored.system_prompt.clone(),
                     messages,

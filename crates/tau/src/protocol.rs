@@ -98,6 +98,8 @@ pub enum Response {
     Messages {
         messages: Vec<crate::types::Message>,
     },
+    /// A user message was sent (broadcast to subscribers).
+    UserMessage { text: String },
     /// Agent loop completed (all turns done).
     AgentDone,
     /// Success (generic ack).
