@@ -492,16 +492,9 @@ async fn handle_client(
                         messages: messages.clone(),
                         tools: Vec::new(),
                     };
-                    let cont_result = run_agent_turn(
-                        &state,
-                        &shutdown,
-                        &model,
-                        &mut context,
-                        &cwd,
-                        &session_id,
-                        &mut writer,
-                    )
-                    .await;
+                    let cont_result =
+                        run_agent_turn(&state, &shutdown, &model, &mut context, &cwd, &mut writer)
+                            .await;
                     match cont_result {
                         Ok(new_msgs) => {
                             let st = state.lock().unwrap();
@@ -532,16 +525,9 @@ async fn handle_client(
 
                 // Run agent loop
                 let mut context = context;
-                let result = run_agent_turn(
-                    &state,
-                    &shutdown,
-                    &model,
-                    &mut context,
-                    &cwd,
-                    &session_id,
-                    &mut writer,
-                )
-                .await;
+                let result =
+                    run_agent_turn(&state, &shutdown, &model, &mut context, &cwd, &mut writer)
+                        .await;
 
                 match result {
                     Ok(new_msgs) => {
@@ -797,7 +783,6 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     model: &Model,
     context: &mut Context,
     cwd: &str,
-    _session_id: &str,
     writer: &mut W,
 ) -> crate::Result<Vec<Message>> {
     let api_key = {
@@ -817,7 +802,6 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     };
 
     let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
-    let tool_defs = crate::tools::default_tools();
 
     let shutdown_flag = shutdown.flag.clone();
     let agent_config = crate::agent::AgentConfig {
@@ -838,18 +822,20 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     let in_flight = shutdown.clone();
     let agent_handle = smol::unblock(move || {
         in_flight.enter();
+        // Spawn worker subprocess for tool execution
+        let mut worker = crate::worker::Worker::spawn(&cwd_clone)?;
         let result = crate::agent::run(
             &registry_clone,
             &model_clone,
             &mut context_clone,
-            &tool_defs,
+            &mut worker,
             &options_clone,
             &agent_config,
-            &cwd_clone,
             Box::new(move |event| {
                 let _ = event_tx.send_blocking(event);
             }),
         );
+        worker.kill();
         in_flight.leave();
         result
     });

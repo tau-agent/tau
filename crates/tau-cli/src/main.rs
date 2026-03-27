@@ -31,6 +31,9 @@ enum Commands {
         #[arg(default_value = "anthropic")]
         provider: String,
     },
+    /// Tool execution worker (internal, used by daemon)
+    #[command(hide = true)]
+    Worker,
     /// Manage the tau server
     Server {
         #[command(subcommand)]
@@ -176,6 +179,10 @@ async fn run(cli: Cli) -> tau::Result<()> {
             model,
         } => {
             cmd_chat(message, session, &model).await?;
+        }
+        Commands::Worker => {
+            tau::worker::run_worker_loop();
+            return Ok(());
         }
         Commands::Login { provider } => {
             cmd_login(&provider).await?;

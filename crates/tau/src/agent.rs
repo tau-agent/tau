@@ -4,8 +4,9 @@
 //! unrecoverable error occurs, or max_turns is reached.
 
 use crate::provider::{EventReceiver, ProviderRegistry};
-use crate::tools::{self, ToolDef};
+use crate::tools;
 use crate::types::*;
+use crate::worker::ToolExecutor;
 
 /// Configuration for the agent loop.
 pub struct AgentConfig {
@@ -50,23 +51,23 @@ pub fn needs_continuation(messages: &[Message]) -> bool {
 
 /// Run the agent loop.
 ///
-/// Streams LLM responses, executes tool calls, and loops until the model
-/// stops or max_turns is reached. All stream events are forwarded via `on_event`.
-#[allow(clippy::too_many_arguments)]
+/// Streams LLM responses, executes tool calls via the worker subprocess,
+/// and loops until the model stops or max_turns is reached.
+/// All stream events are forwarded via `on_event`.
 pub fn run(
     registry: &ProviderRegistry,
     model: &Model,
     context: &mut Context,
-    tool_defs: &[ToolDef],
+    worker: &mut dyn ToolExecutor,
     options: &StreamOptions,
     config: &AgentConfig,
-    cwd: &str,
     mut on_event: EventCallback,
 ) -> crate::Result<AgentResult> {
     let mut new_messages = Vec::new();
 
     // Add tool schemas to context
-    context.tools = tools::tool_schemas(tool_defs);
+    let tool_defs = tools::default_tools();
+    context.tools = tools::tool_schemas(&tool_defs);
 
     for turn in 0..config.max_turns {
         // Stream LLM response (with retry)
@@ -111,7 +112,7 @@ pub fn run(
         }
 
         for tc in &tool_calls {
-            let result = tools::execute_tool(tool_defs, tc, cwd);
+            let result = worker.execute(tc)?;
             new_messages.push(Message::ToolResult(result.clone()));
             context.messages.push(Message::ToolResult(result));
         }
@@ -240,6 +241,7 @@ pub fn is_context_overflow(err_msg: &str) -> bool {
 mod tests {
     use super::*;
     use crate::providers::mock::*;
+    use crate::worker::InProcessWorker;
 
     fn setup_registry(responses: Vec<MockResponse>) -> ProviderRegistry {
         let mut registry = ProviderRegistry::new();
@@ -263,15 +265,15 @@ mod tests {
         let config = AgentConfig::default();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let events_clone = events.clone();
+        let mut worker = InProcessWorker::new("/tmp");
 
         let result = run(
             &registry,
             &model,
             &mut context,
-            &[],
+            &mut worker,
             &StreamOptions::default(),
             &config,
-            "/tmp",
             Box::new(move |e| events_clone.lock().unwrap().push(e)),
         )
         .unwrap();
@@ -285,33 +287,29 @@ mod tests {
     #[test]
     fn tool_call_loop() {
         let registry = setup_registry(vec![
-            // Turn 1: model calls a tool
             MockResponse::ToolCalls(vec![ToolCall {
                 id: "tc1".into(),
                 name: "bash".into(),
                 arguments: serde_json::json!({"command": "echo hi"}),
             }]),
-            // Turn 2: model responds with text after seeing tool result
             MockResponse::Text("The command output 'hi'.".into()),
         ]);
         let model = mock_model();
         let mut context = basic_context();
         let config = AgentConfig::default();
-        let tools = crate::tools::default_tools();
+        let mut worker = InProcessWorker::new("/tmp");
 
         let result = run(
             &registry,
             &model,
             &mut context,
-            &tools,
+            &mut worker,
             &StreamOptions::default(),
             &config,
-            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();
 
-        // Should have: assistant(tool_call) + tool_result + assistant(text)
         assert_eq!(result.new_messages.len(), 3);
         assert!(matches!(&result.new_messages[0], Message::Assistant(_)));
         assert!(matches!(&result.new_messages[1], Message::ToolResult(_)));
@@ -322,7 +320,6 @@ mod tests {
 
     #[test]
     fn max_turns_limit() {
-        // Model always returns tool calls — should hit max_turns
         let mut responses = Vec::new();
         for i in 0..10 {
             responses.push(MockResponse::ToolCalls(vec![ToolCall {
@@ -338,22 +335,20 @@ mod tests {
             max_turns: 3,
             ..Default::default()
         };
-        let tools = crate::tools::default_tools();
+        let mut worker = InProcessWorker::new("/tmp");
 
         let result = run(
             &registry,
             &model,
             &mut context,
-            &tools,
+            &mut worker,
             &StreamOptions::default(),
             &config,
-            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();
 
         assert!(result.max_turns_reached);
-        // 3 turns × (assistant + tool_result) = 6 messages
         assert_eq!(result.new_messages.len(), 6);
     }
 
@@ -366,15 +361,15 @@ mod tests {
             max_retries: 0,
             ..Default::default()
         };
+        let mut worker = InProcessWorker::new("/tmp");
 
         let result = run(
             &registry,
             &model,
             &mut context,
-            &[],
+            &mut worker,
             &StreamOptions::default(),
             &config,
-            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();
@@ -399,20 +394,19 @@ mod tests {
         let model = mock_model();
         let mut context = basic_context();
         let config = AgentConfig::default();
+        let mut worker = InProcessWorker::new("/tmp");
 
         let result = run(
             &registry,
             &model,
             &mut context,
-            &[],
+            &mut worker,
             &StreamOptions::default(),
             &config,
-            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();
 
-        // assistant(tool_call) + tool_result(error) + assistant(text)
         assert_eq!(result.new_messages.len(), 3);
         if let Message::ToolResult(tr) = &result.new_messages[1] {
             assert!(tr.is_error);
@@ -426,19 +420,12 @@ mod tests {
 
     #[test]
     fn resume_after_interrupted_tool_call() {
-        // Simulate: session was interrupted after tool call.
-        // Context has: [user, assistant(tool_call), tool_result]
-        // On resume, the agent loop should send context to LLM to get
-        // a response to the dangling tool result.
-
-        // The mock will return text when called (the continuation response)
         let registry = setup_registry(vec![MockResponse::Text(
             "The tool returned some output.".into(),
         )]);
         let model = mock_model();
-        let tools = crate::tools::default_tools();
+        let mut worker = InProcessWorker::new("/tmp");
 
-        // Build context as if interrupted mid-session
         let mut context = Context {
             system_prompt: Some("You are helpful.".into()),
             messages: vec![
@@ -469,24 +456,19 @@ mod tests {
         };
         let config = AgentConfig::default();
 
-        // Check that context needs continuation
         assert!(needs_continuation(&context.messages));
 
-        // Run the agent loop — it should send the existing context
-        // (with tool result) to the LLM and get a text response
         let result = run(
             &registry,
             &model,
             &mut context,
-            &tools,
+            &mut worker,
             &StreamOptions::default(),
             &config,
-            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();
 
-        // Should get one assistant message (the continuation)
         assert_eq!(result.new_messages.len(), 1);
         assert!(
             matches!(&result.new_messages[0], Message::Assistant(a) if a.text().contains("tool returned"))

@@ -11,6 +11,7 @@ pub mod server;
 pub mod system_prompt;
 pub mod tools;
 pub mod types;
+pub mod worker;
 
 pub use provider::{Provider, ProviderRegistry};
 pub use types::*;
