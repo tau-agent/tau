@@ -1,4 +1,7 @@
-use clap::{Parser, Subcommand};
+mod completer;
+
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::ArgValueCandidates;
 
 #[derive(Parser)]
 #[command(name = "tau", about = "LLM agent CLI")]
@@ -15,10 +18,11 @@ enum Commands {
         #[arg(short, long)]
         message: Option<String>,
         /// Session ID (creates new if omitted)
-        #[arg(short, long)]
+        #[arg(short, long, add = ArgValueCandidates::new(completer::session_completer))]
         session: Option<String>,
         /// Model name
-        #[arg(long, default_value = "claude-sonnet-4-6")]
+        #[arg(long, default_value = "claude-sonnet-4-6",
+              add = ArgValueCandidates::new(completer::model_completer))]
         model: String,
     },
     /// Log in to an LLM provider (OAuth)
@@ -67,6 +71,7 @@ enum SessionAction {
     /// Delete a session
     Delete {
         /// Session ID
+        #[arg(add = ArgValueCandidates::new(completer::session_completer))]
         id: String,
     },
 }
@@ -83,6 +88,7 @@ enum AuthAction {
 }
 
 fn main() {
+    clap_complete::env::CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
 
     smol::block_on(async {

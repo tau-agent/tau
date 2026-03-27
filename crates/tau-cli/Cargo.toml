@@ -15,4 +15,5 @@ tau.workspace = true
 smol.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 rustyline.workspace = true
