@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -26,9 +27,9 @@ pub trait Provider: Send + Sync {
 }
 
 /// Simple registry mapping API id → provider.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ProviderRegistry {
-    providers: HashMap<String, Box<dyn Provider>>,
+    providers: HashMap<String, Arc<dyn Provider>>,
 }
 
 impl ProviderRegistry {
@@ -36,9 +37,9 @@ impl ProviderRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, provider: Box<dyn Provider>) {
-        self.providers
-            .insert(provider.api_id().to_string(), provider);
+    pub fn register(&mut self, provider: impl Provider + 'static) {
+        let api_id = provider.api_id().to_string();
+        self.providers.insert(api_id, Arc::new(provider));
     }
 
     pub fn get(&self, api: &str) -> Option<&dyn Provider> {

@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod auth;
 pub mod client;
 pub mod compaction;
@@ -7,6 +8,8 @@ pub mod protocol;
 pub mod provider;
 pub mod providers;
 pub mod server;
+pub mod system_prompt;
+pub mod tools;
 pub mod types;
 
 pub use provider::{Provider, ProviderRegistry};

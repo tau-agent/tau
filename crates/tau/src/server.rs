@@ -155,8 +155,8 @@ pub fn pid_path() -> PathBuf {
 /// Build registry with all known API providers.
 fn build_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
-    registry.register(Box::new(crate::providers::anthropic::Anthropic));
-    registry.register(Box::new(crate::providers::openai::OpenAi));
+    registry.register(crate::providers::anthropic::Anthropic);
+    registry.register(crate::providers::openai::OpenAi);
     registry
 }
 
@@ -272,6 +272,8 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                         .flatten()
                         .is_some_and(|c| matches!(c, AuthCredential::Oauth(_)));
                     let id = st.db.next_session_id()?;
+                    let system_prompt = system_prompt
+                        .or_else(|| Some(crate::system_prompt::DEFAULT_SYSTEM_PROMPT.to_string()));
                     let stored = StoredSession {
                         id: id.clone(),
                         model,
@@ -381,71 +383,75 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     ..Default::default()
                 };
 
-                let stream_result = {
+                // Run agent loop on a blocking thread, forwarding events via channel
+                let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
+                let tool_defs = crate::tools::default_tools();
+                let agent_config = crate::agent::AgentConfig::default();
+
+                let registry_clone = {
                     let st = state.lock().unwrap();
-                    st.registry.stream(&model, &context, &options)
+                    st.registry.clone()
                 };
-                let rx = match stream_result {
-                    Ok(rx) => rx,
-                    Err(e) => {
+
+                let model_clone = model.clone();
+                let mut context_clone = context;
+                let options_clone = options;
+
+                let agent_handle = smol::unblock(move || {
+                    crate::agent::run(
+                        &registry_clone,
+                        &model_clone,
+                        &mut context_clone,
+                        &tool_defs,
+                        &options_clone,
+                        &agent_config,
+                        Box::new(move |event| {
+                            let _ = event_tx.send_blocking(event);
+                        }),
+                    )
+                });
+
+                // Forward events to client
+                let forward_handle = async {
+                    while let Ok(event) = event_rx.recv().await {
                         send(
                             &mut writer,
-                            &Response::Error {
-                                message: e.to_string(),
+                            &Response::Stream {
+                                event: Box::new(event),
                             },
                         )
                         .await?;
-                        continue;
                     }
+                    Ok::<(), crate::Error>(())
                 };
 
-                let mut final_message = None;
-                while let Ok(event) = rx.recv().await {
-                    match &event {
-                        StreamEvent::Done { message, .. } => {
-                            final_message = Some(Message::Assistant(message.clone()));
-                        }
-                        StreamEvent::Error { error, .. } => {
-                            final_message = Some(Message::Assistant(error.clone()));
-                        }
-                        _ => {}
-                    }
-                    send(
-                        &mut writer,
-                        &Response::Stream {
-                            event: Box::new(event),
-                        },
-                    )
-                    .await?;
-                }
+                let (agent_result, _) = futures::future::join(agent_handle, forward_handle).await;
+                let agent_result = agent_result?;
 
-                if let Some(ref msg) = final_message {
-                    let st = state.lock().unwrap();
-                    st.db.append_message(&session_id, msg)?;
-                }
-
-                // Check if compaction is needed
-                if let Some(Message::Assistant(ref assistant)) = final_message
-                    && assistant.stop_reason != StopReason::Error
-                    && assistant.stop_reason != StopReason::Aborted
+                // Persist all new messages
                 {
-                    let should = {
-                        let st = state.lock().unwrap();
-                        let messages = st.db.get_messages(&session_id)?;
-                        let ctx_tokens = compaction::estimate_context_tokens(&messages);
-                        compaction::should_compact(
-                            ctx_tokens,
-                            model.context_window,
-                            &compaction::CompactionSettings::default(),
-                        )
-                    };
-                    if should {
-                        // Run compaction
-                        let compact_result =
-                            run_compaction(&state, &session_id, &model, &mut writer).await;
-                        if let Err(e) = compact_result {
-                            eprintln!("compaction error: {}", e);
-                        }
+                    let st = state.lock().unwrap();
+                    for msg in &agent_result.new_messages {
+                        st.db.append_message(&session_id, msg)?;
+                    }
+                }
+
+                // Check compaction after agent loop completes
+                let should = {
+                    let st = state.lock().unwrap();
+                    let messages = st.db.get_messages(&session_id)?;
+                    let ctx_tokens = compaction::estimate_context_tokens(&messages);
+                    compaction::should_compact(
+                        ctx_tokens,
+                        model.context_window,
+                        &compaction::CompactionSettings::default(),
+                    )
+                };
+                if should {
+                    let compact_result =
+                        run_compaction(&state, &session_id, &model, &mut writer).await;
+                    if let Err(e) = compact_result {
+                        eprintln!("compaction error: {}", e);
                     }
                 }
             }
