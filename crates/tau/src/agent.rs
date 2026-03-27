@@ -222,7 +222,14 @@ pub fn is_context_overflow(err_msg: &str) -> bool {
     lower.contains("context_length_exceeded")
         || lower.contains("maximum context length")
         || lower.contains("too many tokens")
-        || lower.contains("max_tokens") && (lower.contains("exceed") || lower.contains("too long"))
+        || lower.contains("prompt is too long")
+        || lower.contains("prompt too long")
+        || lower.contains("exceeded max context length")
+        || lower.contains("exceeded context length")
+        || lower.contains("token limit exceeded")
+        || lower.contains("model_context_window_exceeded")
+        || (lower.contains("max_tokens")
+            && (lower.contains("exceed") || lower.contains("too long")))
 }
 
 // ---------------------------------------------------------------------------
@@ -511,10 +518,28 @@ mod tests {
 
     #[test]
     fn overflow_detection() {
+        // Anthropic
+        assert!(is_context_overflow(
+            "prompt is too long: 250000 tokens > 200000 maximum"
+        ));
+        // OpenAI
         assert!(is_context_overflow(
             "context_length_exceeded: maximum context length is 200000"
         ));
         assert!(is_context_overflow("maximum context length exceeded"));
+        // Ollama
+        assert!(is_context_overflow(
+            "prompt too long; exceeded max context length by 5000 tokens"
+        ));
+        assert!(is_context_overflow(
+            "prompt too long; exceeded context length of 131072"
+        ));
+        // Generic
+        assert!(is_context_overflow("too many tokens in the prompt"));
+        assert!(is_context_overflow("token limit exceeded"));
+        assert!(is_context_overflow("model_context_window_exceeded"));
+        // Negative
         assert!(!is_context_overflow("invalid request"));
+        assert!(!is_context_overflow("rate limit exceeded"));
     }
 }

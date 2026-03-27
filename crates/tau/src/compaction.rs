@@ -428,4 +428,61 @@ mod tests {
         assert!(text.contains("## Assistant"));
         assert!(text.contains("here's the code"));
     }
+
+    #[test]
+    fn repeated_compaction_preserves_recent() {
+        // Simulate a session that was already compacted once:
+        // [compaction_summary, user, assistant, user, assistant, user, assistant]
+        // When compacting again, the compaction summary is a valid cut point,
+        // and recent messages should be preserved.
+        let big = "x".repeat(400); // ~100 tokens each
+        let messages = vec![
+            compaction_summary("previous work summary"), // 0: ~5 tokens
+            user(&big),                                  // 1: ~100 tokens
+            assistant(&big, 500),                        // 2: ~100 tokens
+            user(&big),                                  // 3: ~100 tokens
+            assistant(&big, 800),                        // 4: ~100 tokens
+            user(&big),                                  // 5: ~100 tokens
+            assistant(&big, 1000),                       // 6: ~100 tokens
+        ];
+
+        // keep_recent_tokens=250 → should keep ~3 messages from end
+        let cut = find_cut_point(&messages, 250);
+        // Should cut at index 5 (user message) — keeping msgs 5,6
+        // Index 3 is also valid. Either way, compaction summary + old messages
+        // get summarized, recent messages kept.
+        assert!(cut >= 3, "cut={cut} should be >= 3 (keep recent)");
+        assert!(cut <= 5, "cut={cut} should be <= 5");
+        // The cut point must be a valid boundary (user or compaction summary)
+        assert!(
+            matches!(
+                &messages[cut],
+                Message::User(_) | Message::CompactionSummary(_)
+            ),
+            "cut point must be at a turn boundary"
+        );
+    }
+
+    #[test]
+    fn should_compact_after_previous_compaction() {
+        // After a compaction, context is smaller. Verify should_compact
+        // correctly handles sessions starting with CompactionSummary.
+        let messages = vec![
+            compaction_summary("summary of earlier work"),
+            user("continue working"),
+            assistant("ok", 190_000), // usage says 190K tokens
+        ];
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 16_000,
+            keep_recent_tokens: 20_000,
+        };
+        let ctx_tokens = estimate_context_tokens(&messages);
+        // 190K + 100 output ≈ 190100 tokens
+        assert!(ctx_tokens > 180_000);
+        // With 200K window and 16K reserve → should compact
+        assert!(should_compact(ctx_tokens, 200_000, &settings));
+        // With 1M window → should not compact
+        assert!(!should_compact(ctx_tokens, 1_000_000, &settings));
+    }
 }
