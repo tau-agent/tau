@@ -364,11 +364,15 @@ async fn cmd_chat(
     let session_id = if let Some(id) = session_id {
         id
     } else {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from));
         client
             .send(&tau::protocol::Request::CreateSession {
                 model: Some(model_id),
                 provider,
                 system_prompt: None,
+                cwd,
             })
             .await?;
 
@@ -652,6 +656,7 @@ async fn handle_slash_command(
             println!("session:  {}", info.id);
             println!("provider: {}", info.provider);
             println!("model:    {}", info.model);
+            println!("cwd:      {}", info.cwd.as_deref().unwrap_or("(not set)"));
             println!(
                 "messages: {} user, {} assistant, {} tool calls",
                 info.stats.user_messages, info.stats.assistant_messages, info.stats.tool_calls
@@ -712,11 +717,49 @@ async fn handle_slash_command(
             }
         }
 
+        "/cwd" => {
+            if args.is_empty() {
+                // Show current cwd
+                let info = get_session_info(client, session_id).await?;
+                println!("{}", info.cwd.as_deref().unwrap_or("(not set)"));
+            } else {
+                // Resolve and set new cwd
+                let new_cwd = if std::path::Path::new(args).is_absolute() {
+                    args.to_string()
+                } else {
+                    // Resolve relative to current session cwd or process cwd
+                    let info = get_session_info(client, session_id).await.ok();
+                    let base = info.and_then(|i| i.cwd).unwrap_or_else(|| {
+                        std::env::current_dir()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string()
+                    });
+                    let resolved = std::path::Path::new(&base).join(args);
+                    resolved.to_string_lossy().to_string()
+                };
+                if !std::path::Path::new(&new_cwd).is_dir() {
+                    eprintln!("error: {} is not a directory", new_cwd);
+                } else {
+                    client
+                        .send(&tau::protocol::Request::SetCwd {
+                            session_id: session_id.to_string(),
+                            cwd: new_cwd.clone(),
+                        })
+                        .await?;
+                    client.recv_streaming(|_| {}).await?;
+                    eprintln!("cwd: {}", new_cwd);
+                }
+            }
+        }
+
         "/help" => {
             println!("commands:");
             println!("  /status        show session info and stats");
             println!("  /model         list available models");
             println!("  /model <id>    switch to a different model");
+            println!("  /cwd           show working directory");
+            println!("  /cwd <path>    change working directory");
             println!("  /help          show this help");
             println!("  /quit          exit");
         }

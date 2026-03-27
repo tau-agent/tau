@@ -29,15 +29,24 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-fn execute(args: serde_json::Value) -> ToolOutput {
-    let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
+fn resolve_path(cwd: &str, path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::path::Path::new(cwd).join(p)
+    }
+}
+
+fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
+    let Some(path_str) = args.get("path").and_then(|p| p.as_str()) else {
         return ToolOutput::error("missing 'path' argument");
     };
     let Some(content) = args.get("content").and_then(|c| c.as_str()) else {
         return ToolOutput::error("missing 'content' argument");
     };
 
-    let path = std::path::Path::new(path);
+    let path = resolve_path(cwd, path_str);
 
     // Create parent directories
     if let Some(parent) = path.parent()
@@ -47,7 +56,7 @@ fn execute(args: serde_json::Value) -> ToolOutput {
         return ToolOutput::error(format!("failed to create directory: {}", e));
     }
 
-    match std::fs::write(path, content) {
+    match std::fs::write(&path, content) {
         Ok(()) => ToolOutput::text(format!(
             "Successfully wrote {} bytes to {}",
             content.len(),

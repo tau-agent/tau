@@ -42,6 +42,7 @@ pub type EventCallback = Box<dyn FnMut(StreamEvent) + Send>;
 ///
 /// Streams LLM responses, executes tool calls, and loops until the model
 /// stops or max_turns is reached. All stream events are forwarded via `on_event`.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     registry: &ProviderRegistry,
     model: &Model,
@@ -49,6 +50,7 @@ pub fn run(
     tool_defs: &[ToolDef],
     options: &StreamOptions,
     config: &AgentConfig,
+    cwd: &str,
     mut on_event: EventCallback,
 ) -> crate::Result<AgentResult> {
     let mut new_messages = Vec::new();
@@ -99,7 +101,7 @@ pub fn run(
         }
 
         for tc in &tool_calls {
-            let result = tools::execute_tool(tool_defs, tc);
+            let result = tools::execute_tool(tool_defs, tc, cwd);
             new_messages.push(Message::ToolResult(result.clone()));
             context.messages.push(Message::ToolResult(result));
         }
@@ -246,6 +248,7 @@ mod tests {
             &[],
             &StreamOptions::default(),
             &config,
+            "/tmp",
             Box::new(move |e| events_clone.lock().unwrap().push(e)),
         )
         .unwrap();
@@ -280,6 +283,7 @@ mod tests {
             &tools,
             &StreamOptions::default(),
             &config,
+            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();
@@ -320,6 +324,7 @@ mod tests {
             &tools,
             &StreamOptions::default(),
             &config,
+            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();
@@ -346,6 +351,7 @@ mod tests {
             &[],
             &StreamOptions::default(),
             &config,
+            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();
@@ -378,6 +384,7 @@ mod tests {
             &[],
             &StreamOptions::default(),
             &config,
+            "/tmp",
             Box::new(|_| {}),
         )
         .unwrap();

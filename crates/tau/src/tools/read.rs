@@ -1,7 +1,18 @@
 //! Read tool — read file contents.
 
+use std::path::{Path, PathBuf};
+
 use super::{ToolDef, ToolOutput};
 use crate::types::Tool;
+
+fn resolve_path(cwd: &str, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        Path::new(cwd).join(p)
+    }
+}
 
 pub fn tool_def() -> ToolDef {
     ToolDef {
@@ -32,14 +43,15 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-fn execute(args: serde_json::Value) -> ToolOutput {
+fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
     let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
         return ToolOutput::error("missing 'path' argument");
     };
 
-    let content = match std::fs::read_to_string(path) {
+    let path = resolve_path(cwd, path);
+    let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
-        Err(e) => return ToolOutput::error(format!("failed to read {}: {}", path, e)),
+        Err(e) => return ToolOutput::error(format!("failed to read {}: {}", path.display(), e)),
     };
 
     let offset = args

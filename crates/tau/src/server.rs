@@ -73,6 +73,7 @@ fn session_info(stored: &StoredSession, messages: &[Message]) -> SessionInfo {
         id: stored.id.clone(),
         model: stored.model.id.clone(),
         provider: stored.model.provider.clone(),
+        cwd: stored.cwd.clone(),
         message_count: messages.len(),
         stats: compute_stats(messages, &stored.model, stored.is_subscription),
     }
@@ -250,6 +251,7 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 model: model_id,
                 provider: provider_name,
                 system_prompt,
+                cwd,
             } => {
                 let result = {
                     let st = state.lock().unwrap();
@@ -272,12 +274,13 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                         .flatten()
                         .is_some_and(|c| matches!(c, AuthCredential::Oauth(_)));
                     let id = st.db.next_session_id()?;
-                    let system_prompt = system_prompt
-                        .or_else(|| Some(crate::system_prompt::DEFAULT_SYSTEM_PROMPT.to_string()));
+                    let system_prompt =
+                        system_prompt.or_else(|| Some(crate::system_prompt::build(cwd.as_deref())));
                     let stored = StoredSession {
                         id: id.clone(),
                         model,
                         system_prompt,
+                        cwd,
                         is_subscription,
                         created_at: crate::types::timestamp_ms() as i64,
                     };
@@ -333,13 +336,14 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                                 messages,
                                 tools: Vec::new(),
                             };
-                            Ok((context, stored.model))
+                            let cwd = stored.cwd.unwrap_or_else(|| "/tmp".to_string());
+                            Ok((context, stored.model, cwd))
                         }
                         Ok(None) => Err(format!("session not found: {}", session_id)),
                         Err(e) => Err(format!("db error: {}", e)),
                     }
                 };
-                let (context, model) = match chat_data {
+                let (context, model, cwd) = match chat_data {
                     Ok(data) => data,
                     Err(msg) => {
                         send(&mut writer, &Response::Error { message: msg }).await?;
@@ -396,6 +400,7 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                 let model_clone = model.clone();
                 let mut context_clone = context;
                 let options_clone = options;
+                let cwd_clone = cwd;
 
                 let agent_handle = smol::unblock(move || {
                     crate::agent::run(
@@ -405,6 +410,7 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                         &tool_defs,
                         &options_clone,
                         &agent_config,
+                        &cwd_clone,
                         Box::new(move |event| {
                             let _ = event_tx.send_blocking(event);
                         }),
@@ -499,6 +505,26 @@ async fn handle_client(stream: Async<UnixStream>, state: SharedState) -> crate::
                     st.all_models.iter().map(model_info).collect::<Vec<_>>()
                 };
                 send(&mut writer, &Response::Models { models }).await?;
+            }
+            Request::SetCwd { session_id, cwd } => {
+                let result = {
+                    let st = state.lock().unwrap();
+                    st.db.update_cwd(&session_id, &cwd)
+                };
+                match result {
+                    Ok(()) => {
+                        send(&mut writer, &Response::Ok).await?;
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
             Request::SetModel {
                 session_id,

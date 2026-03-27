@@ -27,7 +27,7 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-fn execute(args: serde_json::Value) -> ToolOutput {
+fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
     let Some(command) = args.get("command").and_then(|c| c.as_str()) else {
         return ToolOutput::error("missing 'command' argument");
     };
@@ -37,6 +37,7 @@ fn execute(args: serde_json::Value) -> ToolOutput {
     let result = std::process::Command::new("bash")
         .arg("-c")
         .arg(command)
+        .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

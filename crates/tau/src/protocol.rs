@@ -21,6 +21,9 @@ pub enum Request {
         provider: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         system_prompt: Option<String>,
+        /// Working directory for tool execution.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },
@@ -35,6 +38,8 @@ pub enum Request {
         session_id: String,
         model_id: String,
     },
+    /// Change working directory for a session.
+    SetCwd { session_id: String, cwd: String },
     /// Start OAuth login for a provider.
     Login { provider: String },
     /// Query authentication status.
@@ -87,6 +92,7 @@ pub struct SessionInfo {
     pub id: String,
     pub model: String,
     pub provider: String,
+    pub cwd: Option<String>,
     pub message_count: usize,
     pub stats: SessionStats,
 }

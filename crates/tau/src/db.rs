@@ -16,6 +16,7 @@ pub struct StoredSession {
     pub id: String,
     pub model: Model,
     pub system_prompt: Option<String>,
+    pub cwd: Option<String>,
     pub is_subscription: bool,
     pub created_at: i64,
 }
@@ -48,6 +49,7 @@ impl Db {
                 id             TEXT PRIMARY KEY,
                 model_json     TEXT NOT NULL,
                 system_prompt  TEXT,
+                cwd            TEXT,
                 is_subscription INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL
             );
@@ -60,6 +62,9 @@ impl Db {
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);",
         )
         .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
+
+        // Migration: add cwd column if missing (existing DBs)
+        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN cwd TEXT;");
 
         Ok(Self { conn })
     }
@@ -79,6 +84,7 @@ impl Db {
                 id             TEXT PRIMARY KEY,
                 model_json     TEXT NOT NULL,
                 system_prompt  TEXT,
+                cwd            TEXT,
                 is_subscription INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL
             );
@@ -104,12 +110,13 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, is_subscription, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     session.id,
                     model_json,
                     session.system_prompt,
+                    session.cwd,
                     session.is_subscription as i32,
                     session.created_at,
                 ],
@@ -122,7 +129,7 @@ impl Db {
     pub fn get_session(&self, id: &str) -> crate::Result<Option<StoredSession>> {
         self.conn
             .query_row(
-                "SELECT id, model_json, system_prompt, is_subscription, created_at
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at
                  FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -138,8 +145,9 @@ impl Db {
                         id: row.get(0)?,
                         model,
                         system_prompt: row.get(2)?,
-                        is_subscription: row.get::<_, i32>(3)? != 0,
-                        created_at: row.get(4)?,
+                        cwd: row.get(3)?,
+                        is_subscription: row.get::<_, i32>(4)? != 0,
+                        created_at: row.get(5)?,
                     })
                 },
             )
@@ -152,7 +160,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, model_json, system_prompt, is_subscription, created_at
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at
                  FROM sessions ORDER BY created_at",
             )
             .map_err(|e| crate::Error::Io(format!("prepare list: {}", e)))?;
@@ -171,8 +179,9 @@ impl Db {
                     id: row.get(0)?,
                     model,
                     system_prompt: row.get(2)?,
-                    is_subscription: row.get::<_, i32>(3)? != 0,
-                    created_at: row.get(4)?,
+                    cwd: row.get(3)?,
+                    is_subscription: row.get::<_, i32>(4)? != 0,
+                    created_at: row.get(5)?,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list sessions: {}", e)))?;
@@ -189,6 +198,17 @@ impl Db {
         self.conn
             .execute("DELETE FROM sessions WHERE id = ?1", params![id])
             .map_err(|e| crate::Error::Io(format!("delete session: {}", e)))?;
+        Ok(())
+    }
+
+    /// Update the working directory for a session.
+    pub fn update_cwd(&self, session_id: &str, cwd: &str) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET cwd = ?1 WHERE id = ?2",
+                params![cwd, session_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("update cwd: {}", e)))?;
         Ok(())
     }
 
@@ -398,6 +418,7 @@ mod tests {
             id: "s1".into(),
             model: test_model(),
             system_prompt: Some("Be helpful.".into()),
+            cwd: None,
             is_subscription: true,
             created_at: 1000,
         };
@@ -417,6 +438,7 @@ mod tests {
             id: "s1".into(),
             model: test_model(),
             system_prompt: None,
+            cwd: None,
             is_subscription: false,
             created_at: 1000,
         };
@@ -446,6 +468,7 @@ mod tests {
             id: "s1".into(),
             model: test_model(),
             system_prompt: None,
+            cwd: None,
             is_subscription: false,
             created_at: 1000,
         };
@@ -466,6 +489,7 @@ mod tests {
                 id: id.into(),
                 model: test_model(),
                 system_prompt: None,
+                cwd: None,
                 is_subscription: false,
                 created_at: ts,
             })
@@ -485,6 +509,7 @@ mod tests {
             id: "s5".into(),
             model: test_model(),
             system_prompt: None,
+            cwd: None,
             is_subscription: false,
             created_at: 1000,
         })
