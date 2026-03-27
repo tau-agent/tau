@@ -115,6 +115,9 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
 
     let mut block_index_map: Vec<(u64, usize)> = Vec::new();
     let mut current_event_type = String::new();
+    // Accumulate partial JSON for tool call arguments (keyed by block index)
+    let mut tool_json_accum: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
 
     for line in reader.lines() {
         let line = line.map_err(|e: std::io::Error| crate::Error::Http(e.to_string()))?;
@@ -239,6 +242,10 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                         .map_err(|_| crate::Error::ChannelClosed)?;
                     }
                     Delta::InputJsonDelta { partial_json } => {
+                        tool_json_accum
+                            .entry(ev.index)
+                            .or_default()
+                            .push_str(&partial_json);
                         tx.send_blocking(StreamEvent::ToolcallDelta {
                             content_index: ci,
                             delta: partial_json,
@@ -280,10 +287,21 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                         })
                         .map_err(|_| crate::Error::ChannelClosed)?;
                     }
-                    Some(AssistantContent::ToolCall(tc)) => {
+                    Some(AssistantContent::ToolCall(_)) => {
+                        // Parse accumulated JSON into arguments
+                        if let Some(json_str) = tool_json_accum.remove(&ev.index)
+                            && let Ok(args) = serde_json::from_str(&json_str)
+                            && let Some(AssistantContent::ToolCall(tc)) = output.content.get_mut(ci)
+                        {
+                            tc.arguments = args;
+                        }
+                        let tc = match output.content.get(ci) {
+                            Some(AssistantContent::ToolCall(tc)) => tc.clone(),
+                            _ => continue,
+                        };
                         tx.send_blocking(StreamEvent::ToolcallEnd {
                             content_index: ci,
-                            tool_call: tc.clone(),
+                            tool_call: tc,
                             partial: output.clone(),
                         })
                         .map_err(|_| crate::Error::ChannelClosed)?;
