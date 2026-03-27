@@ -146,9 +146,11 @@ impl Theme {
         Style::default().fg(self.dim.to_ratatui())
     }
 
-    /// Input border (matches pi: borderMuted always).
+    /// Input border color.
+    /// Pi uses thinking-level color (teal/purple depending on level).
+    /// Until tau has thinking levels, default to accent (teal).
     pub fn input_border_style(&self) -> Style {
-        Style::default().fg(self.border_muted.to_ratatui())
+        Style::default().fg(self.accent.to_ratatui())
     }
 
     /// Spinner character style (accent color, like pi).
