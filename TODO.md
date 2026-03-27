@@ -9,6 +9,10 @@
 
 - [ ] **Restore messages on session resume**: when resuming a session (`tau chat -s <id>`), fetch and display previous messages so the conversation continues where it left off. Needs a protocol request to retrieve message history from the server.
 
+## Local TUI Settings
+
+- [ ] **Persist theme selection**: save active theme name to `~/.config/tau/settings.toml` (local TUI setting, not per-session). Load on startup, `/theme <name>` writes it. Separate from provider/model config since it's client-side display preference.
+
 ## Multi-Client Sessions
 
 - [ ] **Multiple connections to one session**: currently breaks when two clients connect to the same session. This would be a great feature — multiple TUI instances viewing/interacting with the same session in real time.
