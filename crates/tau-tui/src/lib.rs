@@ -197,6 +197,18 @@ async fn run_inner(
             .map_err(|e| tau::Error::Io(e.to_string()))?;
     }
 
+    // Clean up empty sessions (no user messages sent)
+    let has_user_messages = app
+        .messages
+        .iter()
+        .any(|m| matches!(m, crate::message::MessageItem::User { .. }));
+    if !has_user_messages {
+        let sid = app.session_id.clone();
+        send_request_and_recv(Request::DeleteSession { session_id: sid }, server_tx)
+            .await
+            .ok();
+    }
+
     Ok(())
 }
 
