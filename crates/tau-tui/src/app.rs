@@ -43,6 +43,12 @@ pub enum AppMode {
     Streaming,
 }
 
+/// Messages queued while the agent is working (steering / follow-up).
+#[derive(Debug, Clone)]
+pub struct QueuedMessage {
+    pub text: String,
+}
+
 /// Application state.
 pub struct App {
     /// Theme for rendering.
@@ -69,6 +75,8 @@ pub struct App {
     pub spinner_frame: usize,
     /// Last escape press time for double-escape detection.
     pub last_escape: std::time::Instant,
+    /// Queued steering messages (sent after current agent turn completes).
+    pub queued_messages: Vec<QueuedMessage>,
     /// Server stream ended.
     pub server_done: bool,
 }
@@ -93,6 +101,7 @@ impl App {
             last_escape: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(10))
                 .unwrap(),
+            queued_messages: Vec::new(),
             server_done: false,
         }
     }
@@ -176,6 +185,16 @@ impl App {
             Event::Terminal(ct_event) => self.handle_terminal_event(ct_event),
             Event::Server(response) => {
                 self.handle_server_response(response);
+                // After AgentDone, drain queued steering messages
+                if self.mode == AppMode::Input && !self.queued_messages.is_empty() {
+                    let queued = self.queued_messages.remove(0);
+                    self.messages.push(MessageItem::User {
+                        text: queued.text.clone(),
+                    });
+                    self.scroll_offset = 0;
+                    self.mode = AppMode::Streaming;
+                    return Some(Action::SendQueued(queued.text));
+                }
                 None
             }
             Event::ServerDone => {
@@ -241,10 +260,24 @@ impl App {
                 self.mode = AppMode::Streaming;
                 Some(Action::SendChat(text))
             }
-            // Alt+Enter or Shift+Enter: insert newline
-            (KeyCode::Enter, m)
-                if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::SHIFT) =>
-            {
+            // Alt+Enter: queue steering message (sent after current turn)
+            (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
+                let text: String = self.textarea.lines().join("\n");
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return None;
+                }
+                self.textarea.select_all();
+                self.textarea.cut();
+                self.queued_messages
+                    .push(QueuedMessage { text: text.clone() });
+                self.messages.push(MessageItem::Status {
+                    text: format!("[queued: {}]", text),
+                });
+                None
+            }
+            // Shift+Enter: insert newline
+            (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
                 self.textarea.insert_newline();
                 None
             }
@@ -272,6 +305,22 @@ impl App {
 
     fn handle_streaming_key(&mut self, key: &KeyEvent) -> Option<Action> {
         match (key.code, key.modifiers) {
+            // Alt+Enter during streaming: queue steering message
+            (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
+                let text: String = self.textarea.lines().join("\n");
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return None;
+                }
+                self.textarea.select_all();
+                self.textarea.cut();
+                self.queued_messages
+                    .push(QueuedMessage { text: text.clone() });
+                self.messages.push(MessageItem::Status {
+                    text: format!("[queued: {}]", text),
+                });
+                None
+            }
             // Escape: detect double-escape for cancel
             (KeyCode::Esc, _) => {
                 let now = std::time::Instant::now();
@@ -300,7 +349,11 @@ impl App {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 None
             }
-            _ => None,
+            // All other keys go to textarea (compose steering message while streaming)
+            _ => {
+                self.textarea.input(event_to_tui_textarea(key));
+                None
+            }
         }
     }
 
@@ -607,6 +660,8 @@ pub enum Action {
     SetModel(String),
     GetStatus,
     SetCwd(String),
+    /// Send the next queued steering message.
+    SendQueued(String),
 }
 
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.
