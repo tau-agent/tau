@@ -24,6 +24,9 @@ enum Commands {
         #[arg(long, default_value = "claude-sonnet-4-6",
               add = ArgValueCandidates::new(completer::model_completer))]
         model: String,
+        /// Disable TUI (use plain text streaming)
+        #[arg(long)]
+        no_tui: bool,
     },
     /// Log in to an LLM provider (OAuth)
     Login {
@@ -177,8 +180,9 @@ async fn run(cli: Cli) -> tau::Result<()> {
             message,
             session,
             model,
+            no_tui,
         } => {
-            cmd_chat(message, session, &model).await?;
+            cmd_chat(message, session, &model, no_tui).await?;
         }
         Commands::Worker => {
             tau::worker::run_worker_loop();
@@ -358,6 +362,7 @@ async fn cmd_chat(
     message: Option<String>,
     session_id: Option<String>,
     model: &str,
+    no_tui: bool,
 ) -> tau::Result<()> {
     let mut client = tau::client::Client::connect_or_start().await?;
 
@@ -394,24 +399,54 @@ async fn cmd_chat(
         created_id.ok_or_else(|| tau::Error::Io("failed to create session".into()))?
     };
 
-    // Initialize totals with session info (for context_window, is_subscription)
-    let mut totals = UsageTotals::default();
-    if let Ok(info) = get_session_info(&mut client, &session_id).await {
-        totals.context_window = info.stats.context_window;
-        totals.is_subscription = info.stats.is_subscription;
-        // If resuming an existing session, seed totals from stored stats
-        totals.input = info.stats.tokens.input;
-        totals.output = info.stats.tokens.output;
-        totals.cache_read = info.stats.tokens.cache_read;
-        totals.cache_write = info.stats.tokens.cache_write;
-        totals.cost = info.stats.cost;
-        totals.context_tokens = info.stats.context_tokens;
-    }
+    // Get session info for display
+    let info = get_session_info(&mut client, &session_id).await.ok();
+    let info_model = info.as_ref().map(|i| i.model.clone()).unwrap_or_default();
+    let info_provider = info
+        .as_ref()
+        .map(|i| i.provider.clone())
+        .unwrap_or_default();
+    let context_window = info.as_ref().map(|i| i.stats.context_window).unwrap_or(0);
+    let is_subscription = info.as_ref().is_some_and(|i| i.stats.is_subscription);
 
     if let Some(text) = message {
+        // Non-interactive: plain text streaming (no TUI)
+        let mut totals = UsageTotals::default();
+        if let Some(ref info) = info {
+            totals.context_window = info.stats.context_window;
+            totals.is_subscription = info.stats.is_subscription;
+            totals.input = info.stats.tokens.input;
+            totals.output = info.stats.tokens.output;
+            totals.cache_read = info.stats.tokens.cache_read;
+            totals.cache_write = info.stats.tokens.cache_write;
+            totals.cost = info.stats.cost;
+            totals.context_tokens = info.stats.context_tokens;
+        }
         send_and_print(&mut client, &session_id, &text, &mut totals).await?;
-    } else {
+    } else if no_tui {
+        // Interactive but no TUI: use rustyline
+        let mut totals = UsageTotals::default();
+        if let Some(ref info) = info {
+            totals.context_window = info.stats.context_window;
+            totals.is_subscription = info.stats.is_subscription;
+            totals.input = info.stats.tokens.input;
+            totals.output = info.stats.tokens.output;
+            totals.cache_read = info.stats.tokens.cache_read;
+            totals.cache_write = info.stats.tokens.cache_write;
+            totals.cost = info.stats.cost;
+            totals.context_tokens = info.stats.context_tokens;
+        }
         interactive_loop(&mut client, &session_id, &mut totals).await?;
+    } else {
+        // TUI mode
+        tau_tui::run(
+            session_id,
+            info_model,
+            info_provider,
+            context_window,
+            is_subscription,
+        )
+        .await?;
     }
 
     Ok(())
@@ -461,6 +496,110 @@ async fn send_and_print(
         })
         .await?;
 
+    // Spawn a background thread that watches for double-Escape on raw stdin.
+    // When detected it sends a CancelChat via a fresh connection.
+    // The thread uses poll() with a short timeout so it can notice `done`
+    // and restore terminal settings promptly when streaming ends.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_clone = done.clone();
+    let session_id_clone = session_id.to_string();
+
+    let cancel_thread = std::thread::spawn(move || {
+        #[cfg(unix)]
+        {
+            use std::io::Read;
+            use std::os::fd::AsRawFd;
+
+            let stdin = std::io::stdin();
+            let fd = stdin.as_raw_fd();
+
+            // Only operate on a real tty.
+            if unsafe { libc::isatty(fd) } == 0 {
+                return;
+            }
+
+            // Save terminal settings and switch to raw mode.
+            let mut saved = unsafe { std::mem::zeroed::<libc::termios>() };
+            if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+                return;
+            }
+            let mut raw = saved;
+            unsafe {
+                libc::cfmakeraw(&mut raw);
+                // Keep output processing enabled so that \n is still
+                // translated to \r\n while we are in raw input mode.
+                // Without this, streamed text loses carriage returns and
+                // every newline just moves the cursor down (staircase effect).
+                raw.c_oflag |= libc::OPOST;
+                libc::tcsetattr(fd, libc::TCSANOW, &raw);
+            }
+
+            let mut last_was_esc = false;
+
+            loop {
+                if done_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
+                // poll() with 50 ms timeout so we check `done` regularly.
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ret = unsafe { libc::poll(&mut pfd, 1, 50) };
+
+                if ret <= 0 {
+                    // Timeout or error — loop back and check `done`.
+                    continue;
+                }
+
+                let mut buf = [0u8; 1];
+                match stdin.lock().read(&mut buf) {
+                    Ok(1) => {
+                        if buf[0] == 0x1b {
+                            if last_was_esc {
+                                // Double Escape — send cancel.
+                                eprintln!("\n[cancelling...]");
+                                let cancel_req = tau::protocol::Request::CancelChat {
+                                    session_id: session_id_clone.clone(),
+                                };
+                                if let Ok(stream) = std::os::unix::net::UnixStream::connect(
+                                    tau::server::socket_path(),
+                                ) {
+                                    use std::io::Write;
+                                    let mut line =
+                                        serde_json::to_string(&cancel_req).unwrap_or_default();
+                                    line.push('\n');
+                                    let mut w = std::io::BufWriter::new(stream);
+                                    let _ = w.write_all(line.as_bytes());
+                                    let _ = w.flush();
+                                }
+                                last_was_esc = false;
+                            } else {
+                                last_was_esc = true;
+                            }
+                        } else {
+                            last_was_esc = false;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            // Always restore terminal settings before the thread exits.
+            unsafe {
+                libc::tcsetattr(fd, libc::TCSANOW, &saved);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = done_clone;
+            let _ = session_id_clone;
+        }
+    });
+
+    let mut was_cancelled = false;
     client
         .recv_streaming(|resp| match resp {
             tau::protocol::Response::Stream { event } => {
@@ -499,6 +638,11 @@ async fn send_and_print(
             tau::protocol::Response::AgentDone => {
                 totals.display();
             }
+            tau::protocol::Response::Cancelled => {
+                was_cancelled = true;
+                eprintln!("[cancelled]");
+                totals.display();
+            }
             tau::protocol::Response::ServerShutdown { restart } => {
                 if *restart {
                     eprintln!("[server restarting...]");
@@ -513,6 +657,12 @@ async fn send_and_print(
         })
         .await?;
 
+    // Signal the escape-watcher thread to stop, then join it so we are
+    // guaranteed terminal settings are restored before we return.
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = cancel_thread.join();
+
+    let _ = was_cancelled; // available for future use
     Ok(())
 }
 

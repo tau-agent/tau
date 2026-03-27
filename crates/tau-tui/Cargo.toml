@@ -1,24 +1,19 @@
 [package]
-name = "tau-cli"
+name = "tau-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "LLM agent CLI"
-
-[[bin]]
-name = "tau"
-path = "src/main.rs"
+description = "Terminal UI for tau"
 
 [dependencies]
 tau.workspace = true
-tau-tui.workspace = true
 smol.workspace = true
-chrono.workspace = true
-clap.workspace = true
-clap_complete.workspace = true
-rustyline.workspace = true
 serde_json.workspace = true
+futures.workspace = true
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
