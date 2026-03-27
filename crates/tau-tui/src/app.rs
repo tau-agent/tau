@@ -263,10 +263,13 @@ impl App {
                         });
                     }
                 } else {
-                    // Switch theme
+                    // Switch theme and persist
                     match crate::theme::load_by_name(args) {
                         Ok(new_theme) => {
                             self.theme = new_theme;
+                            let mut s = crate::settings::load();
+                            s.tui.theme = Some(args.to_string());
+                            crate::settings::save(&s);
                             self.messages.push(MessageItem::Status {
                                 text: format!("theme: {}", args),
                             });

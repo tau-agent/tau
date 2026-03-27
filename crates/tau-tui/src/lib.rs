@@ -3,6 +3,7 @@
 mod app;
 mod events;
 mod message;
+mod settings;
 pub mod theme;
 mod ui;
 
@@ -73,7 +74,11 @@ async fn run_inner(
     context_window: u64,
     is_subscription: bool,
 ) -> tau::Result<()> {
-    let theme = theme::dark();
+    let saved_settings = settings::load();
+    let theme = match saved_settings.tui.theme.as_deref() {
+        Some(name) => theme::load_by_name(name).unwrap_or_else(|_| theme::dark()),
+        None => theme::dark(),
+    };
     let mut app = App::new(session_id, model, provider, theme);
     app.totals.context_window = context_window;
     app.totals.is_subscription = is_subscription;

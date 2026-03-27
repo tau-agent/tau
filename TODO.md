@@ -12,7 +12,7 @@
 
 ## Local TUI Settings
 
-- [ ] **Persist theme selection**: save active theme name to `~/.config/tau/settings.toml` (local TUI setting, not per-session). Load on startup, `/theme <name>` writes it. Separate from provider/model config since it's client-side display preference.
+- [x] **Persist theme selection**: saved to `~/.config/tau/settings.toml` under `[tui]`. Loaded on startup, `/theme <name>` writes it.
 
 ## Multi-Client Sessions
 
