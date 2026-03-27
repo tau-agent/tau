@@ -643,7 +643,7 @@ async fn handle_slash_command(
     client: &mut tau::client::Client,
     session_id: &str,
     line: &str,
-    _totals: &UsageTotals,
+    totals: &mut UsageTotals,
 ) -> tau::Result<bool> {
     let (cmd, args) = line.split_once(' ').unwrap_or((line, ""));
     let args = args.trim();
@@ -748,6 +748,9 @@ async fn handle_slash_command(
                         })
                         .await?;
                     client.recv_streaming(|_| {}).await?;
+                    // Notify the model about the cwd change
+                    let notice = format!("[Working directory changed to: {}]", new_cwd);
+                    send_and_print(client, session_id, &notice, totals).await?;
                     eprintln!("cwd: {}", new_cwd);
                 }
             }
