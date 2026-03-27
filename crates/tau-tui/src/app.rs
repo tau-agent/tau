@@ -393,10 +393,45 @@ impl App {
                 } else {
                     args_str
                 };
-                self.messages.push(MessageItem::Tool {
-                    name: tool_call.name,
-                    preview,
+                // Show pending tool call (will be replaced by ToolResult)
+                self.messages.push(MessageItem::Status {
+                    text: format!("[running: {} {}]", tool_call.name, preview),
                 });
+            }
+            StreamEvent::ToolResult {
+                tool_name,
+                is_error,
+                preview,
+            } => {
+                // Replace the "running" status with result
+                if let Some(last @ MessageItem::Status { .. }) = self.messages.last_mut()
+                    && matches!(last, MessageItem::Status { text } if text.contains("[running:"))
+                {
+                    if is_error {
+                        *last = MessageItem::ToolError {
+                            name: tool_name,
+                            message: preview,
+                        };
+                    } else {
+                        *last = MessageItem::Tool {
+                            name: tool_name,
+                            preview,
+                        };
+                    }
+                    return;
+                }
+                // Fallback: just append
+                if is_error {
+                    self.messages.push(MessageItem::ToolError {
+                        name: tool_name,
+                        message: preview,
+                    });
+                } else {
+                    self.messages.push(MessageItem::Tool {
+                        name: tool_name,
+                        preview,
+                    });
+                }
             }
             StreamEvent::Done { message, .. } => {
                 self.totals.add(&message.usage);

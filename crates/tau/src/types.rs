@@ -337,6 +337,13 @@ pub enum StreamEvent {
         tool_call: ToolCall,
         partial: AssistantMessage,
     },
+    /// Summary of a tool execution result (emitted by agent after tool runs).
+    ToolResult {
+        tool_name: String,
+        is_error: bool,
+        /// Short preview of the tool output.
+        preview: String,
+    },
     Done {
         reason: StopReason,
         message: AssistantMessage,

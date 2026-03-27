@@ -618,6 +618,17 @@ async fn send_and_print(
                         };
                         eprintln!("[tool: {} {}]", tool_call.name, preview);
                     }
+                    tau::StreamEvent::ToolResult {
+                        tool_name,
+                        is_error,
+                        preview,
+                    } => {
+                        if *is_error {
+                            eprintln!("[tool error: {} {}]", tool_name, preview);
+                        } else {
+                            eprintln!("[tool ok: {} {}]", tool_name, preview);
+                        }
+                    }
                     tau::StreamEvent::Done { message, .. } => {
                         // Only print newline if there was text content
                         if message.content.iter().any(

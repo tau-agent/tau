@@ -131,6 +131,28 @@ pub fn run(
                 });
             }
             let result = worker.execute(tc)?;
+
+            // Emit a tool result summary for the UI
+            let preview = result
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    crate::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let preview = if preview.len() > 120 {
+                format!("{}...", &preview[..120])
+            } else {
+                preview
+            };
+            on_event(StreamEvent::ToolResult {
+                tool_name: result.tool_name.clone(),
+                is_error: result.is_error,
+                preview,
+            });
+
             new_messages.push(Message::ToolResult(result.clone()));
             context.messages.push(Message::ToolResult(result));
         }

@@ -14,8 +14,10 @@ pub enum MessageItem {
     AssistantStreaming { text: String },
     /// Thinking indicator / content.
     Thinking { text: String, done: bool },
-    /// Tool call summary.
+    /// Tool call summary (success).
     Tool { name: String, preview: String },
+    /// Tool call that resulted in an error.
+    ToolError { name: String, message: String },
     /// Status line (e.g. "[cancelled]", "[Working...]").
     Status { text: String },
     /// Error message.
@@ -87,21 +89,38 @@ impl MessageItem {
                 Text::from(lines)
             }
             MessageItem::Tool { name, preview } => {
-                let style = Style::default().fg(Color::Yellow);
-                Text::from(Line::from(vec![
+                let bg = Color::Rgb(30, 40, 30); // subtle green-tinted bg
+                let style = Style::default().fg(Color::Yellow).bg(bg);
+                let mut lines = Vec::new();
+                lines.push(Line::from(vec![
                     Span::styled("  [tool: ", style),
                     Span::styled(name.clone(), style.add_modifier(Modifier::BOLD)),
                     Span::styled(format!(" {}]", preview), style),
-                ]))
+                ]));
+                Text::from(lines)
+            }
+            MessageItem::ToolError { name, message } => {
+                let bg = Color::Rgb(50, 25, 25); // subtle red-tinted bg
+                let style = Style::default().fg(Color::Red).bg(bg);
+                let mut lines = Vec::new();
+                lines.push(Line::from(vec![
+                    Span::styled("  [tool error: ", style),
+                    Span::styled(name.clone(), style.add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" {}]", message), style),
+                ]));
+                Text::from(lines)
             }
             MessageItem::Status { text } => Text::from(Line::from(Span::styled(
                 format!("  {}", text),
                 Style::default().fg(Color::DarkGray),
             ))),
-            MessageItem::Error { text } => Text::from(Line::from(Span::styled(
-                format!("  error: {}", text),
-                Style::default().fg(Color::Red),
-            ))),
+            MessageItem::Error { text } => {
+                let bg = Color::Rgb(50, 20, 20);
+                Text::from(Line::from(Span::styled(
+                    format!("  error: {}", text),
+                    Style::default().fg(Color::Red).bg(bg),
+                )))
+            }
         }
     }
 }
