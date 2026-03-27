@@ -82,6 +82,7 @@ impl Client {
                     matches!(event.as_ref(), crate::types::StreamEvent::Error { .. })
                 }
                 Response::AgentDone
+                | Response::Cancelled
                 | Response::Error { .. }
                 | Response::Ok
                 | Response::SessionCreated { .. }

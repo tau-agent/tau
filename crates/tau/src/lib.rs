@@ -34,6 +34,8 @@ pub enum Error {
     Io(String),
     #[error("channel closed")]
     ChannelClosed,
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

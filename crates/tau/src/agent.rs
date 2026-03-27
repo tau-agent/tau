@@ -71,7 +71,16 @@ pub fn run(
 
     for turn in 0..config.max_turns {
         // Stream LLM response (with retry)
-        let message = stream_with_retry(registry, model, context, options, config, &mut on_event)?;
+        let message =
+            match stream_with_retry(registry, model, context, options, config, &mut on_event) {
+                Err(crate::Error::Cancelled) => {
+                    return Ok(AgentResult {
+                        new_messages,
+                        max_turns_reached: false,
+                    });
+                }
+                other => other?,
+            };
 
         let stop_reason = message.stop_reason;
         new_messages.push(Message::Assistant(message.clone()));
@@ -112,6 +121,15 @@ pub fn run(
         }
 
         for tc in &tool_calls {
+            // Check for cancellation/shutdown before each tool call so that
+            // a cancel request received while a previous tool was running
+            // prevents the remaining tools in this batch from executing.
+            if config.should_stop.as_ref().is_some_and(|f| f()) {
+                return Ok(AgentResult {
+                    new_messages,
+                    max_turns_reached: false,
+                });
+            }
             let result = worker.execute(tc)?;
             new_messages.push(Message::ToolResult(result.clone()));
             context.messages.push(Message::ToolResult(result));
@@ -149,7 +167,14 @@ fn stream_with_retry(
 ) -> crate::Result<AssistantMessage> {
     for attempt in 0..=config.max_retries {
         let rx = registry.stream(model, context, options)?;
-        let message = consume_stream(rx, on_event)?;
+        let should_stop = config.should_stop.as_deref();
+        let message = consume_stream(rx, on_event, should_stop);
+
+        // Propagate cancellation immediately — no retry.
+        let message = match message {
+            Err(crate::Error::Cancelled) => return Err(crate::Error::Cancelled),
+            other => other?,
+        };
 
         if message.stop_reason == StopReason::Error
             && let Some(ref err_msg) = message.error_message
@@ -179,11 +204,28 @@ fn stream_with_retry(
 }
 
 /// Consume a stream, forwarding events and returning the final message.
+///
+/// `should_stop` is polled between events so that a cancel/shutdown signal
+/// received while the stream is in-flight can abort it promptly rather than
+/// waiting for the full response to finish.
 fn consume_stream(
     rx: EventReceiver,
     on_event: &mut EventCallback,
+    should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> crate::Result<AssistantMessage> {
     loop {
+        // Check cancellation between events.
+        if should_stop.is_some_and(|f| f()) {
+            // Drain the channel without forwarding so the provider thread
+            // can finish and clean up, then return an aborted message.
+            while let Ok(event) = rx.recv_blocking() {
+                if matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. }) {
+                    break;
+                }
+            }
+            return Err(crate::Error::Cancelled);
+        }
+
         match rx.recv_blocking() {
             Ok(event) => {
                 let is_done =

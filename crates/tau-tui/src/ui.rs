@@ -125,8 +125,17 @@ fn draw_messages(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
 
-    let total_lines = all_lines.len() as u16;
+    // Pad with empty lines so content is bottom-aligned (starts just above input)
+    let content_lines = all_lines.len() as u16;
     let visible = area.height;
+    if content_lines < visible {
+        let pad = visible - content_lines;
+        let mut padded = vec![Line::from(""); pad as usize];
+        padded.append(&mut all_lines);
+        all_lines = padded;
+    }
+
+    let total_lines = all_lines.len() as u16;
 
     // Calculate scroll position (scroll_offset=0 means bottom)
     let max_scroll = total_lines.saturating_sub(visible);

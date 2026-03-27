@@ -46,6 +46,8 @@ pub enum Request {
     AuthStatus,
     /// Fetch subscription usage (OAuth only, cached 5 min).
     GetSubscriptionUsage,
+    /// Cancel an in-progress chat (agent loop) for a session.
+    CancelChat { session_id: String },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -85,6 +87,8 @@ pub enum Response {
     },
     /// Server is shutting down. Clients should reconnect if restart=true.
     ServerShutdown { restart: bool },
+    /// Agent loop was cancelled by the user.
+    Cancelled,
     /// Agent loop completed (all turns done).
     AgentDone,
     /// Success (generic ack).

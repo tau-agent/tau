@@ -1,5 +1,6 @@
 //! Unix socket server — manages sessions and streams LLM responses.
 
+use std::collections::HashMap;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -126,6 +127,8 @@ struct State {
     all_models: Vec<Model>,
     /// Cached subscription usage (value, fetched_at_ms).
     usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
+    /// Per-session cancel flags.  Set by CancelChat, cleared on Chat start.
+    cancel_flags: HashMap<String, Arc<AtomicBool>>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -256,6 +259,7 @@ pub async fn run() -> crate::Result<()> {
         default_model,
         all_models,
         usage_cache: None,
+        cancel_flags: HashMap::new(),
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -463,6 +467,16 @@ async fn handle_client(
                     .await?;
                     continue;
                 }
+                // Reset (and create) the cancel flag for this session.
+                let cancel_flag: Arc<AtomicBool> = {
+                    let mut st = state.lock().unwrap();
+                    let flag = st
+                        .cancel_flags
+                        .entry(session_id.clone())
+                        .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+                    flag.store(false, Ordering::Relaxed);
+                    flag.clone()
+                };
                 // Load session
                 let session_data = {
                     let st = state.lock().unwrap();
@@ -492,9 +506,16 @@ async fn handle_client(
                         messages: messages.clone(),
                         tools: Vec::new(),
                     };
-                    let cont_result =
-                        run_agent_turn(&state, &shutdown, &model, &mut context, &cwd, &mut writer)
-                            .await;
+                    let cont_result = run_agent_turn(
+                        &state,
+                        &shutdown,
+                        cancel_flag.clone(),
+                        &model,
+                        &mut context,
+                        &cwd,
+                        &mut writer,
+                    )
+                    .await;
                     match cont_result {
                         Ok(new_msgs) => {
                             let st = state.lock().unwrap();
@@ -525,9 +546,16 @@ async fn handle_client(
 
                 // Run agent loop
                 let mut context = context;
-                let result =
-                    run_agent_turn(&state, &shutdown, &model, &mut context, &cwd, &mut writer)
-                        .await;
+                let result = run_agent_turn(
+                    &state,
+                    &shutdown,
+                    cancel_flag.clone(),
+                    &model,
+                    &mut context,
+                    &cwd,
+                    &mut writer,
+                )
+                .await;
 
                 match result {
                     Ok(new_msgs) => {
@@ -535,6 +563,11 @@ async fn handle_client(
                         for msg in &new_msgs {
                             st.db.append_message(&session_id, msg)?;
                         }
+                    }
+                    Err(crate::Error::Cancelled) => {
+                        // Stream was aborted mid-flight by the cancel flag;
+                        // treat it the same as a normal cancellation.
+                        cancel_flag.store(true, Ordering::Relaxed);
                     }
                     Err(e) => {
                         send(
@@ -550,23 +583,31 @@ async fn handle_client(
                 }
 
                 // Check compaction
-                let should = {
-                    let st = state.lock().unwrap();
-                    let messages = st.db.get_messages(&session_id)?;
-                    let ctx_tokens = compaction::estimate_context_tokens(&messages);
-                    compaction::should_compact(
-                        ctx_tokens,
-                        model.context_window,
-                        &compaction::CompactionSettings::default(),
-                    )
-                };
-                if should
-                    && let Err(e) = run_compaction(&state, &session_id, &model, &mut writer).await
-                {
-                    eprintln!("compaction error: {}", e);
+                let was_cancelled = cancel_flag.load(Ordering::Relaxed);
+                if !was_cancelled {
+                    let should = {
+                        let st = state.lock().unwrap();
+                        let messages = st.db.get_messages(&session_id)?;
+                        let ctx_tokens = compaction::estimate_context_tokens(&messages);
+                        compaction::should_compact(
+                            ctx_tokens,
+                            model.context_window,
+                            &compaction::CompactionSettings::default(),
+                        )
+                    };
+                    if should
+                        && let Err(e) =
+                            run_compaction(&state, &session_id, &model, &mut writer).await
+                    {
+                        eprintln!("compaction error: {}", e);
+                    }
                 }
 
-                send(&mut writer, &Response::AgentDone).await?;
+                if was_cancelled {
+                    send(&mut writer, &Response::Cancelled).await?;
+                } else {
+                    send(&mut writer, &Response::AgentDone).await?;
+                }
 
                 if shutdown.is_shutting_down() {
                     send(
@@ -578,6 +619,20 @@ async fn handle_client(
                     .await
                     .ok();
                 }
+            }
+            Request::CancelChat { session_id } => {
+                {
+                    let mut st = state.lock().unwrap();
+                    if let Some(flag) = st.cancel_flags.get(&session_id) {
+                        flag.store(true, Ordering::Relaxed);
+                    } else {
+                        // No active chat — create a pre-set flag so the next Chat
+                        // is immediately cancelled (race-free).
+                        st.cancel_flags
+                            .insert(session_id, Arc::new(AtomicBool::new(true)));
+                    }
+                } // lock released before await
+                send(&mut writer, &Response::Ok).await?;
             }
             Request::ListSessions => {
                 let sessions = {
@@ -780,6 +835,7 @@ async fn handle_client(
 async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     state: &SharedState,
     shutdown: &ShutdownHandle,
+    cancel_flag: Arc<AtomicBool>,
     model: &Model,
     context: &mut Context,
     cwd: &str,
@@ -804,8 +860,11 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
 
     let shutdown_flag = shutdown.flag.clone();
+    let cancel_flag_clone = cancel_flag.clone();
     let agent_config = crate::agent::AgentConfig {
-        should_stop: Some(Box::new(move || shutdown_flag.load(Ordering::Relaxed))),
+        should_stop: Some(Box::new(move || {
+            shutdown_flag.load(Ordering::Relaxed) || cancel_flag_clone.load(Ordering::Relaxed)
+        })),
         ..Default::default()
     };
 
