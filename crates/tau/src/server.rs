@@ -411,8 +411,8 @@ async fn handle_client(
                         .flatten()
                         .is_some_and(|c| matches!(c, AuthCredential::Oauth(_)));
                     let id = st.db.next_session_id()?;
-                    let system_prompt =
-                        system_prompt.or_else(|| Some(crate::system_prompt::build(cwd.as_deref())));
+                    let system_prompt = system_prompt
+                        .or_else(|| Some(crate::system_prompt::build_default(cwd.as_deref())));
                     let stored = StoredSession {
                         id: id.clone(),
                         model,

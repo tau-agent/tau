@@ -475,7 +475,7 @@ impl App {
             Response::UserMessage { text } => {
                 // Another client sent a message — display it
                 self.messages.push(MessageItem::User { text: text.clone() });
-                self.scroll_offset = 0;
+                // Don't reset scroll if user has scrolled up to read history
             }
             Response::Models { models } => {
                 for m in &models {
@@ -523,7 +523,10 @@ impl App {
                 if let Some(MessageItem::AssistantStreaming { text }) = self.messages.last_mut() {
                     text.push_str(&delta);
                 }
-                self.scroll_offset = 0;
+                // Only auto-scroll to bottom if user hasn't scrolled up
+                if self.scroll_offset == 0 {
+                    // already at bottom, nothing to do
+                }
             }
             StreamEvent::TextEnd { .. } => {
                 // Convert streaming to complete
