@@ -58,13 +58,19 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         return;
     }
 
-    // Build all message lines
+    // Build all message lines with single empty line between messages
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     for msg in &app.messages {
         let text = msg.to_text(area.width, theme);
-        for line in text.lines {
-            all_lines.push(line);
+        let msg_lines: Vec<Line<'static>> = text.lines.into_iter().collect();
+        if msg_lines.is_empty() {
+            continue;
         }
+        // Add separator before this message (if there's already content)
+        if !all_lines.is_empty() {
+            all_lines.push(Line::from(""));
+        }
+        all_lines.extend(msg_lines);
     }
 
     // Add working indicator if streaming
@@ -74,7 +80,9 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             Some(crate::message::MessageItem::AssistantStreaming { .. })
         );
         if needs_indicator {
-            all_lines.push(Line::from(""));
+            if !all_lines.is_empty() {
+                all_lines.push(Line::from(""));
+            }
             all_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(app.spinner().to_string(), theme.spinner_style()),
@@ -84,9 +92,7 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 
     // Always end with an empty line so there's a gap above the input field
-    if !all_lines.is_empty() {
-        all_lines.push(Line::from(""));
-    }
+    all_lines.push(Line::from(""));
 
     // Pad with empty lines so content is bottom-aligned (starts just above input)
     let content_lines = all_lines.len() as u16;

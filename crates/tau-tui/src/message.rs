@@ -2,6 +2,9 @@
 //!
 //! Pi-style rendering: message types are differentiated purely by background
 //! color. No labels like "You" or "Assistant".
+//!
+//! Note: messages do NOT include leading/trailing empty lines for spacing.
+//! The caller (ui.rs draw_messages) handles inter-message spacing.
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -34,45 +37,60 @@ pub enum MessageItem {
 /// Pad each line to `width` so the background color fills the full row.
 fn fill_bg(lines: &mut [Line<'static>], style: Style, width: u16) {
     for line in lines.iter_mut() {
-        // Calculate current visible width
         let visible: usize = line.spans.iter().map(|s| s.content.len()).sum();
         let pad = (width as usize).saturating_sub(visible);
         if pad > 0 {
             line.spans.push(Span::styled(" ".repeat(pad), style));
         }
-        // Apply bg style to the whole line
         *line = line.clone().style(style);
     }
 }
 
+fn tool_block(
+    bg_style: Style,
+    title_style: Style,
+    name: &str,
+    detail: &str,
+    detail_style: Style,
+    width: u16,
+) -> Text<'static> {
+    let mut lines = vec![
+        Line::from(Span::styled(" ", bg_style)), // top padding
+        Line::from(vec![
+            Span::styled(format!(" {}", name), title_style),
+            Span::styled(format!(" {}", detail), detail_style),
+        ]),
+        Line::from(Span::styled(" ", bg_style)), // bottom padding
+    ];
+    fill_bg(&mut lines, bg_style, width);
+    Text::from(lines)
+}
+
 impl MessageItem {
     /// Render this item to ratatui `Text` for the given width.
+    /// Does NOT include leading/trailing spacer lines — caller handles spacing.
     pub fn to_text(&self, width: u16, theme: &Theme) -> Text<'static> {
         match self {
             MessageItem::User { text } => {
                 let bg_style = theme.bg(theme.user_message_bg);
                 let text_style = bg_style.fg(theme.user_message_text.to_ratatui());
 
-                // Empty line before, then content with userMessageBg
-                let mut lines = vec![Line::from("")];
-
-                // Content lines with padding
-                let mut content_lines: Vec<Line<'static>> = Vec::new();
-                content_lines.push(Line::from(Span::styled(" ", bg_style))); // top padding
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                lines.push(Line::from(Span::styled(" ", bg_style))); // top padding
                 for l in text.lines() {
-                    content_lines.push(Line::from(Span::styled(format!(" {}", l), text_style)));
+                    lines.push(Line::from(Span::styled(format!(" {}", l), text_style)));
                 }
-                content_lines.push(Line::from(Span::styled(" ", bg_style))); // bottom padding
-
-                fill_bg(&mut content_lines, bg_style, width);
-                lines.extend(content_lines);
+                lines.push(Line::from(Span::styled(" ", bg_style))); // bottom padding
+                fill_bg(&mut lines, bg_style, width);
                 Text::from(lines)
             }
             MessageItem::Assistant { text } | MessageItem::AssistantStreaming { text } => {
-                // No background — just text with padding
-                let mut lines = vec![Line::from("")];
+                let mut lines: Vec<Line<'static>> = Vec::new();
                 for l in text.lines() {
                     lines.push(Line::from(format!(" {}", l)));
+                }
+                if lines.is_empty() {
+                    lines.push(Line::from(""));
                 }
                 // Streaming cursor
                 if matches!(self, MessageItem::AssistantStreaming { .. })
@@ -104,72 +122,50 @@ impl MessageItem {
                 let title_style = bg_style
                     .fg(theme.tool_title.to_ratatui())
                     .add_modifier(Modifier::BOLD);
-
-                let mut lines = vec![
-                    Line::from(""),
-                    Line::from(Span::styled(" ", bg_style)), // top padding
-                    Line::from(vec![
-                        Span::styled(format!(" {}", name), title_style),
-                        Span::styled(
-                            format!(" {}", preview),
-                            bg_style.fg(theme.tool_output.to_ratatui()),
-                        ),
-                    ]),
-                    Line::from(Span::styled(" ", bg_style)), // bottom padding
-                ];
-                fill_bg(&mut lines, bg_style, width);
-                Text::from(lines)
+                tool_block(
+                    bg_style,
+                    title_style,
+                    name,
+                    preview,
+                    bg_style.fg(theme.tool_output.to_ratatui()),
+                    width,
+                )
             }
             MessageItem::Tool { name, preview } => {
                 let bg_style = theme.tool_success_style();
                 let title_style = bg_style
                     .fg(theme.tool_title.to_ratatui())
                     .add_modifier(Modifier::BOLD);
-
-                let mut lines = vec![
-                    Line::from(""),
-                    Line::from(Span::styled(" ", bg_style)),
-                    Line::from(vec![
-                        Span::styled(format!(" {}", name), title_style),
-                        Span::styled(
-                            format!(" {}", preview),
-                            bg_style.fg(theme.tool_output.to_ratatui()),
-                        ),
-                    ]),
-                    Line::from(Span::styled(" ", bg_style)),
-                ];
-                fill_bg(&mut lines, bg_style, width);
-                Text::from(lines)
+                tool_block(
+                    bg_style,
+                    title_style,
+                    name,
+                    preview,
+                    bg_style.fg(theme.tool_output.to_ratatui()),
+                    width,
+                )
             }
             MessageItem::ToolError { name, message } => {
                 let bg_style = theme.tool_error_style();
                 let title_style = bg_style
                     .fg(theme.error.to_ratatui())
                     .add_modifier(Modifier::BOLD);
-
-                let mut lines = vec![
-                    Line::from(""),
-                    Line::from(Span::styled(" ", bg_style)),
-                    Line::from(vec![
-                        Span::styled(format!(" {}", name), title_style),
-                        Span::styled(
-                            format!(" {}", message),
-                            bg_style.fg(theme.tool_output.to_ratatui()),
-                        ),
-                    ]),
-                    Line::from(Span::styled(" ", bg_style)),
-                ];
-                fill_bg(&mut lines, bg_style, width);
-                Text::from(lines)
+                tool_block(
+                    bg_style,
+                    title_style,
+                    name,
+                    message,
+                    bg_style.fg(theme.tool_output.to_ratatui()),
+                    width,
+                )
             }
-            MessageItem::Status { text } => Text::from(vec![
-                Line::from(""),
-                Line::from(Span::styled(format!(" {}", text), theme.status_style())),
-            ]),
+            MessageItem::Status { text } => Text::from(Line::from(Span::styled(
+                format!(" {}", text),
+                theme.status_style(),
+            ))),
             MessageItem::Error { text } => {
                 let bg_style = theme.error_style();
                 let mut lines = vec![
-                    Line::from(""),
                     Line::from(Span::styled(" ", bg_style)),
                     Line::from(Span::styled(format!(" error: {}", text), bg_style)),
                     Line::from(Span::styled(" ", bg_style)),
