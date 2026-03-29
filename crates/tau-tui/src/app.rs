@@ -86,6 +86,8 @@ pub struct App {
     pub history_index: Option<usize>,
     /// Saved text when entering history browse (restored on down past end).
     pub history_saved_text: String,
+    /// Whether to fetch subscription usage after session info.
+    pub pending_subscription_usage: bool,
     /// Server stream ended.
     pub server_done: bool,
 }
@@ -115,6 +117,7 @@ impl App {
             queued_messages: Vec::new(),
             history_index: None,
             history_saved_text: String::new(),
+            pending_subscription_usage: false,
             server_done: false,
         }
     }
@@ -207,6 +210,11 @@ impl App {
             Event::Terminal(ct_event) => self.handle_terminal_event(ct_event),
             Event::Server(response) => {
                 self.handle_server_response(response);
+                // Fetch subscription usage if requested
+                if self.pending_subscription_usage {
+                    self.pending_subscription_usage = false;
+                    return Some(Action::GetSubscriptionUsage);
+                }
                 // After AgentDone, drain queued steering messages
                 if self.mode == AppMode::Input && !self.queued_messages.is_empty() {
                     let queued = self.queued_messages.remove(0);
@@ -579,6 +587,37 @@ impl App {
                         info.id, info.provider, info.model, info.message_count, stats_str
                     ),
                 });
+                // Queue subscription usage fetch if applicable
+                if info.stats.is_subscription {
+                    self.pending_subscription_usage = true;
+                }
+            }
+            Response::SubscriptionUsage { usage } => {
+                use tau::auth::UsageBucket;
+                let fmt_bucket = |b: &Option<UsageBucket>| -> String {
+                    match b.as_ref().and_then(|b| b.utilization) {
+                        Some(u) => format!("{:.0}%", u),
+                        None => "?".into(),
+                    }
+                };
+                let mut parts = Vec::new();
+                if usage.five_hour.is_some() {
+                    parts.push(format!("5h: {}", fmt_bucket(&usage.five_hour)));
+                }
+                if usage.seven_day.is_some() {
+                    parts.push(format!("7d: {}", fmt_bucket(&usage.seven_day)));
+                }
+                if usage.seven_day_sonnet.is_some() {
+                    parts.push(format!("sonnet: {}", fmt_bucket(&usage.seven_day_sonnet)));
+                }
+                if usage.seven_day_opus.is_some() {
+                    parts.push(format!("opus: {}", fmt_bucket(&usage.seven_day_opus)));
+                }
+                if !parts.is_empty() {
+                    self.messages.push(MessageItem::Status {
+                        text: format!("usage: {}", parts.join(" | ")),
+                    });
+                }
             }
             _ => {}
         }
@@ -750,6 +789,7 @@ pub enum Action {
     ListModels,
     SetModel(String),
     GetStatus,
+    GetSubscriptionUsage,
     SetCwd(String),
     /// Send the next queued steering message.
     SendQueued(String),

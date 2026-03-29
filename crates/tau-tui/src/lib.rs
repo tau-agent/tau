@@ -175,6 +175,9 @@ async fn run_inner(
                     )
                     .await?;
                 }
+                Action::GetSubscriptionUsage => {
+                    send_request_and_recv(Request::GetSubscriptionUsage, server_tx.clone()).await?;
+                }
                 Action::SetCwd(cwd) => {
                     send_request_and_recv(
                         Request::SetCwd {
