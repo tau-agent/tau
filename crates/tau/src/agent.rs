@@ -142,6 +142,8 @@ pub fn run(
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
+            // Collapse whitespace for single-line display
+            let preview: String = preview.split_whitespace().collect::<Vec<_>>().join(" ");
             let preview = if preview.len() > 120 {
                 format!("{}...", &preview[..120])
             } else {
