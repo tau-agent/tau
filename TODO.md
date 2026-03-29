@@ -3,7 +3,7 @@
 ## UI Polish
 
 - [x] **Working spinner**: match pi-agent's spinner style and "Working..." text exactly
-- [ ] **Shift+Enter in input**: code is wired up but doesn't work — most terminals send Shift+Enter as plain Enter. Need to enable Kitty keyboard protocol in crossterm to distinguish them.
+- [x] **Shift+Enter in input**: enabled via Kitty keyboard protocol (PushKeyboardEnhancementFlags). Falls back gracefully on terminals that don't support it.
 - [ ] **Soft line wrapping in input**: tui-textarea doesn't wrap long lines — they scroll horizontally. Need custom widget or upstream support.
 
 ## Session Continuity

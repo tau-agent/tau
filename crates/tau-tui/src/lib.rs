@@ -10,7 +10,10 @@ mod ui;
 
 use std::io;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -41,6 +44,16 @@ pub async fn run(
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .map_err(|e| tau::Error::Io(e.to_string()))?;
+    // Enable Kitty keyboard protocol for Shift+Enter etc.
+    // Silently ignored if terminal doesn't support it.
+    execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )
+    .ok();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| tau::Error::Io(e.to_string()))?;
 
@@ -56,6 +69,7 @@ pub async fn run(
 
     // Restore terminal
     disable_raw_mode().ok();
+    execute!(io::stdout(), PopKeyboardEnhancementFlags).ok();
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
