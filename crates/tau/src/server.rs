@@ -585,18 +585,10 @@ async fn handle_client(
                     let results = pm.call_hook("before_agent_start", &hook_data);
                     for result in results {
                         if let Some(msg) = result.message {
+                            // Inject into context for this turn only — NOT persisted to DB.
+                            // Persisting would break prompt caching (prefix changes each turn
+                            // as context varies). The hook re-injects fresh context each turn.
                             let ctx_msg = Message::User(UserMessage::text(&msg.content));
-                            {
-                                let st = state.lock().unwrap();
-                                st.db.append_message(&session_id, &ctx_msg)?;
-                            }
-                            broadcast_to_subscribers(
-                                &state,
-                                &session_id,
-                                &Response::UserMessage {
-                                    text: msg.content.clone(),
-                                },
-                            );
                             messages.push(ctx_msg);
                         }
                         if let Some(sp) = result.system_prompt {
