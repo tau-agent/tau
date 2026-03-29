@@ -570,9 +570,14 @@ async fn handle_client(
                     let results = pm.call_hook("before_agent_start", &hook_data);
                     for result in results {
                         if let Some(msg) = result.message {
-                            // Inject context before user message. Transient (not in DB)
-                            // so the cached prefix (persisted messages) stays stable.
+                            // Inject context before user message. Persisted so the
+                            // assistant's response (which may reference context) makes
+                            // sense in future turns. Becomes part of the cached prefix.
                             let ctx_msg = Message::User(UserMessage::text(&msg.content));
+                            {
+                                let st = state.lock().unwrap();
+                                st.db.append_message(&session_id, &ctx_msg)?;
+                            }
                             messages.push(ctx_msg);
                         }
                         if let Some(sp) = result.system_prompt {
