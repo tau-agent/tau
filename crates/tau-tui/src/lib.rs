@@ -94,8 +94,9 @@ async fn run_inner(
     // Event loop merges terminal + server + tick
     let event_loop = EventLoop::new(server_rx);
 
-    // Subscribe to session events (for multi-client support).
-    // This background connection receives events from other clients' Chat requests.
+    // Subscribe to session events.
+    // This is the single source of truth for all session-related responses
+    // (Stream, AgentDone, Cancelled, UserMessage). Chat requests are fire-and-forget.
     let sub_tx = server_tx.clone();
     let sub_session_id = app.session_id.clone();
     smol::spawn(async move {
@@ -107,7 +108,6 @@ async fn run_inner(
                 .await
                 .is_ok()
         {
-            // Read lines indefinitely (subscriber connection stays open).
             let _ = client
                 .recv_lines(|resp| {
                     let _ = sub_tx.try_send(resp.clone());
@@ -135,22 +135,22 @@ async fn run_inner(
             let sid = app.session_id.clone();
             match action {
                 Action::SendChat(text) | Action::SendQueued(text) => {
-                    send_request_and_recv(
-                        Request::Chat {
-                            session_id: sid,
-                            text,
-                        },
-                        server_tx.clone(),
-                    )
+                    // Fire-and-forget: responses arrive via Subscribe connection
+                    send_fire_and_forget(Request::Chat {
+                        session_id: sid,
+                        text,
+                    })
                     .await?;
                 }
                 Action::CancelChat => {
-                    // Send cancel on a fresh connection (fire-and-forget)
+                    // Fire-and-forget: Cancelled arrives via Subscribe connection
+                    let sid_clone = sid;
                     smol::spawn(async move {
-                        if let Ok(mut c) = Client::connect().await {
-                            let _ = c.send(&Request::CancelChat { session_id: sid }).await;
-                            let _ = c.recv_streaming(|_| {}).await;
-                        }
+                        send_fire_and_forget(Request::CancelChat {
+                            session_id: sid_clone,
+                        })
+                        .await
+                        .ok();
                     })
                     .detach();
                 }
@@ -204,6 +204,7 @@ async fn run_inner(
         .any(|m| matches!(m, crate::message::MessageItem::User { .. }));
     if !has_user_messages {
         let sid = app.session_id.clone();
+        // Use send+recv for delete since it's not broadcast via Subscribe
         send_request_and_recv(Request::DeleteSession { session_id: sid }, server_tx)
             .await
             .ok();
@@ -233,8 +234,18 @@ async fn fetch_messages(session_id: &str) -> tau::Result<Vec<tau::types::Message
     messages.ok_or_else(|| tau::Error::Io("no messages response".into()))
 }
 
+/// Send a request and forget — don't recv responses.
+/// Used for Chat and CancelChat where responses arrive via the Subscribe connection.
+async fn send_fire_and_forget(req: Request) -> tau::Result<()> {
+    let mut client = Client::connect().await?;
+    client.send(&req).await?;
+    // Connection drops — server will still process the request and broadcast events.
+    Ok(())
+}
+
 /// Open a fresh connection, send a request, and spawn a background task
 /// that receives all streaming responses and forwards them to `tx`.
+/// Used for point-to-point requests (ListModels, SetModel, etc.) that aren't broadcast.
 async fn send_request_and_recv(req: Request, tx: Sender<Response>) -> tau::Result<()> {
     let mut client = Client::connect().await?;
     client.send(&req).await?;

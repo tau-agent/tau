@@ -583,14 +583,14 @@ async fn handle_client(
                         cancel_flag.store(true, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: format!("agent error: {}", e),
-                            },
-                        )
-                        .await?;
-                        send(&mut writer, &Response::AgentDone).await?;
+                        let err_resp = Response::Error {
+                            message: format!("agent error: {}", e),
+                        };
+                        let done_resp = Response::AgentDone;
+                        broadcast_to_subscribers(&state, &session_id, &err_resp);
+                        broadcast_to_subscribers(&state, &session_id, &done_resp);
+                        send(&mut writer, &err_resp).await.ok();
+                        send(&mut writer, &done_resp).await.ok();
                         continue;
                     }
                 }
@@ -619,11 +619,11 @@ async fn handle_client(
                 if was_cancelled {
                     let resp = Response::Cancelled;
                     broadcast_to_subscribers(&state, &session_id, &resp);
-                    send(&mut writer, &resp).await?;
+                    send(&mut writer, &resp).await.ok();
                 } else {
                     let resp = Response::AgentDone;
                     broadcast_to_subscribers(&state, &session_id, &resp);
-                    send(&mut writer, &resp).await?;
+                    send(&mut writer, &resp).await.ok();
                 }
 
                 if shutdown.is_shutting_down() {
@@ -695,7 +695,7 @@ async fn handle_client(
                             .insert(session_id, Arc::new(AtomicBool::new(true)));
                     }
                 } // lock released before await
-                send(&mut writer, &Response::Ok).await?;
+                send(&mut writer, &Response::Ok).await.ok();
             }
             Request::ListSessions => {
                 let sessions = {
@@ -967,12 +967,17 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     let state_clone = state.clone();
     let session_id_owned = session_id.to_string();
     let forward_handle = async {
+        let mut writer_alive = true;
         while let Ok(event) = event_rx.recv().await {
             let resp = Response::Stream {
                 event: Box::new(event),
             };
             broadcast_to_subscribers(&state_clone, &session_id_owned, &resp);
-            send(writer, &resp).await?;
+            // Keep broadcasting even if the direct writer disconnected
+            // (fire-and-forget clients close immediately).
+            if writer_alive && send(writer, &resp).await.is_err() {
+                writer_alive = false;
+            }
         }
         Ok::<(), crate::Error>(())
     };
