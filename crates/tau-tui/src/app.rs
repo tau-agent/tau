@@ -290,14 +290,14 @@ impl App {
     fn handle_input_key(&mut self, key: &KeyEvent) -> Option<Action> {
         match (key.code, key.modifiers) {
             // Ctrl+D on empty input: quit
-            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
                 if self.textarea.lines().iter().all(|l: &String| l.is_empty()) {
                     self.should_quit = true;
                 }
                 None
             }
             // Ctrl+C: quit
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
                 None
             }
@@ -401,7 +401,7 @@ impl App {
                 None
             }
             // Ctrl+U for scroll up
-            (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('u'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.scroll_up(5);
                 None
             }
@@ -456,11 +456,16 @@ impl App {
                 None
             }
             // Ctrl+C during streaming: cancel
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.messages.push(MessageItem::Status {
                     text: "[cancelling...]".into(),
                 });
                 Some(Action::CancelChat)
+            }
+            // Ctrl+D during streaming: quit
+            (KeyCode::Char('d'), m) if m.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+                None
             }
             // Page up/down still works during streaming
             (KeyCode::PageUp, _) => {
