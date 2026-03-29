@@ -107,10 +107,13 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let total_lines = all_lines.len() as u16;
 
-    // Calculate scroll position (scroll_offset=0 means bottom)
+    // Calculate scroll: None = follow bottom, Some(pos) = pinned at pos from top
     let max_scroll = total_lines.saturating_sub(visible);
     app.max_scroll.set(max_scroll);
-    let scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
+    let scroll = match app.scroll_pos {
+        None => max_scroll,               // follow bottom
+        Some(pos) => pos.min(max_scroll), // pinned
+    };
 
     let paragraph = Paragraph::new(Text::from(all_lines))
         .wrap(Wrap { trim: false })
@@ -120,8 +123,9 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     // Scrollbar
     if total_lines > visible {
-        let mut scrollbar_state = ScrollbarState::new(max_scroll as usize)
-            .position((max_scroll - scroll.min(max_scroll)) as usize);
+        let scroll_from_bottom = max_scroll.saturating_sub(scroll);
+        let mut scrollbar_state =
+            ScrollbarState::new(max_scroll as usize).position(scroll_from_bottom as usize);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight).style(theme.scrollbar_style()),
             area,

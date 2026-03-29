@@ -225,9 +225,6 @@ async fn run_inner(
             break;
         }
 
-        // Stabilize scroll (keep viewport fixed when content grows while scrolled up)
-        app.stabilize_scroll();
-
         // Draw
         terminal
             .draw(|f| ui::draw(f, &app, &app.theme))

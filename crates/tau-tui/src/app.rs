@@ -66,12 +66,10 @@ pub struct App {
     pub messages: Vec<MessageItem>,
     /// Current mode.
     pub mode: AppMode,
-    /// Scroll offset (0 = bottom, increases upward).
-    pub scroll_offset: u16,
+    /// Scroll position. None = follow bottom (auto-scroll). Some(pos) = pinned at line pos from top.
+    pub scroll_pos: Option<u16>,
     /// Max scroll value from last render (set during draw via Cell).
     pub max_scroll: std::cell::Cell<u16>,
-    /// Previous max_scroll for viewport stabilization.
-    pub prev_max_scroll: u16,
     /// Usage totals.
     pub totals: UsageTotals,
     /// Should the app quit?
@@ -107,9 +105,9 @@ impl App {
             provider,
             messages: Vec::new(),
             mode: AppMode::Input,
-            scroll_offset: 0,
+            scroll_pos: None,
             max_scroll: std::cell::Cell::new(0),
-            prev_max_scroll: 0,
+
             totals: UsageTotals::default(),
             should_quit: false,
             textarea,
@@ -207,15 +205,42 @@ impl App {
         self.textarea.insert_str(text);
     }
 
-    /// Stabilize scroll: when scrolled up and max_scroll grew, increase offset
-    /// to keep the viewport at the same content position.
-    pub fn stabilize_scroll(&mut self) {
-        let new_max = self.max_scroll.get();
-        if self.scroll_offset > 0 && new_max > self.prev_max_scroll {
-            let delta = new_max - self.prev_max_scroll;
-            self.scroll_offset = self.scroll_offset.saturating_add(delta).min(new_max);
+    /// Scroll up by N lines (pins viewport if not already pinned).
+    pub fn scroll_up(&mut self, lines: u16) {
+        let max = self.max_scroll.get();
+        let current_top = match self.scroll_pos {
+            Some(pos) => pos,
+            None => max, // at bottom, so top = max_scroll
+        };
+        self.scroll_pos = Some(current_top.saturating_sub(lines));
+    }
+
+    /// Scroll down by N lines (unpins if reaching bottom).
+    pub fn scroll_down(&mut self, lines: u16) {
+        if let Some(pos) = self.scroll_pos {
+            let max = self.max_scroll.get();
+            let new_pos = pos.saturating_add(lines);
+            if new_pos >= max {
+                self.scroll_pos = None; // back to bottom, unpin
+            } else {
+                self.scroll_pos = Some(new_pos);
+            }
         }
-        self.prev_max_scroll = new_max;
+    }
+
+    /// Jump to bottom (unpin).
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_pos = None;
+    }
+
+    /// Jump to top.
+    pub fn scroll_to_top(&mut self) {
+        self.scroll_pos = Some(0);
+    }
+
+    /// Whether the user is scrolled up (not following bottom).
+    pub fn is_scrolled(&self) -> bool {
+        self.scroll_pos.is_some()
     }
 
     /// Handle an event, returning an optional request to send to the server.
@@ -233,7 +258,7 @@ impl App {
                 if self.mode == AppMode::Input && !self.queued_messages.is_empty() {
                     let queued = self.queued_messages.remove(0);
                     // Don't add user message locally — it arrives via Subscribe broadcast
-                    self.scroll_offset = 0;
+                    self.scroll_to_bottom();
                     self.mode = AppMode::Streaming;
                     return Some(Action::SendQueued(queued.text));
                 }
@@ -257,7 +282,8 @@ impl App {
         let CtEvent::Key(key) = &event else {
             return None;
         };
-        if key.kind != KeyEventKind::Press {
+        // Accept Press and Repeat (for key-hold), ignore Release
+        if key.kind == KeyEventKind::Release {
             return None;
         }
 
@@ -297,7 +323,7 @@ impl App {
                 }
 
                 // Don't add user message locally — it arrives via Subscribe broadcast
-                self.scroll_offset = 0;
+                self.scroll_to_bottom();
                 self.mode = AppMode::Streaming;
                 self.history_index = None;
                 Some(Action::SendChat(text))
@@ -331,14 +357,11 @@ impl App {
             }
             // Page up/down for scrolling
             (KeyCode::PageUp, _) => {
-                self.scroll_offset = self
-                    .scroll_offset
-                    .saturating_add(10)
-                    .min(self.max_scroll.get());
+                self.scroll_up(10);
                 None
             }
             (KeyCode::PageDown, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                self.scroll_down(10);
                 None
             }
             // Up arrow: browse history when on first line
@@ -385,20 +408,17 @@ impl App {
             }
             // Ctrl+U for scroll up
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.scroll_offset = self
-                    .scroll_offset
-                    .saturating_add(5)
-                    .min(self.max_scroll.get());
+                self.scroll_up(5);
                 None
             }
             // Home: scroll to top when scrolled, else pass to textarea
-            (KeyCode::Home, KeyModifiers::NONE) if self.scroll_offset > 0 => {
-                self.scroll_offset = self.max_scroll.get();
+            (KeyCode::Home, KeyModifiers::NONE) if self.is_scrolled() => {
+                self.scroll_to_top();
                 None
             }
             // End: scroll to bottom when scrolled, else pass to textarea
-            (KeyCode::End, KeyModifiers::NONE) if self.scroll_offset > 0 => {
-                self.scroll_offset = 0;
+            (KeyCode::End, KeyModifiers::NONE) if self.is_scrolled() => {
+                self.scroll_to_bottom();
                 None
             }
             // Everything else goes to textarea
@@ -450,23 +470,20 @@ impl App {
             }
             // Page up/down still works during streaming
             (KeyCode::PageUp, _) => {
-                self.scroll_offset = self
-                    .scroll_offset
-                    .saturating_add(10)
-                    .min(self.max_scroll.get());
+                self.scroll_up(10);
                 None
             }
             (KeyCode::PageDown, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                self.scroll_down(10);
                 None
             }
             // Home/End for scroll during streaming
             (KeyCode::Home, KeyModifiers::NONE) => {
-                self.scroll_offset = self.max_scroll.get();
+                self.scroll_to_top();
                 None
             }
             (KeyCode::End, KeyModifiers::NONE) => {
-                self.scroll_offset = 0;
+                self.scroll_to_bottom();
                 None
             }
             // All other keys go to textarea (compose steering message while streaming)
@@ -583,7 +600,6 @@ impl App {
             Response::AgentDone => {
                 self.cleanup_empty_streaming();
                 self.mode = AppMode::Input;
-                self.scroll_offset = 0;
             }
             Response::Cancelled => {
                 self.cleanup_empty_streaming();
@@ -600,7 +616,6 @@ impl App {
                     });
                 }
                 self.mode = AppMode::Input;
-                self.scroll_offset = 0;
             }
             Response::ServerShutdown { restart } => {
                 if restart {
@@ -710,7 +725,7 @@ impl App {
                     text.push_str(&delta);
                 }
                 // Only auto-scroll to bottom if user hasn't scrolled up
-                if self.scroll_offset == 0 {
+                if !self.is_scrolled() {
                     // already at bottom, nothing to do
                 }
             }
