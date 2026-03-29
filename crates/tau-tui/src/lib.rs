@@ -42,9 +42,11 @@ pub async fn run(
     // Set up terminal
     enable_raw_mode().map_err(|e| tau::Error::Io(e.to_string()))?;
     let mut stdout = io::stdout();
-    // Enable Kitty keyboard protocol for Shift+Enter etc.
-    // Must be done before entering alternate screen.
-    // Silently ignored if terminal doesn't support it.
+    // Enable keyboard enhancement for Shift+Enter etc.
+    // Send both Kitty protocol AND xterm modifyOtherKeys:
+    // - Kitty protocol works on Ghostty, Kitty, WezTerm etc.
+    // - modifyOtherKeys mode 2 works in tmux with extended-keys
+    // Terminals ignore sequences they don't understand.
     execute!(
         stdout,
         PushKeyboardEnhancementFlags(
@@ -53,6 +55,12 @@ pub async fn run(
         )
     )
     .ok();
+    {
+        // xterm modifyOtherKeys mode 2
+        use io::Write;
+        let _ = stdout.write_all(b"\x1b[>4;2m");
+        let _ = stdout.flush();
+    }
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .map_err(|e| tau::Error::Io(e.to_string()))?;
     let backend = CrosstermBackend::new(stdout);
@@ -71,6 +79,12 @@ pub async fn run(
     // Restore terminal
     // Restore terminal — pop keyboard enhancement before leaving alternate screen
     execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
+    {
+        // Disable xterm modifyOtherKeys
+        use io::Write;
+        let _ = io::stdout().write_all(b"\x1b[>4;0m");
+        let _ = io::stdout().flush();
+    }
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
