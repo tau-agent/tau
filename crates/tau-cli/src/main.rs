@@ -1120,7 +1120,8 @@ async fn cmd_sessions_list() -> tau::Result<()> {
                 } else {
                     for s in sessions {
                         let stats = tau::protocol::format_stats(&s.stats);
-                        println!("{}\t{}/{}\t{}", s.id, s.provider, s.model, stats);
+                        let cwd = s.cwd.as_deref().unwrap_or("");
+                        println!("{}	{}/{}	{}	{}", s.id, s.provider, s.model, cwd, stats);
                     }
                 }
             }
