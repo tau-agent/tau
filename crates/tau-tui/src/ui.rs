@@ -95,20 +95,44 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     all_lines.push(Line::from(""));
     all_lines.push(Line::from(""));
 
+    // Count visual lines (accounting for wrapping)
+    let w = area.width.max(1) as usize;
+    let visual_lines: u16 = all_lines
+        .iter()
+        .map(|line| {
+            let width = line.width();
+            if width == 0 {
+                1
+            } else {
+                width.div_ceil(w) as u16
+            }
+        })
+        .sum();
+
     // Pad with empty lines so content is bottom-aligned (starts just above input)
-    let content_lines = all_lines.len() as u16;
     let visible = area.height;
-    if content_lines < visible {
-        let pad = visible - content_lines;
+    if visual_lines < visible {
+        let pad = visible - visual_lines;
         let mut padded = vec![Line::from(""); pad as usize];
         padded.append(&mut all_lines);
         all_lines = padded;
     }
 
-    let total_lines = all_lines.len() as u16;
+    // Recalculate after padding
+    let total_visual: u16 = all_lines
+        .iter()
+        .map(|line| {
+            let width = line.width();
+            if width == 0 {
+                1
+            } else {
+                width.div_ceil(w) as u16
+            }
+        })
+        .sum();
 
     // Calculate scroll: None = follow bottom, Some(pos) = pinned at pos from top
-    let max_scroll = total_lines.saturating_sub(visible);
+    let max_scroll = total_visual.saturating_sub(visible);
     app.max_scroll.set(max_scroll);
     let scroll = match app.scroll_pos.get() {
         None => max_scroll, // follow bottom
@@ -129,7 +153,7 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     frame.render_widget(paragraph, area);
 
     // Scrollbar
-    if total_lines > visible {
+    if total_visual > visible {
         let scroll_from_bottom = max_scroll.saturating_sub(scroll);
         let mut scrollbar_state =
             ScrollbarState::new(max_scroll as usize).position(scroll_from_bottom as usize);
