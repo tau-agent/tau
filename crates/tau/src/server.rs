@@ -520,6 +520,12 @@ async fn handle_client(
                 };
                 let model = stored.model.clone();
 
+                // Notify plugins of session start
+                {
+                    let mut pm = plugins.lock().unwrap();
+                    pm.notify_session_start(&cwd, &session_id);
+                }
+
                 // If session was interrupted mid-tool-call, continue first
                 if crate::agent::needs_continuation(&messages) {
                     let mut context = Context {
