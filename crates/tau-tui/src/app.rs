@@ -67,9 +67,9 @@ pub struct App {
     /// Current mode.
     pub mode: AppMode,
     /// Scroll position. None = follow bottom (auto-scroll). Some(pos) = pinned at line pos from top.
-    pub scroll_pos: std::cell::Cell<Option<u16>>,
+    pub scroll_pos: std::cell::Cell<Option<usize>>,
     /// Max scroll value from last render (set during draw via Cell).
-    pub max_scroll: std::cell::Cell<u16>,
+    pub max_scroll: std::cell::Cell<usize>,
     /// Usage totals.
     pub totals: UsageTotals,
     /// Should the app quit?
@@ -207,7 +207,7 @@ impl App {
     }
 
     /// Scroll up by N lines (pins viewport if not already pinned).
-    pub fn scroll_up(&mut self, lines: u16) {
+    pub fn scroll_up(&mut self, lines: usize) {
         let max = self.max_scroll.get();
         let current_top = match self.scroll_pos.get() {
             Some(pos) => pos,
@@ -217,7 +217,7 @@ impl App {
     }
 
     /// Scroll down by N lines. Use scroll_to_bottom() / End to unpin.
-    pub fn scroll_down(&mut self, lines: u16) {
+    pub fn scroll_down(&mut self, lines: usize) {
         if let Some(pos) = self.scroll_pos.get() {
             self.scroll_pos.set(Some(pos.saturating_add(lines)));
         }

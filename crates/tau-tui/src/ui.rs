@@ -96,18 +96,18 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     // Use Line count directly (no Wrap on the Paragraph — we don't wrap).
     // Long lines are handled by the terminal / ratatui truncation.
-    let total_lines = all_lines.len() as u16;
-    let visible = area.height;
+    let total_lines = all_lines.len();
+    let visible = area.height as usize;
 
     // Pad with empty lines so content is bottom-aligned (starts just above input)
     if total_lines < visible {
         let pad = visible - total_lines;
-        let mut padded = vec![Line::from(""); pad as usize];
+        let mut padded = vec![Line::from(""); pad];
         padded.append(&mut all_lines);
         all_lines = padded;
     }
 
-    let total_lines = all_lines.len() as u16;
+    let total_lines = all_lines.len();
 
     // Calculate scroll: None = follow bottom, Some(pos) = pinned at pos from top
     let max_scroll = total_lines.saturating_sub(visible);
@@ -124,15 +124,14 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     };
 
-    let paragraph = Paragraph::new(Text::from(all_lines)).scroll((scroll, 0));
+    let paragraph = Paragraph::new(Text::from(all_lines)).scroll((scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
 
     // Scrollbar
     if total_lines > visible {
         let scroll_from_bottom = max_scroll.saturating_sub(scroll);
-        let mut scrollbar_state =
-            ScrollbarState::new(max_scroll as usize).position(scroll_from_bottom as usize);
+        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll_from_bottom);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight).style(theme.scrollbar_style()),
             area,
