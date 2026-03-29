@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 
 use tau::protocol::format_tokens;
@@ -94,44 +94,23 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Empty line above the input field
     all_lines.push(Line::from(""));
 
-    // Count visual lines (accounting for wrapping)
-    let w = area.width.max(1) as usize;
-    let visual_lines: u16 = all_lines
-        .iter()
-        .map(|line| {
-            let width = line.width();
-            if width == 0 {
-                1
-            } else {
-                width.div_ceil(w) as u16
-            }
-        })
-        .sum();
+    // Use Line count directly (no Wrap on the Paragraph — we don't wrap).
+    // Long lines are handled by the terminal / ratatui truncation.
+    let total_lines = all_lines.len() as u16;
+    let visible = area.height;
 
     // Pad with empty lines so content is bottom-aligned (starts just above input)
-    let visible = area.height;
-    if visual_lines < visible {
-        let pad = visible - visual_lines;
+    if total_lines < visible {
+        let pad = visible - total_lines;
         let mut padded = vec![Line::from(""); pad as usize];
         padded.append(&mut all_lines);
         all_lines = padded;
     }
 
-    // Recalculate after padding
-    let total_visual: u16 = all_lines
-        .iter()
-        .map(|line| {
-            let width = line.width();
-            if width == 0 {
-                1
-            } else {
-                width.div_ceil(w) as u16
-            }
-        })
-        .sum();
+    let total_lines = all_lines.len() as u16;
 
     // Calculate scroll: None = follow bottom, Some(pos) = pinned at pos from top
-    let max_scroll = total_visual.saturating_sub(visible);
+    let max_scroll = total_lines.saturating_sub(visible);
     app.max_scroll.set(max_scroll);
     let scroll = match app.scroll_pos.get() {
         None => max_scroll, // follow bottom
@@ -145,14 +124,12 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     };
 
-    let paragraph = Paragraph::new(Text::from(all_lines))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let paragraph = Paragraph::new(Text::from(all_lines)).scroll((scroll, 0));
 
     frame.render_widget(paragraph, area);
 
     // Scrollbar
-    if total_visual > visible {
+    if total_lines > visible {
         let scroll_from_bottom = max_scroll.saturating_sub(scroll);
         let mut scrollbar_state =
             ScrollbarState::new(max_scroll as usize).position(scroll_from_bottom as usize);
