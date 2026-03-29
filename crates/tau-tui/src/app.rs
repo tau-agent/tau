@@ -609,7 +609,6 @@ impl App {
             }
             StreamEvent::Done { message, .. } => {
                 self.totals.add(&message.usage);
-                // Ensure the final text is captured
                 let final_text: String = message
                     .content
                     .iter()
@@ -620,11 +619,15 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                // Update the last streaming message if present
+                // Update or remove the last streaming message
                 if let Some(item) = self.messages.last_mut()
                     && let MessageItem::AssistantStreaming { .. } = item
                 {
-                    *item = MessageItem::Assistant { text: final_text };
+                    if final_text.is_empty() {
+                        self.messages.pop(); // remove empty streaming placeholder
+                    } else {
+                        *item = MessageItem::Assistant { text: final_text };
+                    }
                 }
             }
             StreamEvent::Error { error, .. } => {
