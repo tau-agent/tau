@@ -53,12 +53,58 @@ fn input_area_height(app: &App, width: u16) -> u16 {
 // Messages
 // ---------------------------------------------------------------------------
 
+/// Wrap a single Line into multiple lines at `width` character boundaries.
+/// Preserves span styles across the split.
+fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line];
+    }
+    let line_width = line.width();
+    if line_width <= width {
+        return vec![line];
+    }
+
+    // Flatten all spans into (char, Style) pairs, then re-chunk
+    let style = line.style;
+    let mut chars: Vec<(char, ratatui::style::Style)> = Vec::new();
+    for span in &line.spans {
+        let span_style = style.patch(span.style);
+        for ch in span.content.chars() {
+            chars.push((ch, span_style));
+        }
+    }
+
+    let mut result = Vec::new();
+    for chunk in chars.chunks(width) {
+        // Group consecutive chars with same style into spans
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut current_text = String::new();
+        let mut current_style = chunk[0].1;
+        for &(ch, st) in chunk {
+            if st == current_style {
+                current_text.push(ch);
+            } else {
+                spans.push(Span::styled(current_text, current_style));
+                current_text = String::new();
+                current_text.push(ch);
+                current_style = st;
+            }
+        }
+        if !current_text.is_empty() {
+            spans.push(Span::styled(current_text, current_style));
+        }
+        result.push(Line::from(spans));
+    }
+    result
+}
+
 fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if area.height == 0 {
         return;
     }
 
     // Build all message lines with single empty line between messages
+    let w = area.width as usize;
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     for msg in &app.messages {
         let text = msg.to_text(area.width, theme, &app.renderers);
@@ -70,7 +116,10 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         if !all_lines.is_empty() {
             all_lines.push(Line::from(""));
         }
-        all_lines.extend(msg_lines);
+        // Pre-wrap long lines so Line count == visual row count
+        for line in msg_lines {
+            all_lines.extend(wrap_line(line, w));
+        }
     }
 
     // Add working indicator if streaming
