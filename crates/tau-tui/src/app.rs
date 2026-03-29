@@ -67,7 +67,7 @@ pub struct App {
     /// Current mode.
     pub mode: AppMode,
     /// Scroll position. None = follow bottom (auto-scroll). Some(pos) = pinned at line pos from top.
-    pub scroll_pos: Option<u16>,
+    pub scroll_pos: std::cell::Cell<Option<u16>>,
     /// Max scroll value from last render (set during draw via Cell).
     pub max_scroll: std::cell::Cell<u16>,
     /// Usage totals.
@@ -105,7 +105,7 @@ impl App {
             provider,
             messages: Vec::new(),
             mode: AppMode::Input,
-            scroll_pos: None,
+            scroll_pos: std::cell::Cell::new(None),
             max_scroll: std::cell::Cell::new(0),
 
             totals: UsageTotals::default(),
@@ -208,39 +208,33 @@ impl App {
     /// Scroll up by N lines (pins viewport if not already pinned).
     pub fn scroll_up(&mut self, lines: u16) {
         let max = self.max_scroll.get();
-        let current_top = match self.scroll_pos {
+        let current_top = match self.scroll_pos.get() {
             Some(pos) => pos,
-            None => max, // at bottom, so top = max_scroll
+            None => max,
         };
-        self.scroll_pos = Some(current_top.saturating_sub(lines));
+        self.scroll_pos.set(Some(current_top.saturating_sub(lines)));
     }
 
-    /// Scroll down by N lines (unpins if reaching bottom).
+    /// Scroll down by N lines. Use scroll_to_bottom() / End to unpin.
     pub fn scroll_down(&mut self, lines: u16) {
-        if let Some(pos) = self.scroll_pos {
-            let max = self.max_scroll.get();
-            let new_pos = pos.saturating_add(lines);
-            if new_pos >= max {
-                self.scroll_pos = None; // back to bottom, unpin
-            } else {
-                self.scroll_pos = Some(new_pos);
-            }
+        if let Some(pos) = self.scroll_pos.get() {
+            self.scroll_pos.set(Some(pos.saturating_add(lines)));
         }
     }
 
     /// Jump to bottom (unpin).
     pub fn scroll_to_bottom(&mut self) {
-        self.scroll_pos = None;
+        self.scroll_pos.set(None);
     }
 
     /// Jump to top.
     pub fn scroll_to_top(&mut self) {
-        self.scroll_pos = Some(0);
+        self.scroll_pos.set(Some(0));
     }
 
     /// Whether the user is scrolled up (not following bottom).
     pub fn is_scrolled(&self) -> bool {
-        self.scroll_pos.is_some()
+        self.scroll_pos.get().is_some()
     }
 
     /// Handle an event, returning an optional request to send to the server.

@@ -110,9 +110,16 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Calculate scroll: None = follow bottom, Some(pos) = pinned at pos from top
     let max_scroll = total_lines.saturating_sub(visible);
     app.max_scroll.set(max_scroll);
-    let scroll = match app.scroll_pos {
-        None => max_scroll,               // follow bottom
-        Some(pos) => pos.min(max_scroll), // pinned
+    let scroll = match app.scroll_pos.get() {
+        None => max_scroll, // follow bottom
+        Some(pos) => {
+            let clamped = pos.min(max_scroll);
+            // Auto-unpin if scrolled all the way to the bottom
+            if clamped >= max_scroll {
+                app.scroll_pos.set(None);
+            }
+            clamped
+        }
     };
 
     let paragraph = Paragraph::new(Text::from(all_lines))
