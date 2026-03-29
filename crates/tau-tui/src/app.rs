@@ -68,8 +68,10 @@ pub struct App {
     pub mode: AppMode,
     /// Scroll offset (0 = bottom, increases upward).
     pub scroll_offset: u16,
-    /// Max scroll value from last render (used to clamp scroll_offset).
+    /// Max scroll value from last render (set during draw via Cell).
     pub max_scroll: std::cell::Cell<u16>,
+    /// Previous max_scroll for viewport stabilization.
+    pub prev_max_scroll: u16,
     /// Usage totals.
     pub totals: UsageTotals,
     /// Should the app quit?
@@ -107,6 +109,7 @@ impl App {
             mode: AppMode::Input,
             scroll_offset: 0,
             max_scroll: std::cell::Cell::new(0),
+            prev_max_scroll: 0,
             totals: UsageTotals::default(),
             should_quit: false,
             textarea,
@@ -202,6 +205,17 @@ impl App {
         self.textarea.select_all();
         self.textarea.cut();
         self.textarea.insert_str(text);
+    }
+
+    /// Stabilize scroll: when scrolled up and max_scroll grew, increase offset
+    /// to keep the viewport at the same content position.
+    pub fn stabilize_scroll(&mut self) {
+        let new_max = self.max_scroll.get();
+        if self.scroll_offset > 0 && new_max > self.prev_max_scroll {
+            let delta = new_max - self.prev_max_scroll;
+            self.scroll_offset = self.scroll_offset.saturating_add(delta).min(new_max);
+        }
+        self.prev_max_scroll = new_max;
     }
 
     /// Handle an event, returning an optional request to send to the server.
@@ -377,6 +391,16 @@ impl App {
                     .min(self.max_scroll.get());
                 None
             }
+            // Home: scroll to top when scrolled, else pass to textarea
+            (KeyCode::Home, KeyModifiers::NONE) if self.scroll_offset > 0 => {
+                self.scroll_offset = self.max_scroll.get();
+                None
+            }
+            // End: scroll to bottom when scrolled, else pass to textarea
+            (KeyCode::End, KeyModifiers::NONE) if self.scroll_offset > 0 => {
+                self.scroll_offset = 0;
+                None
+            }
             // Everything else goes to textarea
             _ => {
                 // Reset history browsing on any other key
@@ -434,6 +458,15 @@ impl App {
             }
             (KeyCode::PageDown, _) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
+                None
+            }
+            // Home/End for scroll during streaming
+            (KeyCode::Home, KeyModifiers::NONE) => {
+                self.scroll_offset = self.max_scroll.get();
+                None
+            }
+            (KeyCode::End, KeyModifiers::NONE) => {
+                self.scroll_offset = 0;
                 None
             }
             // All other keys go to textarea (compose steering message while streaming)
@@ -731,7 +764,6 @@ impl App {
                 {
                     output_lines.push(delta);
                 }
-                self.scroll_offset = 0;
             }
             StreamEvent::ToolResult {
                 tool_name,

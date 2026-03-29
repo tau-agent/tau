@@ -45,7 +45,7 @@ pub enum MessageItem {
 /// Pad each line to `width` so the background color fills the full row.
 pub fn fill_bg(lines: &mut [Line<'static>], style: Style, width: u16) {
     for line in lines.iter_mut() {
-        let visible: usize = line.spans.iter().map(|s| s.content.len()).sum();
+        let visible = line.width();
         let pad = (width as usize).saturating_sub(visible);
         if pad > 0 {
             line.spans.push(Span::styled(" ".repeat(pad), style));
