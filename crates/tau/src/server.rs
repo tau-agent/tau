@@ -559,7 +559,29 @@ async fn handle_client(
                     }
                 }
 
-                // Now append user message and run the main agent loop
+                // Call before_agent_start hooks (plugins inject context before user message)
+                let mut system_prompt = stored.system_prompt.clone();
+                {
+                    let mut pm = plugins.lock().unwrap();
+                    let hook_data = serde_json::json!({
+                        "prompt": &text,
+                        "system_prompt": &system_prompt,
+                    });
+                    let results = pm.call_hook("before_agent_start", &hook_data);
+                    for result in results {
+                        if let Some(msg) = result.message {
+                            // Inject context before user message. Transient (not in DB)
+                            // so the cached prefix (persisted messages) stays stable.
+                            let ctx_msg = Message::User(UserMessage::text(&msg.content));
+                            messages.push(ctx_msg);
+                        }
+                        if let Some(sp) = result.system_prompt {
+                            system_prompt = Some(sp);
+                        }
+                    }
+                }
+
+                // Now append user message (persisted to DB)
                 let user_msg = Message::User(UserMessage::text(&text));
                 {
                     let st = state.lock().unwrap();
@@ -573,29 +595,6 @@ async fn handle_client(
                     &session_id,
                     &Response::UserMessage { text: text.clone() },
                 );
-
-                // Call before_agent_start hooks (plugins can inject context)
-                let mut system_prompt = stored.system_prompt.clone();
-                {
-                    let mut pm = plugins.lock().unwrap();
-                    let hook_data = serde_json::json!({
-                        "prompt": &text,
-                        "system_prompt": &system_prompt,
-                    });
-                    let results = pm.call_hook("before_agent_start", &hook_data);
-                    for result in results {
-                        if let Some(msg) = result.message {
-                            // Inject into context for this turn only — NOT persisted to DB.
-                            // Persisting would break prompt caching (prefix changes each turn
-                            // as context varies). The hook re-injects fresh context each turn.
-                            let ctx_msg = Message::User(UserMessage::text(&msg.content));
-                            messages.push(ctx_msg);
-                        }
-                        if let Some(sp) = result.system_prompt {
-                            system_prompt = Some(sp);
-                        }
-                    }
-                }
 
                 let mut context = Context {
                     system_prompt,
