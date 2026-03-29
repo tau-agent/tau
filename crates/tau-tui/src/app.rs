@@ -638,6 +638,12 @@ impl App {
                 }
             }
             StreamEvent::ToolcallEnd { tool_call, .. } => {
+                // Remove empty streaming placeholder before tool call
+                if let Some(MessageItem::AssistantStreaming { text }) = self.messages.last()
+                    && text.is_empty()
+                {
+                    self.messages.pop();
+                }
                 // Start active tool display
                 self.messages.push(MessageItem::ToolActive {
                     name: tool_call.name,
