@@ -14,6 +14,9 @@ pub struct TuiSettings {
     /// Active theme name (e.g. "dark", "light").
     #[serde(default)]
     pub theme: Option<String>,
+    /// Default model (e.g. "claude-sonnet-4-6").
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn settings_path() -> PathBuf {
@@ -65,10 +68,12 @@ mod tests {
         let s = Settings {
             tui: TuiSettings {
                 theme: Some("light".into()),
+                model: Some("claude-sonnet-4-6".into()),
             },
         };
         let toml_str = toml::to_string_pretty(&s).unwrap();
         let parsed: Settings = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.tui.theme.as_deref(), Some("light"));
+        assert_eq!(parsed.tui.model.as_deref(), Some("claude-sonnet-4-6"));
     }
 }

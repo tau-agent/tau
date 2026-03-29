@@ -457,7 +457,18 @@ impl App {
                 if args.is_empty() {
                     Some(Action::ListModels)
                 } else {
-                    Some(Action::SetModel(args.to_string()))
+                    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                    let model_id = parts[0].to_string();
+                    let set_default = parts.get(1).is_some_and(|s| s.trim() == "default");
+                    if set_default {
+                        let mut s = crate::settings::load();
+                        s.tui.model = Some(model_id.clone());
+                        crate::settings::save(&s);
+                        self.messages.push(MessageItem::Status {
+                            text: format!("default model: {}", model_id),
+                        });
+                    }
+                    Some(Action::SetModel(model_id))
                 }
             }
             "/status" => Some(Action::GetStatus),

@@ -4,7 +4,7 @@ mod app;
 mod events;
 mod message;
 mod render;
-mod settings;
+pub mod settings;
 pub mod theme;
 mod ui;
 
