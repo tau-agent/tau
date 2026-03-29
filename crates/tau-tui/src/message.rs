@@ -119,7 +119,8 @@ impl MessageItem {
                 started_at,
             } => {
                 let renderer = renderers.get(name);
-                let lines = renderer.render_active(args, output_lines, *started_at, theme, width);
+                let lines =
+                    renderer.render_active(name, args, output_lines, *started_at, theme, width);
                 Text::from(lines)
             }
             MessageItem::ToolComplete {
@@ -130,8 +131,8 @@ impl MessageItem {
                 duration,
             } => {
                 let renderer = renderers.get(name);
-                let lines =
-                    renderer.render_complete(args, output, *is_error, *duration, theme, width);
+                let lines = renderer
+                    .render_complete(name, args, output, *is_error, *duration, theme, width);
                 Text::from(lines)
             }
             MessageItem::Status { text } => Text::from(Line::from(Span::styled(

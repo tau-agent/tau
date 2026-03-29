@@ -48,10 +48,12 @@ fn format_duration(d: Duration) -> String {
 }
 
 /// Trait for rendering tool calls and results.
+#[allow(clippy::too_many_arguments)]
 pub trait ToolRenderer {
     /// Render an actively running tool (output streaming in).
     fn render_active(
         &self,
+        name: &str,
         args: &Value,
         output_lines: &[String],
         started_at: Instant,
@@ -62,6 +64,7 @@ pub trait ToolRenderer {
     /// Render a completed tool.
     fn render_complete(
         &self,
+        name: &str,
         args: &Value,
         output: &str,
         is_error: bool,
@@ -147,6 +150,7 @@ pub struct DefaultRenderer;
 impl ToolRenderer for DefaultRenderer {
     fn render_active(
         &self,
+        name: &str,
         args: &Value,
         output: &[String],
         _started_at: Instant,
@@ -155,7 +159,7 @@ impl ToolRenderer for DefaultRenderer {
     ) -> Vec<Line<'static>> {
         let bg = theme.tool_pending_style();
         let args_preview = truncate_str(&args.to_string(), 80);
-        let mut lines = vec![header_line("tool", &args_preview, theme, bg)];
+        let mut lines = vec![header_line(name, &args_preview, theme, bg)];
         if !output.is_empty() {
             lines.extend(output_lines(output, theme, bg, DEFAULT_MAX_LINES));
         }
@@ -164,6 +168,7 @@ impl ToolRenderer for DefaultRenderer {
 
     fn render_complete(
         &self,
+        name: &str,
         args: &Value,
         output: &str,
         is_error: bool,
@@ -177,7 +182,7 @@ impl ToolRenderer for DefaultRenderer {
             theme.tool_success_style()
         };
         let args_preview = truncate_str(&args.to_string(), 80);
-        let mut lines = vec![header_line("tool", &args_preview, theme, bg)];
+        let mut lines = vec![header_line(name, &args_preview, theme, bg)];
         if !output.is_empty() {
             let out: Vec<String> = output.lines().map(String::from).collect();
             lines.extend(output_lines(&out, theme, bg, DEFAULT_MAX_LINES));
@@ -210,6 +215,7 @@ impl BashRenderer {
 impl ToolRenderer for BashRenderer {
     fn render_active(
         &self,
+        _name: &str,
         args: &Value,
         output: &[String],
         started_at: Instant,
@@ -232,6 +238,7 @@ impl ToolRenderer for BashRenderer {
 
     fn render_complete(
         &self,
+        _name: &str,
         args: &Value,
         output: &str,
         is_error: bool,
@@ -312,6 +319,7 @@ struct EditRenderer;
 impl ToolRenderer for EditRenderer {
     fn render_active(
         &self,
+        _name: &str,
         args: &Value,
         _output: &[String],
         _started_at: Instant,
@@ -326,6 +334,7 @@ impl ToolRenderer for EditRenderer {
 
     fn render_complete(
         &self,
+        _name: &str,
         args: &Value,
         _output: &str,
         is_error: bool,
@@ -400,6 +409,7 @@ struct ReadRenderer;
 impl ToolRenderer for ReadRenderer {
     fn render_active(
         &self,
+        _name: &str,
         args: &Value,
         _output: &[String],
         _started_at: Instant,
@@ -418,6 +428,7 @@ impl ToolRenderer for ReadRenderer {
 
     fn render_complete(
         &self,
+        _name: &str,
         args: &Value,
         output: &str,
         is_error: bool,
@@ -451,6 +462,7 @@ struct WriteRenderer;
 impl ToolRenderer for WriteRenderer {
     fn render_active(
         &self,
+        _name: &str,
         args: &Value,
         _output: &[String],
         _started_at: Instant,
@@ -465,6 +477,7 @@ impl ToolRenderer for WriteRenderer {
 
     fn render_complete(
         &self,
+        _name: &str,
         args: &Value,
         output: &str,
         is_error: bool,
