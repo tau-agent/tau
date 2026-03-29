@@ -28,6 +28,7 @@ pub enum MessageItem {
         name: String,
         args: serde_json::Value,
         output_lines: Vec<String>,
+        started_at: std::time::Instant,
     },
     /// Tool execution completed.
     ToolComplete {
@@ -35,6 +36,7 @@ pub enum MessageItem {
         args: serde_json::Value,
         output: String,
         is_error: bool,
+        duration: std::time::Duration,
     },
     /// Status line (e.g. "[cancelled]", "[Working...]").
     Status { text: String },
@@ -114,9 +116,10 @@ impl MessageItem {
                 name,
                 args,
                 output_lines,
+                started_at,
             } => {
                 let renderer = renderers.get(name);
-                let lines = renderer.render_active(args, output_lines, theme, width);
+                let lines = renderer.render_active(args, output_lines, *started_at, theme, width);
                 Text::from(lines)
             }
             MessageItem::ToolComplete {
@@ -124,9 +127,11 @@ impl MessageItem {
                 args,
                 output,
                 is_error,
+                duration,
             } => {
                 let renderer = renderers.get(name);
-                let lines = renderer.render_complete(args, output, *is_error, theme, width);
+                let lines =
+                    renderer.render_complete(args, output, *is_error, *duration, theme, width);
                 Text::from(lines)
             }
             MessageItem::Status { text } => Text::from(Line::from(Span::styled(

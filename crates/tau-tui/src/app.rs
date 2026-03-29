@@ -178,6 +178,7 @@ impl App {
                         args: serde_json::Value::Null,
                         output,
                         is_error: *is_error,
+                        duration: std::time::Duration::ZERO,
                     });
                 }
                 Message::CompactionSummary(_) => {
@@ -770,6 +771,7 @@ impl App {
                     name: tool_call.name,
                     args: tool_call.arguments,
                     output_lines: Vec::new(),
+                    started_at: std::time::Instant::now(),
                 });
             }
             StreamEvent::ToolOutputDelta { delta, .. } => {
@@ -787,25 +789,29 @@ impl App {
             } => {
                 // Replace active tool with completed tool
                 if let Some(last @ MessageItem::ToolActive { .. }) = self.messages.last_mut() {
-                    // Extract args from the active item
-                    let args = if let MessageItem::ToolActive { args, .. } = last {
-                        args.clone()
-                    } else {
-                        serde_json::Value::Null
-                    };
+                    let (args, started_at) =
+                        if let MessageItem::ToolActive {
+                            args, started_at, ..
+                        } = last
+                        {
+                            (args.clone(), *started_at)
+                        } else {
+                            (serde_json::Value::Null, std::time::Instant::now())
+                        };
                     *last = MessageItem::ToolComplete {
                         name: tool_name,
                         args,
                         output: content,
                         is_error,
+                        duration: started_at.elapsed(),
                     };
                 } else {
-                    // Fallback: no active tool (shouldn't happen normally)
                     self.messages.push(MessageItem::ToolComplete {
                         name: tool_name,
                         args: serde_json::Value::Null,
                         output: content,
                         is_error,
+                        duration: std::time::Duration::ZERO,
                     });
                 }
             }

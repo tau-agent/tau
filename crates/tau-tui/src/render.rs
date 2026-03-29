@@ -27,6 +27,26 @@ fn clamp_lines<'a>(lines: &[Line<'a>], max: usize, theme: &Theme) -> Vec<Line<'a
     result
 }
 
+use std::time::{Duration, Instant};
+
+/// Format a duration for human display.
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 0.1 {
+        format!("{:.0}ms", d.as_millis())
+    } else if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else if secs < 3600.0 {
+        let m = (secs / 60.0).floor() as u64;
+        let s = (secs % 60.0).floor() as u64;
+        format!("{}m {}s", m, s)
+    } else {
+        let h = (secs / 3600.0).floor() as u64;
+        let m = ((secs % 3600.0) / 60.0).floor() as u64;
+        format!("{}h {}m", h, m)
+    }
+}
+
 /// Trait for rendering tool calls and results.
 pub trait ToolRenderer {
     /// Render an actively running tool (output streaming in).
@@ -34,6 +54,7 @@ pub trait ToolRenderer {
         &self,
         args: &Value,
         output_lines: &[String],
+        started_at: Instant,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>>;
@@ -44,6 +65,7 @@ pub trait ToolRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
+        duration: Duration,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>>;
@@ -127,6 +149,7 @@ impl ToolRenderer for DefaultRenderer {
         &self,
         args: &Value,
         output: &[String],
+        _started_at: Instant,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -144,6 +167,7 @@ impl ToolRenderer for DefaultRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
+        _duration: Duration,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -168,17 +192,38 @@ impl ToolRenderer for DefaultRenderer {
 
 struct BashRenderer;
 
+impl BashRenderer {
+    fn bash_header(args: &Value, suffix: &str, theme: &Theme, bg: Style) -> Line<'static> {
+        let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("?");
+        let timeout = args.get("timeout").and_then(|t| t.as_u64());
+        let mut info = format!("$ {}", command);
+        if let Some(t) = timeout {
+            info.push_str(&format!(" (timeout {}s)", t));
+        }
+        if !suffix.is_empty() {
+            info.push_str(&format!(" {}", suffix));
+        }
+        header_line("bash", &info, theme, bg)
+    }
+}
+
 impl ToolRenderer for BashRenderer {
     fn render_active(
         &self,
         args: &Value,
         output: &[String],
+        started_at: Instant,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
         let bg = theme.tool_pending_style();
-        let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("?");
-        let mut lines = vec![header_line("bash", command, theme, bg)];
+        let elapsed = format_duration(started_at.elapsed());
+        let mut lines = vec![BashRenderer::bash_header(
+            args,
+            &format!("(elapsed {})", elapsed),
+            theme,
+            bg,
+        )];
         if !output.is_empty() {
             lines.extend(output_lines(output, theme, bg, DEFAULT_MAX_LINES));
         }
@@ -190,6 +235,7 @@ impl ToolRenderer for BashRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
+        duration: Duration,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -198,13 +244,62 @@ impl ToolRenderer for BashRenderer {
         } else {
             theme.tool_success_style()
         };
-        let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("?");
-        let mut lines = vec![header_line("bash", command, theme, bg)];
-        if !output.is_empty() {
-            let out: Vec<String> = output.lines().map(String::from).collect();
-            lines.extend(output_lines(&out, theme, bg, DEFAULT_MAX_LINES));
+        let mut lines = vec![BashRenderer::bash_header(args, "", theme, bg)];
+
+        // Output lines
+        let output_text = output.trim_end();
+        if output_text.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (no output)",
+                bg.fg(theme.dim.to_ratatui()),
+            )));
+        } else {
+            // Strip trailing "(exit code: N)" from output since we show it separately
+            let clean = if let Some(code) = extract_exit_code(output_text) {
+                output_text
+                    .strip_suffix(&format!("\n(exit code: {})", code))
+                    .unwrap_or(output_text)
+            } else {
+                output_text
+            };
+            if clean.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  (no output)",
+                    bg.fg(theme.dim.to_ratatui()),
+                )));
+            } else {
+                let out: Vec<String> = clean.lines().map(String::from).collect();
+                lines.extend(output_lines(&out, theme, bg, DEFAULT_MAX_LINES));
+            }
         }
+
+        // Metadata footer
+        let meta_style = bg.fg(theme.dim.to_ratatui());
+        if let Some(code) = extract_exit_code(output_text)
+            && code != 0
+        {
+            lines.push(Line::from(Span::styled(
+                format!("  Command exited with code {}", code),
+                meta_style,
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  Took {}", format_duration(duration)),
+            meta_style,
+        )));
+
         wrap_tool_block(lines, bg, width)
+    }
+}
+
+/// Try to extract exit code from bash output ("(exit code: N)" at end).
+fn extract_exit_code(output: &str) -> Option<i32> {
+    let trimmed = output.trim_end();
+    if let Some(idx) = trimmed.rfind("(exit code: ") {
+        let rest = &trimmed[idx + "(exit code: ".len()..];
+        rest.strip_suffix(')').and_then(|s| s.parse().ok())
+    } else {
+        None
     }
 }
 
@@ -219,6 +314,7 @@ impl ToolRenderer for EditRenderer {
         &self,
         args: &Value,
         _output: &[String],
+        _started_at: Instant,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -233,6 +329,7 @@ impl ToolRenderer for EditRenderer {
         args: &Value,
         _output: &str,
         is_error: bool,
+        _duration: Duration,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -305,6 +402,7 @@ impl ToolRenderer for ReadRenderer {
         &self,
         args: &Value,
         _output: &[String],
+        _started_at: Instant,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -323,6 +421,7 @@ impl ToolRenderer for ReadRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
+        _duration: Duration,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -354,6 +453,7 @@ impl ToolRenderer for WriteRenderer {
         &self,
         args: &Value,
         _output: &[String],
+        _started_at: Instant,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -368,6 +468,7 @@ impl ToolRenderer for WriteRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
+        _duration: Duration,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
