@@ -511,6 +511,15 @@ impl App {
         }
     }
 
+    /// Remove empty AssistantStreaming placeholder if present.
+    fn cleanup_empty_streaming(&mut self) {
+        if let Some(MessageItem::AssistantStreaming { text }) = self.messages.last()
+            && text.is_empty()
+        {
+            self.messages.pop();
+        }
+    }
+
     fn handle_server_response(&mut self, response: Response) {
         match response {
             Response::Stream { event } => {
@@ -522,10 +531,12 @@ impl App {
                 self.handle_stream_event(*event);
             }
             Response::AgentDone => {
+                self.cleanup_empty_streaming();
                 self.mode = AppMode::Input;
                 self.scroll_offset = 0;
             }
             Response::Cancelled => {
+                self.cleanup_empty_streaming();
                 // Replace "cancelling" status with "cancelled"
                 if let Some(last) = self.messages.last_mut()
                     && matches!(last, MessageItem::Status { text } if text.contains("cancelling"))
@@ -533,6 +544,10 @@ impl App {
                     *last = MessageItem::Status {
                         text: "[cancelled]".into(),
                     };
+                } else {
+                    self.messages.push(MessageItem::Status {
+                        text: "[cancelled]".into(),
+                    });
                 }
                 self.mode = AppMode::Input;
                 self.scroll_offset = 0;
@@ -550,6 +565,7 @@ impl App {
                 }
             }
             Response::Error { message } => {
+                self.cleanup_empty_streaming();
                 self.messages.push(MessageItem::Error { text: message });
                 self.mode = AppMode::Input;
             }
@@ -625,14 +641,11 @@ impl App {
 
     fn handle_stream_event(&mut self, event: StreamEvent) {
         // Clean up empty AssistantStreaming placeholder before any non-delta event.
-        // The LLM may emit Start then go straight to thinking/tool calls with no text.
         if !matches!(
             event,
             StreamEvent::TextDelta { .. } | StreamEvent::TextStart { .. }
-        ) && let Some(MessageItem::AssistantStreaming { text }) = self.messages.last()
-            && text.is_empty()
-        {
-            self.messages.pop();
+        ) {
+            self.cleanup_empty_streaming();
         }
 
         match event {
