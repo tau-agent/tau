@@ -309,6 +309,12 @@ impl App {
                 self.textarea.insert_newline();
                 None
             }
+            // Catch Enter with any other modifier (shouldn't happen, but be safe)
+            (KeyCode::Enter, _) => {
+                // Treat as newline if any modifier is held
+                self.textarea.insert_newline();
+                None
+            }
             // Page up/down for scrolling
             (KeyCode::PageUp, _) => {
                 self.scroll_offset = self

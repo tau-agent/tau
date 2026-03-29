@@ -42,18 +42,19 @@ pub async fn run(
     // Set up terminal
     enable_raw_mode().map_err(|e| tau::Error::Io(e.to_string()))?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .map_err(|e| tau::Error::Io(e.to_string()))?;
     // Enable Kitty keyboard protocol for Shift+Enter etc.
+    // Must be done before entering alternate screen.
     // Silently ignored if terminal doesn't support it.
     execute!(
-        io::stdout(),
+        stdout,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         )
     )
     .ok();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .map_err(|e| tau::Error::Io(e.to_string()))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| tau::Error::Io(e.to_string()))?;
 
@@ -68,14 +69,15 @@ pub async fn run(
     .await;
 
     // Restore terminal
-    disable_raw_mode().ok();
-    execute!(io::stdout(), PopKeyboardEnhancementFlags).ok();
+    // Restore terminal — pop keyboard enhancement before leaving alternate screen
+    execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture
     )
     .ok();
+    disable_raw_mode().ok();
     terminal.show_cursor().ok();
 
     result
