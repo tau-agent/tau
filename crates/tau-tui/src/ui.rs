@@ -91,7 +91,8 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    // Always end with an empty line so there's a gap above the input field
+    // Two empty lines above the input field for visual breathing room
+    all_lines.push(Line::from(""));
     all_lines.push(Line::from(""));
 
     // Pad with empty lines so content is bottom-aligned (starts just above input)
