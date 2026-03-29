@@ -91,8 +91,7 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    // Two empty lines above the input field for visual breathing room
-    all_lines.push(Line::from(""));
+    // Empty line above the input field
     all_lines.push(Line::from(""));
 
     // Count visual lines (accounting for wrapping)
