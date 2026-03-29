@@ -109,6 +109,7 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     // Calculate scroll position (scroll_offset=0 means bottom)
     let max_scroll = total_lines.saturating_sub(visible);
+    app.max_scroll.set(max_scroll);
     let scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
 
     let paragraph = Paragraph::new(Text::from(all_lines))

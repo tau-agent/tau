@@ -65,6 +65,8 @@ pub struct App {
     pub mode: AppMode,
     /// Scroll offset (0 = bottom, increases upward).
     pub scroll_offset: u16,
+    /// Max scroll value from last render (used to clamp scroll_offset).
+    pub max_scroll: std::cell::Cell<u16>,
     /// Usage totals.
     pub totals: UsageTotals,
     /// Should the app quit?
@@ -98,6 +100,7 @@ impl App {
             messages: Vec::new(),
             mode: AppMode::Input,
             scroll_offset: 0,
+            max_scroll: std::cell::Cell::new(0),
             totals: UsageTotals::default(),
             should_quit: false,
             textarea,
@@ -306,7 +309,10 @@ impl App {
             }
             // Page up/down for scrolling
             (KeyCode::PageUp, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
+                self.scroll_offset = self
+                    .scroll_offset
+                    .saturating_add(10)
+                    .min(self.max_scroll.get());
                 None
             }
             (KeyCode::PageDown, _) => {
@@ -355,9 +361,12 @@ impl App {
                 self.textarea.input(event_to_tui_textarea(key));
                 None
             }
-            // Ctrl+U / Ctrl+D for scroll
+            // Ctrl+U for scroll up
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(5);
+                self.scroll_offset = self
+                    .scroll_offset
+                    .saturating_add(5)
+                    .min(self.max_scroll.get());
                 None
             }
             // Everything else goes to textarea
@@ -409,7 +418,10 @@ impl App {
             }
             // Page up/down still works during streaming
             (KeyCode::PageUp, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
+                self.scroll_offset = self
+                    .scroll_offset
+                    .saturating_add(10)
+                    .min(self.max_scroll.get());
                 None
             }
             (KeyCode::PageDown, _) => {
