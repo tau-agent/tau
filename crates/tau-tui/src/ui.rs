@@ -4,9 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use tau::protocol::format_tokens;
 
@@ -176,17 +174,6 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let paragraph = Paragraph::new(Text::from(all_lines)).scroll((scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
-
-    // Scrollbar
-    if total_lines > visible {
-        let scroll_from_bottom = max_scroll.saturating_sub(scroll);
-        let mut scrollbar_state = ScrollbarState::new(max_scroll).position(scroll_from_bottom);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight).style(theme.scrollbar_style()),
-            area,
-            &mut scrollbar_state,
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------

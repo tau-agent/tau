@@ -163,10 +163,6 @@ impl Theme {
         Style::default().fg(self.muted.to_ratatui())
     }
 
-    pub fn scrollbar_style(&self) -> Style {
-        Style::default().fg(self.dim.to_ratatui())
-    }
-
     pub fn context_color(&self, pct: f64) -> ThemeColor {
         if pct > 90.0 {
             self.error
