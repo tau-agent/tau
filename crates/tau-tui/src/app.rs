@@ -585,6 +585,17 @@ impl App {
     }
 
     fn handle_stream_event(&mut self, event: StreamEvent) {
+        // Clean up empty AssistantStreaming placeholder before any non-delta event.
+        // The LLM may emit Start then go straight to thinking/tool calls with no text.
+        if !matches!(
+            event,
+            StreamEvent::TextDelta { .. } | StreamEvent::TextStart { .. }
+        ) && let Some(MessageItem::AssistantStreaming { text }) = self.messages.last()
+            && text.is_empty()
+        {
+            self.messages.pop();
+        }
+
         match event {
             StreamEvent::Start { .. } => {
                 self.messages.push(MessageItem::AssistantStreaming {
@@ -638,12 +649,6 @@ impl App {
                 }
             }
             StreamEvent::ToolcallEnd { tool_call, .. } => {
-                // Remove empty streaming placeholder before tool call
-                if let Some(MessageItem::AssistantStreaming { text }) = self.messages.last()
-                    && text.is_empty()
-                {
-                    self.messages.pop();
-                }
                 // Start active tool display
                 self.messages.push(MessageItem::ToolActive {
                     name: tool_call.name,
@@ -701,15 +706,11 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                // Update or remove the last streaming message
+                // Convert last streaming message to complete
                 if let Some(item) = self.messages.last_mut()
                     && let MessageItem::AssistantStreaming { .. } = item
                 {
-                    if final_text.is_empty() {
-                        self.messages.pop(); // remove empty streaming placeholder
-                    } else {
-                        *item = MessageItem::Assistant { text: final_text };
-                    }
+                    *item = MessageItem::Assistant { text: final_text };
                 }
             }
             StreamEvent::Error { error, .. } => {
