@@ -618,11 +618,22 @@ async fn send_and_print(
                         };
                         eprintln!("[tool: {} {}]", tool_call.name, preview);
                     }
+                    tau::StreamEvent::ToolOutputDelta { .. } => {
+                        eprint!("."); // progress dot for streaming output
+                    }
                     tau::StreamEvent::ToolResult {
                         tool_name,
                         is_error,
-                        preview,
+                        content,
+                        ..
                     } => {
+                        let preview: String =
+                            content.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let preview = if preview.len() > 100 {
+                            format!("{}...", &preview[..100])
+                        } else {
+                            preview
+                        };
                         if *is_error {
                             eprintln!("[tool error: {} {}]", tool_name, preview);
                         } else {

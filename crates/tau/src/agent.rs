@@ -130,10 +130,17 @@ pub fn run(
                     max_turns_reached: false,
                 });
             }
-            let result = worker.execute(tc)?;
+            // Execute tool with streaming output deltas
+            let tc_id = tc.id.clone();
+            let result = worker.execute(tc, &mut |delta: &str| {
+                on_event(StreamEvent::ToolOutputDelta {
+                    tool_call_id: tc_id.clone(),
+                    delta: delta.to_string(),
+                });
+            })?;
 
-            // Emit a tool result summary for the UI
-            let preview = result
+            // Emit full tool result
+            let content = result
                 .content
                 .iter()
                 .filter_map(|c| match c {
@@ -141,18 +148,12 @@ pub fn run(
                     _ => None,
                 })
                 .collect::<Vec<_>>()
-                .join(" ");
-            // Collapse whitespace for single-line display
-            let preview: String = preview.split_whitespace().collect::<Vec<_>>().join(" ");
-            let preview = if preview.len() > 120 {
-                format!("{}...", &preview[..120])
-            } else {
-                preview
-            };
+                .join("\n");
             on_event(StreamEvent::ToolResult {
+                tool_call_id: tc.id.clone(),
                 tool_name: result.tool_name.clone(),
                 is_error: result.is_error,
-                preview,
+                content,
             });
 
             new_messages.push(Message::ToolResult(result.clone()));

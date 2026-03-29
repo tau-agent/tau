@@ -2,6 +2,8 @@
 //!
 //! The daemon spawns a worker process (`tau worker`) that executes tool calls.
 //! Communication is JSON lines over stdin/stdout.
+//! Supports streaming output: worker sends `OutputDelta` lines during execution,
+//! then a final `Done` message.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -22,13 +24,23 @@ pub struct WorkerRequest {
     pub arguments: serde_json::Value,
 }
 
-/// Response from worker (worker stdout → daemon).
+/// Message from worker (worker stdout → daemon).
+/// Tagged enum: either incremental output or final result.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct WorkerResponse {
-    pub tool_call_id: String,
-    pub content: Vec<ToolResultContent>,
-    pub is_error: bool,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkerMessage {
+    /// Incremental output line during tool execution (for UI streaming).
+    OutputDelta { tool_call_id: String, text: String },
+    /// Tool execution completed — final result.
+    Done {
+        tool_call_id: String,
+        content: Vec<ToolResultContent>,
+        is_error: bool,
+    },
 }
+
+// Keep the old type as an alias for backward compat
+pub type WorkerResponse = WorkerMessage;
 
 // ---------------------------------------------------------------------------
 // Worker handle (daemon side)
@@ -76,7 +88,12 @@ impl Worker {
     }
 
     /// Execute a tool call via the worker subprocess.
-    pub fn execute(&mut self, tool_call: &ToolCall) -> crate::Result<ToolResultMessage> {
+    /// Calls `on_output` for each incremental output line (streaming).
+    pub fn execute(
+        &mut self,
+        tool_call: &ToolCall,
+        on_output: &mut dyn FnMut(&str),
+    ) -> crate::Result<ToolResultMessage> {
         let req = WorkerRequest {
             tool_call_id: tool_call.id.clone(),
             name: tool_call.name.clone(),
@@ -94,34 +111,46 @@ impl Worker {
             .flush()
             .map_err(|e| crate::Error::Io(format!("flush worker: {}", e)))?;
 
-        // Read response
-        let mut resp_line = String::new();
-        self.stdout
-            .read_line(&mut resp_line)
-            .map_err(|e| crate::Error::Io(format!("read from worker: {}", e)))?;
+        // Read messages until Done
+        loop {
+            let mut resp_line = String::new();
+            self.stdout
+                .read_line(&mut resp_line)
+                .map_err(|e| crate::Error::Io(format!("read from worker: {}", e)))?;
 
-        if resp_line.is_empty() {
-            return Err(crate::Error::Io("worker closed unexpectedly".into()));
+            if resp_line.is_empty() {
+                return Err(crate::Error::Io("worker closed unexpectedly".into()));
+            }
+
+            let msg: WorkerMessage =
+                serde_json::from_str(&resp_line).map_err(|e| crate::Error::Parse(e.to_string()))?;
+
+            match msg {
+                WorkerMessage::OutputDelta { text, .. } => {
+                    on_output(&text);
+                }
+                WorkerMessage::Done {
+                    tool_call_id,
+                    content,
+                    is_error,
+                } => {
+                    return Ok(ToolResultMessage {
+                        tool_call_id,
+                        tool_name: tool_call.name.clone(),
+                        content,
+                        details: None,
+                        is_error,
+                        timestamp: timestamp_ms(),
+                    });
+                }
+            }
         }
-
-        let resp: WorkerResponse =
-            serde_json::from_str(&resp_line).map_err(|e| crate::Error::Parse(e.to_string()))?;
-
-        Ok(ToolResultMessage {
-            tool_call_id: resp.tool_call_id,
-            tool_name: tool_call.name.clone(),
-            content: resp.content,
-            details: None,
-            is_error: resp.is_error,
-            timestamp: timestamp_ms(),
-        })
     }
 
     /// Kill the worker process.
     pub fn kill(&mut self) {
-        // Give it a moment to exit after stdin EOF, then kill
         match self.child.try_wait() {
-            Ok(Some(_)) => {} // already exited
+            Ok(Some(_)) => {}
             _ => {
                 let _ = self.child.kill();
                 let _ = self.child.wait();
@@ -143,12 +172,20 @@ impl Drop for Worker {
 
 /// Trait for tool execution (allows subprocess or in-process).
 pub trait ToolExecutor {
-    fn execute(&mut self, tool_call: &ToolCall) -> crate::Result<ToolResultMessage>;
+    fn execute(
+        &mut self,
+        tool_call: &ToolCall,
+        on_output: &mut dyn FnMut(&str),
+    ) -> crate::Result<ToolResultMessage>;
 }
 
 impl ToolExecutor for Worker {
-    fn execute(&mut self, tool_call: &ToolCall) -> crate::Result<ToolResultMessage> {
-        self.execute(tool_call)
+    fn execute(
+        &mut self,
+        tool_call: &ToolCall,
+        on_output: &mut dyn FnMut(&str),
+    ) -> crate::Result<ToolResultMessage> {
+        self.execute(tool_call, on_output)
     }
 }
 
@@ -168,7 +205,11 @@ impl InProcessWorker {
 }
 
 impl ToolExecutor for InProcessWorker {
-    fn execute(&mut self, tool_call: &ToolCall) -> crate::Result<ToolResultMessage> {
+    fn execute(
+        &mut self,
+        tool_call: &ToolCall,
+        _on_output: &mut dyn FnMut(&str),
+    ) -> crate::Result<ToolResultMessage> {
         let result = crate::tools::execute_tool(&self.tools, tool_call, &self.cwd);
         Ok(result)
     }
@@ -177,6 +218,15 @@ impl ToolExecutor for InProcessWorker {
 // ---------------------------------------------------------------------------
 // Worker main loop (runs in the subprocess)
 // ---------------------------------------------------------------------------
+
+/// Helper to send a worker message to stdout.
+fn send_worker_message(writer: &mut impl Write, msg: &WorkerMessage) {
+    if let Ok(mut line) = serde_json::to_string(msg) {
+        line.push('\n');
+        let _ = writer.write_all(line.as_bytes());
+        let _ = writer.flush();
+    }
+}
 
 /// Run the worker loop: read tool calls from stdin, execute, write results to stdout.
 /// Called from `tau worker` subcommand.
@@ -210,31 +260,46 @@ pub fn run_worker_loop() {
 
         let tool_call = ToolCall {
             id: req.tool_call_id.clone(),
-            name: req.name,
+            name: req.name.clone(),
             arguments: req.arguments,
         };
 
-        let result = crate::tools::execute_tool(&tools, &tool_call, &cwd);
+        // For bash, use streaming execution
+        if req.name == "bash" {
+            let result =
+                crate::tools::bash::execute_streaming(&tool_call.arguments, &cwd, |delta| {
+                    send_worker_message(
+                        &mut writer,
+                        &WorkerMessage::OutputDelta {
+                            tool_call_id: req.tool_call_id.clone(),
+                            text: delta.to_string(),
+                        },
+                    );
+                });
 
-        let resp = WorkerResponse {
-            tool_call_id: req.tool_call_id,
-            content: result.content,
-            is_error: result.is_error,
-        };
+            let content = result.content;
+            let is_error = result.is_error;
 
-        let mut resp_line = match serde_json::to_string(&resp) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("worker: serialize error: {}", e);
-                continue;
-            }
-        };
-        resp_line.push('\n');
-        if writer.write_all(resp_line.as_bytes()).is_err() {
-            break;
-        }
-        if writer.flush().is_err() {
-            break;
+            send_worker_message(
+                &mut writer,
+                &WorkerMessage::Done {
+                    tool_call_id: req.tool_call_id,
+                    content,
+                    is_error,
+                },
+            );
+        } else {
+            // Non-streaming tools
+            let result = crate::tools::execute_tool(&tools, &tool_call, &cwd);
+
+            send_worker_message(
+                &mut writer,
+                &WorkerMessage::Done {
+                    tool_call_id: req.tool_call_id,
+                    content: result.content,
+                    is_error: result.is_error,
+                },
+            );
         }
     }
 }

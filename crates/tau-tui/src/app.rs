@@ -8,6 +8,7 @@ use tau::types::{AssistantContent, Message, StreamEvent, ToolResultMessage, User
 
 use crate::events::Event;
 use crate::message::MessageItem;
+use crate::render::RendererRegistry;
 use crate::theme::Theme;
 
 /// Cumulative usage tracking (mirrored from tau-cli).
@@ -53,6 +54,8 @@ pub struct QueuedMessage {
 pub struct App {
     /// Theme for rendering.
     pub theme: Theme,
+    /// Tool renderer registry.
+    pub renderers: RendererRegistry,
     /// Session ID we're chatting in.
     pub session_id: String,
     /// Model name for display.
@@ -94,6 +97,7 @@ impl App {
 
         Self {
             theme,
+            renderers: RendererRegistry::new(),
             session_id,
             model,
             provider,
@@ -156,31 +160,21 @@ impl App {
                     content,
                     ..
                 }) => {
-                    let preview = content
+                    let output = content
                         .iter()
                         .filter_map(|c| match c {
                             tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
-                        .join(" ");
-                    let preview: String = preview.split_whitespace().collect::<Vec<_>>().join(" ");
-                    let preview = if preview.len() > 120 {
-                        format!("{}...", &preview[..120])
-                    } else {
-                        preview
-                    };
-                    if *is_error {
-                        self.messages.push(MessageItem::ToolError {
-                            name: tool_name.clone(),
-                            message: preview,
-                        });
-                    } else {
-                        self.messages.push(MessageItem::Tool {
-                            name: tool_name.clone(),
-                            preview,
-                        });
-                    }
+                        .join("\n");
+                    // No original args available from DB — use Null
+                    self.messages.push(MessageItem::ToolComplete {
+                        name: tool_name.clone(),
+                        args: serde_json::Value::Null,
+                        output,
+                        is_error: *is_error,
+                    });
                 }
                 Message::CompactionSummary(_) => {
                     // Skip compaction summaries in the UI
@@ -644,48 +638,48 @@ impl App {
                 }
             }
             StreamEvent::ToolcallEnd { tool_call, .. } => {
-                let args_str = tool_call.arguments.to_string();
-                let preview = if args_str.len() > 80 {
-                    format!("{}...", &args_str[..80])
-                } else {
-                    args_str
-                };
-                // Show pending tool call (will be replaced by ToolResult)
-                self.messages.push(MessageItem::ToolPending {
+                // Start active tool display
+                self.messages.push(MessageItem::ToolActive {
                     name: tool_call.name,
-                    preview,
+                    args: tool_call.arguments,
+                    output_lines: Vec::new(),
                 });
+            }
+            StreamEvent::ToolOutputDelta { delta, .. } => {
+                // Append output to the active tool
+                if let Some(MessageItem::ToolActive { output_lines, .. }) = self.messages.last_mut()
+                {
+                    output_lines.push(delta);
+                }
+                self.scroll_offset = 0;
             }
             StreamEvent::ToolResult {
                 tool_name,
                 is_error,
-                preview,
+                content,
+                ..
             } => {
-                // Replace the pending tool with result
-                if let Some(last @ MessageItem::ToolPending { .. }) = self.messages.last_mut() {
-                    if is_error {
-                        *last = MessageItem::ToolError {
-                            name: tool_name,
-                            message: preview,
-                        };
+                // Replace active tool with completed tool
+                if let Some(last @ MessageItem::ToolActive { .. }) = self.messages.last_mut() {
+                    // Extract args from the active item
+                    let args = if let MessageItem::ToolActive { args, .. } = last {
+                        args.clone()
                     } else {
-                        *last = MessageItem::Tool {
-                            name: tool_name,
-                            preview,
-                        };
-                    }
-                    return;
-                }
-                // Fallback: just append
-                if is_error {
-                    self.messages.push(MessageItem::ToolError {
+                        serde_json::Value::Null
+                    };
+                    *last = MessageItem::ToolComplete {
                         name: tool_name,
-                        message: preview,
-                    });
+                        args,
+                        output: content,
+                        is_error,
+                    };
                 } else {
-                    self.messages.push(MessageItem::Tool {
+                    // Fallback: no active tool (shouldn't happen normally)
+                    self.messages.push(MessageItem::ToolComplete {
                         name: tool_name,
-                        preview,
+                        args: serde_json::Value::Null,
+                        output: content,
+                        is_error,
                     });
                 }
             }

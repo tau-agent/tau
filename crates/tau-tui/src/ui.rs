@@ -61,7 +61,7 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Build all message lines with single empty line between messages
     let mut all_lines: Vec<Line<'static>> = Vec::new();
     for msg in &app.messages {
-        let text = msg.to_text(area.width, theme);
+        let text = msg.to_text(area.width, theme, &app.renderers);
         let msg_lines: Vec<Line<'static>> = text.lines.into_iter().collect();
         if msg_lines.is_empty() {
             continue;

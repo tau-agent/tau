@@ -337,12 +337,18 @@ pub enum StreamEvent {
         tool_call: ToolCall,
         partial: AssistantMessage,
     },
-    /// Summary of a tool execution result (emitted by agent after tool runs).
+    /// Incremental tool output line (streaming, e.g. bash).
+    ToolOutputDelta {
+        tool_call_id: String,
+        delta: String,
+    },
+    /// Tool execution completed.
     ToolResult {
+        tool_call_id: String,
         tool_name: String,
         is_error: bool,
-        /// Short preview of the tool output.
-        preview: String,
+        /// Full text output.
+        content: String,
     },
     Done {
         reason: StopReason,
