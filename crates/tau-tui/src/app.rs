@@ -188,9 +188,7 @@ impl App {
                 // After AgentDone, drain queued steering messages
                 if self.mode == AppMode::Input && !self.queued_messages.is_empty() {
                     let queued = self.queued_messages.remove(0);
-                    self.messages.push(MessageItem::User {
-                        text: queued.text.clone(),
-                    });
+                    // Don't add user message locally — it arrives via Subscribe broadcast
                     self.scroll_offset = 0;
                     self.mode = AppMode::Streaming;
                     return Some(Action::SendQueued(queued.text));
@@ -254,8 +252,7 @@ impl App {
                     return self.handle_slash_command(&text);
                 }
 
-                // Add user message
-                self.messages.push(MessageItem::User { text: text.clone() });
+                // Don't add user message locally — it arrives via Subscribe broadcast
                 self.scroll_offset = 0;
                 self.mode = AppMode::Streaming;
                 Some(Action::SendChat(text))
