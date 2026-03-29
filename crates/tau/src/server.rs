@@ -574,14 +574,42 @@ async fn handle_client(
                     &Response::UserMessage { text: text.clone() },
                 );
 
-                let context = Context {
-                    system_prompt: stored.system_prompt.clone(),
+                // Call before_agent_start hooks (plugins can inject context)
+                let mut system_prompt = stored.system_prompt.clone();
+                {
+                    let mut pm = plugins.lock().unwrap();
+                    let hook_data = serde_json::json!({
+                        "prompt": &text,
+                        "system_prompt": &system_prompt,
+                    });
+                    let results = pm.call_hook("before_agent_start", &hook_data);
+                    for result in results {
+                        if let Some(msg) = result.message {
+                            let ctx_msg = Message::User(UserMessage::text(&msg.content));
+                            {
+                                let st = state.lock().unwrap();
+                                st.db.append_message(&session_id, &ctx_msg)?;
+                            }
+                            broadcast_to_subscribers(
+                                &state,
+                                &session_id,
+                                &Response::UserMessage {
+                                    text: msg.content.clone(),
+                                },
+                            );
+                            messages.push(ctx_msg);
+                        }
+                        if let Some(sp) = result.system_prompt {
+                            system_prompt = Some(sp);
+                        }
+                    }
+                }
+
+                let mut context = Context {
+                    system_prompt,
                     messages,
                     tools: Vec::new(),
                 };
-
-                // Run agent loop
-                let mut context = context;
                 let result = run_agent_turn(
                     &state,
                     &plugins,
