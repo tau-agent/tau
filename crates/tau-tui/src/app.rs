@@ -77,6 +77,10 @@ pub struct App {
     pub last_escape: std::time::Instant,
     /// Queued steering messages (sent after current agent turn completes).
     pub queued_messages: Vec<QueuedMessage>,
+    /// Command history index (None = composing new, Some(i) = browsing history).
+    pub history_index: Option<usize>,
+    /// Saved text when entering history browse (restored on down past end).
+    pub history_saved_text: String,
     /// Server stream ended.
     pub server_done: bool,
 }
@@ -102,6 +106,8 @@ impl App {
                 .checked_sub(std::time::Duration::from_secs(10))
                 .unwrap(),
             queued_messages: Vec::new(),
+            history_index: None,
+            history_saved_text: String::new(),
             server_done: false,
         }
     }
@@ -180,6 +186,24 @@ impl App {
         }
     }
 
+    /// Get user message history (most recent last, owned strings).
+    fn user_history(&self) -> Vec<String> {
+        self.messages
+            .iter()
+            .filter_map(|m| match m {
+                MessageItem::User { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Set textarea content from a string.
+    fn set_textarea_text(&mut self, text: &str) {
+        self.textarea.select_all();
+        self.textarea.cut();
+        self.textarea.insert_str(text);
+    }
+
     /// Handle an event, returning an optional request to send to the server.
     pub fn handle_event(&mut self, event: Event) -> Option<Action> {
         match event {
@@ -256,6 +280,7 @@ impl App {
                 // Don't add user message locally — it arrives via Subscribe broadcast
                 self.scroll_offset = 0;
                 self.mode = AppMode::Streaming;
+                self.history_index = None;
                 Some(Action::SendChat(text))
             }
             // Alt+Enter: queue steering message (sent after current turn)
@@ -288,6 +313,48 @@ impl App {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 None
             }
+            // Up arrow: browse history when on first line
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                let (row, _) = self.textarea.cursor();
+                if row == 0 {
+                    let history = self.user_history();
+                    if history.is_empty() {
+                        return None;
+                    }
+                    let new_idx = match self.history_index {
+                        None => {
+                            // Save current text before browsing
+                            self.history_saved_text = self.textarea.lines().join("\n");
+                            history.len() - 1
+                        }
+                        Some(i) if i > 0 => i - 1,
+                        Some(_) => return None, // already at oldest
+                    };
+                    self.history_index = Some(new_idx);
+                    self.set_textarea_text(&history[new_idx]);
+                    return None;
+                }
+                self.textarea.input(event_to_tui_textarea(key));
+                None
+            }
+            // Down arrow: browse history forward or restore saved text
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                if let Some(idx) = self.history_index {
+                    let history = self.user_history();
+                    if idx + 1 < history.len() {
+                        self.history_index = Some(idx + 1);
+                        self.set_textarea_text(&history[idx + 1]);
+                    } else {
+                        // Past end: restore saved text
+                        self.history_index = None;
+                        let saved = self.history_saved_text.clone();
+                        self.set_textarea_text(&saved);
+                    }
+                    return None;
+                }
+                self.textarea.input(event_to_tui_textarea(key));
+                None
+            }
             // Ctrl+U / Ctrl+D for scroll
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(5);
@@ -295,6 +362,8 @@ impl App {
             }
             // Everything else goes to textarea
             _ => {
+                // Reset history browsing on any other key
+                self.history_index = None;
                 self.textarea.input(event_to_tui_textarea(key));
                 None
             }
