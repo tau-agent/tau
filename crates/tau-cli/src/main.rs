@@ -379,8 +379,8 @@ async fn cmd_chat(
         (None, model.to_string())
     };
 
-    let session_id = if let Some(id) = session_id {
-        id
+    let (session_id, session_id_user_provided) = if let Some(id) = session_id {
+        (id, true)
     } else {
         let cwd = std::env::current_dir()
             .ok()
@@ -402,11 +402,16 @@ async fn cmd_chat(
                 }
             })
             .await?;
-        created_id.ok_or_else(|| tau::Error::Io("failed to create session".into()))?
+        let id = created_id.ok_or_else(|| tau::Error::Io("failed to create session".into()))?;
+        (id, false)
     };
 
-    // Get session info for display
-    let info = get_session_info(&mut client, &session_id).await.ok();
+    // Get session info for display; error if user specified a session that doesn't exist
+    let info = if session_id_user_provided {
+        Some(get_session_info(&mut client, &session_id).await?)
+    } else {
+        get_session_info(&mut client, &session_id).await.ok()
+    };
     let info_model = info.as_ref().map(|i| i.model.clone()).unwrap_or_default();
     let info_provider = info
         .as_ref()
