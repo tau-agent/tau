@@ -346,11 +346,25 @@ impl PluginManager {
         for (name, plugin_config) in &config.plugins {
             match PluginHandle::spawn(&plugin_config.command, cwd) {
                 Ok(handle) => {
-                    eprintln!("plugin loaded: {} ({})", handle.name, name);
+                    let tools: Vec<&str> = handle
+                        .registration
+                        .tools
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect();
+                    let hooks = &handle.registration.hooks;
+                    eprintln!(
+                        "plugin '{}': {} tools {:?}, {} hooks {:?}",
+                        handle.name,
+                        tools.len(),
+                        tools,
+                        hooks.len(),
+                        hooks,
+                    );
                     manager.plugins.push(handle);
                 }
                 Err(e) => {
-                    eprintln!("plugin {} failed to load: {}", name, e);
+                    eprintln!("plugin '{}' failed to load: {}", name, e);
                 }
             }
         }
