@@ -520,10 +520,10 @@ async fn handle_client(
                 };
                 let model = stored.model.clone();
 
-                // Notify plugins of session start
+                // Notify plugins of session start (once per session)
                 {
                     let mut pm = plugins.lock().unwrap();
-                    pm.notify_session_start(&cwd, &session_id);
+                    pm.notify_session_start_once(&cwd, &session_id);
                 }
 
                 // If session was interrupted mid-tool-call, continue first

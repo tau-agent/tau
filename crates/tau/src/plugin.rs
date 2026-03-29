@@ -325,6 +325,8 @@ impl Drop for PluginHandle {
 /// Manages all loaded plugins.
 pub struct PluginManager {
     plugins: Vec<PluginHandle>,
+    /// Sessions that have already received session_start.
+    initialized_sessions: std::collections::HashSet<String>,
 }
 
 impl Default for PluginManager {
@@ -337,6 +339,7 @@ impl PluginManager {
     pub fn new() -> Self {
         Self {
             plugins: Vec::new(),
+            initialized_sessions: std::collections::HashSet::new(),
         }
     }
 
@@ -402,8 +405,11 @@ impl PluginManager {
         results
     }
 
-    /// Notify session start to all plugins.
-    pub fn notify_session_start(&mut self, cwd: &str, session_id: &str) {
+    /// Notify session start to all plugins (only once per session).
+    pub fn notify_session_start_once(&mut self, cwd: &str, session_id: &str) {
+        if !self.initialized_sessions.insert(session_id.to_string()) {
+            return; // already notified
+        }
         for plugin in &mut self.plugins {
             if plugin.wants_hook("session_start") {
                 let _ = plugin.send(&PluginRequest::SessionStart {
