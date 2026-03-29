@@ -54,6 +54,7 @@ pub fn needs_continuation(messages: &[Message]) -> bool {
 /// Streams LLM responses, executes tool calls via the worker subprocess,
 /// and loops until the model stops or max_turns is reached.
 /// All stream events are forwarded via `on_event`.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     registry: &ProviderRegistry,
     model: &Model,
@@ -61,13 +62,16 @@ pub fn run(
     worker: &mut dyn ToolExecutor,
     options: &StreamOptions,
     config: &AgentConfig,
+    extra_tools: &[Tool],
     mut on_event: EventCallback,
 ) -> crate::Result<AgentResult> {
     let mut new_messages = Vec::new();
 
-    // Add tool schemas to context
+    // Add tool schemas to context (built-in + plugin tools)
     let tool_defs = tools::default_tools();
-    context.tools = tools::tool_schemas(&tool_defs);
+    let mut all_tools = tools::tool_schemas(&tool_defs);
+    all_tools.extend_from_slice(extra_tools);
+    context.tools = all_tools;
 
     for turn in 0..config.max_turns {
         // Stream LLM response (with retry)
@@ -341,6 +345,7 @@ mod tests {
             &mut worker,
             &StreamOptions::default(),
             &config,
+            &[],
             Box::new(move |e| events_clone.lock().unwrap().push(e)),
         )
         .unwrap();
@@ -373,6 +378,7 @@ mod tests {
             &mut worker,
             &StreamOptions::default(),
             &config,
+            &[],
             Box::new(|_| {}),
         )
         .unwrap();
@@ -411,6 +417,7 @@ mod tests {
             &mut worker,
             &StreamOptions::default(),
             &config,
+            &[],
             Box::new(|_| {}),
         )
         .unwrap();
@@ -437,6 +444,7 @@ mod tests {
             &mut worker,
             &StreamOptions::default(),
             &config,
+            &[],
             Box::new(|_| {}),
         )
         .unwrap();
@@ -470,6 +478,7 @@ mod tests {
             &mut worker,
             &StreamOptions::default(),
             &config,
+            &[],
             Box::new(|_| {}),
         )
         .unwrap();
@@ -532,6 +541,7 @@ mod tests {
             &mut worker,
             &StreamOptions::default(),
             &config,
+            &[],
             Box::new(|_| {}),
         )
         .unwrap();

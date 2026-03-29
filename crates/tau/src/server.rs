@@ -254,6 +254,11 @@ pub async fn run() -> crate::Result<()> {
     let db = Db::open_default()?;
     eprintln!("tau server listening on {}", sock.display());
 
+    // Load plugins
+    let plugins_config = crate::plugin::load_plugins_config();
+    let plugins = crate::plugin::PluginManager::load_from_config(&plugins_config, "/tmp");
+    let plugins: Arc<Mutex<crate::plugin::PluginManager>> = Arc::new(Mutex::new(plugins));
+
     let state: SharedState = Arc::new(Mutex::new(State {
         db,
         registry,
@@ -292,9 +297,10 @@ pub async fn run() -> crate::Result<()> {
         }
 
         let state = state.clone();
+        let plugins = plugins.clone();
         let shutdown_handle = shutdown.clone();
         smol::spawn(async move {
-            if let Err(e) = handle_client(stream, state, shutdown_handle).await {
+            if let Err(e) = handle_client(stream, state, plugins, shutdown_handle).await {
                 eprintln!("client error: {}", e);
             }
         })
@@ -336,6 +342,7 @@ pub fn is_running() -> bool {
 async fn handle_client(
     stream: Async<UnixStream>,
     state: SharedState,
+    plugins: Arc<Mutex<crate::plugin::PluginManager>>,
     shutdown: ShutdownHandle,
 ) -> crate::Result<()> {
     // Register for shutdown notifications
@@ -411,8 +418,18 @@ async fn handle_client(
                         .flatten()
                         .is_some_and(|c| matches!(c, AuthCredential::Oauth(_)));
                     let id = st.db.next_session_id()?;
-                    let system_prompt = system_prompt
-                        .or_else(|| Some(crate::system_prompt::build_default(cwd.as_deref())));
+                    let system_prompt = system_prompt.or_else(|| {
+                        let mut tool_prompts = crate::system_prompt::default_tool_prompts();
+                        let pm = plugins.lock().unwrap();
+                        tool_prompts.extend(pm.tool_prompts());
+                        Some(crate::system_prompt::build(
+                            &crate::system_prompt::PromptOptions {
+                                cwd: cwd.clone(),
+                                tools: tool_prompts,
+                                ..Default::default()
+                            },
+                        ))
+                    });
                     let stored = StoredSession {
                         id: id.clone(),
                         model,
@@ -512,6 +529,7 @@ async fn handle_client(
                     };
                     let cont_result = run_agent_turn(
                         &state,
+                        &plugins,
                         &shutdown,
                         cancel_flag.clone(),
                         &model,
@@ -560,6 +578,7 @@ async fn handle_client(
                 let mut context = context;
                 let result = run_agent_turn(
                     &state,
+                    &plugins,
                     &shutdown,
                     cancel_flag.clone(),
                     &model,
@@ -895,9 +914,48 @@ async fn handle_client(
 // ---------------------------------------------------------------------------
 
 /// Run an agent loop turn: resolve API key, stream, forward events, return new messages.
+/// Combined tool executor: routes to worker (built-in) or plugin.
+struct CombinedExecutor {
+    worker: crate::worker::Worker,
+    plugins: Arc<Mutex<crate::plugin::PluginManager>>,
+}
+
+impl CombinedExecutor {
+    fn new(
+        worker: crate::worker::Worker,
+        plugins: Arc<Mutex<crate::plugin::PluginManager>>,
+    ) -> Self {
+        Self { worker, plugins }
+    }
+
+    fn kill_worker(&mut self) {
+        self.worker.kill();
+    }
+}
+
+impl crate::worker::ToolExecutor for CombinedExecutor {
+    fn execute(
+        &mut self,
+        tool_call: &ToolCall,
+        on_output: &mut dyn FnMut(&str),
+    ) -> crate::Result<ToolResultMessage> {
+        // Check if a plugin handles this tool
+        let mut pm = self.plugins.lock().unwrap();
+        if pm.has_tool(&tool_call.name)
+            && let Some(plugin) = pm.find_tool_plugin(&tool_call.name)
+        {
+            return plugin.execute_tool(tool_call, on_output);
+        }
+        drop(pm);
+        // Fall through to built-in worker
+        self.worker.execute(tool_call, on_output)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     state: &SharedState,
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
     shutdown: &ShutdownHandle,
     cancel_flag: Arc<AtomicBool>,
     model: &Model,
@@ -937,29 +995,36 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
         let st = state.lock().unwrap();
         st.registry.clone()
     };
+    let plugin_tools = {
+        let pm = plugins.lock().unwrap();
+        pm.tool_schemas()
+    };
 
     let model_clone = model.clone();
     let options_clone = options;
     let cwd_clone = cwd.to_string();
     let mut context_clone = context.clone();
 
+    let plugins_clone = plugins.clone();
     let in_flight = shutdown.clone();
     let agent_handle = smol::unblock(move || {
         in_flight.enter();
         // Spawn worker subprocess for tool execution
-        let mut worker = crate::worker::Worker::spawn(&cwd_clone)?;
+        let worker = crate::worker::Worker::spawn(&cwd_clone)?;
+        let mut executor = CombinedExecutor::new(worker, plugins_clone);
         let result = crate::agent::run(
             &registry_clone,
             &model_clone,
             &mut context_clone,
-            &mut worker,
+            &mut executor,
             &options_clone,
             &agent_config,
+            &plugin_tools,
             Box::new(move |event| {
                 let _ = event_tx.send_blocking(event);
             }),
         );
-        worker.kill();
+        executor.kill_worker();
         in_flight.leave();
         result
     });

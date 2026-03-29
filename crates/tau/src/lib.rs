@@ -4,6 +4,7 @@ pub mod client;
 pub mod compaction;
 pub mod config;
 pub mod db;
+pub mod plugin;
 pub mod protocol;
 pub mod provider;
 pub mod providers;
