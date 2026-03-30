@@ -120,7 +120,9 @@ async fn run_inner(
     }
 
     // Channel for server responses — background recv tasks push here.
-    let (server_tx, server_rx) = channel::bounded::<Response>(256);
+    // Unbounded: dropping critical messages like AgentDone causes the UI to
+    // get stuck in Streaming mode. The producer is network-bound anyway.
+    let (server_tx, server_rx) = channel::unbounded::<Response>();
 
     // Event loop merges terminal + server + tick
     let event_loop = EventLoop::new(server_rx);

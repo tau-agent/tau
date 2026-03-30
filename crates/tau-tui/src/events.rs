@@ -31,7 +31,7 @@ impl EventLoop {
     ///
     /// `server_rx` receives `Response` values pushed by the chat sender task.
     pub fn new(server_rx: Receiver<Response>) -> Self {
-        let (tx, rx) = smol::channel::bounded(256);
+        let (tx, rx) = smol::channel::unbounded();
 
         let mut tasks = Vec::new();
 
