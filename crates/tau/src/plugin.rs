@@ -2,6 +2,12 @@
 //!
 //! Plugins are external processes that communicate via JSON-lines on stdin/stdout.
 //! They can register tools, hooks, and slash commands.
+//!
+//! Two scopes:
+//! - **global** plugins: spawned once at server start, shared across sessions.
+//! - **session** plugins: spawned per session, killed when session is destroyed.
+//!   An optional `session_prefix` is prepended to all session plugin commands
+//!   (e.g. `["sandbox", "run", "--"]`).
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -15,7 +21,7 @@ use crate::types::{Tool, ToolCall, ToolResultContent};
 // Protocol messages: tau → plugin
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginRequest {
     /// Initialize the plugin with session context.
@@ -30,6 +36,9 @@ pub enum PluginRequest {
         tool_call_id: String,
         name: String,
         arguments: serde_json::Value,
+        /// Working directory for tool execution.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     /// Notify session start.
     SessionStart { cwd: String, session_id: String },
@@ -39,7 +48,7 @@ pub enum PluginRequest {
 // Protocol messages: plugin → tau
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginMessage {
     /// Plugin registration (sent once on startup).
@@ -52,7 +61,7 @@ pub enum PluginMessage {
     OutputDelta { tool_call_id: String, text: String },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginRegistration {
     /// Plugin name.
     pub name: String,
@@ -67,7 +76,7 @@ pub struct PluginRegistration {
     pub commands: Vec<PluginCommand>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginToolDef {
     /// Tool name.
     pub name: String,
@@ -83,7 +92,7 @@ pub struct PluginToolDef {
     pub prompt_guidelines: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginCommand {
     /// Command name (without /).
     pub name: String,
@@ -91,7 +100,7 @@ pub struct PluginCommand {
     pub description: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct HookResult {
     /// Optional message to inject before the LLM turn.
     #[serde(default)]
@@ -104,13 +113,13 @@ pub struct HookResult {
     pub tool_result_append: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookMessage {
     /// Content of the injected message.
     pub content: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PluginToolResult {
     pub tool_call_id: String,
     pub content: Vec<ToolResultContent>,
@@ -128,6 +137,8 @@ pub struct PluginHandle {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    /// Piped stderr for diagnostics.
+    stderr_pipe: Option<std::process::ChildStderr>,
 }
 
 impl PluginHandle {
@@ -142,7 +153,7 @@ impl PluginHandle {
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| crate::Error::Io(format!("spawn plugin {:?}: {}", command, e)))?;
 
@@ -159,6 +170,8 @@ impl PluginHandle {
                 .ok_or_else(|| crate::Error::Io("plugin stdout not available".into()))?,
         );
 
+        let stderr_pipe = child.stderr.take();
+
         let mut handle = Self {
             name: String::new(),
             registration: PluginRegistration {
@@ -170,19 +183,44 @@ impl PluginHandle {
             child,
             stdin,
             stdout,
+            stderr_pipe,
         };
 
         // Read the registration message
-        let msg = handle.read_message()?;
+        let msg = handle.read_message();
         match msg {
-            PluginMessage::Register(reg) => {
+            Ok(PluginMessage::Register(reg)) => {
                 handle.name = reg.name.clone();
                 handle.registration = reg;
             }
-            _ => {
+            Ok(_) => {
                 return Err(crate::Error::Io(
                     "plugin first message must be Register".into(),
                 ));
+            }
+            Err(e) => {
+                // Child likely died -- wait for it and collect diagnostics
+                let mut diag = format!("plugin {:?} failed during registration: {}", command, e);
+                // Give child a moment to fully exit
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                match handle.child.try_wait() {
+                    Ok(Some(exit)) => {
+                        diag.push_str(&format!("\n  exit status: {}", exit));
+                        let stderr = handle.drain_stderr();
+                        if !stderr.is_empty() {
+                            diag.push_str(&format!(
+                                "\n  stderr:\n{}",
+                                indent_lines(&stderr, "    ")
+                            ));
+                        }
+                    }
+                    _ => {
+                        // Child still running but stdout closed -- kill it
+                        let _ = handle.child.kill();
+                        let _ = handle.child.wait();
+                    }
+                }
+                return Err(crate::Error::Io(diag));
             }
         }
 
@@ -210,10 +248,19 @@ impl PluginHandle {
             .read_line(&mut line)
             .map_err(|e| crate::Error::Io(format!("read from plugin {}: {}", self.name, e)))?;
         if line.is_empty() {
-            return Err(crate::Error::Io(format!(
-                "plugin {} closed unexpectedly",
-                self.name
-            )));
+            let mut msg = format!("plugin {} closed unexpectedly", self.name);
+            // Wait briefly for child to fully exit so we can collect stderr
+            let _ = self.child.try_wait();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if let Some(exit) = self.child_exit_status() {
+                msg.push_str(&format!(" (exit status: {})", exit));
+                // Only drain stderr if child has exited (otherwise read blocks)
+                let stderr = self.drain_stderr();
+                if !stderr.is_empty() {
+                    msg.push_str(&format!("\n  stderr:\n{}", indent_lines(&stderr, "    ")));
+                }
+            }
+            return Err(crate::Error::Io(msg));
         }
         serde_json::from_str(&line)
             .map_err(|e| crate::Error::Parse(format!("plugin {} message: {}", self.name, e)))
@@ -223,12 +270,14 @@ impl PluginHandle {
     pub fn execute_tool(
         &mut self,
         tool_call: &ToolCall,
+        cwd: Option<&str>,
         on_output: &mut dyn FnMut(&str),
     ) -> crate::Result<crate::types::ToolResultMessage> {
         self.send(&PluginRequest::ToolCall {
             tool_call_id: tool_call.id.clone(),
             name: tool_call.name.clone(),
             arguments: tool_call.arguments.clone(),
+            cwd: cwd.map(String::from),
         })?;
 
         loop {
@@ -266,6 +315,30 @@ impl PluginHandle {
             PluginMessage::HookResult(result) => Ok(result),
             _ => Ok(HookResult::default()),
         }
+    }
+
+    /// Try to get the child exit status without blocking.
+    fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
+    /// Drain stderr from the child process.
+    /// Only safe to call after the child has exited (otherwise may block).
+    /// Consumes the stderr pipe.
+    fn drain_stderr(&mut self) -> String {
+        let Some(pipe) = self.stderr_pipe.take() else {
+            return String::new();
+        };
+        use std::io::Read;
+        let mut reader = BufReader::new(pipe);
+        let mut output = String::new();
+        // Read up to 8KB
+        let mut buf = vec![0u8; 8192];
+        match reader.read(&mut buf) {
+            Ok(n) if n > 0 => output.push_str(&String::from_utf8_lossy(&buf[..n])),
+            _ => {}
+        }
+        output
     }
 
     /// Kill the plugin process.
@@ -313,6 +386,11 @@ impl PluginHandle {
             })
             .collect()
     }
+
+    /// Check if this plugin provides a given tool.
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.registration.tools.iter().any(|t| t.name == name)
+    }
 }
 
 impl Drop for PluginHandle {
@@ -322,35 +400,189 @@ impl Drop for PluginHandle {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin manager
+// Helper: collect tool info from a list of plugin handles
 // ---------------------------------------------------------------------------
 
-/// Manages all loaded plugins.
-pub struct PluginManager {
-    plugins: Vec<PluginHandle>,
-    /// Sessions that have already received session_start.
-    initialized_sessions: std::collections::HashSet<String>,
+fn indent_lines(text: &str, prefix: &str) -> String {
+    text.lines()
+        .map(|l| format!("{}{}", prefix, l))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-impl Default for PluginManager {
-    fn default() -> Self {
-        Self::new()
+fn collect_tool_schemas(plugins: &[PluginHandle]) -> Vec<Tool> {
+    plugins.iter().flat_map(|p| p.tool_schemas()).collect()
+}
+
+fn collect_tool_prompts(plugins: &[PluginHandle]) -> Vec<crate::system_prompt::ToolPrompt> {
+    plugins.iter().flat_map(|p| p.tool_prompts()).collect()
+}
+
+fn find_tool_plugin<'a>(
+    plugins: &'a mut [PluginHandle],
+    tool_name: &str,
+) -> Option<&'a mut PluginHandle> {
+    plugins.iter_mut().find(|p| p.has_tool(tool_name))
+}
+
+fn call_hook_all(
+    plugins: &mut [PluginHandle],
+    name: &str,
+    data: &serde_json::Value,
+) -> Vec<HookResult> {
+    let mut results = Vec::new();
+    for plugin in plugins {
+        if plugin.wants_hook(name) {
+            match plugin.call_hook(name, data.clone()) {
+                Ok(result) => results.push(result),
+                Err(e) => eprintln!("plugin {} hook {} error: {}", plugin.name, name, e),
+            }
+        }
     }
+    results
 }
 
-impl PluginManager {
-    pub fn new() -> Self {
-        Self {
-            plugins: Vec::new(),
-            initialized_sessions: std::collections::HashSet::new(),
+// ---------------------------------------------------------------------------
+// Session plugins: per-session plugin handles
+// ---------------------------------------------------------------------------
+
+/// Per-session plugin set. Spawned when the session is first used.
+pub struct SessionPlugins {
+    plugins: Vec<PluginHandle>,
+}
+
+impl SessionPlugins {
+    /// Spawn session plugins from config entries, prepending session_prefix.
+    pub fn spawn(config: &PluginsConfig, cwd: &str) -> crate::Result<Self> {
+        let mut plugins = Vec::new();
+        let prefix = config.session_prefix.as_deref().unwrap_or(&[]);
+
+        let entries: Vec<_> = if config.session.is_empty() {
+            // No config: use default built-in worker
+            let exe = std::env::current_exe()
+                .map_err(|e| crate::Error::Io(e.to_string()))?
+                .to_string_lossy()
+                .to_string();
+            vec![(
+                "worker".to_string(),
+                PluginEntry {
+                    command: vec![exe, "worker".to_string()],
+                },
+            )]
+        } else {
+            config
+                .session
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+
+        for (name, entry) in &entries {
+            let mut cmd: Vec<String> = prefix.iter().map(|s| s.replace("{cwd}", cwd)).collect();
+            cmd.extend(entry.command.iter().cloned());
+
+            eprintln!("spawning session plugin '{}': {:?}", name, cmd);
+            match PluginHandle::spawn(&cmd, cwd) {
+                Ok(handle) => {
+                    let tools: Vec<&str> = handle
+                        .registration
+                        .tools
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect();
+                    eprintln!(
+                        "session plugin '{}': {} tools {:?}",
+                        handle.name,
+                        tools.len(),
+                        tools,
+                    );
+                    plugins.push(handle);
+                }
+                Err(e) => {
+                    eprintln!("session plugin '{}' failed to spawn: {}", name, e);
+                }
+            }
+        }
+
+        Ok(Self { plugins })
+    }
+
+    pub fn tool_schemas(&self) -> Vec<Tool> {
+        collect_tool_schemas(&self.plugins)
+    }
+
+    pub fn tool_prompts(&self) -> Vec<crate::system_prompt::ToolPrompt> {
+        collect_tool_prompts(&self.plugins)
+    }
+
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.plugins.iter().any(|p| p.has_tool(name))
+    }
+
+    /// Execute a tool call, routing to the right session plugin.
+    pub fn execute_tool(
+        &mut self,
+        tool_call: &ToolCall,
+        cwd: &str,
+        on_output: &mut dyn FnMut(&str),
+    ) -> crate::Result<crate::types::ToolResultMessage> {
+        let plugin = find_tool_plugin(&mut self.plugins, &tool_call.name);
+        match plugin {
+            Some(p) => p.execute_tool(tool_call, Some(cwd), on_output),
+            None => Err(crate::Error::Io(format!(
+                "no session plugin provides tool '{}'",
+                tool_call.name
+            ))),
         }
     }
 
-    /// Load plugins from config.
-    pub fn load_from_config(config: &PluginsConfig, cwd: &str) -> Self {
-        let mut manager = Self::new();
-        for (name, plugin_config) in &config.plugins {
-            match PluginHandle::spawn(&plugin_config.command, cwd) {
+    pub fn call_hook(&mut self, name: &str, data: &serde_json::Value) -> Vec<HookResult> {
+        call_hook_all(&mut self.plugins, name, data)
+    }
+
+    pub fn kill_all(&mut self) {
+        for p in &mut self.plugins {
+            p.kill();
+        }
+    }
+}
+
+impl Drop for SessionPlugins {
+    fn drop(&mut self) {
+        self.kill_all();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin manager: global plugins + per-session plugin tracking
+// ---------------------------------------------------------------------------
+
+/// Manages global plugins and per-session plugin sets.
+pub struct PluginManager {
+    /// Global plugins (spawned once at server start).
+    global_plugins: Vec<PluginHandle>,
+    /// Per-session plugin sets, keyed by session ID.
+    session_plugins: HashMap<String, SessionPlugins>,
+    /// Sessions that have already received session_start.
+    initialized_sessions: std::collections::HashSet<String>,
+    /// Config for spawning session plugins.
+    config: PluginsConfig,
+}
+
+impl PluginManager {
+    pub fn new(config: PluginsConfig) -> Self {
+        Self {
+            global_plugins: Vec::new(),
+            session_plugins: HashMap::new(),
+            initialized_sessions: std::collections::HashSet::new(),
+            config,
+        }
+    }
+
+    /// Load global plugins from config.
+    pub fn load_global_plugins(&mut self, cwd: &str) {
+        for (name, entry) in &self.config.global {
+            match PluginHandle::spawn(&entry.command, cwd) {
                 Ok(handle) => {
                     let tools: Vec<&str> = handle
                         .registration
@@ -360,50 +592,146 @@ impl PluginManager {
                         .collect();
                     let hooks = &handle.registration.hooks;
                     eprintln!(
-                        "plugin '{}': {} tools {:?}, {} hooks {:?}",
+                        "global plugin '{}': {} tools {:?}, {} hooks {:?}",
                         handle.name,
                         tools.len(),
                         tools,
                         hooks.len(),
                         hooks,
                     );
-                    manager.plugins.push(handle);
+                    self.global_plugins.push(handle);
                 }
                 Err(e) => {
-                    eprintln!("plugin '{}' failed to load: {}", name, e);
+                    eprintln!("global plugin '{}' failed to load: {}", name, e);
                 }
             }
         }
-        manager
     }
 
-    /// Get all tool schemas from all plugins.
-    pub fn tool_schemas(&self) -> Vec<Tool> {
-        self.plugins.iter().flat_map(|p| p.tool_schemas()).collect()
+    /// Ensure session plugins are spawned for the given session.
+    /// Returns Ok(()) if already spawned or newly spawned.
+    pub fn ensure_session_plugins(&mut self, session_id: &str, cwd: &str) -> crate::Result<()> {
+        if self.session_plugins.contains_key(session_id) {
+            return Ok(());
+        }
+        let sp = SessionPlugins::spawn(&self.config, cwd)?;
+        self.session_plugins.insert(session_id.to_string(), sp);
+        Ok(())
     }
 
-    /// Get all tool prompt contributions from all plugins.
-    pub fn tool_prompts(&self) -> Vec<crate::system_prompt::ToolPrompt> {
-        self.plugins.iter().flat_map(|p| p.tool_prompts()).collect()
+    /// Destroy session plugins for a given session.
+    pub fn destroy_session_plugins(&mut self, session_id: &str) {
+        self.session_plugins.remove(session_id);
+        self.initialized_sessions.remove(session_id);
     }
 
-    /// Find which plugin handles a tool by name.
-    pub fn find_tool_plugin(&mut self, tool_name: &str) -> Option<&mut PluginHandle> {
-        self.plugins
-            .iter_mut()
-            .find(|p| p.registration.tools.iter().any(|t| t.name == tool_name))
+    /// Get all tool schemas (global + session).
+    pub fn tool_schemas(&self, session_id: &str) -> Vec<Tool> {
+        let mut schemas = Vec::new();
+        if let Some(sp) = self.session_plugins.get(session_id) {
+            schemas.extend(sp.tool_schemas());
+        }
+        schemas.extend(collect_tool_schemas(&self.global_plugins));
+        schemas
     }
 
-    /// Call a hook on all plugins that want it. Returns merged results.
-    pub fn call_hook(&mut self, name: &str, data: &serde_json::Value) -> Vec<HookResult> {
-        let mut results = Vec::new();
-        for plugin in &mut self.plugins {
-            if plugin.wants_hook(name) {
-                match plugin.call_hook(name, data.clone()) {
-                    Ok(result) => results.push(result),
-                    Err(e) => eprintln!("plugin {} hook {} error: {}", plugin.name, name, e),
-                }
+    /// Get all tool prompt contributions (global + session).
+    pub fn tool_prompts(&self, session_id: &str) -> Vec<crate::system_prompt::ToolPrompt> {
+        let mut prompts = Vec::new();
+        if let Some(sp) = self.session_plugins.get(session_id) {
+            prompts.extend(sp.tool_prompts());
+        }
+        prompts.extend(collect_tool_prompts(&self.global_plugins));
+        prompts
+    }
+
+    /// Execute a tool call: try session plugins first, then global.
+    /// Runs after_tool_result hooks on all plugins afterward.
+    pub fn execute_tool(
+        &mut self,
+        session_id: &str,
+        tool_call: &ToolCall,
+        cwd: &str,
+        on_output: &mut dyn FnMut(&str),
+    ) -> crate::Result<crate::types::ToolResultMessage> {
+        // Try session plugins first
+        if let Some(sp) = self.session_plugins.get_mut(session_id)
+            && sp.has_tool(&tool_call.name)
+        {
+            let mut result = sp.execute_tool(tool_call, cwd, on_output)?;
+            self.run_after_tool_hooks(session_id, tool_call, &mut result);
+            return Ok(result);
+        }
+
+        // Fall through to global plugins
+        let plugin = find_tool_plugin(&mut self.global_plugins, &tool_call.name);
+        match plugin {
+            Some(p) => {
+                let mut result = p.execute_tool(tool_call, Some(cwd), on_output)?;
+                self.run_after_tool_hooks(session_id, tool_call, &mut result);
+                Ok(result)
             }
+            None => Err(crate::Error::Io(format!(
+                "no plugin provides tool '{}'",
+                tool_call.name
+            ))),
+        }
+    }
+
+    /// Run after_tool_result hooks on all plugins (global + session).
+    fn run_after_tool_hooks(
+        &mut self,
+        session_id: &str,
+        tool_call: &ToolCall,
+        result: &mut crate::types::ToolResultMessage,
+    ) {
+        let result_text: String = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                crate::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let hook_data = serde_json::json!({
+            "tool_name": tool_call.name,
+            "arguments": tool_call.arguments,
+            "content": result_text,
+            "is_error": result.is_error,
+        });
+
+        let mut hook_results =
+            call_hook_all(&mut self.global_plugins, "after_tool_result", &hook_data);
+        if let Some(sp) = self.session_plugins.get_mut(session_id) {
+            hook_results.extend(sp.call_hook("after_tool_result", &hook_data));
+        }
+
+        for hook_result in hook_results {
+            if let Some(append) = hook_result.tool_result_append
+                && !append.is_empty()
+            {
+                result.content.push(crate::types::ToolResultContent::Text(
+                    crate::types::TextContent {
+                        text: append,
+                        text_signature: None,
+                    },
+                ));
+            }
+        }
+    }
+
+    /// Call a hook on all plugins (global + session). Returns merged results.
+    pub fn call_hook(
+        &mut self,
+        session_id: &str,
+        name: &str,
+        data: &serde_json::Value,
+    ) -> Vec<HookResult> {
+        let mut results = call_hook_all(&mut self.global_plugins, name, data);
+        if let Some(sp) = self.session_plugins.get_mut(session_id) {
+            results.extend(sp.call_hook(name, data));
         }
         results
     }
@@ -413,21 +741,30 @@ impl PluginManager {
         if !self.initialized_sessions.insert(session_id.to_string()) {
             return; // already notified
         }
-        for plugin in &mut self.plugins {
+        let req = PluginRequest::SessionStart {
+            cwd: cwd.to_string(),
+            session_id: session_id.to_string(),
+        };
+        for plugin in &mut self.global_plugins {
             if plugin.wants_hook("session_start") {
-                let _ = plugin.send(&PluginRequest::SessionStart {
-                    cwd: cwd.to_string(),
-                    session_id: session_id.to_string(),
-                });
-                // Read and discard the hook result
+                let _ = plugin.send(&req);
                 let _ = plugin.read_message();
+            }
+        }
+        if let Some(sp) = self.session_plugins.get_mut(session_id) {
+            for plugin in &mut sp.plugins {
+                if plugin.wants_hook("session_start") {
+                    let _ = plugin.send(&req);
+                    let _ = plugin.read_message();
+                }
             }
         }
     }
 
-    /// Get all slash commands from plugins.
+    /// Get all slash commands from all plugins (global + all session).
     pub fn commands(&self) -> Vec<(String, String)> {
-        self.plugins
+        let mut cmds: Vec<(String, String)> = self
+            .global_plugins
             .iter()
             .flat_map(|p| {
                 p.registration
@@ -435,21 +772,28 @@ impl PluginManager {
                     .iter()
                     .map(|c| (c.name.clone(), c.description.clone()))
             })
-            .collect()
+            .collect();
+        for sp in self.session_plugins.values() {
+            for p in &sp.plugins {
+                cmds.extend(
+                    p.registration
+                        .commands
+                        .iter()
+                        .map(|c| (c.name.clone(), c.description.clone())),
+                );
+            }
+        }
+        cmds
     }
 
     /// Kill all plugins.
     pub fn kill_all(&mut self) {
-        for plugin in &mut self.plugins {
-            plugin.kill();
+        for p in &mut self.global_plugins {
+            p.kill();
         }
-    }
-
-    /// Check if any plugin provides a given tool.
-    pub fn has_tool(&self, name: &str) -> bool {
-        self.plugins
-            .iter()
-            .any(|p| p.registration.tools.iter().any(|t| t.name == name))
+        for sp in self.session_plugins.values_mut() {
+            sp.kill_all();
+        }
     }
 }
 
@@ -465,8 +809,16 @@ impl Drop for PluginManager {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PluginsConfig {
+    /// Prefix prepended to all session plugin commands.
+    /// Example: `["sandbox", "run", "--"]`
     #[serde(default)]
-    pub plugins: HashMap<String, PluginEntry>,
+    pub session_prefix: Option<Vec<String>>,
+    /// Global plugins (spawned once at server start).
+    #[serde(default)]
+    pub global: HashMap<String, PluginEntry>,
+    /// Session plugins (spawned per session).
+    #[serde(default)]
+    pub session: HashMap<String, PluginEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

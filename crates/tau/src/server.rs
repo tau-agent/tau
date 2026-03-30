@@ -262,7 +262,8 @@ pub async fn run() -> crate::Result<()> {
 
     // Load plugins
     let plugins_config = crate::plugin::load_plugins_config();
-    let plugins = crate::plugin::PluginManager::load_from_config(&plugins_config, "/tmp");
+    let mut plugins = crate::plugin::PluginManager::new(plugins_config);
+    plugins.load_global_plugins("/tmp");
     let plugins: Arc<Mutex<crate::plugin::PluginManager>> = Arc::new(Mutex::new(plugins));
 
     let state: SharedState = Arc::new(Mutex::new(State {
@@ -425,9 +426,14 @@ async fn handle_client(
                         .is_some_and(|c| matches!(c, AuthCredential::Oauth(_)));
                     let id = st.db.next_session_id()?;
                     let system_prompt = system_prompt.or_else(|| {
-                        let mut tool_prompts = crate::system_prompt::default_tool_prompts();
-                        let pm = plugins.lock().unwrap();
-                        tool_prompts.extend(pm.tool_prompts());
+                        let mut pm = plugins.lock().unwrap();
+                        // Ensure session plugins are spawned so we get tool prompts
+                        let cwd_str = cwd.as_deref().unwrap_or("/tmp");
+                        if let Err(e) = pm.ensure_session_plugins(&id, cwd_str) {
+                            eprintln!("failed to spawn session plugins: {}", e);
+                            // Error is not fatal; session continues without plugins
+                        }
+                        let tool_prompts = pm.tool_prompts(&id);
                         Some(crate::system_prompt::build(
                             &crate::system_prompt::PromptOptions {
                                 cwd: cwd.clone(),
@@ -527,10 +533,23 @@ async fn handle_client(
                 };
                 let model = stored.model.clone();
 
-                // Notify plugins of session start (once per session)
-                {
+                // Ensure session plugins are spawned and notify session start
+                let plugin_error = {
                     let mut pm = plugins.lock().unwrap();
+                    let err = if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
+                        let msg = format!("failed to spawn session plugins: {}", e);
+                        eprintln!("{}", msg);
+                        Some(msg)
+                    } else {
+                        None
+                    };
                     pm.notify_session_start_once(&cwd, &session_id);
+                    err
+                };
+                if let Some(msg) = plugin_error {
+                    send(&mut writer, &Response::Error { message: msg })
+                        .await
+                        .ok();
                 }
 
                 // If session was interrupted mid-tool-call, continue first
@@ -574,7 +593,7 @@ async fn handle_client(
                         "prompt": &text,
                         "system_prompt": &system_prompt,
                     });
-                    let results = pm.call_hook("before_agent_start", &hook_data);
+                    let results = pm.call_hook(&session_id, "before_agent_start", &hook_data);
                     for result in results {
                         if let Some(msg) = result.message {
                             // Inject context before user message. Persisted so the
@@ -951,92 +970,21 @@ async fn handle_client(
 // Compaction
 // ---------------------------------------------------------------------------
 
-/// Run an agent loop turn: resolve API key, stream, forward events, return new messages.
-/// Combined tool executor: routes to worker (built-in) or plugin.
-struct CombinedExecutor {
-    worker: crate::worker::Worker,
+/// Plugin-based tool executor for the agent loop.
+struct PluginExecutor {
     plugins: Arc<Mutex<crate::plugin::PluginManager>>,
+    session_id: String,
+    cwd: String,
 }
 
-impl CombinedExecutor {
-    fn new(
-        worker: crate::worker::Worker,
-        plugins: Arc<Mutex<crate::plugin::PluginManager>>,
-    ) -> Self {
-        Self { worker, plugins }
-    }
-
-    fn kill_worker(&mut self) {
-        self.worker.kill();
-    }
-}
-
-impl crate::worker::ToolExecutor for CombinedExecutor {
+impl crate::worker::ToolExecutor for PluginExecutor {
     fn execute(
         &mut self,
         tool_call: &ToolCall,
         on_output: &mut dyn FnMut(&str),
     ) -> crate::Result<ToolResultMessage> {
-        // Check if a plugin handles this tool
         let mut pm = self.plugins.lock().unwrap();
-        if pm.has_tool(&tool_call.name)
-            && let Some(plugin) = pm.find_tool_plugin(&tool_call.name)
-        {
-            let result = plugin.execute_tool(tool_call, on_output)?;
-            drop(pm);
-            return Ok(self.run_after_tool_hooks(tool_call, result));
-        }
-        drop(pm);
-
-        // Fall through to built-in worker
-        let result = self.worker.execute(tool_call, on_output)?;
-        Ok(self.run_after_tool_hooks(tool_call, result))
-    }
-}
-
-impl CombinedExecutor {
-    /// Call after_tool_result hooks on all interested plugins.
-    /// Appends returned content to the tool result.
-    fn run_after_tool_hooks(
-        &mut self,
-        tool_call: &ToolCall,
-        mut result: ToolResultMessage,
-    ) -> ToolResultMessage {
-        let result_text: String = result
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                crate::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let hook_data = serde_json::json!({
-            "tool_name": tool_call.name,
-            "arguments": tool_call.arguments,
-            "content": result_text,
-            "is_error": result.is_error,
-        });
-
-        let mut pm = self.plugins.lock().unwrap();
-        let hook_results = pm.call_hook("after_tool_result", &hook_data);
-        drop(pm);
-
-        for hook_result in hook_results {
-            if let Some(append) = hook_result.tool_result_append
-                && !append.is_empty()
-            {
-                result.content.push(crate::types::ToolResultContent::Text(
-                    crate::types::TextContent {
-                        text: append,
-                        text_signature: None,
-                    },
-                ));
-            }
-        }
-
-        result
+        pm.execute_tool(&self.session_id, tool_call, &self.cwd, on_output)
     }
 }
 
@@ -1085,7 +1033,7 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     };
     let plugin_tools = {
         let pm = plugins.lock().unwrap();
-        pm.tool_schemas()
+        pm.tool_schemas(session_id)
     };
 
     let model_clone = model.clone();
@@ -1095,11 +1043,14 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
 
     let plugins_clone = plugins.clone();
     let in_flight = shutdown.clone();
+    let session_id_for_executor = session_id.to_string();
     let agent_handle = smol::unblock(move || {
         in_flight.enter();
-        // Spawn worker subprocess for tool execution
-        let worker = crate::worker::Worker::spawn(&cwd_clone)?;
-        let mut executor = CombinedExecutor::new(worker, plugins_clone);
+        let mut executor = PluginExecutor {
+            plugins: plugins_clone,
+            session_id: session_id_for_executor,
+            cwd: cwd_clone,
+        };
         let result = crate::agent::run(
             &registry_clone,
             &model_clone,
@@ -1112,7 +1063,6 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
                 let _ = event_tx.send_blocking(event);
             }),
         );
-        executor.kill_worker();
         in_flight.leave();
         result
     });

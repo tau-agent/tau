@@ -113,7 +113,7 @@ fn plugin_echo_tool() {
 
     let mut deltas = Vec::new();
     let result = handle
-        .execute_tool(&tc, &mut |d| deltas.push(d.to_string()))
+        .execute_tool(&tc, None, &mut |d| deltas.push(d.to_string()))
         .unwrap();
 
     assert!(!result.is_error);
@@ -145,7 +145,7 @@ fn plugin_slow_tool_streaming() {
 
     let mut deltas = Vec::new();
     let result = handle
-        .execute_tool(&tc, &mut |d| deltas.push(d.to_string()))
+        .execute_tool(&tc, None, &mut |d| deltas.push(d.to_string()))
         .unwrap();
 
     assert!(!result.is_error);
@@ -178,7 +178,7 @@ fn plugin_fail_tool() {
 
     let mut deltas = Vec::new();
     let result = handle
-        .execute_tool(&tc, &mut |d| deltas.push(d.to_string()))
+        .execute_tool(&tc, None, &mut |d| deltas.push(d.to_string()))
         .unwrap();
 
     assert!(result.is_error);
@@ -240,7 +240,7 @@ fn plugin_multiple_tool_calls() {
             name: "echo_tool".into(),
             arguments: serde_json::json!({"message": format!("msg {}", i)}),
         };
-        let result = handle.execute_tool(&tc, &mut |_| {}).unwrap();
+        let result = handle.execute_tool(&tc, None, &mut |_| {}).unwrap();
         assert!(!result.is_error);
         let text = result
             .content
@@ -259,25 +259,24 @@ fn plugin_multiple_tool_calls() {
 fn plugin_manager_integration() {
     let cmd = test_plugin_command();
     let config = PluginsConfig {
-        plugins: [("test".into(), PluginEntry { command: cmd })]
+        session_prefix: None,
+        global: [("test".into(), PluginEntry { command: cmd })]
             .into_iter()
             .collect(),
+        session: Default::default(),
     };
 
-    let mut manager = PluginManager::load_from_config(&config, "/tmp");
+    let mut manager = PluginManager::new(config);
+    manager.load_global_plugins("/tmp");
 
-    // Check tool discovery
-    assert!(manager.has_tool("echo_tool"));
-    assert!(manager.has_tool("slow_tool"));
-    assert!(manager.has_tool("fail_tool"));
-    assert!(!manager.has_tool("nonexistent"));
+    let session_id = "test-session";
 
     // Check tool schemas
-    let schemas = manager.tool_schemas();
+    let schemas = manager.tool_schemas(session_id);
     assert_eq!(schemas.len(), 3);
 
     // Check tool prompts
-    let prompts = manager.tool_prompts();
+    let prompts = manager.tool_prompts(session_id);
     assert_eq!(prompts.len(), 2);
 
     // Check commands
@@ -291,12 +290,17 @@ fn plugin_manager_integration() {
         name: "echo_tool".into(),
         arguments: serde_json::json!({"message": "via manager"}),
     };
-    let plugin = manager.find_tool_plugin("echo_tool").unwrap();
-    let result = plugin.execute_tool(&tc, &mut |_| {}).unwrap();
+    let result = manager
+        .execute_tool(session_id, &tc, "/tmp", &mut |_| {})
+        .unwrap();
     assert!(!result.is_error);
 
     // Call hook through the manager
-    let results = manager.call_hook("before_agent_start", &serde_json::json!({"prompt": "test"}));
+    let results = manager.call_hook(
+        session_id,
+        "before_agent_start",
+        &serde_json::json!({"prompt": "test"}),
+    );
     assert_eq!(results.len(), 1);
     assert!(results[0].message.is_some());
 }

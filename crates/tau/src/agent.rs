@@ -4,7 +4,7 @@
 //! unrecoverable error occurs, or max_turns is reached.
 
 use crate::provider::{EventReceiver, ProviderRegistry};
-use crate::tools;
+
 use crate::types::*;
 use crate::worker::ToolExecutor;
 
@@ -67,11 +67,8 @@ pub fn run(
 ) -> crate::Result<AgentResult> {
     let mut new_messages = Vec::new();
 
-    // Add tool schemas to context (built-in + plugin tools)
-    let tool_defs = tools::default_tools();
-    let mut all_tools = tools::tool_schemas(&tool_defs);
-    all_tools.extend_from_slice(extra_tools);
-    context.tools = all_tools;
+    // All tools come from plugins (session + global)
+    context.tools = extra_tools.to_vec();
 
     for turn in 0..config.max_turns {
         // Stream LLM response (with retry)
@@ -336,7 +333,7 @@ mod tests {
         let config = AgentConfig::default();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let events_clone = events.clone();
-        let mut worker = InProcessWorker::new("/tmp");
+        let mut worker = InProcessWorker::new();
 
         let result = run(
             &registry,
@@ -369,7 +366,7 @@ mod tests {
         let model = mock_model();
         let mut context = basic_context();
         let config = AgentConfig::default();
-        let mut worker = InProcessWorker::new("/tmp");
+        let mut worker = InProcessWorker::new();
 
         let result = run(
             &registry,
@@ -408,7 +405,7 @@ mod tests {
             max_turns: 3,
             ..Default::default()
         };
-        let mut worker = InProcessWorker::new("/tmp");
+        let mut worker = InProcessWorker::new();
 
         let result = run(
             &registry,
@@ -435,7 +432,7 @@ mod tests {
             max_retries: 0,
             ..Default::default()
         };
-        let mut worker = InProcessWorker::new("/tmp");
+        let mut worker = InProcessWorker::new();
 
         let result = run(
             &registry,
@@ -469,7 +466,7 @@ mod tests {
         let model = mock_model();
         let mut context = basic_context();
         let config = AgentConfig::default();
-        let mut worker = InProcessWorker::new("/tmp");
+        let mut worker = InProcessWorker::new();
 
         let result = run(
             &registry,
@@ -500,7 +497,7 @@ mod tests {
             "The tool returned some output.".into(),
         )]);
         let model = mock_model();
-        let mut worker = InProcessWorker::new("/tmp");
+        let mut worker = InProcessWorker::new();
 
         let mut context = Context {
             system_prompt: Some("You are helpful.".into()),
