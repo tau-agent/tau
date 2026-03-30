@@ -124,6 +124,25 @@ impl Client {
         }
         Ok(())
     }
+
+    /// Return an async stream of parsed responses.
+    /// Consumes self — the stream owns the connection.
+    /// Used for long-lived subscriptions where the caller needs async control
+    /// (e.g. to apply backpressure via channel send().await).
+    pub fn response_stream(self) -> impl futures::Stream<Item = crate::Result<Response>> {
+        let reader = BufReader::new(self.stream);
+        reader.lines().filter_map(|line_result| {
+            let result = match line_result {
+                Ok(line) if line.trim().is_empty() => None,
+                Ok(line) => Some(
+                    serde_json::from_str(&line)
+                        .map_err(|e: serde_json::Error| crate::Error::Parse(e.to_string())),
+                ),
+                Err(e) => Some(Err(crate::Error::Io(e.to_string()))),
+            };
+            async { result }
+        })
+    }
 }
 
 /// Spawn the server as a background daemon process.

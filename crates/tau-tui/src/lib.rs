@@ -18,6 +18,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use smol::channel::{self, Sender};
@@ -120,9 +121,7 @@ async fn run_inner(
     }
 
     // Channel for server responses — background recv tasks push here.
-    // Unbounded: dropping critical messages like AgentDone causes the UI to
-    // get stuck in Streaming mode. The producer is network-bound anyway.
-    let (server_tx, server_rx) = channel::unbounded::<Response>();
+    let (server_tx, server_rx) = channel::bounded::<Response>(256);
 
     // Event loop merges terminal + server + tick
     let event_loop = EventLoop::new(server_rx);
@@ -141,11 +140,13 @@ async fn run_inner(
                 .await
                 .is_ok()
         {
-            let _ = client
-                .recv_lines(|resp| {
-                    let _ = sub_tx.try_send(resp.clone());
-                })
-                .await;
+            let stream = client.response_stream();
+            futures::pin_mut!(stream);
+            while let Some(Ok(resp)) = stream.next().await {
+                if sub_tx.send(resp).await.is_err() {
+                    break;
+                }
+            }
         }
     })
     .detach();
