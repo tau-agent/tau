@@ -205,6 +205,34 @@ Respond with any combination of:
 
 If you have nothing to inject, return `{"type": "hook_result"}`.
 
+### `after_tool_result`
+
+Sent after every tool execution (built-in or plugin). The plugin can append content to the tool result (e.g., LSP diagnostics).
+
+```json
+{"type": "hook", "name": "after_tool_result", "data": {
+  "tool_name": "edit",
+  "arguments": {"path": "src/main.rs", "edits": [...]},
+  "content": "Applied 1 edit to src/main.rs",
+  "is_error": false
+}}
+```
+
+Respond with optional text to append:
+
+```json
+{
+  "type": "hook_result",
+  "tool_result_append": "\n<file_diagnostics>\nError: src/main.rs:42:5 unused variable\n</file_diagnostics>"
+}
+```
+
+| Field | Optional | Description |
+|---|---|---|
+| `tool_result_append` | yes | Text appended to the tool result content (LLM sees it) |
+
+This hook enables LSP plugins to automatically append diagnostics after file edits.
+
 ## Commands
 
 Register slash commands that users can invoke from the TUI:
