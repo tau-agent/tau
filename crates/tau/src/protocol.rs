@@ -116,6 +116,8 @@ pub struct SessionInfo {
     pub cwd: Option<String>,
     pub message_count: usize,
     pub stats: SessionStats,
+    /// Unix timestamp (seconds) of last activity (last message or session creation).
+    pub last_activity: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

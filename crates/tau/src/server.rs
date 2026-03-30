@@ -70,7 +70,11 @@ fn compute_stats(messages: &[Message], model: &Model, is_subscription: bool) -> 
     }
 }
 
-fn session_info(stored: &StoredSession, messages: &[Message]) -> SessionInfo {
+fn session_info(
+    stored: &StoredSession,
+    messages: &[Message],
+    last_message_time: Option<i64>,
+) -> SessionInfo {
     SessionInfo {
         id: stored.id.clone(),
         model: stored.model.id.clone(),
@@ -78,6 +82,8 @@ fn session_info(stored: &StoredSession, messages: &[Message]) -> SessionInfo {
         cwd: stored.cwd.clone(),
         message_count: messages.len(),
         stats: compute_stats(messages, &stored.model, stored.is_subscription),
+        // Timestamps in DB are milliseconds; convert to seconds for display
+        last_activity: last_message_time.unwrap_or(stored.created_at) / 1000,
     }
 }
 
@@ -462,7 +468,8 @@ async fn handle_client(
                     match st.db.get_session(&session_id) {
                         Ok(Some(stored)) => {
                             let messages = st.db.get_messages(&session_id)?;
-                            Ok(session_info(&stored, &messages))
+                            let last_msg = st.db.last_message_time(&session_id)?;
+                            Ok(session_info(&stored, &messages, last_msg))
                         }
                         Ok(None) => Err(format!("session not found: {}", session_id)),
                         Err(e) => Err(format!("db error: {}", e)),
@@ -753,7 +760,8 @@ async fn handle_client(
                     let mut infos = Vec::with_capacity(stored.len());
                     for s in &stored {
                         let messages = st.db.get_messages(&s.id)?;
-                        infos.push(session_info(s, &messages));
+                        let last_msg = st.db.last_message_time(&s.id)?;
+                        infos.push(session_info(s, &messages, last_msg));
                     }
                     infos
                 };

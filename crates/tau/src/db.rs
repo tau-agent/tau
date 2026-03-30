@@ -193,6 +193,19 @@ impl Db {
         Ok(sessions)
     }
 
+    /// Get the timestamp of the last message in a session (or None if no messages).
+    pub fn last_message_time(&self, session_id: &str) -> crate::Result<Option<i64>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT MAX(created_at) FROM messages WHERE session_id = ?1",
+                [session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|e| crate::Error::Io(format!("last_message_time: {}", e)))?;
+        Ok(result)
+    }
+
     /// Delete a session and all its messages (CASCADE).
     pub fn delete_session(&self, id: &str) -> crate::Result<()> {
         self.conn

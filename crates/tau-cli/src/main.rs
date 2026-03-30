@@ -1143,7 +1143,11 @@ async fn cmd_sessions_list() -> tau::Result<()> {
                     for s in sessions {
                         let stats = tau::protocol::format_stats(&s.stats);
                         let cwd = s.cwd.as_deref().unwrap_or("");
-                        println!("{}	{}/{}	{}	{}", s.id, s.provider, s.model, cwd, stats);
+                        let ago = format_time_ago(s.last_activity);
+                        println!(
+                            "{}	{}/{}	{}	{}	{}",
+                            s.id, s.provider, s.model, ago, cwd, stats
+                        );
                     }
                 }
             }
@@ -1310,4 +1314,35 @@ fn cmd_models_remove(id: &str, provider: &str) -> tau::Result<()> {
         id, provider
     );
     Ok(())
+}
+
+fn format_time_ago(unix_secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let delta = now - unix_secs;
+    if delta < 0 {
+        return "just now".to_string();
+    }
+    let delta = delta as u64;
+    match delta {
+        0..=59 => "just now".to_string(),
+        60..=3599 => {
+            let m = delta / 60;
+            format!("{}m ago", m)
+        }
+        3600..=86399 => {
+            let h = delta / 3600;
+            format!("{}h ago", h)
+        }
+        86400..=2591999 => {
+            let d = delta / 86400;
+            format!("{}d ago", d)
+        }
+        _ => {
+            let mo = delta / 2592000;
+            format!("{}mo ago", mo)
+        }
+    }
 }
