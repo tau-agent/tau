@@ -974,11 +974,61 @@ impl crate::worker::ToolExecutor for CombinedExecutor {
         if pm.has_tool(&tool_call.name)
             && let Some(plugin) = pm.find_tool_plugin(&tool_call.name)
         {
-            return plugin.execute_tool(tool_call, on_output);
+            let result = plugin.execute_tool(tool_call, on_output)?;
+            drop(pm);
+            return Ok(self.run_after_tool_hooks(tool_call, result));
         }
         drop(pm);
+
         // Fall through to built-in worker
-        self.worker.execute(tool_call, on_output)
+        let result = self.worker.execute(tool_call, on_output)?;
+        Ok(self.run_after_tool_hooks(tool_call, result))
+    }
+}
+
+impl CombinedExecutor {
+    /// Call after_tool_result hooks on all interested plugins.
+    /// Appends returned content to the tool result.
+    fn run_after_tool_hooks(
+        &mut self,
+        tool_call: &ToolCall,
+        mut result: ToolResultMessage,
+    ) -> ToolResultMessage {
+        let result_text: String = result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                crate::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let hook_data = serde_json::json!({
+            "tool_name": tool_call.name,
+            "arguments": tool_call.arguments,
+            "content": result_text,
+            "is_error": result.is_error,
+        });
+
+        let mut pm = self.plugins.lock().unwrap();
+        let hook_results = pm.call_hook("after_tool_result", &hook_data);
+        drop(pm);
+
+        for hook_result in hook_results {
+            if let Some(append) = hook_result.tool_result_append
+                && !append.is_empty()
+            {
+                result.content.push(crate::types::ToolResultContent::Text(
+                    crate::types::TextContent {
+                        text: append,
+                        text_signature: None,
+                    },
+                ));
+            }
+        }
+
+        result
     }
 }
 

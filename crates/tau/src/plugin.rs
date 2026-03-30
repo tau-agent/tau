@@ -99,6 +99,9 @@ pub struct HookResult {
     /// Optional replacement system prompt.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Optional text to append to a tool result (for after_tool_result hook).
+    #[serde(default)]
+    pub tool_result_append: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

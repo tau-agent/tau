@@ -69,7 +69,7 @@ send({
             }
         }
     ],
-    "hooks": ["before_agent_start", "session_start"],
+    "hooks": ["before_agent_start", "session_start", "after_tool_result"],
     "commands": [
         {"name": "test-cmd", "description": "A test command"}
     ]
@@ -98,6 +98,13 @@ while True:
                 "message": {
                     "content": "[TEST PLUGIN] Context injected by test plugin."
                 }
+            })
+        elif hook_name == "after_tool_result":
+            data = msg.get("data", {})
+            tool_name = data.get("tool_name", "")
+            send({
+                "type": "hook_result",
+                "tool_result_append": f"\n[TEST DIAGNOSTICS for {tool_name}]"
             })
         else:
             send({"type": "hook_result"})

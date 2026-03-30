@@ -23,7 +23,7 @@ fn plugin_registration() {
 
     assert_eq!(handle.name, "test-plugin");
     assert_eq!(handle.registration.tools.len(), 3);
-    assert_eq!(handle.registration.hooks.len(), 2);
+    assert_eq!(handle.registration.hooks.len(), 3);
     assert_eq!(handle.registration.commands.len(), 1);
 
     // Check tool details
@@ -308,5 +308,29 @@ fn plugin_wants_hook() {
 
     assert!(handle.wants_hook("before_agent_start"));
     assert!(handle.wants_hook("session_start"));
+    assert!(handle.wants_hook("after_tool_result"));
     assert!(!handle.wants_hook("nonexistent_hook"));
+}
+
+#[test]
+fn plugin_after_tool_result_hook() {
+    let cmd = test_plugin_command();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+
+    let result = handle
+        .call_hook(
+            "after_tool_result",
+            serde_json::json!({
+                "tool_name": "edit",
+                "arguments": {"path": "src/main.rs"},
+                "content": "Applied 1 edit",
+                "is_error": false,
+            }),
+        )
+        .unwrap();
+
+    assert!(result.tool_result_append.is_some());
+    let append = result.tool_result_append.unwrap();
+    assert!(append.contains("TEST DIAGNOSTICS"));
+    assert!(append.contains("edit"));
 }
