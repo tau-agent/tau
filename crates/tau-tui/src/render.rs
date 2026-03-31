@@ -105,16 +105,54 @@ impl RendererRegistry {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Render a header line: "tool_name key_info"
-fn header_line(name: &str, info: &str, theme: &Theme, bg: Style) -> Line<'static> {
+/// Render a header, wrapping long info text across multiple lines.
+/// First line: " name info...", continuation lines indented to align.
+fn header_lines(
+    name: &str,
+    info: &str,
+    theme: &Theme,
+    bg: Style,
+    width: u16,
+) -> Vec<Line<'static>> {
     let title_style = bg
         .fg(theme.tool_title.to_ratatui())
         .add_modifier(Modifier::BOLD);
     let info_style = bg.fg(theme.tool_output.to_ratatui());
-    Line::from(vec![
-        Span::styled(format!(" {}", name), title_style),
-        Span::styled(format!(" {}", info), info_style),
-    ])
+
+    // " name " prefix occupies this many columns
+    let prefix_len = 1 + name.len() + 1; // space + name + space
+    let usable = (width as usize).saturating_sub(prefix_len);
+
+    if usable == 0 || info.len() <= usable {
+        return vec![Line::from(vec![
+            Span::styled(format!(" {}", name), title_style),
+            Span::styled(format!(" {}", info), info_style),
+        ])];
+    }
+
+    // Wrap info into chunks of `usable` width
+    let mut lines = Vec::new();
+    let mut remaining = info;
+    let indent: String = " ".repeat(prefix_len);
+    let mut first = true;
+    while !remaining.is_empty() {
+        let split = remaining.len().min(usable);
+        let chunk = &remaining[..split];
+        remaining = &remaining[split..];
+        if first {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}", name), title_style),
+                Span::styled(format!(" {}", chunk), info_style),
+            ]));
+            first = false;
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("{}{}", indent, chunk),
+                info_style,
+            )));
+        }
+    }
+    lines
 }
 
 /// Render output lines with clamping and indentation.
@@ -159,7 +197,7 @@ impl ToolRenderer for DefaultRenderer {
     ) -> Vec<Line<'static>> {
         let bg = theme.tool_pending_style();
         let args_preview = truncate_str(&args.to_string(), 80);
-        let mut lines = vec![header_line(name, &args_preview, theme, bg)];
+        let mut lines = header_lines(name, &args_preview, theme, bg, width);
         if !output.is_empty() {
             lines.extend(output_lines(output, theme, bg, DEFAULT_MAX_LINES));
         }
@@ -182,7 +220,7 @@ impl ToolRenderer for DefaultRenderer {
             theme.tool_success_style()
         };
         let args_preview = truncate_str(&args.to_string(), 80);
-        let mut lines = vec![header_line(name, &args_preview, theme, bg)];
+        let mut lines = header_lines(name, &args_preview, theme, bg, width);
         if !output.is_empty() {
             let out: Vec<String> = output.lines().map(String::from).collect();
             lines.extend(output_lines(&out, theme, bg, DEFAULT_MAX_LINES));
@@ -198,7 +236,13 @@ impl ToolRenderer for DefaultRenderer {
 struct BashRenderer;
 
 impl BashRenderer {
-    fn bash_header(args: &Value, suffix: &str, theme: &Theme, bg: Style) -> Line<'static> {
+    fn bash_header(
+        args: &Value,
+        suffix: &str,
+        theme: &Theme,
+        bg: Style,
+        width: u16,
+    ) -> Vec<Line<'static>> {
         let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("?");
         let timeout = args.get("timeout").and_then(|t| t.as_u64());
         let mut info = format!("$ {}", command);
@@ -208,7 +252,7 @@ impl BashRenderer {
         if !suffix.is_empty() {
             info.push_str(&format!(" {}", suffix));
         }
-        header_line("bash", &info, theme, bg)
+        header_lines("bash", &info, theme, bg, width)
     }
 }
 
@@ -224,12 +268,8 @@ impl ToolRenderer for BashRenderer {
     ) -> Vec<Line<'static>> {
         let bg = theme.tool_pending_style();
         let elapsed = format_duration(started_at.elapsed());
-        let mut lines = vec![BashRenderer::bash_header(
-            args,
-            &format!("(elapsed {})", elapsed),
-            theme,
-            bg,
-        )];
+        let mut lines =
+            BashRenderer::bash_header(args, &format!("(elapsed {})", elapsed), theme, bg, width);
         if !output.is_empty() {
             lines.extend(output_lines(output, theme, bg, DEFAULT_MAX_LINES));
         }
@@ -251,7 +291,7 @@ impl ToolRenderer for BashRenderer {
         } else {
             theme.tool_success_style()
         };
-        let mut lines = vec![BashRenderer::bash_header(args, "", theme, bg)];
+        let mut lines = BashRenderer::bash_header(args, "", theme, bg, width);
 
         // Output lines
         let output_text = output.trim_end();
@@ -328,7 +368,7 @@ impl ToolRenderer for EditRenderer {
     ) -> Vec<Line<'static>> {
         let bg = theme.tool_pending_style();
         let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-        let lines = vec![header_line("edit", path, theme, bg)];
+        let lines = header_lines("edit", path, theme, bg, width);
         wrap_tool_block(lines, bg, width)
     }
 
@@ -349,7 +389,7 @@ impl ToolRenderer for EditRenderer {
         };
         let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
 
-        let mut lines = vec![header_line("edit", path, theme, bg)];
+        let mut lines = header_lines("edit", path, theme, bg, width);
 
         // Render a diff-like view from edits
         if let Some(edits) = args.get("edits").and_then(|e| e.as_array()) {
@@ -422,7 +462,7 @@ impl ToolRenderer for ReadRenderer {
         if let Some(offset) = args.get("offset").and_then(|o| o.as_u64()) {
             info.push_str(&format!(" (offset: {})", offset));
         }
-        let lines = vec![header_line("read", &info, theme, bg)];
+        let lines = header_lines("read", &info, theme, bg, width);
         wrap_tool_block(lines, bg, width)
     }
 
@@ -444,7 +484,7 @@ impl ToolRenderer for ReadRenderer {
         let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
         let line_count = output.lines().count();
         let info = format!("{} ({} lines)", path, line_count);
-        let mut lines = vec![header_line("read", &info, theme, bg)];
+        let mut lines = header_lines("read", &info, theme, bg, width);
         if !output.is_empty() {
             let out: Vec<String> = output.lines().map(String::from).collect();
             lines.extend(output_lines(&out, theme, bg, DEFAULT_MAX_LINES));
@@ -471,7 +511,7 @@ impl ToolRenderer for WriteRenderer {
     ) -> Vec<Line<'static>> {
         let bg = theme.tool_pending_style();
         let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-        let lines = vec![header_line("write", path, theme, bg)];
+        let lines = header_lines("write", path, theme, bg, width);
         wrap_tool_block(lines, bg, width)
     }
 
@@ -501,7 +541,7 @@ impl ToolRenderer for WriteRenderer {
         } else {
             format!("{} ({} bytes)", path, content_len)
         };
-        let mut lines = vec![header_line("write", &info, theme, bg)];
+        let mut lines = header_lines("write", &info, theme, bg, width);
         if is_error && !output.is_empty() {
             let out: Vec<String> = output.lines().map(String::from).collect();
             lines.extend(output_lines(&out, theme, bg, DEFAULT_MAX_LINES));
