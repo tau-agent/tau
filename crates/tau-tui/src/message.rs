@@ -108,8 +108,9 @@ impl MessageItem {
             }
             MessageItem::Assistant { text } | MessageItem::AssistantStreaming { text } => {
                 let usable = (width as usize).saturating_sub(1);
+                let trimmed = text.trim_start_matches('\n');
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                for l in wrap_text(text, usable) {
+                for l in wrap_text(trimmed, usable) {
                     lines.push(Line::from(format!(" {}", l)));
                 }
                 if lines.is_empty() {
