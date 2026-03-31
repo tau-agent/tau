@@ -95,9 +95,18 @@ pub async fn run(
     disable_raw_mode().ok();
     terminal.show_cursor().ok();
 
-    result
+    // Print exit message with session resume hint
+    if let Ok(Some(session_id)) = &result {
+        eprintln!(
+            "Thanks for using tau. Resume with: tau chat -s {}",
+            session_id
+        );
+    }
+
+    result.map(|_| ())
 }
 
+/// Returns Ok(Some(session_id)) if the session was kept, Ok(None) if it was deleted (empty).
 async fn run_inner(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     session_id: String,
@@ -105,7 +114,7 @@ async fn run_inner(
     provider: String,
     context_window: u64,
     is_subscription: bool,
-) -> tau::Result<()> {
+) -> tau::Result<Option<String>> {
     let saved_settings = settings::load();
     let theme = match saved_settings.tui.theme.as_deref() {
         Some(name) => theme::load_by_name(name).unwrap_or_else(|_| theme::dark()),
@@ -248,9 +257,10 @@ async fn run_inner(
         send_request_and_recv(Request::DeleteSession { session_id: sid }, server_tx)
             .await
             .ok();
+        Ok(None)
+    } else {
+        Ok(Some(app.session_id.clone()))
     }
-
-    Ok(())
 }
 
 /// Fetch message history for a session (blocking request/response).

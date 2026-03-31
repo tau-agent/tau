@@ -200,8 +200,11 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let totals = &app.totals;
     let dim = theme.fg(theme.dim);
 
-    // Build left side: stats
+    // Build left side: session ID + stats
     let mut left_parts: Vec<Span<'static>> = Vec::new();
+
+    // Session ID
+    left_parts.push(Span::styled(app.session_id.clone(), dim));
 
     if totals.input > 0 {
         left_parts.push(Span::styled(
