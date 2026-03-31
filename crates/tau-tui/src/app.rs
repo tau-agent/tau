@@ -671,6 +671,47 @@ impl App {
         }
     }
 
+    /// Finalize all in-flight display items after an interruption (cancel or
+    /// abrupt agent-done).  Walks the message list and converts any
+    /// still-active items to their completed equivalents so the TUI does not
+    /// keep showing spinners/cursors after the agent loop has ended.
+    fn finalize_in_flight(&mut self) {
+        for item in self.messages.iter_mut() {
+            match item {
+                MessageItem::AssistantStreaming { text } => {
+                    if text.is_empty() {
+                        // Will be removed by the cleanup pass below.
+                        continue;
+                    }
+                    *item = MessageItem::Assistant {
+                        text: std::mem::take(text),
+                    };
+                }
+                MessageItem::Thinking { done, .. } if !*done => {
+                    *done = true;
+                }
+                MessageItem::ToolActive {
+                    name,
+                    args,
+                    started_at,
+                    ..
+                } => {
+                    *item = MessageItem::ToolComplete {
+                        name: std::mem::take(name),
+                        args: std::mem::take(args),
+                        output: "[interrupted]".into(),
+                        is_error: true,
+                        duration: started_at.elapsed(),
+                    };
+                }
+                _ => {}
+            }
+        }
+        // Remove any remaining empty streaming placeholders.
+        self.messages
+            .retain(|m| !matches!(m, MessageItem::AssistantStreaming { text } if text.is_empty()));
+    }
+
     fn handle_server_response(&mut self, response: Response) {
         match response {
             Response::Stream { event } => {
@@ -682,11 +723,11 @@ impl App {
                 self.handle_stream_event(*event);
             }
             Response::AgentDone => {
-                self.cleanup_empty_streaming();
+                self.finalize_in_flight();
                 self.mode = AppMode::Input;
             }
             Response::Cancelled => {
-                self.cleanup_empty_streaming();
+                self.finalize_in_flight();
                 // Replace "cancelling" status with "cancelled"
                 if let Some(last) = self.messages.last_mut()
                     && matches!(last, MessageItem::Status { text } if text.contains("cancelling"))
@@ -714,7 +755,7 @@ impl App {
                 }
             }
             Response::Error { message } => {
-                self.cleanup_empty_streaming();
+                self.finalize_in_flight();
                 self.messages.push(MessageItem::Error { text: message });
                 self.mode = AppMode::Input;
             }
