@@ -365,6 +365,26 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                 .map_err(|_| crate::Error::ChannelClosed)?;
                 return Ok(());
             }
+            "error" => {
+                // Anthropic SSE error event: {"type":"error","error":{"type":"...","message":"..."}}
+                let error_msg = serde_json::from_str::<serde_json::Value>(data)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_else(|| format!("SSE error: {}", data));
+                output.stop_reason = StopReason::Error;
+                output.error_message = Some(error_msg);
+                tx.send_blocking(StreamEvent::Error {
+                    reason: StopReason::Error,
+                    error: output,
+                })
+                .map_err(|_| crate::Error::ChannelClosed)?;
+                return Ok(());
+            }
             _ => {}
         }
     }
