@@ -18,6 +18,9 @@ pub struct AgentConfig {
     pub retry_base_ms: u64,
     /// Optional shutdown check — if returns true, stop after current turn.
     pub should_stop: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// Channel for receiving steering messages injected mid-loop.
+    /// Checked at the top of each turn (after tool results, before next LLM call).
+    pub steer_rx: Option<smol::channel::Receiver<String>>,
 }
 
 impl Default for AgentConfig {
@@ -27,6 +30,7 @@ impl Default for AgentConfig {
             max_retries: 5,
             retry_base_ms: 1000,
             should_stop: None,
+            steer_rx: None,
         }
     }
 }
@@ -71,6 +75,20 @@ pub fn run(
     context.tools = extra_tools.to_vec();
 
     for turn in 0..config.max_turns {
+        // Drain any pending steering messages before the next LLM call.
+        // These are user messages injected mid-loop via Request::Steer.
+        if let Some(ref rx) = config.steer_rx {
+            while let Ok(text) = rx.try_recv() {
+                let user_msg = UserMessage::text(&text);
+                on_event(StreamEvent::SteerMessage {
+                    message: user_msg.clone(),
+                });
+                let msg = Message::User(user_msg);
+                new_messages.push(msg.clone());
+                context.messages.push(msg);
+            }
+        }
+
         // Stream LLM response (with retry)
         let message =
             match stream_with_retry(registry, model, context, options, config, &mut on_event) {

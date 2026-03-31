@@ -197,6 +197,14 @@ async fn run_inner(
                     })
                     .detach();
                 }
+                Action::Steer(text) => {
+                    // Fire-and-forget: steering message injected into agent loop
+                    send_fire_and_forget(Request::Steer {
+                        session_id: sid,
+                        text,
+                    })
+                    .await?;
+                }
                 Action::ListModels => {
                     send_request_and_recv(Request::ListModels, server_tx.clone()).await?;
                 }

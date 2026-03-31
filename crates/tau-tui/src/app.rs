@@ -480,7 +480,7 @@ impl App {
 
     fn handle_streaming_key(&mut self, key: &KeyEvent) -> Option<Action> {
         match (key.code, key.modifiers) {
-            // Enter during streaming: steering message (runs next, before queued)
+            // Enter during streaming: inject steering message into agent loop
             (KeyCode::Enter, KeyModifiers::NONE) => {
                 let text: String = self.textarea.lines().join("\n");
                 let text = text.trim().to_string();
@@ -495,14 +495,9 @@ impl App {
                     return self.handle_slash_command(&text);
                 }
 
-                self.queued_messages.push(QueuedMessage {
-                    text: text.clone(),
-                    is_steering: true,
-                });
-                self.messages.push(MessageItem::Status {
-                    text: format!("[steer: {}]", text),
-                });
-                None
+                self.scroll_to_bottom();
+                self.history_index = None;
+                Some(Action::Steer(text))
             }
             // Alt+Enter during streaming: queued message (runs after steering)
             (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
@@ -968,8 +963,10 @@ pub enum Action {
     GetStatus,
     GetSubscriptionUsage,
     SetCwd(String),
-    /// Send the next queued steering message.
+    /// Send the next queued message (after AgentDone).
     SendQueued(String),
+    /// Inject a steering message into the running agent loop.
+    Steer(String),
 }
 
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.

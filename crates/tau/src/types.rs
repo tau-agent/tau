@@ -358,6 +358,10 @@ pub enum StreamEvent {
         reason: StopReason,
         error: AssistantMessage,
     },
+    /// A steering message was injected mid-loop.
+    SteerMessage {
+        message: UserMessage,
+    },
 }
 
 // ---------------------------------------------------------------------------

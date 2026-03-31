@@ -53,6 +53,10 @@ pub enum Request {
     Subscribe { session_id: String },
     /// Cancel an in-progress chat (agent loop) for a session.
     CancelChat { session_id: String },
+    /// Inject a steering message into a running agent loop.
+    /// The message is inserted as a user message between tool results
+    /// and the next LLM call. If no agent is running, treated as Chat.
+    Steer { session_id: String, text: String },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).

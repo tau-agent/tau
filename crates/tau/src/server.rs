@@ -135,6 +135,8 @@ struct State {
     usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
     /// Per-session cancel flags.  Set by CancelChat, cleared on Chat start.
     cancel_flags: HashMap<String, Arc<AtomicBool>>,
+    /// Per-session steering channels for injecting messages into running agent loops.
+    steer_txs: HashMap<String, smol::channel::Sender<String>>,
     /// Per-session broadcast subscribers.
     /// Other clients watching a session receive streamed responses.
     subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
@@ -293,6 +295,7 @@ pub async fn run() -> crate::Result<()> {
         all_models,
         usage_cache: None,
         cancel_flags: HashMap::new(),
+        steer_txs: HashMap::new(),
         subscribers: HashMap::new(),
     }));
 
@@ -816,6 +819,33 @@ async fn handle_client(
                 } // lock released before await
                 send(&mut writer, &Response::Ok).await.ok();
             }
+            Request::Steer { session_id, text } => {
+                let sent = {
+                    let st = state.lock().unwrap();
+                    if let Some(tx) = st.steer_txs.get(&session_id) {
+                        tx.try_send(text.clone()).is_ok()
+                    } else {
+                        false
+                    }
+                };
+                if sent {
+                    // Steering message will be picked up by the agent loop
+                    send(&mut writer, &Response::Ok).await.ok();
+                } else {
+                    // No active agent loop — treat as a regular chat message
+                    // Re-dispatch as Chat by pushing it back. We handle it inline
+                    // to avoid recursion: just send an error telling the client
+                    // to send a Chat instead.
+                    send(
+                        &mut writer,
+                        &Response::Error {
+                            message: "no active agent loop, use Chat instead".into(),
+                        },
+                    )
+                    .await
+                    .ok();
+                }
+            }
             Request::ListSessions => {
                 let sessions = {
                     let st = state.lock().unwrap();
@@ -1091,12 +1121,20 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
 
     let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
 
+    // Create steering channel for this session's agent loop
+    let (steer_tx, steer_rx) = smol::channel::bounded::<String>(16);
+    {
+        let mut st = state.lock().unwrap();
+        st.steer_txs.insert(session_id.to_string(), steer_tx);
+    }
+
     let shutdown_flag = shutdown.flag.clone();
     let cancel_flag_clone = cancel_flag.clone();
     let agent_config = crate::agent::AgentConfig {
         should_stop: Some(Box::new(move || {
             shutdown_flag.load(Ordering::Relaxed) || cancel_flag_clone.load(Ordering::Relaxed)
         })),
+        steer_rx: Some(steer_rx),
         ..Default::default()
     };
 
@@ -1145,6 +1183,29 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     let forward_handle = async {
         let mut writer_alive = true;
         while let Ok(event) = event_rx.recv().await {
+            // Persist steering messages to DB and broadcast as UserMessage
+            if let StreamEvent::SteerMessage { ref message } = event {
+                let user_msg = Message::User(message.clone());
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                {
+                    let st = state_clone.lock().unwrap();
+                    st.db.append_message(&session_id_owned, &user_msg).ok();
+                }
+                let user_resp = Response::UserMessage { text };
+                broadcast_to_subscribers(&state_clone, &session_id_owned, &user_resp);
+                if writer_alive && send(writer, &user_resp).await.is_err() {
+                    writer_alive = false;
+                }
+                continue;
+            }
             let resp = Response::Stream {
                 event: Box::new(event),
             };
@@ -1164,6 +1225,13 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     }
 
     let agent_result = agent_result?;
+
+    // Clean up steering channel
+    {
+        let mut st = state.lock().unwrap();
+        st.steer_txs.remove(session_id);
+    }
+
     Ok(agent_result.new_messages)
 }
 
