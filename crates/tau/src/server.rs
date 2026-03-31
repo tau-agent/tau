@@ -142,6 +142,19 @@ struct State {
 
 type SharedState = Arc<Mutex<State>>;
 
+/// Per-session async locks to serialize Chat requests.
+/// The outer std::Mutex is only held briefly to get/create a lock.
+/// The inner smol::lock::Mutex is held across the entire agent turn.
+type SessionLocks = Arc<Mutex<HashMap<String, Arc<smol::lock::Mutex<()>>>>>;
+
+/// Get or create an async lock for a session.
+fn session_lock(locks: &SessionLocks, session_id: &str) -> Arc<smol::lock::Mutex<()>> {
+    let mut map = locks.lock().unwrap();
+    map.entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(smol::lock::Mutex::new(())))
+        .clone()
+}
+
 /// A sender that can deliver shutdown notifications to a connected client.
 type ClientNotifier = smol::channel::Sender<Response>;
 
@@ -266,6 +279,8 @@ pub async fn run() -> crate::Result<()> {
     plugins.load_global_plugins("/tmp");
     let plugins: Arc<Mutex<crate::plugin::PluginManager>> = Arc::new(Mutex::new(plugins));
 
+    let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
+
     let state: SharedState = Arc::new(Mutex::new(State {
         db,
         registry,
@@ -306,8 +321,11 @@ pub async fn run() -> crate::Result<()> {
         let state = state.clone();
         let plugins = plugins.clone();
         let shutdown_handle = shutdown.clone();
+        let session_locks = session_locks.clone();
         smol::spawn(async move {
-            if let Err(e) = handle_client(stream, state, plugins, shutdown_handle).await {
+            if let Err(e) =
+                handle_client(stream, state, plugins, shutdown_handle, session_locks).await
+            {
                 eprintln!("client error: {}", e);
             }
         })
@@ -351,6 +369,7 @@ async fn handle_client(
     state: SharedState,
     plugins: Arc<Mutex<crate::plugin::PluginManager>>,
     shutdown: ShutdownHandle,
+    session_locks: SessionLocks,
 ) -> crate::Result<()> {
     // Register for shutdown notifications
     let shutdown_rx = shutdown.register_client();
@@ -501,6 +520,10 @@ async fn handle_client(
                     .await?;
                     continue;
                 }
+                // Acquire per-session lock — serializes concurrent Chat requests.
+                // If another agent turn is running, this awaits until it finishes.
+                let _session_guard = session_lock(&session_locks, &session_id).lock_arc().await;
+
                 // Reset (and create) the cancel flag for this session.
                 let cancel_flag: Arc<AtomicBool> = {
                     let mut st = state.lock().unwrap();
