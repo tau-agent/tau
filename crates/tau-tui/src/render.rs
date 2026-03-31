@@ -123,40 +123,57 @@ fn header_lines(
     let prefix_len = 1 + name.len() + 1 + 1; // space + name + space + info leading space
     let usable = (width as usize).saturating_sub(prefix_len);
 
-    if usable == 0 || info.len() <= usable {
+    /// Display width of a string (excludes control characters).
+    fn display_width(s: &str) -> usize {
+        s.chars().filter(|c| !c.is_control()).count()
+    }
+
+    if usable == 0 || display_width(info) <= usable {
         return vec![Line::from(vec![
             Span::styled(format!(" {}", name), title_style),
             Span::styled(format!(" {}", info), info_style),
         ])];
     }
 
-    // Wrap info into chunks of `usable` width
+    // Split on newlines, then wrap each sub-line to `usable` display width.
     let mut lines = Vec::new();
-    let mut remaining = info;
     let indent: String = " ".repeat(prefix_len);
     let mut first = true;
-    while !remaining.is_empty() {
-        let split = if remaining.len() <= usable {
-            remaining.len()
-        } else {
-            remaining[..usable]
-                .rfind(' ')
-                .map(|i| i + 1)
-                .unwrap_or(usable)
-        };
-        let chunk = &remaining[..split];
-        remaining = &remaining[split..];
-        if first {
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {}", name), title_style),
-                Span::styled(format!(" {}", chunk), info_style),
-            ]));
-            first = false;
-        } else {
-            lines.push(Line::from(Span::styled(
-                format!("{}{}", indent, chunk),
-                info_style,
-            )));
+
+    for info_line in info.split('\n') {
+        let mut remaining = info_line;
+        while !remaining.is_empty() {
+            let dw = display_width(remaining);
+            let split = if dw <= usable {
+                remaining.len()
+            } else {
+                // Find byte offset of the usable-th display character
+                let byte_limit = remaining
+                    .char_indices()
+                    .filter(|(_, c)| !c.is_control())
+                    .nth(usable)
+                    .map(|(i, _)| i)
+                    .unwrap_or(remaining.len());
+                // Try word boundary within that range
+                remaining[..byte_limit]
+                    .rfind(' ')
+                    .map(|i| i + 1)
+                    .unwrap_or(byte_limit)
+            };
+            let chunk = &remaining[..split];
+            remaining = &remaining[split..];
+            if first {
+                lines.push(Line::from(vec![
+                    Span::styled(format!(" {}", name), title_style),
+                    Span::styled(format!(" {}", chunk), info_style),
+                ]));
+                first = false;
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("{}{}", indent, chunk),
+                    info_style,
+                )));
+            }
         }
     }
     lines
