@@ -119,8 +119,8 @@ fn header_lines(
         .add_modifier(Modifier::BOLD);
     let info_style = bg.fg(theme.tool_output.to_ratatui());
 
-    // " name " prefix occupies this many columns
-    let prefix_len = 1 + name.len() + 1; // space + name + space
+    // " name " + leading space of info span = total columns before info text
+    let prefix_len = 1 + name.len() + 1 + 1; // space + name + space + info leading space
     let usable = (width as usize).saturating_sub(prefix_len);
 
     if usable == 0 || info.len() <= usable {
