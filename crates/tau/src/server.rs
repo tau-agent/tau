@@ -280,6 +280,7 @@ pub async fn run() -> crate::Result<()> {
     let plugins: Arc<Mutex<crate::plugin::PluginManager>> = Arc::new(Mutex::new(plugins));
 
     let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
+    let throttle = crate::throttle::ProviderThrottle::new();
 
     let state: SharedState = Arc::new(Mutex::new(State {
         db,
@@ -322,9 +323,17 @@ pub async fn run() -> crate::Result<()> {
         let plugins = plugins.clone();
         let shutdown_handle = shutdown.clone();
         let session_locks = session_locks.clone();
+        let throttle = throttle.clone();
         smol::spawn(async move {
-            if let Err(e) =
-                handle_client(stream, state, plugins, shutdown_handle, session_locks).await
+            if let Err(e) = handle_client(
+                stream,
+                state,
+                plugins,
+                shutdown_handle,
+                session_locks,
+                throttle,
+            )
+            .await
             {
                 eprintln!("client error: {}", e);
             }
@@ -370,6 +379,7 @@ async fn handle_client(
     plugins: Arc<Mutex<crate::plugin::PluginManager>>,
     shutdown: ShutdownHandle,
     session_locks: SessionLocks,
+    throttle: crate::throttle::ProviderThrottle,
 ) -> crate::Result<()> {
     // Register for shutdown notifications
     let shutdown_rx = shutdown.register_client();
@@ -592,6 +602,7 @@ async fn handle_client(
                         &cwd,
                         &session_id,
                         &mut writer,
+                        &throttle,
                     )
                     .await;
                     match cont_result {
@@ -667,6 +678,7 @@ async fn handle_client(
                     &cwd,
                     &session_id,
                     &mut writer,
+                    &throttle,
                 )
                 .await;
 
@@ -683,9 +695,14 @@ async fn handle_client(
                         cancel_flag.store(true, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        let err_resp = Response::Error {
-                            message: format!("agent error: {}", e),
-                        };
+                        let err_msg = format!("agent error: {}", e);
+                        // Update throttle on rate limit errors
+                        if let crate::Error::Http(ref msg) = e {
+                            throttle.handle_error(&model.provider, msg, None);
+                        }
+                        // Also check the error string for rate limit patterns
+                        throttle.handle_error(&model.provider, &err_msg, None);
+                        let err_resp = Response::Error { message: err_msg };
                         let done_resp = Response::AgentDone;
                         broadcast_to_subscribers(&state, &session_id, &err_resp);
                         broadcast_to_subscribers(&state, &session_id, &done_resp);
@@ -1024,7 +1041,36 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     cwd: &str,
     session_id: &str,
     writer: &mut W,
+    throttle: &crate::throttle::ProviderThrottle,
 ) -> crate::Result<Vec<Message>> {
+    // Check provider throttle — sleep if rate limited
+    if let Some(remaining) = throttle.check(&model.provider) {
+        let secs = remaining.as_secs();
+        eprintln!("provider '{}' throttled, waiting {}s", model.provider, secs);
+        let msg = format!(
+            "provider '{}' rate limited, retrying in {}s...",
+            model.provider, secs
+        );
+        // Notify subscribers about the wait (non-fatal)
+        send(
+            writer,
+            &Response::Error {
+                message: msg.clone(),
+            },
+        )
+        .await
+        .ok();
+        broadcast_to_subscribers(state, session_id, &Response::Error { message: msg });
+        // Sleep with periodic cancellation checks
+        let deadline = std::time::Instant::now() + remaining;
+        while std::time::Instant::now() < deadline {
+            if cancel_flag.load(Ordering::Relaxed) || shutdown.is_shutting_down() {
+                return Err(crate::Error::Cancelled);
+            }
+            smol::Timer::after(std::time::Duration::from_secs(1)).await;
+        }
+    }
+
     let api_key = {
         let st = state.lock().unwrap();
         resolve_api_key(&st.auth, &st.config, &model.provider)?

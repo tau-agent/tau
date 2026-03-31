@@ -49,9 +49,24 @@ impl Provider for Anthropic {
             };
             let result = run_stream(&ctx, &body, &tx);
             if let Err(e) = result {
+                // For HTTP status errors, include the structured info in the error message
+                let error_message = match &e {
+                    crate::Error::HttpStatus {
+                        status,
+                        message,
+                        retry_after,
+                    } => {
+                        let mut msg = format!("HTTP {}: {}", status, message);
+                        if let Some(ra) = retry_after {
+                            msg.push_str(&format!(" [retry-after: {}s]", ra));
+                        }
+                        msg
+                    }
+                    other => other.to_string(),
+                };
                 let mut msg = AssistantMessage::empty(&api_id, &provider_name, &model_id);
                 msg.stop_reason = StopReason::Error;
-                msg.error_message = Some(e.to_string());
+                msg.error_message = Some(error_message);
                 let _ = tx.send_blocking(StreamEvent::Error {
                     reason: StopReason::Error,
                     error: msg,
@@ -103,8 +118,28 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
     }
 
     let mut resp = req
+        .config()
+        .http_status_as_error(false)
+        .build()
         .send_json(body)
         .map_err(|e| crate::Error::Http(e.to_string()))?;
+
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        use std::io::Read;
+        let mut body_text = String::new();
+        let _ = resp.body_mut().as_reader().read_to_string(&mut body_text);
+        return Err(crate::Error::HttpStatus {
+            status,
+            message: body_text,
+            retry_after,
+        });
+    }
 
     let reader = BufReader::new(resp.body_mut().as_reader());
     let mut output = AssistantMessage::empty(ctx.api_id, ctx.provider_name, ctx.model_id);

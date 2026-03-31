@@ -10,6 +10,7 @@ pub mod provider;
 pub mod providers;
 pub mod server;
 pub mod system_prompt;
+pub mod throttle;
 pub mod tools;
 pub mod types;
 pub mod worker;
@@ -29,6 +30,13 @@ pub enum Error {
     NoApiKey(String),
     #[error("HTTP error: {0}")]
     Http(String),
+    #[error("HTTP {status}: {message}")]
+    HttpStatus {
+        status: u16,
+        message: String,
+        /// Retry-After header value in seconds, if present.
+        retry_after: Option<u64>,
+    },
     #[error("parse error: {0}")]
     Parse(String),
     #[error("IO error: {0}")]
@@ -37,6 +45,8 @@ pub enum Error {
     ChannelClosed,
     #[error("cancelled")]
     Cancelled,
+    #[error("provider throttled until {0}")]
+    Throttled(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

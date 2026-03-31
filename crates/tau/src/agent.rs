@@ -182,6 +182,9 @@ pub fn run(
     })
 }
 
+/// Maximum retry delay in milliseconds (60 seconds).
+const MAX_RETRY_DELAY_MS: u64 = 60_000;
+
 /// Stream a single LLM call with retry logic for transient errors.
 fn stream_with_retry(
     registry: &ProviderRegistry,
@@ -206,7 +209,12 @@ fn stream_with_retry(
             && let Some(ref err_msg) = message.error_message
         {
             if is_retryable(err_msg) && attempt < config.max_retries {
-                let delay = config.retry_base_ms * 2u64.pow(attempt as u32);
+                // Use retry-after from the error if present, otherwise exponential backoff
+                let delay = parse_retry_after(err_msg)
+                    .map(|secs| secs * 1000)
+                    .unwrap_or_else(|| {
+                        (config.retry_base_ms * 2u64.pow(attempt as u32)).min(MAX_RETRY_DELAY_MS)
+                    });
                 eprintln!(
                     "retryable error (attempt {}/{}), retrying in {}ms: {}",
                     attempt + 1,
@@ -227,6 +235,15 @@ fn stream_with_retry(
     }
 
     Err(crate::Error::Http("max retries exceeded".into()))
+}
+
+/// Extract retry-after seconds from an error message containing "[retry-after: Ns]".
+fn parse_retry_after(err_msg: &str) -> Option<u64> {
+    let marker = "[retry-after: ";
+    let start = err_msg.find(marker)? + marker.len();
+    let rest = &err_msg[start..];
+    let end = rest.find('s')?;
+    rest[..end].parse().ok()
 }
 
 /// Consume a stream, forwarding events and returning the final message.
@@ -597,5 +614,19 @@ mod tests {
         // Negative
         assert!(!is_context_overflow("invalid request"));
         assert!(!is_context_overflow("rate limit exceeded"));
+    }
+
+    #[test]
+    fn parse_retry_after_from_error_msg() {
+        assert_eq!(
+            parse_retry_after("HTTP 429: rate limit [retry-after: 30s]"),
+            Some(30)
+        );
+        assert_eq!(
+            parse_retry_after("HTTP 429: too many requests [retry-after: 120s] please wait"),
+            Some(120)
+        );
+        assert_eq!(parse_retry_after("HTTP 500: internal error"), None);
+        assert_eq!(parse_retry_after("no retry info here"), None);
     }
 }
