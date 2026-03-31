@@ -447,8 +447,8 @@ impl App {
 
     fn handle_streaming_key(&mut self, key: &KeyEvent) -> Option<Action> {
         match (key.code, key.modifiers) {
-            // Alt+Enter during streaming: queue steering message
-            (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
+            // Enter (or Alt+Enter) during streaming: queue steering message
+            (KeyCode::Enter, KeyModifiers::NONE | KeyModifiers::ALT) => {
                 let text: String = self.textarea.lines().join("\n");
                 let text = text.trim().to_string();
                 if text.is_empty() {
@@ -461,6 +461,11 @@ impl App {
                 self.messages.push(MessageItem::Status {
                     text: format!("[queued: {}]", text),
                 });
+                None
+            }
+            // Shift+Enter during streaming: insert newline in textarea
+            (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
+                self.textarea.insert_newline();
                 None
             }
             // Escape: detect double-escape for cancel
