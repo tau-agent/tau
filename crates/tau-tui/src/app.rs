@@ -272,7 +272,7 @@ impl App {
                     return Some(Action::GetSubscriptionUsage);
                 }
                 // After AgentDone, drain steering messages first, then queued
-                if self.mode == AppMode::Input && !self.queued_messages.is_empty() {
+                while self.mode == AppMode::Input && !self.queued_messages.is_empty() {
                     // Steering messages first, then queued
                     let idx = self
                         .queued_messages
@@ -280,6 +280,16 @@ impl App {
                         .position(|m| m.is_steering)
                         .unwrap_or(0);
                     let next = self.queued_messages.remove(idx);
+
+                    // Handle slash commands from queue without sending to LLM
+                    if next.text.starts_with('/') {
+                        let action = self.handle_slash_command(&next.text);
+                        if action.is_some() {
+                            return action;
+                        }
+                        continue;
+                    }
+
                     // Don't add user message locally — it arrives via Subscribe broadcast
                     self.scroll_to_bottom();
                     self.mode = AppMode::Streaming;
@@ -360,6 +370,12 @@ impl App {
                 }
                 self.textarea.select_all();
                 self.textarea.cut();
+
+                // Handle slash commands immediately, don't queue them
+                if text.starts_with('/') {
+                    return self.handle_slash_command(&text);
+                }
+
                 self.queued_messages.push(QueuedMessage {
                     text: text.clone(),
                     is_steering: false,
@@ -467,6 +483,12 @@ impl App {
                 }
                 self.textarea.select_all();
                 self.textarea.cut();
+
+                // Handle slash commands immediately, don't queue them
+                if text.starts_with('/') {
+                    return self.handle_slash_command(&text);
+                }
+
                 self.queued_messages.push(QueuedMessage {
                     text: text.clone(),
                     is_steering: true,
@@ -485,6 +507,12 @@ impl App {
                 }
                 self.textarea.select_all();
                 self.textarea.cut();
+
+                // Handle slash commands immediately, don't queue them
+                if text.starts_with('/') {
+                    return self.handle_slash_command(&text);
+                }
+
                 self.queued_messages.push(QueuedMessage {
                     text: text.clone(),
                     is_steering: false,
