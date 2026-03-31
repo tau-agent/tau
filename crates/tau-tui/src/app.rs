@@ -125,6 +125,20 @@ impl App {
 
     /// Populate message history from stored messages (for session resume).
     pub fn restore_messages(&mut self, messages: &[Message]) {
+        // Build a map of tool_call_id -> arguments from assistant messages
+        // so we can recover args when displaying ToolResult entries.
+        let mut tool_call_args: std::collections::HashMap<&str, &serde_json::Value> =
+            std::collections::HashMap::new();
+        for msg in messages {
+            if let Message::Assistant(a) = msg {
+                for content in &a.content {
+                    if let AssistantContent::ToolCall(tc) = content {
+                        tool_call_args.insert(&tc.id, &tc.arguments);
+                    }
+                }
+            }
+        }
+
         for msg in messages {
             match msg {
                 Message::User(user_msg) => {
@@ -159,6 +173,7 @@ impl App {
                     self.totals.add(&assistant_msg.usage);
                 }
                 Message::ToolResult(ToolResultMessage {
+                    tool_call_id,
                     tool_name,
                     is_error,
                     content,
@@ -172,10 +187,14 @@ impl App {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    // No original args available from DB — use Null
+                    let args = tool_call_args
+                        .get(tool_call_id.as_str())
+                        .cloned()
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     self.messages.push(MessageItem::ToolComplete {
                         name: tool_name.clone(),
-                        args: serde_json::Value::Null,
+                        args,
                         output,
                         is_error: *is_error,
                         duration: std::time::Duration::ZERO,
