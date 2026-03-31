@@ -39,11 +39,19 @@ pub enum PluginRequest {
         /// Working directory for tool execution.
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Session this tool call belongs to.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// Notify session start.
     SessionStart { cwd: String, session_id: String },
+    /// Server response (server -> plugin tunnel).
+    /// Response to a PluginMessage::ServerRequest.
+    ServerResponse {
+        request_id: String,
+        response: crate::protocol::Response,
+    },
 }
-
 // ---------------------------------------------------------------------------
 // Protocol messages: plugin → tau
 // ---------------------------------------------------------------------------
@@ -59,6 +67,13 @@ pub enum PluginMessage {
     ToolResult(PluginToolResult),
     /// Tool output delta (streaming).
     OutputDelta { tool_call_id: String, text: String },
+    /// Server request (plugin → server tunnel).
+    /// Plugin sends a client protocol Request; server processes it and
+    /// responds with ServerResponse.
+    ServerRequest {
+        request_id: String,
+        request: crate::protocol::Request,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,13 +286,31 @@ impl PluginHandle {
         &mut self,
         tool_call: &ToolCall,
         cwd: Option<&str>,
+        session_id: Option<&str>,
         on_output: &mut dyn FnMut(&str),
+    ) -> crate::Result<crate::types::ToolResultMessage> {
+        self.execute_tool_with_server(tool_call, cwd, session_id, on_output, None)
+    }
+
+    /// Execute a tool call with optional server request handler.
+    /// `on_server_request` is called when the plugin sends a ServerRequest.
+    /// It receives the Request and returns a Response.
+    pub fn execute_tool_with_server(
+        &mut self,
+        tool_call: &ToolCall,
+        cwd: Option<&str>,
+        session_id: Option<&str>,
+        on_output: &mut dyn FnMut(&str),
+        mut on_server_request: Option<
+            &mut dyn FnMut(&crate::protocol::Request) -> crate::protocol::Response,
+        >,
     ) -> crate::Result<crate::types::ToolResultMessage> {
         self.send(&PluginRequest::ToolCall {
             tool_call_id: tool_call.id.clone(),
             name: tool_call.name.clone(),
             arguments: tool_call.arguments.clone(),
             cwd: cwd.map(String::from),
+            session_id: session_id.map(String::from),
         })?;
 
         loop {
@@ -295,6 +328,21 @@ impl PluginHandle {
                         is_error: result.is_error,
                         timestamp: crate::types::timestamp_ms(),
                     });
+                }
+                PluginMessage::ServerRequest {
+                    request_id,
+                    request,
+                } => {
+                    let response = match on_server_request {
+                        Some(ref mut handler) => handler(&request),
+                        None => crate::protocol::Response::Error {
+                            message: "server requests not supported in this context".into(),
+                        },
+                    };
+                    self.send(&PluginRequest::ServerResponse {
+                        request_id,
+                        response,
+                    })?;
                 }
                 _ => {
                     // Ignore unexpected messages during tool execution
@@ -524,11 +572,12 @@ impl SessionPlugins {
         &mut self,
         tool_call: &ToolCall,
         cwd: &str,
+        session_id: Option<&str>,
         on_output: &mut dyn FnMut(&str),
     ) -> crate::Result<crate::types::ToolResultMessage> {
         let plugin = find_tool_plugin(&mut self.plugins, &tool_call.name);
         match plugin {
-            Some(p) => p.execute_tool(tool_call, Some(cwd), on_output),
+            Some(p) => p.execute_tool(tool_call, Some(cwd), session_id, on_output),
             None => Err(crate::Error::Io(format!(
                 "no session plugin provides tool '{}'",
                 tool_call.name
@@ -658,7 +707,7 @@ impl PluginManager {
         if let Some(sp) = self.session_plugins.get_mut(session_id)
             && sp.has_tool(&tool_call.name)
         {
-            let mut result = sp.execute_tool(tool_call, cwd, on_output)?;
+            let mut result = sp.execute_tool(tool_call, cwd, Some(session_id), on_output)?;
             self.run_after_tool_hooks(session_id, tool_call, &mut result);
             return Ok(result);
         }
@@ -667,7 +716,8 @@ impl PluginManager {
         let plugin = find_tool_plugin(&mut self.global_plugins, &tool_call.name);
         match plugin {
             Some(p) => {
-                let mut result = p.execute_tool(tool_call, Some(cwd), on_output)?;
+                let mut result =
+                    p.execute_tool(tool_call, Some(cwd), Some(session_id), on_output)?;
                 self.run_after_tool_hooks(session_id, tool_call, &mut result);
                 Ok(result)
             }

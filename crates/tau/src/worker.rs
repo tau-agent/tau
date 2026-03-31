@@ -136,6 +136,7 @@ pub fn run_worker_loop() {
                 name,
                 arguments,
                 cwd,
+                session_id: _,
             } => {
                 let cwd = cwd.unwrap_or_else(|| {
                     std::env::current_dir()
@@ -200,6 +201,9 @@ pub fn run_worker_loop() {
                     &mut writer,
                     &PluginMessage::HookResult(crate::plugin::HookResult::default()),
                 );
+            }
+            PluginRequest::ServerResponse { .. } => {
+                // Worker doesn't handle server responses -- ignore
             }
         }
     }
