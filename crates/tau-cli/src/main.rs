@@ -4,7 +4,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::ArgValueCandidates;
 
 #[derive(Parser)]
-#[command(name = "tau", about = "LLM agent CLI")]
+#[command(name = "tau", about = "LLM agent CLI", infer_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -37,26 +37,31 @@ enum Commands {
     #[command(hide = true)]
     Worker,
     /// Manage the tau server
+    #[command(alias = "srv")]
     Server {
         #[command(subcommand)]
         action: ServerAction,
     },
     /// Manage sessions
+    #[command(alias = "s")]
     Sessions {
         #[command(subcommand)]
         action: SessionAction,
     },
     /// Manage providers
+    #[command(alias = "p")]
     Providers {
         #[command(subcommand)]
         action: ProviderAction,
     },
     /// Manage models
+    #[command(alias = "m")]
     Models {
         #[command(subcommand)]
         action: ModelAction,
     },
     /// Manage authentication
+    #[command(alias = "a")]
     Auth {
         #[command(subcommand)]
         action: AuthAction,
@@ -66,8 +71,10 @@ enum Commands {
 #[derive(Subcommand)]
 enum ProviderAction {
     /// List configured providers
+    #[command(alias = "l")]
     List,
     /// Add a provider
+    #[command(alias = "a")]
     Add {
         /// Provider name
         name: String,
@@ -82,6 +89,7 @@ enum ProviderAction {
         api_key: Option<String>,
     },
     /// Remove a provider
+    #[command(alias = "rm")]
     Remove {
         /// Provider name
         name: String,
@@ -91,8 +99,10 @@ enum ProviderAction {
 #[derive(Subcommand)]
 enum ModelAction {
     /// List all available models
+    #[command(alias = "l")]
     List,
     /// Add a model to a provider
+    #[command(alias = "a")]
     Add {
         /// Model ID
         id: String,
@@ -113,6 +123,7 @@ enum ModelAction {
         thinking: String,
     },
     /// Remove a model from a provider
+    #[command(alias = "rm")]
     Remove {
         /// Model ID
         id: String,
@@ -125,12 +136,14 @@ enum ModelAction {
 #[derive(Subcommand)]
 enum ServerAction {
     /// Start the server
+    #[command(alias = "up")]
     Start {
         /// Run in foreground (don't daemonize)
         #[arg(long)]
         foreground: bool,
     },
     /// Stop the server
+    #[command(alias = "down")]
     Stop,
     /// Restart the server
     Restart,
@@ -141,8 +154,10 @@ enum ServerAction {
 #[derive(Subcommand)]
 enum SessionAction {
     /// List all sessions
+    #[command(alias = "l")]
     List,
     /// Delete a session
+    #[command(aliases = ["del", "rm"])]
     Delete {
         /// Session ID
         #[arg(add = ArgValueCandidates::new(completer::session_completer))]
@@ -155,6 +170,7 @@ enum AuthAction {
     /// Show authentication status
     Status,
     /// Log out from a provider
+    #[command(alias = "rm")]
     Logout {
         /// Provider name
         provider: String,
