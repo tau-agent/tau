@@ -24,6 +24,12 @@ pub enum Request {
         /// Working directory for tool execution.
         #[serde(skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Parent session ID (for child sessions).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
+        /// Max descendant sessions this session can spawn.
+        #[serde(default)]
+        child_budget: u32,
     },
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },
@@ -51,6 +57,12 @@ pub enum Request {
     /// Subscribe to live events on a session (for multi-client).
     /// The connection stays open and receives Stream/AgentDone/Cancelled events.
     Subscribe { session_id: String },
+    /// Wait for sessions to complete.
+    WaitSessions {
+        session_ids: Vec<String>,
+        #[serde(default = "default_wait_timeout")]
+        timeout_secs: u64,
+    },
     /// Cancel an in-progress chat (agent loop) for a session.
     CancelChat { session_id: String },
     /// Inject a steering message into a running agent loop.
@@ -96,6 +108,8 @@ pub enum Response {
     },
     /// Server is shutting down. Clients should reconnect if restart=true.
     ServerShutdown { restart: bool },
+    /// Sessions completed (response to WaitSessions).
+    SessionsCompleted { results: Vec<SessionResult> },
     /// Agent loop was cancelled by the user.
     Cancelled,
     /// Message history for a session.
@@ -122,6 +136,27 @@ pub struct SessionInfo {
     pub stats: SessionStats,
     /// Unix timestamp (seconds) of last activity (last message or session creation).
     pub last_activity: i64,
+    /// Parent session ID (None for root sessions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Number of direct child sessions.
+    pub child_count: usize,
+    /// Budget for descendant sessions.
+    pub child_budget: u32,
+}
+
+/// Result for a single session in WaitSessions response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionResult {
+    pub session_id: String,
+    /// "done", "error", "cancelled", "timeout"
+    pub status: String,
+    /// Last assistant message text (truncated).
+    pub summary: String,
+}
+
+fn default_wait_timeout() -> u64 {
+    300
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

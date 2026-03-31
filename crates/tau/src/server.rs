@@ -74,6 +74,7 @@ fn session_info(
     stored: &StoredSession,
     messages: &[Message],
     last_message_time: Option<i64>,
+    child_count: usize,
 ) -> SessionInfo {
     SessionInfo {
         id: stored.id.clone(),
@@ -84,6 +85,9 @@ fn session_info(
         stats: compute_stats(messages, &stored.model, stored.is_subscription),
         // Timestamps in DB are milliseconds; convert to seconds for display
         last_activity: last_message_time.unwrap_or(stored.created_at) / 1000,
+        parent_id: stored.parent_id.clone(),
+        child_count,
+        child_budget: stored.child_budget,
     }
 }
 
@@ -437,10 +441,50 @@ async fn handle_client(
                 provider: provider_name,
                 system_prompt,
                 cwd,
+                parent_id,
+                child_budget,
             } => {
+                // Budget check (before acquiring state lock for creation)
+                let budget_error = {
+                    let st = state.lock().unwrap();
+                    if let Some(ref pid) = parent_id {
+                        match st.db.get_session(pid)? {
+                            Some(parent) => {
+                                let used = st.db.budget_used(&parent.id)?;
+                                let cost = 1 + child_budget;
+                                if used + cost > parent.child_budget {
+                                    Some(format!(
+                                        "child budget exceeded: need {} but only {} available (budget={}, used={})",
+                                        cost,
+                                        parent.child_budget.saturating_sub(used),
+                                        parent.child_budget,
+                                        used
+                                    ))
+                                } else {
+                                    None
+                                }
+                            }
+                            None => Some(format!("parent session not found: {}", pid)),
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(msg) = budget_error {
+                    send(&mut writer, &Response::Error { message: msg }).await?;
+                    continue;
+                }
+
                 let result = {
                     let st = state.lock().unwrap();
-                    // Find requested model, or fall back to default
+
+                    // Load parent for inheritance
+                    let parent = match &parent_id {
+                        Some(pid) => st.db.get_session(pid)?,
+                        None => None,
+                    };
+
+                    // Model inheritance: None = inherit parent's model
                     let model = match (&model_id, &provider_name) {
                         (Some(mid), Some(prov)) => st
                             .all_models
@@ -450,7 +494,11 @@ async fn handle_client(
                         (Some(mid), None) => st.all_models.iter().find(|m| m.id == *mid).cloned(),
                         _ => None,
                     }
+                    .or_else(|| parent.as_ref().map(|p| p.model.clone()))
                     .unwrap_or_else(|| st.default_model.clone());
+
+                    // CWD inheritance: None = inherit parent's cwd
+                    let cwd = cwd.or_else(|| parent.as_ref().and_then(|p| p.cwd.clone()));
 
                     let is_subscription = st
                         .auth
@@ -461,11 +509,9 @@ async fn handle_client(
                     let id = st.db.next_session_id()?;
                     let system_prompt = system_prompt.or_else(|| {
                         let mut pm = plugins.lock().unwrap();
-                        // Ensure session plugins are spawned so we get tool prompts
                         let cwd_str = cwd.as_deref().unwrap_or("/tmp");
                         if let Err(e) = pm.ensure_session_plugins(&id, cwd_str) {
                             eprintln!("failed to spawn session plugins: {}", e);
-                            // Error is not fatal; session continues without plugins
                         }
                         let tool_prompts = pm.tool_prompts(&id);
                         Some(crate::system_prompt::build(
@@ -483,6 +529,8 @@ async fn handle_client(
                         cwd,
                         is_subscription,
                         created_at: crate::types::timestamp_ms() as i64,
+                        parent_id: parent_id.clone(),
+                        child_budget,
                     };
                     st.db.create_session(&stored)?;
                     Ok::<String, crate::Error>(id)
@@ -509,7 +557,8 @@ async fn handle_client(
                         Ok(Some(stored)) => {
                             let messages = st.db.get_messages(&session_id)?;
                             let last_msg = st.db.last_message_time(&session_id)?;
-                            Ok(session_info(&stored, &messages, last_msg))
+                            let children = st.db.child_count(&session_id)?;
+                            Ok(session_info(&stored, &messages, last_msg, children))
                         }
                         Ok(None) => Err(format!("session not found: {}", session_id)),
                         Err(e) => Err(format!("db error: {}", e)),
@@ -854,7 +903,8 @@ async fn handle_client(
                     for s in &stored {
                         let messages = st.db.get_messages(&s.id)?;
                         let last_msg = st.db.last_message_time(&s.id)?;
-                        infos.push(session_info(s, &messages, last_msg));
+                        let children = st.db.child_count(&s.id)?;
+                        infos.push(session_info(s, &messages, last_msg, children));
                     }
                     infos
                 };
@@ -863,7 +913,13 @@ async fn handle_client(
             Request::DeleteSession { session_id } => {
                 {
                     let st = state.lock().unwrap();
-                    st.db.delete_session(&session_id)?;
+                    // Delete session and all descendants
+                    st.db.delete_session_tree(&session_id)?;
+                }
+                // Clean up session plugins for deleted sessions
+                {
+                    let mut pm = plugins.lock().unwrap();
+                    pm.destroy_session_plugins(&session_id);
                 }
                 send(&mut writer, &Response::SessionDeleted).await?;
             }
@@ -1028,6 +1084,68 @@ async fn handle_client(
                         .await?;
                     }
                 }
+            }
+            Request::WaitSessions {
+                session_ids,
+                timeout_secs,
+            } => {
+                // Wait for all specified sessions to have no active agent turn.
+                // A session is "done" if it's not currently locked (no active Chat).
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+                let mut results = Vec::new();
+
+                loop {
+                    let mut all_done = true;
+                    results.clear();
+
+                    for sid in &session_ids {
+                        // Check if session has an active agent turn by trying the lock
+                        let lock = session_lock(&session_locks, sid);
+                        let is_busy = lock.try_lock().is_none();
+
+                        if is_busy {
+                            all_done = false;
+                            results.push(crate::protocol::SessionResult {
+                                session_id: sid.clone(),
+                                status: "busy".into(),
+                                summary: String::new(),
+                            });
+                        } else {
+                            // Session is idle -- get its last assistant message as summary
+                            let st = state.lock().unwrap();
+                            let summary = match st.db.get_session(sid) {
+                                Ok(Some(_)) => {
+                                    let msgs = st.db.get_messages(sid).unwrap_or_default();
+                                    last_assistant_text(&msgs)
+                                }
+                                _ => String::new(),
+                            };
+                            results.push(crate::protocol::SessionResult {
+                                session_id: sid.clone(),
+                                status: "done".into(),
+                                summary,
+                            });
+                        }
+                    }
+
+                    if all_done || std::time::Instant::now() >= deadline {
+                        // Mark timed-out sessions
+                        if !all_done {
+                            for r in &mut results {
+                                if r.status == "busy" {
+                                    r.status = "timeout".into();
+                                }
+                            }
+                        }
+                        break;
+                    }
+
+                    // Poll every second
+                    smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                }
+
+                send(&mut writer, &Response::SessionsCompleted { results }).await?;
             }
             Request::Shutdown { restart } => {
                 shutdown.request_shutdown(restart);
@@ -1334,6 +1452,34 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
 
 /// Broadcast a response to all subscribers of a session.
 /// Removes disconnected subscribers.
+/// Extract the last assistant message text from a message list.
+fn last_assistant_text(messages: &[Message]) -> String {
+    for msg in messages.iter().rev() {
+        if let Message::Assistant(a) = msg {
+            let text: String = a
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    crate::types::AssistantContent::Text(t) if !t.text.is_empty() => {
+                        Some(t.text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !text.is_empty() {
+                // Truncate to ~500 chars for summary
+                return if text.len() > 500 {
+                    format!("{}...", &text[..500])
+                } else {
+                    text
+                };
+            }
+        }
+    }
+    String::new()
+}
+
 fn broadcast_to_subscribers(state: &SharedState, session_id: &str, resp: &Response) {
     let mut st = state.lock().unwrap();
     if let Some(subs) = st.subscribers.get_mut(session_id) {

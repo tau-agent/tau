@@ -96,6 +96,7 @@ impl Client {
                 | Response::LoginSuccess { .. }
                 | Response::AuthStatus { .. }
                 | Response::SubscriptionUsage { .. }
+                | Response::SessionsCompleted { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);

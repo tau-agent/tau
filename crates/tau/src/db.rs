@@ -19,6 +19,8 @@ pub struct StoredSession {
     pub cwd: Option<String>,
     pub is_subscription: bool,
     pub created_at: i64,
+    pub parent_id: Option<String>,
+    pub child_budget: u32,
 }
 
 pub struct Db {
@@ -51,7 +53,9 @@ impl Db {
                 system_prompt  TEXT,
                 cwd            TEXT,
                 is_subscription INTEGER NOT NULL DEFAULT 0,
-                created_at     INTEGER NOT NULL
+                created_at     INTEGER NOT NULL,
+                parent_id      TEXT,
+                child_budget   INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY,
@@ -59,12 +63,20 @@ impl Db {
                 message_json TEXT NOT NULL,
                 created_at  INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);",
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);",
         )
         .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
 
-        // Migration: add cwd column if missing (existing DBs)
+        // Migrations for existing DBs
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN cwd TEXT;");
+        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN parent_id TEXT;");
+        let _ = conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN child_budget INTEGER NOT NULL DEFAULT 0;",
+        );
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);",
+        );
 
         Ok(Self { conn })
     }
@@ -86,7 +98,9 @@ impl Db {
                 system_prompt  TEXT,
                 cwd            TEXT,
                 is_subscription INTEGER NOT NULL DEFAULT 0,
-                created_at     INTEGER NOT NULL
+                created_at     INTEGER NOT NULL,
+                parent_id      TEXT,
+                child_budget   INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,
@@ -94,7 +108,8 @@ impl Db {
                 message_json TEXT NOT NULL,
                 created_at  INTEGER NOT NULL
             );
-            CREATE INDEX idx_messages_session ON messages(session_id);",
+            CREATE INDEX idx_messages_session ON messages(session_id);
+            CREATE INDEX idx_sessions_parent ON sessions(parent_id);",
         )
         .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
 
@@ -110,8 +125,8 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     session.id,
                     model_json,
@@ -119,6 +134,8 @@ impl Db {
                     session.cwd,
                     session.is_subscription as i32,
                     session.created_at,
+                    session.parent_id,
+                    session.child_budget,
                 ],
             )
             .map_err(|e| crate::Error::Io(format!("insert session: {}", e)))?;
@@ -129,7 +146,7 @@ impl Db {
     pub fn get_session(&self, id: &str) -> crate::Result<Option<StoredSession>> {
         self.conn
             .query_row(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget
                  FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -148,6 +165,8 @@ impl Db {
                         cwd: row.get(3)?,
                         is_subscription: row.get::<_, i32>(4)? != 0,
                         created_at: row.get(5)?,
+                        parent_id: row.get(6)?,
+                        child_budget: row.get::<_, i32>(7)? as u32,
                     })
                 },
             )
@@ -160,7 +179,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget
                  FROM sessions ORDER BY created_at",
             )
             .map_err(|e| crate::Error::Io(format!("prepare list: {}", e)))?;
@@ -182,6 +201,8 @@ impl Db {
                     cwd: row.get(3)?,
                     is_subscription: row.get::<_, i32>(4)? != 0,
                     created_at: row.get(5)?,
+                    parent_id: row.get(6)?,
+                    child_budget: row.get::<_, i32>(7)? as u32,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list sessions: {}", e)))?;
@@ -212,6 +233,86 @@ impl Db {
             .execute("DELETE FROM sessions WHERE id = ?1", params![id])
             .map_err(|e| crate::Error::Io(format!("delete session: {}", e)))?;
         Ok(())
+    }
+
+    /// Delete a session and all its descendants (recursive tree delete).
+    pub fn delete_session_tree(&self, id: &str) -> crate::Result<()> {
+        // Recursively delete children first
+        let children = self.get_children(id)?;
+        for child in &children {
+            self.delete_session_tree(&child.id)?;
+        }
+
+        // Delete the session itself (CASCADE deletes its messages)
+        self.delete_session(id)?;
+
+        Ok(())
+    }
+
+    /// Get direct children of a session.
+    pub fn get_children(&self, parent_id: &str) -> crate::Result<Vec<StoredSession>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget
+                 FROM sessions WHERE parent_id = ?1 ORDER BY created_at",
+            )
+            .map_err(|e| crate::Error::Io(format!("prepare children: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![parent_id], |row| {
+                let model_json: String = row.get(1)?;
+                let model: Model = serde_json::from_str(&model_json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                Ok(StoredSession {
+                    id: row.get(0)?,
+                    model,
+                    system_prompt: row.get(2)?,
+                    cwd: row.get(3)?,
+                    is_subscription: row.get::<_, i32>(4)? != 0,
+                    created_at: row.get(5)?,
+                    parent_id: row.get(6)?,
+                    child_budget: row.get::<_, i32>(7)? as u32,
+                })
+            })
+            .map_err(|e| crate::Error::Io(format!("list children: {}", e)))?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row.map_err(|e| crate::Error::Io(format!("read child row: {}", e)))?);
+        }
+        Ok(sessions)
+    }
+
+    /// Count direct children of a session.
+    pub fn child_count(&self, session_id: &str) -> crate::Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE parent_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| crate::Error::Io(format!("child_count: {}", e)))?;
+        Ok(count as usize)
+    }
+
+    /// Compute budget_used for a session (sum of 1 + child_budget for each direct child).
+    pub fn budget_used(&self, session_id: &str) -> crate::Result<u32> {
+        let used: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(1 + child_budget), 0) FROM sessions WHERE parent_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| crate::Error::Io(format!("budget_used: {}", e)))?;
+        Ok(used as u32)
     }
 
     /// Update the working directory for a session.
@@ -434,6 +535,8 @@ mod tests {
             cwd: None,
             is_subscription: true,
             created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
         };
         db.create_session(&session).unwrap();
 
@@ -454,6 +557,8 @@ mod tests {
             cwd: None,
             is_subscription: false,
             created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
         };
         db.create_session(&session).unwrap();
 
@@ -484,6 +589,8 @@ mod tests {
             cwd: None,
             is_subscription: false,
             created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
         };
         db.create_session(&session).unwrap();
         db.append_message("s1", &Message::User(UserMessage::text("hi")))
@@ -505,6 +612,8 @@ mod tests {
                 cwd: None,
                 is_subscription: false,
                 created_at: ts,
+                parent_id: None,
+                child_budget: 0,
             })
             .unwrap();
         }
@@ -525,8 +634,154 @@ mod tests {
             cwd: None,
             is_subscription: false,
             created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
         })
         .unwrap();
         assert_eq!(db.next_session_id().unwrap(), "s6");
+    }
+
+    #[test]
+    fn child_sessions_and_budget() {
+        let db = Db::open_memory().unwrap();
+
+        // Create parent with budget of 5
+        db.create_session(&StoredSession {
+            id: "root".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 5,
+        })
+        .unwrap();
+
+        // budget_used starts at 0
+        assert_eq!(db.budget_used("root").unwrap(), 0);
+        assert_eq!(db.child_count("root").unwrap(), 0);
+
+        // Create a leaf child (budget=0, cost=1)
+        db.create_session(&StoredSession {
+            id: "c1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 2000,
+            parent_id: Some("root".into()),
+            child_budget: 0,
+        })
+        .unwrap();
+
+        assert_eq!(db.budget_used("root").unwrap(), 1); // 1 + 0
+        assert_eq!(db.child_count("root").unwrap(), 1);
+
+        // Create a child with its own budget (cost = 1 + 2 = 3)
+        db.create_session(&StoredSession {
+            id: "c2".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 3000,
+            parent_id: Some("root".into()),
+            child_budget: 2,
+        })
+        .unwrap();
+
+        assert_eq!(db.budget_used("root").unwrap(), 4); // 1 + (1+2)
+        assert_eq!(db.child_count("root").unwrap(), 2);
+
+        // get_children returns both
+        let children = db.get_children("root").unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].id, "c1");
+        assert_eq!(children[1].id, "c2");
+    }
+
+    #[test]
+    fn delete_session_tree() {
+        let db = Db::open_memory().unwrap();
+
+        db.create_session(&StoredSession {
+            id: "root".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 10,
+        })
+        .unwrap();
+
+        db.create_session(&StoredSession {
+            id: "c1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 2000,
+            parent_id: Some("root".into()),
+            child_budget: 3,
+        })
+        .unwrap();
+
+        // Grandchild
+        db.create_session(&StoredSession {
+            id: "gc1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 3000,
+            parent_id: Some("c1".into()),
+            child_budget: 0,
+        })
+        .unwrap();
+
+        // Delete root -- should delete entire tree
+        db.delete_session_tree("root").unwrap();
+        assert!(db.get_session("root").unwrap().is_none());
+        assert!(db.get_session("c1").unwrap().is_none());
+        assert!(db.get_session("gc1").unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_subtree_preserves_parent() {
+        let db = Db::open_memory().unwrap();
+
+        db.create_session(&StoredSession {
+            id: "root".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 5,
+        })
+        .unwrap();
+
+        db.create_session(&StoredSession {
+            id: "c1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 2000,
+            parent_id: Some("root".into()),
+            child_budget: 0,
+        })
+        .unwrap();
+
+        // Delete child only -- parent survives, budget_used drops
+        assert_eq!(db.budget_used("root").unwrap(), 1);
+        db.delete_session_tree("c1").unwrap();
+        assert!(db.get_session("root").unwrap().is_some());
+        assert!(db.get_session("c1").unwrap().is_none());
+        assert_eq!(db.budget_used("root").unwrap(), 0);
     }
 }
