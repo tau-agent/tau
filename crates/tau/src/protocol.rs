@@ -140,8 +140,10 @@ pub struct SessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     /// Number of direct child sessions.
+    #[serde(default)]
     pub child_count: usize,
     /// Budget for descendant sessions.
+    #[serde(default)]
     pub child_budget: u32,
 }
 

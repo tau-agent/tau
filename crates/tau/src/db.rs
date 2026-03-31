@@ -63,17 +63,18 @@ impl Db {
                 message_json TEXT NOT NULL,
                 created_at  INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-            CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);",
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);",
         )
         .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
 
-        // Migrations for existing DBs
+        // Migrations for existing DBs (ALTERs are no-ops if column already exists)
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN cwd TEXT;");
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN parent_id TEXT;");
         let _ = conn.execute_batch(
             "ALTER TABLE sessions ADD COLUMN child_budget INTEGER NOT NULL DEFAULT 0;",
         );
+
+        // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);",
         );
