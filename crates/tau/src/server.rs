@@ -615,6 +615,8 @@ async fn handle_client(
                     let hook_data = serde_json::json!({
                         "prompt": &text,
                         "system_prompt": &system_prompt,
+                        "session_id": &session_id,
+                        "message_count": messages.len(),
                     });
                     let results = pm.call_hook(&session_id, "before_agent_start", &hook_data);
                     for result in results {
