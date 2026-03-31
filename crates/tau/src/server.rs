@@ -758,7 +758,7 @@ async fn handle_client(
                 // Register this client as a subscriber for the session.
                 // The connection stays open — we forward events via the channel.
                 // No ack is sent; the client waits for Stream/AgentDone/Cancelled.
-                let (tx, rx) = smol::channel::bounded::<Response>(256);
+                let (tx, rx) = smol::channel::unbounded::<Response>();
                 {
                     let mut st = state.lock().unwrap();
                     st.subscribers
