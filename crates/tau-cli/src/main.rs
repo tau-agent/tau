@@ -407,6 +407,8 @@ async fn cmd_chat(
                 provider,
                 system_prompt: None,
                 cwd,
+                parent_id: None,
+                child_budget: 0,
             })
             .await?;
 
