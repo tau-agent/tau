@@ -728,6 +728,57 @@ impl PluginManager {
         }
     }
 
+    /// Execute a tool call with server request handler.
+    /// Like execute_tool but passes a server request callback to the plugin handle.
+    pub fn execute_tool_with_server(
+        &mut self,
+        session_id: &str,
+        tool_call: &ToolCall,
+        cwd: &str,
+        on_output: &mut dyn FnMut(&str),
+        on_server_request: Option<
+            &mut dyn FnMut(&crate::protocol::Request) -> crate::protocol::Response,
+        >,
+    ) -> crate::Result<crate::types::ToolResultMessage> {
+        // Try session plugins first
+        if let Some(sp) = self.session_plugins.get_mut(session_id)
+            && sp.has_tool(&tool_call.name)
+        {
+            let plugin = find_tool_plugin(&mut sp.plugins, &tool_call.name);
+            if let Some(p) = plugin {
+                let mut result = p.execute_tool_with_server(
+                    tool_call,
+                    Some(cwd),
+                    Some(session_id),
+                    on_output,
+                    on_server_request,
+                )?;
+                self.run_after_tool_hooks(session_id, tool_call, &mut result);
+                return Ok(result);
+            }
+        }
+
+        // Fall through to global plugins
+        let plugin = find_tool_plugin(&mut self.global_plugins, &tool_call.name);
+        match plugin {
+            Some(p) => {
+                let mut result = p.execute_tool_with_server(
+                    tool_call,
+                    Some(cwd),
+                    Some(session_id),
+                    on_output,
+                    on_server_request,
+                )?;
+                self.run_after_tool_hooks(session_id, tool_call, &mut result);
+                Ok(result)
+            }
+            None => Err(crate::Error::Io(format!(
+                "no plugin provides tool '{}'",
+                tool_call.name
+            ))),
+        }
+    }
+
     /// Run after_tool_result hooks on all plugins (global + session).
     fn run_after_tool_hooks(
         &mut self,
