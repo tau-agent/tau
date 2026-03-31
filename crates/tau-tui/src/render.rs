@@ -136,7 +136,14 @@ fn header_lines(
     let indent: String = " ".repeat(prefix_len);
     let mut first = true;
     while !remaining.is_empty() {
-        let split = remaining.len().min(usable);
+        let split = if remaining.len() <= usable {
+            remaining.len()
+        } else {
+            remaining[..usable]
+                .rfind(' ')
+                .map(|i| i + 1)
+                .unwrap_or(usable)
+        };
         let chunk = &remaining[..split];
         remaining = &remaining[split..];
         if first {
