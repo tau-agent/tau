@@ -192,7 +192,9 @@ impl ShutdownHandle {
         let clients = self.clients.lock().unwrap();
         let msg = Response::ServerShutdown { restart };
         for tx in clients.iter() {
-            let _ = tx.try_send(msg.clone());
+            if tx.try_send(msg.clone()).is_err() {
+                eprintln!("warning: failed to send shutdown notification to client");
+            }
         }
     }
 
@@ -1267,7 +1269,16 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
 fn broadcast_to_subscribers(state: &SharedState, session_id: &str, resp: &Response) {
     let mut st = state.lock().unwrap();
     if let Some(subs) = st.subscribers.get_mut(session_id) {
-        subs.retain(|tx| tx.try_send(resp.clone()).is_ok());
+        subs.retain(|tx| {
+            match tx.try_send(resp.clone()) {
+                Ok(()) => true,
+                Err(smol::channel::TrySendError::Closed(_)) => false,
+                Err(smol::channel::TrySendError::Full(_)) => {
+                    eprintln!("warning: subscriber channel full, dropping message");
+                    true // keep subscriber, just drop this message
+                }
+            }
+        });
         if subs.is_empty() {
             st.subscribers.remove(session_id);
         }

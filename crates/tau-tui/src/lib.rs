@@ -304,7 +304,9 @@ async fn send_request_and_recv(req: Request, tx: Sender<Response>) -> tau::Resul
     smol::spawn(async move {
         let _ = client
             .recv_streaming(|resp| {
-                let _ = tx.try_send(resp.clone());
+                if tx.try_send(resp.clone()).is_err() {
+                    eprintln!("warning: try_send failed in send_request_and_recv");
+                }
             })
             .await;
     })
