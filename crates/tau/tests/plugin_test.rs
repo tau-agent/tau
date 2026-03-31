@@ -113,7 +113,7 @@ fn plugin_echo_tool() {
 
     let mut deltas = Vec::new();
     let result = handle
-        .execute_tool(&tc, None, &mut |d| deltas.push(d.to_string()))
+        .execute_tool(&tc, None, None, &mut |d| deltas.push(d.to_string()))
         .unwrap();
 
     assert!(!result.is_error);
@@ -145,7 +145,7 @@ fn plugin_slow_tool_streaming() {
 
     let mut deltas = Vec::new();
     let result = handle
-        .execute_tool(&tc, None, &mut |d| deltas.push(d.to_string()))
+        .execute_tool(&tc, None, None, &mut |d| deltas.push(d.to_string()))
         .unwrap();
 
     assert!(!result.is_error);
@@ -178,7 +178,7 @@ fn plugin_fail_tool() {
 
     let mut deltas = Vec::new();
     let result = handle
-        .execute_tool(&tc, None, &mut |d| deltas.push(d.to_string()))
+        .execute_tool(&tc, None, None, &mut |d| deltas.push(d.to_string()))
         .unwrap();
 
     assert!(result.is_error);
@@ -240,7 +240,7 @@ fn plugin_multiple_tool_calls() {
             name: "echo_tool".into(),
             arguments: serde_json::json!({"message": format!("msg {}", i)}),
         };
-        let result = handle.execute_tool(&tc, None, &mut |_| {}).unwrap();
+        let result = handle.execute_tool(&tc, None, None, &mut |_| {}).unwrap();
         assert!(!result.is_error);
         let text = result
             .content
