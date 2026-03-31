@@ -269,9 +269,18 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    // Build right side: model name
-    let right_text = format!("{}/{}", app.provider, app.model);
-    let right_span = Span::styled(right_text.clone(), dim);
+    // Build right side: model name + connection status
+    let right_text = if app.server_done {
+        format!("{}/{} (disconnected)", app.provider, app.model)
+    } else {
+        format!("{}/{}", app.provider, app.model)
+    };
+    let right_style = if app.server_done {
+        theme.fg(theme.error)
+    } else {
+        dim
+    };
+    let right_span = Span::styled(right_text.clone(), right_style);
 
     // Calculate left width
     let left_width: usize = left_parts.iter().map(|s| s.content.len()).sum();

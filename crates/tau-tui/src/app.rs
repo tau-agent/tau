@@ -44,10 +44,12 @@ pub enum AppMode {
     Streaming,
 }
 
-/// Messages queued while the agent is working (steering / follow-up).
+/// A steering message is sent as the next turn right after the current one.
+/// A queued message is sent after all steering messages.
 #[derive(Debug, Clone)]
 pub struct QueuedMessage {
     pub text: String,
+    pub is_steering: bool,
 }
 
 /// Application state.
@@ -80,7 +82,8 @@ pub struct App {
     pub spinner_frame: usize,
     /// Last escape press time for double-escape detection.
     pub last_escape: std::time::Instant,
-    /// Queued steering messages (sent after current agent turn completes).
+    /// Messages queued while the agent is working.
+    /// Steering messages (is_steering=true) are drained first, then queued.
     pub queued_messages: Vec<QueuedMessage>,
     /// Command history index (None = composing new, Some(i) = browsing history).
     pub history_index: Option<usize>,
@@ -268,13 +271,19 @@ impl App {
                     self.pending_subscription_usage = false;
                     return Some(Action::GetSubscriptionUsage);
                 }
-                // After AgentDone, drain queued steering messages
+                // After AgentDone, drain steering messages first, then queued
                 if self.mode == AppMode::Input && !self.queued_messages.is_empty() {
-                    let queued = self.queued_messages.remove(0);
+                    // Steering messages first, then queued
+                    let idx = self
+                        .queued_messages
+                        .iter()
+                        .position(|m| m.is_steering)
+                        .unwrap_or(0);
+                    let next = self.queued_messages.remove(idx);
                     // Don't add user message locally — it arrives via Subscribe broadcast
                     self.scroll_to_bottom();
                     self.mode = AppMode::Streaming;
-                    return Some(Action::SendQueued(queued.text));
+                    return Some(Action::SendQueued(next.text));
                 }
                 None
             }
@@ -342,7 +351,7 @@ impl App {
                 self.history_index = None;
                 Some(Action::SendChat(text))
             }
-            // Alt+Enter: queue steering message (sent after current turn)
+            // Alt+Enter: queue message (sent after current turn)
             (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
                 let text: String = self.textarea.lines().join("\n");
                 let text = text.trim().to_string();
@@ -351,8 +360,10 @@ impl App {
                 }
                 self.textarea.select_all();
                 self.textarea.cut();
-                self.queued_messages
-                    .push(QueuedMessage { text: text.clone() });
+                self.queued_messages.push(QueuedMessage {
+                    text: text.clone(),
+                    is_steering: false,
+                });
                 self.messages.push(MessageItem::Status {
                     text: format!("[queued: {}]", text),
                 });
@@ -447,8 +458,8 @@ impl App {
 
     fn handle_streaming_key(&mut self, key: &KeyEvent) -> Option<Action> {
         match (key.code, key.modifiers) {
-            // Enter (or Alt+Enter) during streaming: queue steering message
-            (KeyCode::Enter, KeyModifiers::NONE | KeyModifiers::ALT) => {
+            // Enter during streaming: steering message (runs next, before queued)
+            (KeyCode::Enter, KeyModifiers::NONE) => {
                 let text: String = self.textarea.lines().join("\n");
                 let text = text.trim().to_string();
                 if text.is_empty() {
@@ -456,8 +467,28 @@ impl App {
                 }
                 self.textarea.select_all();
                 self.textarea.cut();
-                self.queued_messages
-                    .push(QueuedMessage { text: text.clone() });
+                self.queued_messages.push(QueuedMessage {
+                    text: text.clone(),
+                    is_steering: true,
+                });
+                self.messages.push(MessageItem::Status {
+                    text: format!("[steer: {}]", text),
+                });
+                None
+            }
+            // Alt+Enter during streaming: queued message (runs after steering)
+            (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
+                let text: String = self.textarea.lines().join("\n");
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    return None;
+                }
+                self.textarea.select_all();
+                self.textarea.cut();
+                self.queued_messages.push(QueuedMessage {
+                    text: text.clone(),
+                    is_steering: false,
+                });
                 self.messages.push(MessageItem::Status {
                     text: format!("[queued: {}]", text),
                 });

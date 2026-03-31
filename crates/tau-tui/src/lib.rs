@@ -25,7 +25,7 @@ use smol::channel::{self, Sender};
 use tau::client::Client;
 use tau::protocol::{Request, Response};
 
-use crate::app::{Action, App};
+use crate::app::{Action, App, AppMode};
 use crate::events::EventLoop;
 
 /// Run the TUI chat interface.
@@ -220,6 +220,9 @@ async fn run_inner(
         if app.should_quit {
             break;
         }
+
+        // Only tick when streaming (spinner animation)
+        event_loop.set_ticking(app.mode == AppMode::Streaming);
 
         // Draw
         terminal
