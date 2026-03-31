@@ -311,6 +311,12 @@ impl App {
     }
 
     fn handle_terminal_event(&mut self, event: CtEvent) -> Option<Action> {
+        // Handle bracketed paste: insert full text into textarea
+        if let CtEvent::Paste(text) = &event {
+            self.textarea.insert_str(text);
+            return None;
+        }
+
         // Only handle key press events
         let CtEvent::Key(key) = &event else {
             return None;
