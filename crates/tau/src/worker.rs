@@ -353,20 +353,15 @@ fn handle_session_tool(
                 other => return tool_err(&format!("unexpected response: {:?}", other)),
             };
 
-            // Send initial message (fire-and-forget)
+            // Send initial message via unix socket (fire-and-forget).
+            // This must go through the real server connection to trigger
+            // an agent turn -- the ServerRequest tunnel only handles sync ops.
             if !task.is_empty() {
-                let chat_req = crate::protocol::Request::Chat {
-                    session_id: child_id.clone(),
-                    text: task.to_string(),
-                };
-                match server_request(writer, stdin, chat_req) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        return tool_err(&format!(
-                            "session {} created but chat failed: {}",
-                            child_id, e
-                        ));
-                    }
+                if let Err(e) = fire_chat_via_socket(&child_id, task) {
+                    return tool_err(&format!(
+                        "session {} created but chat failed: {}",
+                        child_id, e
+                    ));
                 }
             }
 
@@ -557,4 +552,30 @@ fn handle_session_tool(
 
         _ => tool_err(&format!("unknown session tool: {}", name)),
     }
+}
+
+/// Fire a Chat request via unix socket (fire-and-forget).
+/// Opens a direct connection to the server, sends the Chat request,
+/// and returns without waiting for the agent turn to complete.
+fn fire_chat_via_socket(session_id: &str, text: &str) -> Result<(), String> {
+    use std::os::unix::net::UnixStream;
+
+    let sock_path = crate::server::socket_path();
+    let mut stream = UnixStream::connect(&sock_path).map_err(|e| format!("connect: {}", e))?;
+
+    let req = crate::protocol::Request::Chat {
+        session_id: session_id.to_string(),
+        text: text.to_string(),
+    };
+    let mut line = serde_json::to_string(&req).map_err(|e| format!("serialize: {}", e))?;
+    line.push('\n');
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write: {}", e))?;
+    stream.flush().map_err(|e| format!("flush: {}", e))?;
+
+    // Don't read response -- fire and forget.
+    // The server will process the Chat and run the agent turn.
+    // The connection dropping is fine -- responses go to subscribers.
+    Ok(())
 }

@@ -26,6 +26,9 @@ enum Commands {
         /// Disable TUI (use plain text streaming)
         #[arg(long)]
         no_tui: bool,
+        /// Max child sessions this session can spawn (0 = no children)
+        #[arg(long, default_value = "0")]
+        child_budget: u32,
     },
     /// Log in to an LLM provider (OAuth)
     Login {
@@ -196,6 +199,7 @@ async fn run(cli: Cli) -> tau::Result<()> {
             session,
             model,
             no_tui,
+            child_budget,
         } => {
             // Resolve model: CLI flag > saved setting > hardcoded default
             let model = model.unwrap_or_else(|| {
@@ -204,7 +208,7 @@ async fn run(cli: Cli) -> tau::Result<()> {
                     .model
                     .unwrap_or_else(|| "claude-sonnet-4-6".into())
             });
-            cmd_chat(message, session, &model, no_tui).await?;
+            cmd_chat(message, session, &model, no_tui, child_budget).await?;
         }
         Commands::Worker => {
             tau::worker::run_worker_loop();
@@ -385,6 +389,7 @@ async fn cmd_chat(
     session_id: Option<String>,
     model: &str,
     no_tui: bool,
+    child_budget: u32,
 ) -> tau::Result<()> {
     let mut client = tau::client::Client::connect_or_start().await?;
 
@@ -408,7 +413,7 @@ async fn cmd_chat(
                 system_prompt: None,
                 cwd,
                 parent_id: None,
-                child_budget: 0,
+                child_budget,
             })
             .await?;
 
@@ -1158,20 +1163,55 @@ async fn cmd_sessions_list() -> tau::Result<()> {
                 if sessions.is_empty() {
                     println!("no sessions");
                 } else {
-                    for s in sessions {
-                        let stats = tau::protocol::format_stats(&s.stats);
-                        let cwd = s.cwd.as_deref().unwrap_or("");
-                        let ago = format_time_ago(s.last_activity);
-                        println!(
-                            "{}	{}/{}	{}	{}	{}",
-                            s.id, s.provider, s.model, ago, cwd, stats
-                        );
+                    // Build tree display: roots first, then children indented
+                    let roots: Vec<_> = sessions.iter().filter(|s| s.parent_id.is_none()).collect();
+                    for root in &roots {
+                        print_session_tree(root, sessions, 0);
+                    }
+                    // Show orphans (parent deleted but child remains)
+                    let orphans: Vec<_> = sessions
+                        .iter()
+                        .filter(|s| {
+                            s.parent_id.is_some()
+                                && !sessions.iter().any(|p| Some(&p.id) == s.parent_id.as_ref())
+                        })
+                        .collect();
+                    for o in &orphans {
+                        print_session_tree(o, sessions, 0);
                     }
                 }
             }
         })
         .await?;
     Ok(())
+}
+
+fn print_session_tree(
+    session: &tau::protocol::SessionInfo,
+    all: &[tau::protocol::SessionInfo],
+    depth: usize,
+) {
+    let indent = "  ".repeat(depth);
+    let stats = tau::protocol::format_stats(&session.stats);
+    let cwd = session.cwd.as_deref().unwrap_or("");
+    let ago = format_time_ago(session.last_activity);
+    let budget = if session.child_budget > 0 {
+        format!(" [budget:{}/{}]", session.child_count, session.child_budget)
+    } else {
+        String::new()
+    };
+    println!(
+        "{}{}\t{}/{}\t{}\t{}\t{}{}",
+        indent, session.id, session.provider, session.model, ago, cwd, stats, budget
+    );
+    // Print children
+    let children: Vec<_> = all
+        .iter()
+        .filter(|s| s.parent_id.as_ref() == Some(&session.id))
+        .collect();
+    for child in children {
+        print_session_tree(child, all, depth + 1);
+    }
 }
 
 async fn cmd_sessions_delete(id: &str) -> tau::Result<()> {
