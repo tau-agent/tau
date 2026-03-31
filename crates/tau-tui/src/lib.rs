@@ -11,8 +11,7 @@ mod ui;
 use std::io;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -62,8 +61,7 @@ pub async fn run(
         let _ = stdout.write_all(b"\x1b[>4;2m");
         let _ = stdout.flush();
     }
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .map_err(|e| tau::Error::Io(e.to_string()))?;
+    execute!(stdout, EnterAlternateScreen).map_err(|e| tau::Error::Io(e.to_string()))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| tau::Error::Io(e.to_string()))?;
 
@@ -86,12 +84,7 @@ pub async fn run(
         let _ = io::stdout().write_all(b"\x1b[>4;0m");
         let _ = io::stdout().flush();
     }
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     disable_raw_mode().ok();
     terminal.show_cursor().ok();
 
