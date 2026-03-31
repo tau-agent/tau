@@ -925,20 +925,26 @@ impl App {
             }
             StreamEvent::Error { error, .. } => {
                 let msg = error
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        AssistantContent::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let error_text = if msg.is_empty() {
-                    "unknown error".to_string()
-                } else {
-                    msg
-                };
-                self.messages.push(MessageItem::Error { text: error_text });
+                    .error_message
+                    .as_deref()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        let text = error
+                            .content
+                            .iter()
+                            .filter_map(|c| match c {
+                                AssistantContent::Text(t) => Some(t.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if text.is_empty() {
+                            "unknown error".to_string()
+                        } else {
+                            text
+                        }
+                    });
+                self.messages.push(MessageItem::Error { text: msg });
                 self.mode = AppMode::Input;
             }
             _ => {}
