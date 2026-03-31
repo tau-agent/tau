@@ -171,7 +171,10 @@ fn output_lines(lines: &[String], theme: &Theme, bg: Style, max: usize) -> Vec<L
 
 /// Pad lines with bg to full width, add top/bottom padding.
 pub fn wrap_tool_block(lines: Vec<Line<'static>>, bg: Style, width: u16) -> Vec<Line<'static>> {
-    let mut result = lines;
+    let mut result = Vec::with_capacity(lines.len() + 2);
+    result.push(Line::from(Span::styled(" ", bg))); // top padding
+    result.extend(lines);
+    result.push(Line::from(Span::styled(" ", bg))); // bottom padding
     crate::message::fill_bg(&mut result, bg, width);
     result
 }

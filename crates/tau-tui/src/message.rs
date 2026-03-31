@@ -100,9 +100,11 @@ impl MessageItem {
                 let usable = (width as usize).saturating_sub(1); // 1 char indent
 
                 let mut lines: Vec<Line<'static>> = Vec::new();
+                lines.push(Line::from(Span::styled(" ", bg_style))); // top padding
                 for l in wrap_text(text, usable) {
                     lines.push(Line::from(Span::styled(format!(" {}", l), text_style)));
                 }
+                lines.push(Line::from(Span::styled(" ", bg_style))); // bottom padding
                 fill_bg(&mut lines, bg_style, width);
                 Text::from(lines)
             }
