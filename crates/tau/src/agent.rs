@@ -56,6 +56,87 @@ pub fn needs_continuation(messages: &[Message]) -> bool {
     matches!(messages.last(), Some(Message::ToolResult(_)))
 }
 
+/// Repair a message history that was corrupted by a crash or kill.
+///
+/// Two cases:
+/// 1. Last message is Assistant with StopReason::ToolUse but no ToolResult
+///    messages follow (daemon killed before any tool executed).
+/// 2. Last message is ToolResult but the preceding Assistant had more tool_use
+///    blocks than there are ToolResult messages (partial execution).
+///
+/// Returns the stub messages that were synthesized (caller should persist them).
+/// Returns an empty vec if no repair was needed.
+pub fn repair_messages(messages: &[Message]) -> Vec<Message> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    // Find the last Assistant message and collect any trailing ToolResults
+    let mut last_assistant_idx = None;
+    for (i, msg) in messages.iter().enumerate().rev() {
+        match msg {
+            Message::ToolResult(_) => continue,
+            Message::Assistant(_) => {
+                last_assistant_idx = Some(i);
+                break;
+            }
+            _ => break, // User or CompactionSummary — no repair needed
+        }
+    }
+
+    let Some(assistant_idx) = last_assistant_idx else {
+        return Vec::new();
+    };
+
+    let assistant = match &messages[assistant_idx] {
+        Message::Assistant(a) if a.stop_reason == StopReason::ToolUse => a,
+        _ => return Vec::new(),
+    };
+
+    // Collect tool_use IDs from the assistant message
+    let tool_call_ids: Vec<(&str, &str)> = assistant
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            AssistantContent::ToolCall(tc) => Some((tc.id.as_str(), tc.name.as_str())),
+            _ => None,
+        })
+        .collect();
+
+    if tool_call_ids.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect tool_result IDs that follow the assistant message
+    let existing_result_ids: std::collections::HashSet<&str> = messages[assistant_idx + 1..]
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult(tr) => Some(tr.tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    // Synthesize stubs for any missing tool results
+    let mut stubs = Vec::new();
+    for (id, name) in &tool_call_ids {
+        if !existing_result_ids.contains(id) {
+            stubs.push(Message::ToolResult(ToolResultMessage {
+                tool_call_id: id.to_string(),
+                tool_name: name.to_string(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "error: session interrupted before execution".into(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: true,
+                timestamp: crate::types::timestamp_ms(),
+            }));
+        }
+    }
+
+    stubs
+}
+
 /// Async cancellable sleep.
 /// Returns `Err(Cancelled)` if should_stop returns true during the sleep.
 async fn cancellable_sleep(
@@ -169,9 +250,38 @@ pub async fn run(
             });
         }
 
-        for tc in &tool_calls {
-            // Check for cancellation/shutdown before each tool call
+        for (tc_idx, tc) in tool_calls.iter().enumerate() {
+            // Check for cancellation/shutdown before each tool call.
+            // If cancelled, emit stub ToolResult for all remaining tool calls
+            // so the message history stays valid (every tool_use needs a tool_result).
             if config.should_stop.as_ref().is_some_and(|f| f()) {
+                for remaining_tc in &tool_calls[tc_idx..] {
+                    let stub = crate::types::ToolResultMessage {
+                        tool_call_id: remaining_tc.id.clone(),
+                        tool_name: remaining_tc.name.clone(),
+                        content: vec![crate::types::ToolResultContent::Text(
+                            crate::types::TextContent {
+                                text: "error: cancelled before execution".into(),
+                                text_signature: None,
+                            },
+                        )],
+                        details: None,
+                        is_error: true,
+                        timestamp: crate::types::timestamp_ms(),
+                    };
+                    let _ = event_tx.try_send(StreamEvent::ToolResult {
+                        tool_call_id: remaining_tc.id.clone(),
+                        tool_name: remaining_tc.name.clone(),
+                        is_error: true,
+                        content: "error: cancelled before execution".into(),
+                    });
+                    let tool_msg = Message::ToolResult(stub.clone());
+                    if let Some(ref on_msg) = config.on_message {
+                        on_msg.lock().unwrap()(&tool_msg);
+                    }
+                    new_messages.push(tool_msg);
+                    context.messages.push(Message::ToolResult(stub));
+                }
                 return Ok(AgentResult {
                     new_messages,
                     max_turns_reached: false,
@@ -736,6 +846,194 @@ mod tests {
     }
 
     #[test]
+    fn cancel_mid_tool_calls_emits_stub_results() {
+        // When cancelled between tool calls, all remaining tool_use blocks
+        // must get corresponding tool_result messages to avoid API errors
+        // on session resume.
+        smol::block_on(async {
+            let registry = setup_registry(vec![MockResponse::ToolCalls(vec![
+                ToolCall {
+                    id: "tc1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo first"}),
+                },
+                ToolCall {
+                    id: "tc2".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo second"}),
+                },
+                ToolCall {
+                    id: "tc3".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo third"}),
+                },
+            ])]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
+
+            // Use an AtomicBool that starts false (allow stream to complete)
+            // and gets set to true after stream_with_retry returns the
+            // assistant message. We detect this by checking from a wrapper
+            // that only fires after enough calls -- consume_stream polls
+            // should_stop between each event (8 events for 3 tool calls),
+            // plus once at the top of the tool call loop.
+
+            // Set cancel after stream consumption completes.
+            // The mock sends 8 events; consume_stream checks should_stop
+            // before each event. We need it to return false for all of those,
+            // then true when checked in the tool-call loop.
+            let poll_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let poll_count_clone = poll_count.clone();
+            let config = AgentConfig {
+                should_stop: Some(Box::new(move || {
+                    let n = poll_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // The stream has 8 events (Start, 3xToolcallStart, 3xToolcallEnd, Done).
+                    // consume_stream checks should_stop before each recv = 8 checks.
+                    // After stream completes, the tool-call loop checks should_stop
+                    // before each tool call. We want to cancel at that point.
+                    n >= 8
+                })),
+                ..Default::default()
+            };
+
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            // Should have: 1 assistant + 3 stub tool results = 4 messages
+            assert_eq!(
+                result.new_messages.len(),
+                4,
+                "expected assistant + 3 stub tool results, got {:?}",
+                result
+                    .new_messages
+                    .iter()
+                    .map(|m| match m {
+                        Message::Assistant(_) => "assistant",
+                        Message::ToolResult(_) => "tool_result",
+                        Message::User(_) => "user",
+                        Message::CompactionSummary(_) => "summary",
+                    })
+                    .collect::<Vec<_>>()
+            );
+            assert!(matches!(&result.new_messages[0], Message::Assistant(_)));
+
+            // All 3 tool results present with correct IDs
+            for (i, expected_id) in ["tc1", "tc2", "tc3"].iter().enumerate() {
+                if let Message::ToolResult(tr) = &result.new_messages[i + 1] {
+                    assert_eq!(tr.tool_call_id, *expected_id);
+                    assert!(tr.is_error);
+                    assert!(tr.content.iter().any(|c| matches!(c,
+                        ToolResultContent::Text(t) if t.text.contains("cancelled")
+                    )));
+                } else {
+                    panic!("expected tool result at index {}", i + 1);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cancel_after_first_tool_stubs_remaining() {
+        // Cancel after first tool executes -- first tool gets real result,
+        // remaining tools get stub results.
+        smol::block_on(async {
+            let registry = setup_registry(vec![MockResponse::ToolCalls(vec![
+                ToolCall {
+                    id: "tc1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo first"}),
+                },
+                ToolCall {
+                    id: "tc2".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo second"}),
+                },
+            ])]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
+
+            // 8 events for 2 tool calls (Start, 2xToolcallStart, 2xToolcallEnd, Done = 6 events).
+            // Then tool-call loop: check before tc1 (pass), execute tc1, check before tc2 (cancel).
+            let poll_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let poll_count_clone = poll_count.clone();
+            let config = AgentConfig {
+                should_stop: Some(Box::new(move || {
+                    let n = poll_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // 6 stream events + 1 check before tc1 (pass) = 7 checks before tc1 runs.
+                    // Check 7 (0-indexed) is before tc2 -- should cancel.
+                    n >= 7
+                })),
+                ..Default::default()
+            };
+
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            // 1 assistant + 1 real tool result (tc1) + 1 stub tool result (tc2) = 3
+            assert_eq!(
+                result.new_messages.len(),
+                3,
+                "got {:?}",
+                result
+                    .new_messages
+                    .iter()
+                    .map(|m| match m {
+                        Message::Assistant(_) => "assistant",
+                        Message::ToolResult(_) => "tool_result",
+                        Message::User(_) => "user",
+                        Message::CompactionSummary(_) => "summary",
+                    })
+                    .collect::<Vec<_>>()
+            );
+
+            // tc1 got a real result (not cancelled -- it was executed)
+            if let Message::ToolResult(tr) = &result.new_messages[1] {
+                assert_eq!(tr.tool_call_id, "tc1");
+                assert!(!tr.content.iter().any(|c| matches!(c,
+                    ToolResultContent::Text(t) if t.text.contains("cancelled")
+                )));
+            } else {
+                panic!("expected tool result at index 1");
+            }
+
+            // tc2 got a stub cancelled result
+            if let Message::ToolResult(tr) = &result.new_messages[2] {
+                assert_eq!(tr.tool_call_id, "tc2");
+                assert!(tr.is_error);
+                assert!(tr.content.iter().any(|c| matches!(c,
+                    ToolResultContent::Text(t) if t.text.contains("cancelled")
+                )));
+            } else {
+                panic!("expected tool result at index 2");
+            }
+        });
+    }
+
+    #[test]
     fn parse_retry_after_from_error_msg() {
         assert_eq!(
             parse_retry_after("HTTP 429: rate limit [retry-after: 30s]"),
@@ -747,5 +1045,134 @@ mod tests {
         );
         assert_eq!(parse_retry_after("HTTP 500: internal error"), None);
         assert_eq!(parse_retry_after("no retry info here"), None);
+    }
+
+    // ------- repair_messages tests -------
+
+    #[test]
+    fn repair_no_messages() {
+        assert!(repair_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn repair_clean_history_no_op() {
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(AssistantMessage::empty("mock", "mock", "mock-model")),
+        ];
+        assert!(repair_messages(&messages).is_empty());
+    }
+
+    #[test]
+    fn repair_complete_tool_cycle_no_op() {
+        let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
+        a.stop_reason = StopReason::ToolUse;
+        a.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        }));
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(a),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "bash".into(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "ok".into(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }),
+        ];
+        assert!(repair_messages(&messages).is_empty());
+    }
+
+    #[test]
+    fn repair_assistant_with_no_tool_results() {
+        // Daemon killed right after persisting assistant with tool_use
+        let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
+        a.stop_reason = StopReason::ToolUse;
+        a.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        }));
+        a.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc2".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        }));
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(a),
+        ];
+        let stubs = repair_messages(&messages);
+        assert_eq!(stubs.len(), 2);
+        for (i, expected_id) in ["tc1", "tc2"].iter().enumerate() {
+            if let Message::ToolResult(tr) = &stubs[i] {
+                assert_eq!(tr.tool_call_id, *expected_id);
+                assert!(tr.is_error);
+                assert!(tr.content.iter().any(|c| matches!(c,
+                    ToolResultContent::Text(t) if t.text.contains("interrupted")
+                )));
+            } else {
+                panic!("expected ToolResult stub");
+            }
+        }
+    }
+
+    #[test]
+    fn repair_partial_tool_results() {
+        // Daemon killed after first tool result but before second
+        let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
+        a.stop_reason = StopReason::ToolUse;
+        a.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        }));
+        a.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc2".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({}),
+        }));
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(a),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "bash".into(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "ok".into(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }),
+        ];
+        let stubs = repair_messages(&messages);
+        assert_eq!(stubs.len(), 1);
+        if let Message::ToolResult(tr) = &stubs[0] {
+            assert_eq!(tr.tool_call_id, "tc2");
+            assert_eq!(tr.tool_name, "read");
+            assert!(tr.is_error);
+        } else {
+            panic!("expected ToolResult stub");
+        }
+    }
+
+    #[test]
+    fn repair_ignores_non_tooluse_assistant() {
+        // Assistant with StopReason::Stop should not trigger repair
+        let a = AssistantMessage::empty("mock", "mock", "mock-model");
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(a),
+        ];
+        assert!(repair_messages(&messages).is_empty());
     }
 }

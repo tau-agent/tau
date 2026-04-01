@@ -743,6 +743,24 @@ async fn handle_client(
                         pm.notify_session_start_once(&cwd, &session_id);
                     }
 
+                    // Repair any corrupted message history (e.g. daemon killed
+                    // mid-tool-execution, leaving tool_use without tool_result).
+                    let repair_stubs = crate::agent::repair_messages(&messages);
+                    if !repair_stubs.is_empty() {
+                        eprintln!(
+                            "session {}: repaired {} missing tool_result message(s)",
+                            session_id,
+                            repair_stubs.len()
+                        );
+                        let st = state.lock().unwrap();
+                        for stub in &repair_stubs {
+                            if let Err(e) = st.db.append_message(&session_id, stub) {
+                                eprintln!("db error persisting repair stub: {}", e);
+                            }
+                        }
+                        messages.extend(repair_stubs);
+                    }
+
                     // If session was interrupted mid-tool-call, continue first
                     if crate::agent::needs_continuation(&messages) {
                         let mut context = Context {
