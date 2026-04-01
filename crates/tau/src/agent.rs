@@ -177,7 +177,9 @@ pub async fn run(
                     max_turns_reached: false,
                 });
             }
-            // Execute tool with streaming output deltas via channel
+            // Execute tool with streaming output deltas via channel.
+            // Errors (e.g. unknown tool) become error ToolResultMessages so
+            // the LLM can see them and the agent loop continues.
             let (tool_output_tx, tool_output_rx) = smol::channel::unbounded::<String>();
 
             // Spawn tool execution and output forwarding concurrently.
@@ -199,7 +201,22 @@ pub async fn run(
                 }
             };
             let (result, _) = futures::future::join(tool_future, forward_future).await;
-            let result = result?;
+            let result = match result {
+                Ok(r) => r,
+                Err(e) => crate::types::ToolResultMessage {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    content: vec![crate::types::ToolResultContent::Text(
+                        crate::types::TextContent {
+                            text: format!("error: {}", e),
+                            text_signature: None,
+                        },
+                    )],
+                    details: None,
+                    is_error: true,
+                    timestamp: crate::types::timestamp_ms(),
+                },
+            };
 
             // Emit full tool result
             let content = result

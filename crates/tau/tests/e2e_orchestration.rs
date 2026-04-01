@@ -3,43 +3,7 @@
 //! These tests start a real server (with mock LLM provider), connect via
 //! unix socket, and exercise the full protocol.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
-
 use tau::protocol::{Request, Response};
-
-/// Helper to send a request and read one response.
-fn request(stream: &mut UnixStream, req: &Request) -> Response {
-    let mut line = serde_json::to_string(req).unwrap();
-    line.push('\n');
-    stream.write_all(line.as_bytes()).unwrap();
-    stream.flush().unwrap();
-
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut resp_line = String::new();
-    reader.read_line(&mut resp_line).unwrap();
-    serde_json::from_str(&resp_line).unwrap()
-}
-
-/// Start a server in a background thread with a custom socket path.
-/// Returns the socket path. The server uses in-memory DB.
-fn start_test_server() -> PathBuf {
-    let dir = tempfile::tempdir().unwrap();
-    let sock = dir.path().join("tau-test.sock");
-    let sock_clone = sock.clone();
-
-    // Set env so the server uses our socket path
-    // This is a hack -- ideally the server would accept config.
-    // For now, we'll connect directly.
-    std::thread::spawn(move || {
-        // We can't easily run the server with a custom socket.
-        // Instead, test at the protocol level by talking to a running server.
-        let _ = sock_clone;
-    });
-
-    sock
-}
 
 // ---------------------------------------------------------------------------
 // Tests that don't need a running server (protocol-level / DB-level)

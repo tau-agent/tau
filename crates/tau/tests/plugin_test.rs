@@ -264,6 +264,7 @@ fn plugin_manager_integration() {
             .into_iter()
             .collect(),
         session: Default::default(),
+        no_default_worker: false,
     };
 
     let mut manager = PluginManager::new(config);

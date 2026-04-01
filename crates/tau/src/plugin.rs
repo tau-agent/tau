@@ -505,7 +505,7 @@ impl SessionPlugins {
         let mut plugins = Vec::new();
         let prefix = config.session_prefix.as_deref().unwrap_or(&[]);
 
-        let entries: Vec<_> = if config.session.is_empty() {
+        let entries: Vec<_> = if config.session.is_empty() && !config.no_default_worker {
             // No config: use default built-in worker
             let exe = std::env::current_exe()
                 .map_err(|e| crate::Error::Io(e.to_string()))?
@@ -920,6 +920,10 @@ pub struct PluginsConfig {
     /// Session plugins (spawned per session).
     #[serde(default)]
     pub session: HashMap<String, PluginEntry>,
+    /// If true, don't spawn the default built-in worker when session is empty.
+    /// Used in tests where the worker binary isn't available.
+    #[serde(default)]
+    pub no_default_worker: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -255,6 +255,117 @@ fn build_registry() -> ProviderRegistry {
     registry
 }
 
+/// Configuration for a test server instance.
+pub struct TestServerConfig {
+    pub registry: ProviderRegistry,
+    pub models: Vec<Model>,
+    pub socket_path: PathBuf,
+    pub db_path: PathBuf,
+}
+
+/// Run a server with custom config (for testing).
+pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
+    let default_model = config
+        .models
+        .first()
+        .cloned()
+        .ok_or_else(|| crate::Error::Io("no models available".into()))?;
+    let sock = &config.socket_path;
+
+    if let Some(parent) = sock.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if sock.exists() {
+        std::fs::remove_file(sock).ok();
+    }
+
+    let listener = Async::<UnixListener>::bind(sock)
+        .map_err(|e| crate::Error::Io(format!("bind {}: {}", sock.display(), e)))?;
+
+    let db = Db::open(&config.db_path)?;
+
+    let mut cfg = crate::config::Config::default();
+    // Add mock provider config with dummy API key so Chat requests don't fail
+    cfg.providers.insert(
+        "mock".into(),
+        crate::config::ProviderConfig {
+            api: "openai".into(),
+            base_url: "http://mock".into(),
+            api_key: Some("mock-key".into()),
+            models: vec![],
+        },
+    );
+    let plugins_config = crate::plugin::PluginsConfig {
+        no_default_worker: true,
+        ..Default::default()
+    };
+    let mut plugins = crate::plugin::PluginManager::new(plugins_config);
+    plugins.load_global_plugins("/tmp");
+    let plugins: Arc<Mutex<crate::plugin::PluginManager>> = Arc::new(Mutex::new(plugins));
+
+    let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
+    let throttle = crate::throttle::ProviderThrottle::new();
+
+    let state: SharedState = Arc::new(Mutex::new(State {
+        db,
+        registry: config.registry,
+        auth: AuthStorage::open_default(),
+        config: cfg,
+        default_model,
+        all_models: config.models,
+        usage_cache: None,
+        cancel_flags: HashMap::new(),
+        subscribers: HashMap::new(),
+        steer_txs: HashMap::new(),
+    }));
+
+    let shutdown = ShutdownHandle::new();
+
+    let shutdown_watcher = shutdown.clone();
+    let sock_clone = sock.to_path_buf();
+    smol::spawn(async move {
+        while !shutdown_watcher.is_shutting_down() {
+            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = Async::<UnixStream>::connect(&sock_clone).await;
+    })
+    .detach();
+
+    loop {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| crate::Error::Io(e.to_string()))?;
+
+        if shutdown.is_shutting_down() {
+            break;
+        }
+
+        let state = state.clone();
+        let plugins = plugins.clone();
+        let shutdown_handle = shutdown.clone();
+        let session_locks = session_locks.clone();
+        let throttle = throttle.clone();
+        smol::spawn(async move {
+            if let Err(e) = handle_client(
+                stream,
+                state,
+                plugins,
+                shutdown_handle,
+                session_locks,
+                throttle,
+            )
+            .await
+            {
+                eprintln!("client error: {}", e);
+            }
+        })
+        .detach();
+    }
+
+    Ok(())
+}
+
 /// Run the server (blocking). Call from `smol::block_on`.
 pub async fn run() -> crate::Result<()> {
     let registry = build_registry();
@@ -1313,7 +1424,6 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     let in_flight = shutdown.clone();
     let session_id_for_executor = session_id.to_string();
     let agent_handle = {
-        let event_tx_clone = event_tx.clone();
         async move {
             in_flight.enter();
             let mut executor = PluginExecutor {
@@ -1331,7 +1441,7 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
                 &options_clone,
                 &agent_config,
                 &plugin_tools,
-                event_tx_clone,
+                event_tx,
             )
             .await;
             in_flight.leave();
