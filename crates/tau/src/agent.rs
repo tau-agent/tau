@@ -3,7 +3,7 @@
 //! The loop continues until the LLM stops without tool calls, or an
 //! unrecoverable error occurs, or max_turns is reached.
 
-use crate::provider::{EventReceiver, ProviderRegistry};
+use crate::provider::{EventReceiver, EventSender, ProviderRegistry};
 
 use crate::types::*;
 use crate::worker::ToolExecutor;
@@ -23,8 +23,9 @@ pub struct AgentConfig {
     pub steer_rx: Option<smol::channel::Receiver<String>>,
     /// Called for each message produced by the agent (assistant, tool result, steering).
     /// Used for incremental persistence so partial progress survives errors.
+    /// Wrapped in Mutex so AgentConfig is Send+Sync across async boundaries.
     #[allow(clippy::type_complexity)]
-    pub on_message: Option<Box<dyn FnMut(&Message) + Send>>,
+    pub on_message: Option<std::sync::Mutex<Box<dyn FnMut(&Message) + Send>>>,
 }
 
 impl Default for AgentConfig {
@@ -48,9 +49,6 @@ pub struct AgentResult {
     pub max_turns_reached: bool,
 }
 
-/// Callback for agent events (forwarded to client).
-pub type EventCallback = Box<dyn FnMut(StreamEvent) + Send>;
-
 /// Check if a message list needs a continuation turn.
 /// Returns true if the last message is a ToolResult — meaning the session
 /// was interrupted after tool execution but before the LLM responded.
@@ -58,9 +56,9 @@ pub fn needs_continuation(messages: &[Message]) -> bool {
     matches!(messages.last(), Some(Message::ToolResult(_)))
 }
 
-/// Sleep with periodic cancellation checks.
+/// Async cancellable sleep.
 /// Returns `Err(Cancelled)` if should_stop returns true during the sleep.
-fn cancellable_sleep(
+async fn cancellable_sleep(
     delay: std::time::Duration,
     should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> crate::Result<()> {
@@ -74,25 +72,25 @@ fn cancellable_sleep(
             return Ok(());
         }
         let chunk = remaining.min(std::time::Duration::from_millis(100));
-        std::thread::sleep(chunk);
+        smol::Timer::after(chunk).await;
     }
 }
 
 /// Run the agent loop.
 ///
-/// Streams LLM responses, executes tool calls via the worker subprocess,
+/// Streams LLM responses, executes tool calls via the worker,
 /// and loops until the model stops or max_turns is reached.
-/// All stream events are forwarded via `on_event`.
+/// All stream events are sent to `event_tx`.
 #[allow(clippy::too_many_arguments)]
-pub fn run(
+pub async fn run(
     registry: &ProviderRegistry,
     model: &Model,
     context: &mut Context,
     worker: &mut dyn ToolExecutor,
     options: &StreamOptions,
-    config: &mut AgentConfig,
+    config: &AgentConfig,
     extra_tools: &[Tool],
-    mut on_event: EventCallback,
+    event_tx: EventSender,
 ) -> crate::Result<AgentResult> {
     let mut new_messages = Vec::new();
 
@@ -105,12 +103,12 @@ pub fn run(
         if let Some(ref rx) = config.steer_rx {
             while let Ok(text) = rx.try_recv() {
                 let user_msg = UserMessage::text(&text);
-                on_event(StreamEvent::SteerMessage {
+                let _ = event_tx.try_send(StreamEvent::SteerMessage {
                     message: user_msg.clone(),
                 });
                 let msg = Message::User(user_msg);
-                if let Some(ref mut on_msg) = config.on_message {
-                    on_msg(&msg);
+                if let Some(ref on_msg) = config.on_message {
+                    on_msg.lock().unwrap()(&msg);
                 }
                 new_messages.push(msg.clone());
                 context.messages.push(msg);
@@ -119,7 +117,7 @@ pub fn run(
 
         // Stream LLM response (with retry)
         let message =
-            match stream_with_retry(registry, model, context, options, config, &mut on_event) {
+            match stream_with_retry(registry, model, context, options, config, &event_tx).await {
                 Err(crate::Error::Cancelled) => {
                     return Ok(AgentResult {
                         new_messages,
@@ -131,8 +129,8 @@ pub fn run(
 
         let stop_reason = message.stop_reason;
         let assistant_msg = Message::Assistant(message.clone());
-        if let Some(ref mut on_msg) = config.on_message {
-            on_msg(&assistant_msg);
+        if let Some(ref on_msg) = config.on_message {
+            on_msg.lock().unwrap()(&assistant_msg);
         }
         new_messages.push(assistant_msg);
         context.messages.push(Message::Assistant(message.clone()));
@@ -172,23 +170,36 @@ pub fn run(
         }
 
         for tc in &tool_calls {
-            // Check for cancellation/shutdown before each tool call so that
-            // a cancel request received while a previous tool was running
-            // prevents the remaining tools in this batch from executing.
+            // Check for cancellation/shutdown before each tool call
             if config.should_stop.as_ref().is_some_and(|f| f()) {
                 return Ok(AgentResult {
                     new_messages,
                     max_turns_reached: false,
                 });
             }
-            // Execute tool with streaming output deltas
+            // Execute tool with streaming output deltas via channel
+            let (tool_output_tx, tool_output_rx) = smol::channel::unbounded::<String>();
+
+            // Spawn tool execution and output forwarding concurrently.
+            // The execute future must drop tool_output_tx when done so the
+            // forward loop sees channel-closed and terminates.
+            let tool_future = async {
+                let res = worker.execute(tc, &tool_output_tx).await;
+                drop(tool_output_tx);
+                res
+            };
+            let event_tx_ref = &event_tx;
             let tc_id = tc.id.clone();
-            let result = worker.execute(tc, &mut |delta: &str| {
-                on_event(StreamEvent::ToolOutputDelta {
-                    tool_call_id: tc_id.clone(),
-                    delta: delta.to_string(),
-                });
-            })?;
+            let forward_future = async {
+                while let Ok(delta) = tool_output_rx.recv().await {
+                    let _ = event_tx_ref.try_send(StreamEvent::ToolOutputDelta {
+                        tool_call_id: tc_id.clone(),
+                        delta,
+                    });
+                }
+            };
+            let (result, _) = futures::future::join(tool_future, forward_future).await;
+            let result = result?;
 
             // Emit full tool result
             let content = result
@@ -200,7 +211,7 @@ pub fn run(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            on_event(StreamEvent::ToolResult {
+            let _ = event_tx.try_send(StreamEvent::ToolResult {
                 tool_call_id: tc.id.clone(),
                 tool_name: result.tool_name.clone(),
                 is_error: result.is_error,
@@ -208,8 +219,8 @@ pub fn run(
             });
 
             let tool_msg = Message::ToolResult(result.clone());
-            if let Some(ref mut on_msg) = config.on_message {
-                on_msg(&tool_msg);
+            if let Some(ref on_msg) = config.on_message {
+                on_msg.lock().unwrap()(&tool_msg);
             }
             new_messages.push(tool_msg);
             context.messages.push(Message::ToolResult(result));
@@ -240,18 +251,18 @@ pub fn run(
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
 
 /// Stream a single LLM call with retry logic for transient errors.
-fn stream_with_retry(
+async fn stream_with_retry(
     registry: &ProviderRegistry,
     model: &Model,
     context: &Context,
     options: &StreamOptions,
     config: &AgentConfig,
-    on_event: &mut EventCallback,
+    event_tx: &EventSender,
 ) -> crate::Result<AssistantMessage> {
     for attempt in 0..=config.max_retries {
         let rx = registry.stream(model, context, options)?;
         let should_stop = config.should_stop.as_deref();
-        let message = consume_stream(rx, on_event, should_stop);
+        let message = consume_stream(rx, event_tx, should_stop).await;
 
         // Propagate cancellation immediately — no retry.
         let message = match message {
@@ -277,14 +288,15 @@ fn stream_with_retry(
                     err_msg
                 );
                 eprintln!("{}", status_msg);
-                on_event(StreamEvent::Status {
+                let _ = event_tx.try_send(StreamEvent::Status {
                     message: status_msg,
                 });
-                // Cancellable sleep — checks should_stop every 100ms
+                // Async cancellable sleep
                 cancellable_sleep(
                     std::time::Duration::from_millis(delay_ms),
                     config.should_stop.as_deref(),
-                )?;
+                )
+                .await?;
                 continue;
             }
             if is_context_overflow(err_msg) {
@@ -308,14 +320,13 @@ fn parse_retry_after(err_msg: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
-/// Consume a stream, forwarding events and returning the final message.
+/// Consume a stream, forwarding events to the channel and returning the final message.
 ///
 /// `should_stop` is polled between events so that a cancel/shutdown signal
-/// received while the stream is in-flight can abort it promptly rather than
-/// waiting for the full response to finish.
-fn consume_stream(
+/// received while the stream is in-flight can abort it promptly.
+async fn consume_stream(
     rx: EventReceiver,
-    on_event: &mut EventCallback,
+    event_tx: &EventSender,
     should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> crate::Result<AssistantMessage> {
     loop {
@@ -323,7 +334,7 @@ fn consume_stream(
         if should_stop.is_some_and(|f| f()) {
             // Drain the channel without forwarding so the provider thread
             // can finish and clean up, then return an aborted message.
-            while let Ok(event) = rx.recv_blocking() {
+            while let Ok(event) = rx.recv().await {
                 if matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. }) {
                     break;
                 }
@@ -331,7 +342,7 @@ fn consume_stream(
             return Err(crate::Error::Cancelled);
         }
 
-        match rx.recv_blocking() {
+        match rx.recv().await {
             Ok(event) => {
                 let is_done =
                     matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
@@ -340,7 +351,7 @@ fn consume_stream(
                     StreamEvent::Error { error, .. } => Some(error.clone()),
                     _ => None,
                 };
-                on_event(event);
+                let _ = event_tx.try_send(event);
                 if is_done {
                     return final_msg.ok_or(crate::Error::ChannelClosed);
                 }
@@ -406,226 +417,255 @@ mod tests {
 
     #[test]
     fn simple_text_response() {
-        let registry = setup_registry(vec![MockResponse::Text("Hello!".into())]);
-        let model = mock_model();
-        let mut context = basic_context();
-        let mut config = AgentConfig::default();
-        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events_clone = events.clone();
-        let mut worker = InProcessWorker::new();
+        smol::block_on(async {
+            let registry = setup_registry(vec![MockResponse::Text("Hello!".into())]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig::default();
+            let mut worker = InProcessWorker::new();
+            let (tx, rx) = smol::channel::unbounded();
 
-        let result = run(
-            &registry,
-            &model,
-            &mut context,
-            &mut worker,
-            &StreamOptions::default(),
-            &mut config,
-            &[],
-            Box::new(move |e| events_clone.lock().unwrap().push(e)),
-        )
-        .unwrap();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(result.new_messages.len(), 1);
-        assert!(!result.max_turns_reached);
-        assert!(matches!(&result.new_messages[0], Message::Assistant(a) if a.text() == "Hello!"));
-        assert!(!events.lock().unwrap().is_empty());
+            assert_eq!(result.new_messages.len(), 1);
+            assert!(!result.max_turns_reached);
+            assert!(
+                matches!(&result.new_messages[0], Message::Assistant(a) if a.text() == "Hello!")
+            );
+            // Drain and check events were sent
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            assert!(!events.is_empty());
+        });
     }
 
     #[test]
     fn tool_call_loop() {
-        let registry = setup_registry(vec![
-            MockResponse::ToolCalls(vec![ToolCall {
-                id: "tc1".into(),
-                name: "bash".into(),
-                arguments: serde_json::json!({"command": "echo hi"}),
-            }]),
-            MockResponse::Text("The command output 'hi'.".into()),
-        ]);
-        let model = mock_model();
-        let mut context = basic_context();
-        let mut config = AgentConfig::default();
-        let mut worker = InProcessWorker::new();
+        smol::block_on(async {
+            let registry = setup_registry(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                }]),
+                MockResponse::Text("The command output 'hi'.".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig::default();
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
 
-        let result = run(
-            &registry,
-            &model,
-            &mut context,
-            &mut worker,
-            &StreamOptions::default(),
-            &mut config,
-            &[],
-            Box::new(|_| {}),
-        )
-        .unwrap();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(result.new_messages.len(), 3);
-        assert!(matches!(&result.new_messages[0], Message::Assistant(_)));
-        assert!(matches!(&result.new_messages[1], Message::ToolResult(_)));
-        assert!(
-            matches!(&result.new_messages[2], Message::Assistant(a) if a.text().contains("hi"))
-        );
+            assert_eq!(result.new_messages.len(), 3);
+            assert!(matches!(&result.new_messages[0], Message::Assistant(_)));
+            assert!(matches!(&result.new_messages[1], Message::ToolResult(_)));
+            assert!(
+                matches!(&result.new_messages[2], Message::Assistant(a) if a.text().contains("hi"))
+            );
+        });
     }
 
     #[test]
     fn max_turns_limit() {
-        let mut responses = Vec::new();
-        for i in 0..10 {
-            responses.push(MockResponse::ToolCalls(vec![ToolCall {
-                id: format!("tc{}", i),
-                name: "bash".into(),
-                arguments: serde_json::json!({"command": "echo loop"}),
-            }]));
-        }
-        let registry = setup_registry(responses);
-        let model = mock_model();
-        let mut context = basic_context();
-        let mut config = AgentConfig {
-            max_turns: 3,
-            ..Default::default()
-        };
-        let mut worker = InProcessWorker::new();
+        smol::block_on(async {
+            let mut responses = Vec::new();
+            for i in 0..10 {
+                responses.push(MockResponse::ToolCalls(vec![ToolCall {
+                    id: format!("tc{}", i),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo loop"}),
+                }]));
+            }
+            let registry = setup_registry(responses);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig {
+                max_turns: 3,
+                ..Default::default()
+            };
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
 
-        let result = run(
-            &registry,
-            &model,
-            &mut context,
-            &mut worker,
-            &StreamOptions::default(),
-            &mut config,
-            &[],
-            Box::new(|_| {}),
-        )
-        .unwrap();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
 
-        assert!(result.max_turns_reached);
-        assert_eq!(result.new_messages.len(), 6);
+            assert!(result.max_turns_reached);
+            assert_eq!(result.new_messages.len(), 6);
+        });
     }
 
     #[test]
     fn error_stops_loop() {
-        let registry = setup_registry(vec![MockResponse::Error("something broke".into())]);
-        let model = mock_model();
-        let mut context = basic_context();
-        let mut config = AgentConfig {
-            max_retries: 0,
-            ..Default::default()
-        };
-        let mut worker = InProcessWorker::new();
+        smol::block_on(async {
+            let registry = setup_registry(vec![MockResponse::Error("something broke".into())]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig {
+                max_retries: 0,
+                ..Default::default()
+            };
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
 
-        let result = run(
-            &registry,
-            &model,
-            &mut context,
-            &mut worker,
-            &StreamOptions::default(),
-            &mut config,
-            &[],
-            Box::new(|_| {}),
-        )
-        .unwrap();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(result.new_messages.len(), 1);
-        assert!(matches!(
-            &result.new_messages[0],
-            Message::Assistant(a) if a.stop_reason == StopReason::Error
-        ));
+            assert_eq!(result.new_messages.len(), 1);
+            assert!(matches!(
+                &result.new_messages[0],
+                Message::Assistant(a) if a.stop_reason == StopReason::Error
+            ));
+        });
     }
 
     #[test]
     fn unknown_tool_returns_error_result() {
-        let registry = setup_registry(vec![
-            MockResponse::ToolCalls(vec![ToolCall {
-                id: "tc1".into(),
-                name: "nonexistent_tool".into(),
-                arguments: serde_json::json!({}),
-            }]),
-            MockResponse::Text("I see the tool wasn't found.".into()),
-        ]);
-        let model = mock_model();
-        let mut context = basic_context();
-        let mut config = AgentConfig::default();
-        let mut worker = InProcessWorker::new();
+        smol::block_on(async {
+            let registry = setup_registry(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "nonexistent_tool".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                MockResponse::Text("I see the tool wasn't found.".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig::default();
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
 
-        let result = run(
-            &registry,
-            &model,
-            &mut context,
-            &mut worker,
-            &StreamOptions::default(),
-            &mut config,
-            &[],
-            Box::new(|_| {}),
-        )
-        .unwrap();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(result.new_messages.len(), 3);
-        if let Message::ToolResult(tr) = &result.new_messages[1] {
-            assert!(tr.is_error);
-            assert!(tr.content.iter().any(|c| matches!(c,
-                ToolResultContent::Text(t) if t.text.contains("unknown tool")
-            )));
-        } else {
-            panic!("expected tool result");
-        }
+            assert_eq!(result.new_messages.len(), 3);
+            if let Message::ToolResult(tr) = &result.new_messages[1] {
+                assert!(tr.is_error);
+                assert!(tr.content.iter().any(|c| matches!(c,
+                    ToolResultContent::Text(t) if t.text.contains("unknown tool")
+                )));
+            } else {
+                panic!("expected tool result");
+            }
+        });
     }
 
     #[test]
     fn resume_after_interrupted_tool_call() {
-        let registry = setup_registry(vec![MockResponse::Text(
-            "The tool returned some output.".into(),
-        )]);
-        let model = mock_model();
-        let mut worker = InProcessWorker::new();
+        smol::block_on(async {
+            let registry = setup_registry(vec![MockResponse::Text(
+                "The tool returned some output.".into(),
+            )]);
+            let model = mock_model();
+            let mut worker = InProcessWorker::new();
 
-        let mut context = Context {
-            system_prompt: Some("You are helpful.".into()),
-            messages: vec![
-                Message::User(UserMessage::text("run echo hello")),
-                Message::Assistant({
-                    let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
-                    a.content.push(AssistantContent::ToolCall(ToolCall {
-                        id: "tc1".into(),
-                        name: "bash".into(),
-                        arguments: serde_json::json!({"command": "echo hello"}),
-                    }));
-                    a.stop_reason = StopReason::ToolUse;
-                    a
-                }),
-                Message::ToolResult(ToolResultMessage {
-                    tool_call_id: "tc1".into(),
-                    tool_name: "bash".into(),
-                    content: vec![ToolResultContent::Text(TextContent {
-                        text: "hello\n".into(),
-                        text_signature: None,
-                    })],
-                    details: None,
-                    is_error: false,
-                    timestamp: 0,
-                }),
-            ],
-            tools: Vec::new(),
-        };
-        let mut config = AgentConfig::default();
+            let mut context = Context {
+                system_prompt: Some("You are helpful.".into()),
+                messages: vec![
+                    Message::User(UserMessage::text("run echo hello")),
+                    Message::Assistant({
+                        let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
+                        a.content.push(AssistantContent::ToolCall(ToolCall {
+                            id: "tc1".into(),
+                            name: "bash".into(),
+                            arguments: serde_json::json!({"command": "echo hello"}),
+                        }));
+                        a.stop_reason = StopReason::ToolUse;
+                        a
+                    }),
+                    Message::ToolResult(ToolResultMessage {
+                        tool_call_id: "tc1".into(),
+                        tool_name: "bash".into(),
+                        content: vec![ToolResultContent::Text(TextContent {
+                            text: "hello\n".into(),
+                            text_signature: None,
+                        })],
+                        details: None,
+                        is_error: false,
+                        timestamp: 0,
+                    }),
+                ],
+                tools: Vec::new(),
+            };
+            let config = AgentConfig::default();
+            let (tx, _rx) = smol::channel::unbounded();
 
-        assert!(needs_continuation(&context.messages));
+            assert!(needs_continuation(&context.messages));
 
-        let result = run(
-            &registry,
-            &model,
-            &mut context,
-            &mut worker,
-            &StreamOptions::default(),
-            &mut config,
-            &[],
-            Box::new(|_| {}),
-        )
-        .unwrap();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(result.new_messages.len(), 1);
-        assert!(
-            matches!(&result.new_messages[0], Message::Assistant(a) if a.text().contains("tool returned"))
-        );
+            assert_eq!(result.new_messages.len(), 1);
+            assert!(
+                matches!(&result.new_messages[0], Message::Assistant(a) if a.text().contains("tool returned"))
+            );
+        });
     }
 
     #[test]

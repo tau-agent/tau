@@ -1172,26 +1172,40 @@ struct PluginExecutor {
     cwd: String,
 }
 
+#[async_trait::async_trait]
 impl crate::worker::ToolExecutor for PluginExecutor {
-    fn execute(
+    async fn execute(
         &mut self,
         tool_call: &ToolCall,
-        on_output: &mut dyn FnMut(&str),
+        output_tx: &smol::channel::Sender<String>,
     ) -> crate::Result<ToolResultMessage> {
+        // Plugin IO is still blocking -- offload to thread pool
         let state = self.state.clone();
         let session_locks = self.session_locks.clone();
-        let mut server_handler =
-            move |req: &crate::protocol::Request| -> crate::protocol::Response {
-                handle_server_request_sync(&state, &session_locks, req)
+        let plugins = self.plugins.clone();
+        let session_id = self.session_id.clone();
+        let cwd = self.cwd.clone();
+        let tool_call = tool_call.clone();
+        let output_tx_clone = output_tx.clone();
+
+        smol::unblock(move || {
+            let mut server_handler =
+                move |req: &crate::protocol::Request| -> crate::protocol::Response {
+                    handle_server_request_sync(&state, &session_locks, req)
+                };
+            let mut pm = plugins.lock().unwrap();
+            let mut output_fn = |delta: &str| {
+                let _ = output_tx_clone.send_blocking(delta.to_string());
             };
-        let mut pm = self.plugins.lock().unwrap();
-        pm.execute_tool_with_server(
-            &self.session_id,
-            tool_call,
-            &self.cwd,
-            on_output,
-            Some(&mut server_handler),
-        )
+            pm.execute_tool_with_server(
+                &session_id,
+                &tool_call,
+                &cwd,
+                &mut output_fn,
+                Some(&mut server_handler),
+            )
+        })
+        .await
     }
 }
 
@@ -1263,11 +1277,19 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
 
     let shutdown_flag = shutdown.flag.clone();
     let cancel_flag_clone = cancel_flag.clone();
-    let mut agent_config = crate::agent::AgentConfig {
+    let state_clone_persist = state.clone();
+    let session_id_persist = session_id.to_string();
+    let agent_config = crate::agent::AgentConfig {
         should_stop: Some(Box::new(move || {
             shutdown_flag.load(Ordering::Relaxed) || cancel_flag_clone.load(Ordering::Relaxed)
         })),
         steer_rx: Some(steer_rx),
+        on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
+            let st = state_clone_persist.lock().unwrap();
+            if let Err(e) = st.db.append_message(&session_id_persist, msg) {
+                eprintln!("db error persisting agent message: {}", e);
+            }
+        }))),
         ..Default::default()
     };
 
@@ -1287,42 +1309,35 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
 
     let plugins_clone = plugins.clone();
     let state_clone_exec = state.clone();
-    let state_clone_persist = state.clone();
-    let session_id_persist = session_id.to_string();
     let session_locks_clone = session_locks.clone();
     let in_flight = shutdown.clone();
     let session_id_for_executor = session_id.to_string();
-    let agent_handle = smol::unblock(move || {
-        in_flight.enter();
-        let mut executor = PluginExecutor {
-            plugins: plugins_clone,
-            state: state_clone_exec,
-            session_locks: session_locks_clone,
-            session_id: session_id_for_executor,
-            cwd: cwd_clone,
-        };
-        // Incremental persistence: persist each message to DB as produced
-        agent_config.on_message = Some(Box::new(move |msg: &Message| {
-            let st = state_clone_persist.lock().unwrap();
-            if let Err(e) = st.db.append_message(&session_id_persist, msg) {
-                eprintln!("db error persisting agent message: {}", e);
-            }
-        }));
-        let result = crate::agent::run(
-            &registry_clone,
-            &model_clone,
-            &mut context_clone,
-            &mut executor,
-            &options_clone,
-            &mut agent_config,
-            &plugin_tools,
-            Box::new(move |event| {
-                let _ = event_tx.send_blocking(event);
-            }),
-        );
-        in_flight.leave();
-        result
-    });
+    let agent_handle = {
+        let event_tx_clone = event_tx.clone();
+        async move {
+            in_flight.enter();
+            let mut executor = PluginExecutor {
+                plugins: plugins_clone,
+                state: state_clone_exec,
+                session_locks: session_locks_clone,
+                session_id: session_id_for_executor,
+                cwd: cwd_clone,
+            };
+            let result = crate::agent::run(
+                &registry_clone,
+                &model_clone,
+                &mut context_clone,
+                &mut executor,
+                &options_clone,
+                &agent_config,
+                &plugin_tools,
+                event_tx_clone,
+            )
+            .await;
+            in_flight.leave();
+            result
+        }
+    };
 
     let state_clone = state.clone();
     let session_id_owned = session_id.to_string();

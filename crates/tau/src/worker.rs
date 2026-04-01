@@ -15,6 +15,8 @@
 
 use std::io::{BufRead, BufWriter, Write};
 
+use async_trait::async_trait;
+
 use crate::plugin::{
     PluginMessage, PluginRegistration, PluginRequest, PluginToolDef, PluginToolResult,
 };
@@ -22,11 +24,12 @@ use crate::system_prompt::ToolPrompt;
 use crate::types::*;
 
 /// Trait for tool execution (allows plugin-based or in-process).
-pub trait ToolExecutor {
-    fn execute(
+#[async_trait]
+pub trait ToolExecutor: Send {
+    async fn execute(
         &mut self,
         tool_call: &ToolCall,
-        on_output: &mut dyn FnMut(&str),
+        output_tx: &smol::channel::Sender<String>,
     ) -> crate::Result<ToolResultMessage>;
 }
 
@@ -49,11 +52,12 @@ impl InProcessWorker {
     }
 }
 
+#[async_trait]
 impl ToolExecutor for InProcessWorker {
-    fn execute(
+    async fn execute(
         &mut self,
         tool_call: &ToolCall,
-        _on_output: &mut dyn FnMut(&str),
+        _output_tx: &smol::channel::Sender<String>,
     ) -> crate::Result<ToolResultMessage> {
         let result = crate::tools::execute_tool(&self.tools, tool_call, "/tmp");
         Ok(result)
