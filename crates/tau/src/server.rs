@@ -1,6 +1,6 @@
 //! Unix socket server — manages sessions and streams LLM responses.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -146,6 +146,10 @@ struct State {
     subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
     /// Current agent phase per session, for new subscribers.
     phases: HashMap<String, crate::types::AgentPhase>,
+    /// Sessions currently being waited on by WaitSessions/WaitAnySessions.
+    /// Maps child_session_id -> parent_session_id. Used to suppress redundant
+    /// completion notifications when parent is actively joining.
+    waited_sessions: HashSet<String>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -366,6 +370,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         subscribers: HashMap::new(),
         steer_txs: HashMap::new(),
         phases: HashMap::new(),
+        waited_sessions: HashSet::new(),
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -465,6 +470,7 @@ pub async fn run() -> crate::Result<()> {
         steer_txs: HashMap::new(),
         subscribers: HashMap::new(),
         phases: HashMap::new(),
+        waited_sessions: HashSet::new(),
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -1315,6 +1321,15 @@ async fn handle_client(
                     std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
                 let mut results = Vec::new();
 
+                // Track waited sessions so child completion doesn't send
+                // redundant notifications.
+                {
+                    let mut st = state.lock().unwrap();
+                    for sid in &session_ids {
+                        st.waited_sessions.insert(sid.clone());
+                    }
+                }
+
                 loop {
                     let mut all_done = true;
                     results.clear();
@@ -1365,6 +1380,14 @@ async fn handle_client(
                     smol::Timer::after(std::time::Duration::from_secs(1)).await;
                 }
 
+                // Remove from waited set.
+                {
+                    let mut st = state.lock().unwrap();
+                    for sid in &session_ids {
+                        st.waited_sessions.remove(sid);
+                    }
+                }
+
                 send(&mut writer, &Response::SessionsCompleted { results }).await?;
             }
             Request::WaitAnySessions {
@@ -1376,6 +1399,15 @@ async fn handle_client(
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
                 let results;
+
+                // Track waited sessions so child completion doesn't send
+                // redundant notifications.
+                {
+                    let mut st = state.lock().unwrap();
+                    for sid in &session_ids {
+                        st.waited_sessions.insert(sid.clone());
+                    }
+                }
 
                 loop {
                     let mut done = Vec::new();
@@ -1422,6 +1454,14 @@ async fn handle_client(
                     }
 
                     smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                }
+
+                // Remove from waited set.
+                {
+                    let mut st = state.lock().unwrap();
+                    for sid in &session_ids {
+                        st.waited_sessions.remove(sid);
+                    }
                 }
 
                 send(&mut writer, &Response::SessionsCompleted { results }).await?;
@@ -1924,10 +1964,12 @@ async fn run_child_chat(
     }
     .await;
 
-    // Broadcast terminal response
+    // Broadcast terminal response and notify parent.
     match chat_result {
         Ok((true, _)) => {
             broadcast_to_subscribers(&state, &session_id, &Response::Cancelled);
+            // Notify parent about cancellation.
+            notify_parent_of_child_completion(&state, &session_id, "cancelled", None);
         }
         Ok((false, max_turns_reached)) => {
             if max_turns_reached {
@@ -1963,18 +2005,24 @@ async fn run_child_chat(
                         broadcast_to_subscribers(&state, &pid, &status_resp);
                     }
                 }
+            } else {
+                // Normal completion -- notify parent.
+                notify_parent_of_child_completion(&state, &session_id, "completed", None);
             }
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
         }
-        Err(e) => {
+        Err(ref e) => {
+            let err_msg = format!("child agent error: {}", e);
             broadcast_to_subscribers(
                 &state,
                 &session_id,
                 &Response::Error {
-                    message: format!("child agent error: {}", e),
+                    message: err_msg.clone(),
                 },
             );
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
+            // Notify parent about error.
+            notify_parent_of_child_completion(&state, &session_id, &format!("error: {}", e), None);
         }
     }
 
@@ -2354,6 +2402,76 @@ fn handle_server_request_sync(
         _ => Response::Error {
             message: "request not supported in plugin context".into(),
         },
+    }
+}
+
+/// Notify a child session's parent that the child has completed.
+/// Skipped if the parent is actively waiting on this child via WaitSessions/WaitAnySessions.
+fn notify_parent_of_child_completion(
+    state: &SharedState,
+    child_session_id: &str,
+    status: &str,
+    error_detail: Option<&str>,
+) {
+    let (parent_id, summary) = {
+        let st = state.lock().unwrap();
+        // Check if parent is already waiting on this child.
+        if st.waited_sessions.contains(child_session_id) {
+            return;
+        }
+        let parent = st
+            .db
+            .get_session(child_session_id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parent_id);
+        let summary = st
+            .db
+            .get_messages(child_session_id)
+            .ok()
+            .map(|msgs| {
+                let text = last_assistant_text(&msgs);
+                if text.len() > 200 {
+                    format!("{}...", &text[..200])
+                } else {
+                    text
+                }
+            })
+            .unwrap_or_default();
+        (parent, summary)
+    };
+
+    let pid = match parent_id {
+        Some(pid) => pid,
+        None => return,
+    };
+
+    let _ = error_detail; // reserved for future use
+    let notice = format!(
+        "Child session {} {}. Summary: {}",
+        child_session_id,
+        status,
+        if summary.is_empty() {
+            "(no output)".to_string()
+        } else {
+            summary
+        }
+    );
+
+    let sent = {
+        let st = state.lock().unwrap();
+        if let Some(tx) = st.steer_txs.get(&pid) {
+            tx.try_send(notice.clone()).is_ok()
+        } else {
+            false
+        }
+    };
+    if !sent {
+        // Parent agent loop not running -- broadcast as status.
+        let status_resp = Response::Stream {
+            event: Box::new(StreamEvent::Status { message: notice }),
+        };
+        broadcast_to_subscribers(state, &pid, &status_resp);
     }
 }
 
