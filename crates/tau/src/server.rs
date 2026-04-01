@@ -1929,6 +1929,8 @@ async fn run_child_chat(
         }
     }
 
+    emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+
     Ok(())
 }
 
