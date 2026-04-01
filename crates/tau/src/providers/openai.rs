@@ -4,12 +4,22 @@
 //! via different base_url and model settings.
 
 use std::io::{BufRead, BufReader};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use super::openai_types;
 use crate::provider::{EventReceiver, EventSender, Provider};
 use crate::types::*;
+
+/// Timeout for TCP + TLS connection establishment.
+const TIMEOUT_CONNECT: Duration = Duration::from_secs(30);
+/// Timeout for sending the request headers.
+const TIMEOUT_SEND_REQUEST: Duration = Duration::from_secs(30);
+/// Timeout for sending the request body (JSON payload).
+const TIMEOUT_SEND_BODY: Duration = Duration::from_secs(30);
+/// Timeout for receiving response headers (time-to-first-byte).
+const TIMEOUT_RECV_RESPONSE: Duration = Duration::from_secs(120);
 
 const API_ID: &str = "openai-completions";
 
@@ -112,6 +122,10 @@ fn run_stream(
 
     let mut resp = req
         .config()
+        .timeout_connect(Some(TIMEOUT_CONNECT))
+        .timeout_send_request(Some(TIMEOUT_SEND_REQUEST))
+        .timeout_send_body(Some(TIMEOUT_SEND_BODY))
+        .timeout_recv_response(Some(TIMEOUT_RECV_RESPONSE))
         .http_status_as_error(false)
         .build()
         .send_json(body)
