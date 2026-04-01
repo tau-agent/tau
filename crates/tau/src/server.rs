@@ -780,7 +780,7 @@ async fn handle_client(
                 // Without this guarantee the TUI gets stuck in Streaming
                 // mode forever when an internal error (e.g. DB write)
                 // causes the handler to bail out early via `?`.
-                let chat_result: Result<bool, crate::Error> = async {
+                let chat_result: Result<(bool, bool), crate::Error> = async {
                     // Load session
                     let session_data = {
                         let st = state.lock().unwrap();
@@ -849,7 +849,7 @@ async fn handle_client(
                         )
                         .await;
                         match cont_result {
-                            Ok(_new_msgs) => {
+                            Ok(_agent_result) => {
                                 // Messages already persisted incrementally via on_message
                                 let st = state.lock().unwrap();
                                 messages = st.db.get_messages(&session_id)?;
@@ -923,12 +923,14 @@ async fn handle_client(
                     )
                     .await;
 
-                    match result {
-                        Ok(_new_msgs) => {
+                    let max_turns_reached = match result {
+                        Ok(ref agent_result) => {
                             // Messages already persisted incrementally via on_message
+                            agent_result.max_turns_reached
                         }
                         Err(crate::Error::Cancelled) => {
                             cancel_flag.store(true, Ordering::Relaxed);
+                            false
                         }
                         Err(e) => {
                             // Update throttle on rate limit errors
@@ -939,7 +941,7 @@ async fn handle_client(
                             throttle.handle_error(&model.provider, &err_msg, None);
                             return Err(e);
                         }
-                    }
+                    };
 
                     // Check compaction
                     let was_cancelled = cancel_flag.load(Ordering::Relaxed);
@@ -962,21 +964,31 @@ async fn handle_client(
                         }
                     }
 
-                    Ok(was_cancelled)
+                    Ok((was_cancelled, max_turns_reached))
                 }
                 .await;
 
                 // Always broadcast a terminal response so subscribers
                 // (especially the TUI) never get stuck in Streaming mode.
                 match chat_result {
-                    Ok(true) => {
+                    Ok((true, _)) => {
                         // Cancelled
                         let resp = Response::Cancelled;
                         broadcast_to_subscribers(&state, &session_id, &resp);
                         send(&mut writer, &resp).await.ok();
                     }
-                    Ok(false) => {
-                        // Normal completion
+                    Ok((false, max_turns_reached)) => {
+                        // Normal completion (or max turns reached)
+                        if max_turns_reached {
+                            let status_resp = Response::Stream {
+                                event: Box::new(StreamEvent::Status {
+                                    message: "Reached tool use limit. Send a message to continue."
+                                        .to_string(),
+                                }),
+                            };
+                            broadcast_to_subscribers(&state, &session_id, &status_resp);
+                            send(&mut writer, &status_resp).await.ok();
+                        }
                         let resp = Response::AgentDone;
                         broadcast_to_subscribers(&state, &session_id, &resp);
                         send(&mut writer, &resp).await.ok();
@@ -1525,7 +1537,9 @@ fn run_agent_turn<'a, W: futures::io::AsyncWrite + Unpin + Send + 'a>(
     writer: &'a mut W,
     throttle: &'a crate::throttle::ProviderThrottle,
     session_locks: &'a SessionLocks,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<Vec<Message>>> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::Result<crate::agent::AgentResult>> + Send + 'a>,
+> {
     Box::pin(run_agent_turn_inner(
         state,
         plugins,
@@ -1554,7 +1568,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     writer: &mut W,
     throttle: &crate::throttle::ProviderThrottle,
     session_locks: &SessionLocks,
-) -> crate::Result<Vec<Message>> {
+) -> crate::Result<crate::agent::AgentResult> {
     // Check provider throttle — sleep if rate limited
     if let Some(remaining) = throttle.check(&model.provider) {
         let human = crate::agent::format_duration_human(remaining.as_millis() as u64);
@@ -1786,7 +1800,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         st.steer_txs.remove(session_id);
     }
 
-    Ok(agent_result.new_messages)
+    Ok(agent_result)
 }
 
 /// Run an agent turn for a child session (spawned by orchestration tools).
@@ -1818,7 +1832,7 @@ async fn run_child_chat(
         flag.clone()
     };
 
-    let chat_result: Result<bool, crate::Error> = async {
+    let chat_result: Result<(bool, bool), crate::Error> = async {
         // Load session
         let (stored, mut messages, cwd) = {
             let st = state.lock().unwrap();
@@ -1897,24 +1911,59 @@ async fn run_child_chat(
         )
         .await;
 
-        match result {
-            Ok(_) => {}
+        let max_turns_reached = match result {
+            Ok(ref agent_result) => agent_result.max_turns_reached,
             Err(crate::Error::Cancelled) => {
                 cancel_flag.store(true, Ordering::Relaxed);
+                false
             }
             Err(e) => return Err(e),
-        }
+        };
 
-        Ok(cancel_flag.load(Ordering::Relaxed))
+        Ok((cancel_flag.load(Ordering::Relaxed), max_turns_reached))
     }
     .await;
 
     // Broadcast terminal response
     match chat_result {
-        Ok(true) => {
+        Ok((true, _)) => {
             broadcast_to_subscribers(&state, &session_id, &Response::Cancelled);
         }
-        Ok(false) => {
+        Ok((false, max_turns_reached)) => {
+            if max_turns_reached {
+                // Notify the parent session that this child hit its step limit.
+                let parent_id = {
+                    let st = state.lock().unwrap();
+                    st.db
+                        .get_session(&session_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.parent_id)
+                };
+                if let Some(pid) = parent_id {
+                    let notice = format!(
+                        "Child session {} reached its tool use limit. \
+                         Use session_read to check progress and send a follow-up message to continue, \
+                         or session_cancel to stop it.",
+                        session_id
+                    );
+                    let sent = {
+                        let st = state.lock().unwrap();
+                        if let Some(tx) = st.steer_txs.get(&pid) {
+                            tx.try_send(notice.clone()).is_ok()
+                        } else {
+                            false
+                        }
+                    };
+                    if !sent {
+                        // Parent agent loop not running -- broadcast as status
+                        let status_resp = Response::Stream {
+                            event: Box::new(StreamEvent::Status { message: notice }),
+                        };
+                        broadcast_to_subscribers(&state, &pid, &status_resp);
+                    }
+                }
+            }
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
         }
         Err(e) => {
