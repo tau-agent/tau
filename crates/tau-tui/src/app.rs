@@ -824,8 +824,8 @@ impl App {
             | StreamEvent::ToolcallStart { .. } => {
                 self.phase = AgentPhase::Responding;
             }
-            // Tool result → ToolExec phase
-            StreamEvent::ToolResult { .. } => {
+            // Tool call defined or result received → ToolExec phase
+            StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
                 self.phase = AgentPhase::ToolExec;
             }
             // Explicit phase transition

@@ -1699,7 +1699,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                         crate::types::AgentPhase::Responding,
                     );
                 }
-                StreamEvent::ToolResult { .. } => {
+                StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
                     let mut st = state_clone.lock().unwrap();
                     st.phases
                         .insert(session_id_owned.clone(), crate::types::AgentPhase::ToolExec);

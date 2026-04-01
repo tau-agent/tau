@@ -332,7 +332,7 @@ impl AgentPhase {
             Self::Preparing => "preparing...",
             Self::Connecting => "connecting...",
             Self::Thinking => "thinking...",
-            Self::Responding => "responding...",
+            Self::Responding => "working...",
             Self::ToolExec => "running tools...",
             Self::Compacting => "compacting...",
         }
