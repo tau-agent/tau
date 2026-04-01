@@ -72,6 +72,42 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             ],
         },
         PluginToolDef {
+            name: "session_join_all".into(),
+            description: "Wait for all unjoined child sessions to complete. Blocks until every child spawned (that hasn't been joined yet) is done or timeout is reached.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 300)"
+                    }
+                }
+            }),
+            prompt_snippet: None,
+            prompt_guidelines: vec![
+                "Waits for all children spawned since the last join. No need to track session IDs.".into(),
+                "Returns status and summary for each child session.".into(),
+            ],
+        },
+        PluginToolDef {
+            name: "session_join_any".into(),
+            description: "Wait for any unjoined child session to complete. Returns as soon as at least one child finishes, with results for all completed children.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 300)"
+                    }
+                }
+            }),
+            prompt_snippet: None,
+            prompt_guidelines: vec![
+                "Use for fan-out patterns where children have variable completion times.".into(),
+                "Returns results for all children that completed, remaining stay unjoined.".into(),
+            ],
+        },
+        PluginToolDef {
             name: "session_status".into(),
             description: "Check the status of a child session without blocking.".into(),
             parameters: serde_json::json!({

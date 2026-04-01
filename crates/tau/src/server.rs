@@ -1303,6 +1303,65 @@ async fn handle_client(
 
                 send(&mut writer, &Response::SessionsCompleted { results }).await?;
             }
+            Request::WaitAnySessions {
+                session_ids,
+                timeout_secs,
+            } => {
+                // Wait until at least one session completes.
+                // Returns results for all sessions that are done at that point.
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+                let results;
+
+                loop {
+                    let mut done = Vec::new();
+                    let mut pending = Vec::new();
+
+                    for sid in &session_ids {
+                        let lock = session_lock(&session_locks, sid);
+                        let is_busy = lock.try_lock().is_none();
+
+                        if is_busy {
+                            pending.push(sid.clone());
+                        } else {
+                            let st = state.lock().unwrap();
+                            let summary = match st.db.get_session(sid) {
+                                Ok(Some(_)) => {
+                                    let msgs = st.db.get_messages(sid).unwrap_or_default();
+                                    last_assistant_text(&msgs)
+                                }
+                                _ => String::new(),
+                            };
+                            done.push(crate::protocol::SessionResult {
+                                session_id: sid.clone(),
+                                status: "done".into(),
+                                summary,
+                            });
+                        }
+                    }
+
+                    if !done.is_empty() || std::time::Instant::now() >= deadline {
+                        if done.is_empty() {
+                            // Timeout -- mark all as timeout
+                            results = session_ids
+                                .iter()
+                                .map(|sid| crate::protocol::SessionResult {
+                                    session_id: sid.clone(),
+                                    status: "timeout".into(),
+                                    summary: String::new(),
+                                })
+                                .collect();
+                        } else {
+                            results = done;
+                        }
+                        break;
+                    }
+
+                    smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                }
+
+                send(&mut writer, &Response::SessionsCompleted { results }).await?;
+            }
             Request::Shutdown { restart } => {
                 shutdown.request_shutdown(restart);
                 send(&mut writer, &Response::Ok).await?;
@@ -2137,6 +2196,52 @@ fn handle_server_request_sync(
                         }
                     }
                     return Response::SessionsCompleted { results };
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        Request::WaitAnySessions {
+            session_ids,
+            timeout_secs,
+        } => {
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
+            loop {
+                let mut done = Vec::new();
+
+                for sid in session_ids {
+                    let lock = session_lock(_session_locks, sid);
+                    let is_busy = lock.try_lock().is_none();
+
+                    if !is_busy {
+                        let st = state.lock().unwrap();
+                        let summary = match st.db.get_messages(sid) {
+                            Ok(msgs) => last_assistant_text(&msgs),
+                            Err(_) => String::new(),
+                        };
+                        drop(st);
+                        done.push(crate::protocol::SessionResult {
+                            session_id: sid.clone(),
+                            status: "done".into(),
+                            summary,
+                        });
+                    }
+                }
+
+                if !done.is_empty() || std::time::Instant::now() >= deadline {
+                    if done.is_empty() {
+                        return Response::SessionsCompleted {
+                            results: session_ids
+                                .iter()
+                                .map(|sid| crate::protocol::SessionResult {
+                                    session_id: sid.clone(),
+                                    status: "timeout".into(),
+                                    summary: String::new(),
+                                })
+                                .collect(),
+                        };
+                    }
+                    return Response::SessionsCompleted { results: done };
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }

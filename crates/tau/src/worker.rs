@@ -13,6 +13,7 @@
 //! Can be wrapped with sandbox or other execution environments:
 //!   worker_command = ["sandbox", "run", "--", "tau", "worker"]
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use async_trait::async_trait;
@@ -114,6 +115,9 @@ pub fn run_worker_loop() {
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
 
+    // Track unjoined child sessions for session_join_all / session_join_any.
+    let mut unjoined_children: HashSet<String> = HashSet::new();
+
     // Send registration (plugin protocol)
     let mut all_tools = builtin_plugin_tools();
     all_tools.extend(crate::orchestration::orchestration_tools());
@@ -174,6 +178,7 @@ pub fn run_worker_loop() {
                         session_id.as_deref(),
                         &mut writer,
                         &mut reader,
+                        &mut unjoined_children,
                     );
                     send_message(
                         &mut writer,
@@ -325,6 +330,7 @@ fn handle_session_tool(
     session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
+    unjoined_children: &mut HashSet<String>,
 ) -> crate::types::ToolResultMessage {
     match name {
         "session_spawn" => {
@@ -391,6 +397,9 @@ fn handle_session_tool(
                 }
             }
 
+            // Track as unjoined
+            unjoined_children.insert(child_id.clone());
+
             tool_ok(&format!("Spawned session {}", child_id))
         }
 
@@ -410,12 +419,93 @@ fn handle_session_tool(
                 return tool_err("session_ids is required");
             }
 
+            // Remove joined IDs from unjoined set
+            for sid in &session_ids {
+                unjoined_children.remove(sid);
+            }
+
             let req = crate::protocol::Request::WaitSessions {
                 session_ids,
                 timeout_secs: timeout,
             };
             match server_request(writer, reader, req) {
                 Ok(crate::protocol::Response::SessionsCompleted { results }) => {
+                    let mut text = String::new();
+                    for r in &results {
+                        text.push_str(&format!(
+                            "Session {}: {} | {}\n",
+                            r.session_id,
+                            r.status,
+                            if r.summary.is_empty() {
+                                "(no output)"
+                            } else {
+                                &r.summary
+                            }
+                        ));
+                    }
+                    tool_ok(text.trim_end())
+                }
+                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
+                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(&e),
+            }
+        }
+
+        "session_join_all" => {
+            let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(300);
+
+            if unjoined_children.is_empty() {
+                return tool_ok("No unjoined child sessions.");
+            }
+
+            let session_ids: Vec<String> = unjoined_children.drain().collect();
+
+            let req = crate::protocol::Request::WaitSessions {
+                session_ids,
+                timeout_secs: timeout,
+            };
+            match server_request(writer, reader, req) {
+                Ok(crate::protocol::Response::SessionsCompleted { results }) => {
+                    let mut text = String::new();
+                    for r in &results {
+                        text.push_str(&format!(
+                            "Session {}: {} | {}\n",
+                            r.session_id,
+                            r.status,
+                            if r.summary.is_empty() {
+                                "(no output)"
+                            } else {
+                                &r.summary
+                            }
+                        ));
+                    }
+                    tool_ok(text.trim_end())
+                }
+                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
+                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(&e),
+            }
+        }
+
+        "session_join_any" => {
+            let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(300);
+
+            if unjoined_children.is_empty() {
+                return tool_ok("No unjoined child sessions.");
+            }
+
+            let session_ids: Vec<String> = unjoined_children.iter().cloned().collect();
+
+            let req = crate::protocol::Request::WaitAnySessions {
+                session_ids,
+                timeout_secs: timeout,
+            };
+            match server_request(writer, reader, req) {
+                Ok(crate::protocol::Response::SessionsCompleted { results }) => {
+                    // Remove completed sessions from unjoined set
+                    for r in &results {
+                        unjoined_children.remove(&r.session_id);
+                    }
                     let mut text = String::new();
                     for r in &results {
                         text.push_str(&format!(

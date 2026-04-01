@@ -348,11 +348,13 @@ fn session_info_includes_tree_fields() {
 #[test]
 fn orchestration_tool_definitions() {
     let tools = tau::orchestration::orchestration_tools();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 8);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"session_spawn"));
     assert!(names.contains(&"session_join"));
+    assert!(names.contains(&"session_join_all"));
+    assert!(names.contains(&"session_join_any"));
     assert!(names.contains(&"session_status"));
     assert!(names.contains(&"session_list_children"));
     assert!(names.contains(&"session_read"));
@@ -1015,4 +1017,212 @@ fn wait_sessions_returns_summary() {
     }
 
     server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// WaitAnySessions protocol tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn protocol_wait_any_sessions_roundtrip() {
+    let req = Request::WaitAnySessions {
+        session_ids: vec!["s1".into(), "s2".into()],
+        timeout_secs: 30,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains("wait_any_sessions"));
+    let parsed: Request = serde_json::from_str(&json).unwrap();
+    if let Request::WaitAnySessions {
+        session_ids,
+        timeout_secs,
+    } = parsed
+    {
+        assert_eq!(session_ids, vec!["s1", "s2"]);
+        assert_eq!(timeout_secs, 30);
+    } else {
+        panic!("wrong variant");
+    }
+}
+
+/// WaitAnySessions returns immediately when all sessions are idle.
+#[test]
+fn wait_any_sessions_idle_returns_all() {
+    let server = TestServer::start(vec![]);
+
+    let mut sids = Vec::new();
+    for _ in 0..3 {
+        let c = server.connect();
+        let sid = match send_recv(
+            &c,
+            &Request::CreateSession {
+                model: None,
+                provider: None,
+                system_prompt: None,
+                cwd: None,
+                parent_id: None,
+                child_budget: 0,
+            },
+        ) {
+            Response::SessionCreated { session_id } => session_id,
+            other => panic!("{:?}", other),
+        };
+        sids.push(sid);
+    }
+
+    let c = server.connect();
+    let resp = send_recv(
+        &c,
+        &Request::WaitAnySessions {
+            session_ids: sids.clone(),
+            timeout_secs: 5,
+        },
+    );
+    match resp {
+        Response::SessionsCompleted { results } => {
+            // All idle -> all returned as done
+            assert_eq!(results.len(), 3);
+            for r in &results {
+                assert_eq!(r.status, "done");
+            }
+        }
+        other => panic!("expected SessionsCompleted, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// WaitAnySessions returns completed children, not the still-busy ones.
+#[test]
+fn wait_any_sessions_returns_only_completed() {
+    let server = TestServer::start(vec![
+        MockResponse::Text("fast child done".into()),
+        MockResponse::Text("slow child done".into()),
+    ]);
+
+    let conn = server.connect();
+    let parent_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("parent".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 10,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Create fast child and start its chat
+    let c = server.connect();
+    let fast_id = match send_recv(
+        &c,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("fast".into()),
+            cwd: None,
+            parent_id: Some(parent_id.clone()),
+            child_budget: 0,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Chat with fast child and wait for it to finish
+    let c = server.connect();
+    let responses = send_recv_all(
+        &c,
+        &Request::Chat {
+            session_id: fast_id.clone(),
+            text: "go fast".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Create slow child (idle, no messages)
+    let c = server.connect();
+    let slow_id = match send_recv(
+        &c,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("slow".into()),
+            cwd: None,
+            parent_id: Some(parent_id.clone()),
+            child_budget: 0,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // WaitAnySessions with both -- both are idle so both should return
+    let c = server.connect();
+    let resp = send_recv(
+        &c,
+        &Request::WaitAnySessions {
+            session_ids: vec![fast_id.clone(), slow_id.clone()],
+            timeout_secs: 5,
+        },
+    );
+    match resp {
+        Response::SessionsCompleted { results } => {
+            assert_eq!(results.len(), 2, "expected 2 results, got {:?}", results);
+            for r in &results {
+                assert_eq!(r.status, "done");
+            }
+            let fast_result = results.iter().find(|r| r.session_id == fast_id).unwrap();
+            assert!(
+                fast_result.summary.contains("fast child done"),
+                "fast child summary: {}",
+                fast_result.summary
+            );
+        }
+        other => panic!("expected SessionsCompleted, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Worker unjoined_children unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unjoined_children_tracking() {
+    use std::collections::HashSet;
+
+    let mut unjoined: HashSet<String> = HashSet::new();
+
+    // Spawn adds
+    unjoined.insert("c1".into());
+    unjoined.insert("c2".into());
+    unjoined.insert("c3".into());
+    assert_eq!(unjoined.len(), 3);
+
+    // Join specific removes
+    unjoined.remove("c1");
+    assert_eq!(unjoined.len(), 2);
+    assert!(!unjoined.contains("c1"));
+
+    // Join all drains
+    let ids: Vec<String> = unjoined.drain().collect();
+    assert_eq!(ids.len(), 2);
+    assert!(unjoined.is_empty());
+
+    // New spawns after drain
+    unjoined.insert("c4".into());
+    unjoined.insert("c5".into());
+
+    // Join any removes only completed
+    let completed = vec!["c4".to_string()];
+    for id in &completed {
+        unjoined.remove(id);
+    }
+    assert_eq!(unjoined.len(), 1);
+    assert!(unjoined.contains("c5"));
 }

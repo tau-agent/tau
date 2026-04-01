@@ -63,6 +63,12 @@ pub enum Request {
         #[serde(default = "default_wait_timeout")]
         timeout_secs: u64,
     },
+    /// Wait for any of the specified sessions to complete (returns as soon as >= 1 is done).
+    WaitAnySessions {
+        session_ids: Vec<String>,
+        #[serde(default = "default_wait_timeout")]
+        timeout_secs: u64,
+    },
     /// Cancel an in-progress chat (agent loop) for a session.
     CancelChat { session_id: String },
     /// Inject a steering message into a running agent loop.
