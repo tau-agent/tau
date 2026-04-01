@@ -4,20 +4,45 @@
 //! color. No labels like "You" or "Assistant".
 //!
 
-/// Wrap a single text line at `max_width` characters.
+/// Wrap a single text line at `max_width` display columns.
+/// Uses unicode display width so multi-byte chars (box drawing, CJK, etc.) work.
 /// Tries to break at word boundaries; falls back to hard break.
 fn wrap_str(line: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 || line.len() <= max_width {
+    use unicode_width::UnicodeWidthChar;
+    use unicode_width::UnicodeWidthStr;
+
+    if max_width == 0 || UnicodeWidthStr::width(line) <= max_width {
         return vec![line.to_string()];
     }
     let mut result = Vec::new();
     let mut remaining = line;
-    while remaining.len() > max_width {
-        // Try to find a word boundary (space) to break at
-        let break_at = remaining[..max_width]
-            .rfind(' ')
-            .map(|i| i + 1) // include the space on the current line
-            .unwrap_or(max_width); // hard break if no space found
+    while UnicodeWidthStr::width(remaining) > max_width {
+        // Walk chars to find the byte offset where display width exceeds max_width
+        let mut width_so_far = 0;
+        let mut last_space_byte = None;
+        let mut cut_byte = remaining.len();
+        for (byte_idx, ch) in remaining.char_indices() {
+            let ch_w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width_so_far + ch_w > max_width {
+                cut_byte = byte_idx;
+                break;
+            }
+            width_so_far += ch_w;
+            if ch == ' ' {
+                last_space_byte = Some(byte_idx + 1); // break after the space
+            }
+        }
+        let break_at = last_space_byte.unwrap_or(cut_byte);
+        // Avoid zero-progress infinite loop (e.g. single wide char > max_width)
+        let break_at = if break_at == 0 {
+            remaining
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| i)
+                .unwrap_or(remaining.len())
+        } else {
+            break_at
+        };
         result.push(remaining[..break_at].to_string());
         remaining = &remaining[break_at..];
     }
