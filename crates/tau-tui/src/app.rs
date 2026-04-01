@@ -222,6 +222,7 @@ impl App {
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     self.messages.push(MessageItem::ToolComplete {
+                        tool_call_id: tool_call_id.clone(),
                         name: tool_name.clone(),
                         args,
                         output,
@@ -788,12 +789,14 @@ impl App {
                     *done = true;
                 }
                 MessageItem::ToolActive {
+                    tool_call_id,
                     name,
                     args,
                     started_at,
                     ..
                 } => {
                     *item = MessageItem::ToolComplete {
+                        tool_call_id: std::mem::take(tool_call_id),
                         name: std::mem::take(name),
                         args: std::mem::take(args),
                         output: "[interrupted]".into(),
@@ -1068,37 +1071,49 @@ impl App {
             StreamEvent::ToolcallEnd { tool_call, .. } => {
                 // Start active tool display
                 self.messages.push(MessageItem::ToolActive {
+                    tool_call_id: tool_call.id,
                     name: tool_call.name,
                     args: tool_call.arguments,
                     output_lines: Vec::new(),
                     started_at: std::time::Instant::now(),
                 });
             }
-            StreamEvent::ToolOutputDelta { delta, .. } => {
-                // Append output to the active tool
-                if let Some(MessageItem::ToolActive { output_lines, .. }) = self.messages.last_mut()
+            StreamEvent::ToolOutputDelta {
+                tool_call_id,
+                delta,
+            } => {
+                // Find matching active tool by tool_call_id (search from end)
+                if let Some(MessageItem::ToolActive { output_lines, .. }) =
+                    self.messages.iter_mut().rev().find(|m| {
+                        matches!(m, MessageItem::ToolActive { tool_call_id: id, .. } if id == &tool_call_id)
+                    })
                 {
                     output_lines.push(delta);
                 }
             }
             StreamEvent::ToolResult {
+                tool_call_id,
                 tool_name,
                 is_error,
                 content,
-                ..
             } => {
-                // Replace active tool with completed tool
-                if let Some(last @ MessageItem::ToolActive { .. }) = self.messages.last_mut() {
+                // Find matching active tool by tool_call_id (search from end)
+                if let Some(item @ MessageItem::ToolActive { .. }) =
+                    self.messages.iter_mut().rev().find(|m| {
+                        matches!(m, MessageItem::ToolActive { tool_call_id: id, .. } if id == &tool_call_id)
+                    })
+                {
                     let (args, started_at) =
                         if let MessageItem::ToolActive {
                             args, started_at, ..
-                        } = last
+                        } = item
                         {
                             (args.clone(), *started_at)
                         } else {
-                            (serde_json::Value::Null, std::time::Instant::now())
+                            unreachable!()
                         };
-                    *last = MessageItem::ToolComplete {
+                    *item = MessageItem::ToolComplete {
+                        tool_call_id,
                         name: tool_name,
                         args,
                         output: content,
@@ -1107,6 +1122,7 @@ impl App {
                     };
                 } else {
                     self.messages.push(MessageItem::ToolComplete {
+                        tool_call_id,
                         name: tool_name,
                         args: serde_json::Value::Null,
                         output: content,

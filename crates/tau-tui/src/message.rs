@@ -78,6 +78,7 @@ pub enum MessageItem {
     Thinking { text: String, done: bool },
     /// Tool actively running (output streaming in).
     ToolActive {
+        tool_call_id: String,
         name: String,
         args: serde_json::Value,
         output_lines: Vec<String>,
@@ -85,6 +86,7 @@ pub enum MessageItem {
     },
     /// Tool execution completed.
     ToolComplete {
+        tool_call_id: String,
         name: String,
         args: serde_json::Value,
         output: String,
@@ -174,6 +176,7 @@ impl MessageItem {
                 args,
                 output_lines,
                 started_at,
+                ..
             } => {
                 let renderer = renderers.get(name);
                 let lines =
@@ -186,6 +189,7 @@ impl MessageItem {
                 output,
                 is_error,
                 duration,
+                ..
             } => {
                 let renderer = renderers.get(name);
                 let lines = renderer
