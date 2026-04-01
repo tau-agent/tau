@@ -196,6 +196,11 @@ pub async fn run(
             }
         }
 
+        // Signal that we're about to call the LLM (so the UI can update the phase).
+        let _ = event_tx.try_send(StreamEvent::Phase {
+            phase: crate::types::AgentPhase::Connecting,
+        });
+
         // Stream LLM response (with retry)
         let message =
             match stream_with_retry(registry, model, context, options, config, &event_tx).await {
