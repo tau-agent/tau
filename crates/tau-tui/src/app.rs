@@ -236,7 +236,6 @@ impl App {
                         .cloned()
                         .unwrap_or(serde_json::Value::Null);
                     self.messages.push(MessageItem::ToolComplete {
-                        tool_call_id: tool_call_id.clone(),
                         name: tool_name.clone(),
                         args,
                         output,
@@ -904,14 +903,12 @@ impl App {
                     *done = true;
                 }
                 MessageItem::ToolActive {
-                    tool_call_id,
                     name,
                     args,
                     started_at,
                     ..
                 } => {
                     *item = MessageItem::ToolComplete {
-                        tool_call_id: std::mem::take(tool_call_id),
                         name: std::mem::take(name),
                         args: std::mem::take(args),
                         output: "[interrupted]".into(),
@@ -1250,7 +1247,6 @@ impl App {
                             unreachable!()
                         };
                     *item = MessageItem::ToolComplete {
-                        tool_call_id,
                         name: tool_name,
                         args,
                         output: content,
@@ -1259,7 +1255,6 @@ impl App {
                     };
                 } else {
                     self.messages.push(MessageItem::ToolComplete {
-                        tool_call_id,
                         name: tool_name,
                         args: serde_json::Value::Null,
                         output: content,

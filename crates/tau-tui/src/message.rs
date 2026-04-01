@@ -86,7 +86,6 @@ pub enum MessageItem {
     },
     /// Tool execution completed.
     ToolComplete {
-        tool_call_id: String,
         name: String,
         args: serde_json::Value,
         output: String,
