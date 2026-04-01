@@ -296,6 +296,50 @@ pub struct StreamOptions {
 }
 
 // ---------------------------------------------------------------------------
+// Agent phase
+// ---------------------------------------------------------------------------
+
+/// Current phase of the agent loop, broadcast to subscribers for UI display.
+/// The TUI also derives phase implicitly from certain stream events
+/// (see `App::update_phase_from_event` in tau-tui).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AgentPhase {
+    /// No agent turn running.
+    #[default]
+    Idle,
+    /// Blocked waiting for session lock (another turn in progress).
+    Waiting,
+    /// Loading session, spawning plugins, running hooks.
+    Preparing,
+    /// HTTP request sent, waiting for first SSE byte from provider.
+    Connecting,
+    /// Receiving thinking tokens from the LLM.
+    Thinking,
+    /// Streaming text/tool-call tokens from the LLM.
+    Responding,
+    /// Executing tool calls.
+    ToolExec,
+    /// Running context compaction.
+    Compacting,
+}
+
+impl AgentPhase {
+    /// Human-readable label for the status line.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Waiting => "waiting...",
+            Self::Preparing => "preparing...",
+            Self::Connecting => "connecting...",
+            Self::Thinking => "thinking...",
+            Self::Responding => "responding...",
+            Self::ToolExec => "running tools...",
+            Self::Compacting => "compacting...",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Streaming events (mirrors pi-ai's AssistantMessageEvent)
 // ---------------------------------------------------------------------------
 
@@ -371,6 +415,18 @@ pub enum StreamEvent {
     /// A steering message was injected mid-loop.
     SteerMessage {
         message: UserMessage,
+    },
+    /// Agent phase transition. Only sent for phases that have no implicit
+    /// stream event (Waiting, Preparing, Connecting, Compacting).
+    /// Other phases are derived by the TUI from existing events:
+    /// - ThinkingStart/ThinkingDelta → Thinking
+    /// - TextStart/TextDelta → Responding  
+    /// - ToolcallStart → Responding (still LLM output)
+    /// - ToolResult → ToolExec
+    /// - Start → transition from Connecting (but phase already set)
+    /// - AgentDone/Cancelled/Error → Idle
+    Phase {
+        phase: AgentPhase,
     },
     /// Informational status message (e.g. retry notices).
     Status {

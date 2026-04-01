@@ -4,7 +4,9 @@ use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyMod
 use ratatui_textarea::TextArea;
 
 use tau::protocol::Response;
-use tau::types::{AssistantContent, Message, StreamEvent, ToolResultMessage, UserContent};
+use tau::types::{
+    AgentPhase, AssistantContent, Message, StreamEvent, ToolResultMessage, UserContent,
+};
 
 use crate::events::Event;
 use crate::message::MessageItem;
@@ -68,6 +70,9 @@ pub struct App {
     pub messages: Vec<MessageItem>,
     /// Current mode.
     pub mode: AppMode,
+    /// Current agent phase — updated explicitly by Phase events and
+    /// implicitly by stream events (see `update_phase_from_event`).
+    pub phase: AgentPhase,
     /// Scroll position. None = follow bottom (auto-scroll). Some(pos) = pinned at line pos from top.
     pub scroll_pos: std::cell::Cell<Option<usize>>,
     /// Max scroll value from last render (set during draw via Cell).
@@ -108,6 +113,7 @@ impl App {
             provider,
             messages: Vec::new(),
             mode: AppMode::Input,
+            phase: AgentPhase::default(),
             scroll_pos: std::cell::Cell::new(None),
             max_scroll: std::cell::Cell::new(0),
 
@@ -712,6 +718,33 @@ impl App {
             .retain(|m| !matches!(m, MessageItem::AssistantStreaming { text } if text.is_empty()));
     }
 
+    /// Derive phase from stream events that implicitly indicate a transition.
+    /// Called from handle_stream_event; avoids sending redundant Phase messages
+    /// from the server for events that already carry enough information.
+    fn update_phase_from_event(&mut self, event: &StreamEvent) {
+        match event {
+            // Thinking tokens → Thinking phase
+            StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
+                self.phase = AgentPhase::Thinking;
+            }
+            // Text/toolcall tokens → Responding phase
+            StreamEvent::TextStart { .. }
+            | StreamEvent::TextDelta { .. }
+            | StreamEvent::ToolcallStart { .. } => {
+                self.phase = AgentPhase::Responding;
+            }
+            // Tool result → ToolExec phase
+            StreamEvent::ToolResult { .. } => {
+                self.phase = AgentPhase::ToolExec;
+            }
+            // Explicit phase transition
+            StreamEvent::Phase { phase } => {
+                self.phase = *phase;
+            }
+            _ => {}
+        }
+    }
+
     fn handle_server_response(&mut self, response: Response) {
         match response {
             Response::Stream { event } => {
@@ -724,6 +757,7 @@ impl App {
             }
             Response::AgentDone => {
                 self.finalize_in_flight();
+                self.phase = AgentPhase::Idle;
                 self.mode = AppMode::Input;
             }
             Response::Cancelled => {
@@ -740,6 +774,7 @@ impl App {
                         text: "[cancelled]".into(),
                     });
                 }
+                self.phase = AgentPhase::Idle;
                 self.mode = AppMode::Input;
             }
             Response::ServerShutdown { restart } => {
@@ -757,6 +792,7 @@ impl App {
             Response::Error { message } => {
                 self.finalize_in_flight();
                 self.messages.push(MessageItem::Error { text: message });
+                self.phase = AgentPhase::Idle;
                 self.mode = AppMode::Input;
             }
             Response::UserMessage { text } => {
@@ -830,6 +866,8 @@ impl App {
     }
 
     fn handle_stream_event(&mut self, event: StreamEvent) {
+        self.update_phase_from_event(&event);
+
         // Clean up empty AssistantStreaming placeholder before any non-delta event.
         if !matches!(
             event,

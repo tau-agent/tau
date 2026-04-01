@@ -144,6 +144,8 @@ struct State {
     /// Per-session broadcast subscribers.
     /// Other clients watching a session receive streamed responses.
     subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
+    /// Current agent phase per session, for new subscribers.
+    phases: HashMap<String, crate::types::AgentPhase>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -317,6 +319,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         cancel_flags: HashMap::new(),
         subscribers: HashMap::new(),
         steer_txs: HashMap::new(),
+        phases: HashMap::new(),
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -412,6 +415,7 @@ pub async fn run() -> crate::Result<()> {
         cancel_flags: HashMap::new(),
         steer_txs: HashMap::new(),
         subscribers: HashMap::new(),
+        phases: HashMap::new(),
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -695,7 +699,15 @@ async fn handle_client(
                 }
                 // Acquire per-session lock — serializes concurrent Chat requests.
                 // If another agent turn is running, this awaits until it finishes.
-                let _session_guard = session_lock(&session_locks, &session_id).lock_arc().await;
+                // Try non-blocking lock first; if contended, notify and then block.
+                let session_mutex = session_lock(&session_locks, &session_id);
+                let _session_guard = match session_mutex.try_lock_arc() {
+                    Some(guard) => guard,
+                    None => {
+                        emit_phase(&state, &session_id, crate::types::AgentPhase::Waiting);
+                        session_mutex.lock_arc().await
+                    }
+                };
 
                 // Reset (and create) the cancel flag for this session.
                 let cancel_flag: Arc<AtomicBool> = {
@@ -707,6 +719,8 @@ async fn handle_client(
                     flag.store(false, Ordering::Relaxed);
                     flag.clone()
                 };
+
+                emit_phase(&state, &session_id, crate::types::AgentPhase::Preparing);
 
                 // Run the Chat handler body inside a closure so that any
                 // error is caught and we *always* broadcast a terminal
@@ -927,6 +941,8 @@ async fn handle_client(
                     }
                 }
 
+                emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+
                 if shutdown.is_shutting_down() {
                     send(
                         &mut writer,
@@ -949,6 +965,17 @@ async fn handle_client(
                         .entry(session_id.clone())
                         .or_default()
                         .push(tx);
+                }
+
+                // Send current agent phase so newly connected TUI shows correct state.
+                {
+                    let st = state.lock().unwrap();
+                    let phase = st.phases.get(&session_id).copied().unwrap_or_default();
+                    let phase_resp = Response::Stream {
+                        event: Box::new(crate::types::StreamEvent::Phase { phase }),
+                    };
+                    drop(st);
+                    send(&mut writer, &phase_resp).await.ok();
                 }
 
                 // Forward events until the channel closes or client disconnects.
@@ -1461,6 +1488,8 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         ..Default::default()
     };
 
+    emit_phase(state, session_id, crate::types::AgentPhase::Connecting);
+
     let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
 
     // Create steering channel for this session's agent loop
@@ -1595,6 +1624,29 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                     writer_alive = false;
                 }
                 continue;
+            }
+            // Update stored phase from implicit stream events.
+            match &event {
+                StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
+                    let mut st = state_clone.lock().unwrap();
+                    st.phases
+                        .insert(session_id_owned.clone(), crate::types::AgentPhase::Thinking);
+                }
+                StreamEvent::TextStart { .. }
+                | StreamEvent::TextDelta { .. }
+                | StreamEvent::ToolcallStart { .. } => {
+                    let mut st = state_clone.lock().unwrap();
+                    st.phases.insert(
+                        session_id_owned.clone(),
+                        crate::types::AgentPhase::Responding,
+                    );
+                }
+                StreamEvent::ToolResult { .. } => {
+                    let mut st = state_clone.lock().unwrap();
+                    st.phases
+                        .insert(session_id_owned.clone(), crate::types::AgentPhase::ToolExec);
+                }
+                _ => {}
             }
             let resp = Response::Stream {
                 event: Box::new(event),
@@ -1774,6 +1826,8 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
     model: &Model,
     writer: &mut W,
 ) -> crate::Result<()> {
+    emit_phase(state, session_id, crate::types::AgentPhase::Compacting);
+
     let settings = compaction::CompactionSettings::default();
 
     // Load messages and find cut point
@@ -2119,6 +2173,18 @@ fn last_assistant_text(messages: &[Message]) -> String {
         }
     }
     String::new()
+}
+
+/// Update the session's phase and broadcast a Phase event to subscribers.
+fn emit_phase(state: &SharedState, session_id: &str, phase: crate::types::AgentPhase) {
+    {
+        let mut st = state.lock().unwrap();
+        st.phases.insert(session_id.to_string(), phase);
+    }
+    let resp = Response::Stream {
+        event: Box::new(crate::types::StreamEvent::Phase { phase }),
+    };
+    broadcast_to_subscribers(state, session_id, &resp);
 }
 
 fn broadcast_to_subscribers(state: &SharedState, session_id: &str, resp: &Response) {

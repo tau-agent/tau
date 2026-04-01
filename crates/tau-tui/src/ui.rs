@@ -8,6 +8,8 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use tau::protocol::format_tokens;
 
+use tau::types::AgentPhase;
+
 use crate::app::{App, AppMode};
 use crate::theme::Theme;
 
@@ -133,7 +135,10 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             all_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(app.spinner().to_string(), theme.spinner_style()),
-                Span::styled(" Working...", theme.spinner_message_style()),
+                Span::styled(
+                    format!(" {}", app.phase.label()),
+                    theme.spinner_message_style(),
+                ),
             ]));
         }
     }
@@ -275,6 +280,8 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Build right side: model name + connection status
     let right_text = if app.server_done {
         format!("{}/{} (disconnected)", app.provider, app.model)
+    } else if app.phase != AgentPhase::Idle {
+        format!("{}/{} ({})", app.provider, app.model, app.phase.label())
     } else {
         format!("{}/{}", app.provider, app.model)
     };
