@@ -209,3 +209,63 @@ impl MessageItem {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_str_no_wrap_needed() {
+        assert_eq!(wrap_str("hello", 10), vec!["hello"]);
+        assert_eq!(wrap_str("hello", 5), vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_str_empty() {
+        assert_eq!(wrap_str("", 10), vec![""]);
+    }
+
+    #[test]
+    fn wrap_str_zero_width() {
+        assert_eq!(wrap_str("hello world", 0), vec!["hello world"]);
+    }
+
+    #[test]
+    fn wrap_str_word_boundary() {
+        let result = wrap_str("hello world foo", 11);
+        assert_eq!(result, vec!["hello ", "world foo"]);
+    }
+
+    #[test]
+    fn wrap_str_hard_break() {
+        let result = wrap_str("abcdefghij", 5);
+        assert_eq!(result, vec!["abcde", "fghij"]);
+    }
+
+    #[test]
+    fn wrap_str_cjk_double_width() {
+        let result = wrap_str("\u{4e00}\u{4e8c}\u{4e09}\u{56db}\u{4e94}", 6);
+        assert_eq!(result, vec!["\u{4e00}\u{4e8c}\u{4e09}", "\u{56db}\u{4e94}"]);
+    }
+
+    #[test]
+    fn wrap_str_box_drawing() {
+        let line = "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}";
+        let result = wrap_str(line, 4);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].chars().count(), 4);
+        assert_eq!(result[1].chars().count(), 4);
+    }
+
+    #[test]
+    fn wrap_str_mixed_ascii_cjk() {
+        let result = wrap_str("hi\u{4e00}\u{4e8c}", 4);
+        assert_eq!(result, vec!["hi\u{4e00}", "\u{4e8c}"]);
+    }
+
+    #[test]
+    fn wrap_text_multiline() {
+        let result = wrap_text("aaa\nbbb\nccc", 10);
+        assert_eq!(result, vec!["aaa", "bbb", "ccc"]);
+    }
+}
