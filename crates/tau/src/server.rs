@@ -654,13 +654,9 @@ async fn handle_client(
                         )
                         .await;
                         match cont_result {
-                            Ok(new_msgs) => {
+                            Ok(_new_msgs) => {
+                                // Messages already persisted incrementally via on_message
                                 let st = state.lock().unwrap();
-                                for msg in &new_msgs {
-                                    if let Err(e) = st.db.append_message(&session_id, msg) {
-                                        eprintln!("db error persisting continuation: {}", e);
-                                    }
-                                }
                                 messages = st.db.get_messages(&session_id)?;
                             }
                             Err(e) => {
@@ -733,13 +729,8 @@ async fn handle_client(
                     .await;
 
                     match result {
-                        Ok(new_msgs) => {
-                            let st = state.lock().unwrap();
-                            for msg in &new_msgs {
-                                if let Err(e) = st.db.append_message(&session_id, msg) {
-                                    eprintln!("db error persisting agent message: {}", e);
-                                }
-                            }
+                        Ok(_new_msgs) => {
+                            // Messages already persisted incrementally via on_message
                         }
                         Err(crate::Error::Cancelled) => {
                             cancel_flag.store(true, Ordering::Relaxed);
@@ -1272,7 +1263,7 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
 
     let shutdown_flag = shutdown.flag.clone();
     let cancel_flag_clone = cancel_flag.clone();
-    let agent_config = crate::agent::AgentConfig {
+    let mut agent_config = crate::agent::AgentConfig {
         should_stop: Some(Box::new(move || {
             shutdown_flag.load(Ordering::Relaxed) || cancel_flag_clone.load(Ordering::Relaxed)
         })),
@@ -1296,6 +1287,8 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
 
     let plugins_clone = plugins.clone();
     let state_clone_exec = state.clone();
+    let state_clone_persist = state.clone();
+    let session_id_persist = session_id.to_string();
     let session_locks_clone = session_locks.clone();
     let in_flight = shutdown.clone();
     let session_id_for_executor = session_id.to_string();
@@ -1308,13 +1301,20 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
             session_id: session_id_for_executor,
             cwd: cwd_clone,
         };
+        // Incremental persistence: persist each message to DB as produced
+        agent_config.on_message = Some(Box::new(move |msg: &Message| {
+            let st = state_clone_persist.lock().unwrap();
+            if let Err(e) = st.db.append_message(&session_id_persist, msg) {
+                eprintln!("db error persisting agent message: {}", e);
+            }
+        }));
         let result = crate::agent::run(
             &registry_clone,
             &model_clone,
             &mut context_clone,
             &mut executor,
             &options_clone,
-            &agent_config,
+            &mut agent_config,
             &plugin_tools,
             Box::new(move |event| {
                 let _ = event_tx.send_blocking(event);
@@ -1329,9 +1329,8 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     let forward_handle = async {
         let mut writer_alive = true;
         while let Ok(event) = event_rx.recv().await {
-            // Persist steering messages to DB and broadcast as UserMessage
+            // Broadcast steering messages as UserMessage (persistence handled by on_message)
             if let StreamEvent::SteerMessage { ref message } = event {
-                let user_msg = Message::User(message.clone());
                 let text = message
                     .content
                     .iter()
@@ -1341,10 +1340,6 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
                     })
                     .collect::<Vec<_>>()
                     .join("");
-                {
-                    let st = state_clone.lock().unwrap();
-                    st.db.append_message(&session_id_owned, &user_msg).ok();
-                }
                 let user_resp = Response::UserMessage { text };
                 broadcast_to_subscribers(&state_clone, &session_id_owned, &user_resp);
                 if writer_alive && send(writer, &user_resp).await.is_err() {

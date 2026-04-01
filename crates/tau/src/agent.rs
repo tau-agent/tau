@@ -21,6 +21,10 @@ pub struct AgentConfig {
     /// Channel for receiving steering messages injected mid-loop.
     /// Checked at the top of each turn (after tool results, before next LLM call).
     pub steer_rx: Option<smol::channel::Receiver<String>>,
+    /// Called for each message produced by the agent (assistant, tool result, steering).
+    /// Used for incremental persistence so partial progress survives errors.
+    #[allow(clippy::type_complexity)]
+    pub on_message: Option<Box<dyn FnMut(&Message) + Send>>,
 }
 
 impl Default for AgentConfig {
@@ -31,6 +35,7 @@ impl Default for AgentConfig {
             retry_base_ms: 1000,
             should_stop: None,
             steer_rx: None,
+            on_message: None,
         }
     }
 }
@@ -53,6 +58,26 @@ pub fn needs_continuation(messages: &[Message]) -> bool {
     matches!(messages.last(), Some(Message::ToolResult(_)))
 }
 
+/// Sleep with periodic cancellation checks.
+/// Returns `Err(Cancelled)` if should_stop returns true during the sleep.
+fn cancellable_sleep(
+    delay: std::time::Duration,
+    should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
+) -> crate::Result<()> {
+    let deadline = std::time::Instant::now() + delay;
+    loop {
+        if should_stop.is_some_and(|f| f()) {
+            return Err(crate::Error::Cancelled);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let chunk = remaining.min(std::time::Duration::from_millis(100));
+        std::thread::sleep(chunk);
+    }
+}
+
 /// Run the agent loop.
 ///
 /// Streams LLM responses, executes tool calls via the worker subprocess,
@@ -65,7 +90,7 @@ pub fn run(
     context: &mut Context,
     worker: &mut dyn ToolExecutor,
     options: &StreamOptions,
-    config: &AgentConfig,
+    config: &mut AgentConfig,
     extra_tools: &[Tool],
     mut on_event: EventCallback,
 ) -> crate::Result<AgentResult> {
@@ -84,6 +109,9 @@ pub fn run(
                     message: user_msg.clone(),
                 });
                 let msg = Message::User(user_msg);
+                if let Some(ref mut on_msg) = config.on_message {
+                    on_msg(&msg);
+                }
                 new_messages.push(msg.clone());
                 context.messages.push(msg);
             }
@@ -102,7 +130,11 @@ pub fn run(
             };
 
         let stop_reason = message.stop_reason;
-        new_messages.push(Message::Assistant(message.clone()));
+        let assistant_msg = Message::Assistant(message.clone());
+        if let Some(ref mut on_msg) = config.on_message {
+            on_msg(&assistant_msg);
+        }
+        new_messages.push(assistant_msg);
         context.messages.push(Message::Assistant(message.clone()));
 
         // If error or aborted, stop
@@ -175,7 +207,11 @@ pub fn run(
                 content,
             });
 
-            new_messages.push(Message::ToolResult(result.clone()));
+            let tool_msg = Message::ToolResult(result.clone());
+            if let Some(ref mut on_msg) = config.on_message {
+                on_msg(&tool_msg);
+            }
+            new_messages.push(tool_msg);
             context.messages.push(Message::ToolResult(result));
         }
 
@@ -228,7 +264,7 @@ fn stream_with_retry(
         {
             if is_retryable(err_msg) && attempt < config.max_retries {
                 // Use retry-after from the error if present, otherwise exponential backoff
-                let delay = parse_retry_after(err_msg)
+                let delay_ms = parse_retry_after(err_msg)
                     .map(|secs| secs * 1000)
                     .unwrap_or_else(|| {
                         (config.retry_base_ms * 2u64.pow(attempt as u32)).min(MAX_RETRY_DELAY_MS)
@@ -237,14 +273,18 @@ fn stream_with_retry(
                     "retryable error (attempt {}/{}), retrying in {}ms: {}",
                     attempt + 1,
                     config.max_retries,
-                    delay,
+                    delay_ms,
                     err_msg
                 );
                 eprintln!("{}", status_msg);
                 on_event(StreamEvent::Status {
                     message: status_msg,
                 });
-                std::thread::sleep(std::time::Duration::from_millis(delay));
+                // Cancellable sleep — checks should_stop every 100ms
+                cancellable_sleep(
+                    std::time::Duration::from_millis(delay_ms),
+                    config.should_stop.as_deref(),
+                )?;
                 continue;
             }
             if is_context_overflow(err_msg) {
@@ -369,7 +409,7 @@ mod tests {
         let registry = setup_registry(vec![MockResponse::Text("Hello!".into())]);
         let model = mock_model();
         let mut context = basic_context();
-        let config = AgentConfig::default();
+        let mut config = AgentConfig::default();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let events_clone = events.clone();
         let mut worker = InProcessWorker::new();
@@ -380,7 +420,7 @@ mod tests {
             &mut context,
             &mut worker,
             &StreamOptions::default(),
-            &config,
+            &mut config,
             &[],
             Box::new(move |e| events_clone.lock().unwrap().push(e)),
         )
@@ -404,7 +444,7 @@ mod tests {
         ]);
         let model = mock_model();
         let mut context = basic_context();
-        let config = AgentConfig::default();
+        let mut config = AgentConfig::default();
         let mut worker = InProcessWorker::new();
 
         let result = run(
@@ -413,7 +453,7 @@ mod tests {
             &mut context,
             &mut worker,
             &StreamOptions::default(),
-            &config,
+            &mut config,
             &[],
             Box::new(|_| {}),
         )
@@ -440,7 +480,7 @@ mod tests {
         let registry = setup_registry(responses);
         let model = mock_model();
         let mut context = basic_context();
-        let config = AgentConfig {
+        let mut config = AgentConfig {
             max_turns: 3,
             ..Default::default()
         };
@@ -452,7 +492,7 @@ mod tests {
             &mut context,
             &mut worker,
             &StreamOptions::default(),
-            &config,
+            &mut config,
             &[],
             Box::new(|_| {}),
         )
@@ -467,7 +507,7 @@ mod tests {
         let registry = setup_registry(vec![MockResponse::Error("something broke".into())]);
         let model = mock_model();
         let mut context = basic_context();
-        let config = AgentConfig {
+        let mut config = AgentConfig {
             max_retries: 0,
             ..Default::default()
         };
@@ -479,7 +519,7 @@ mod tests {
             &mut context,
             &mut worker,
             &StreamOptions::default(),
-            &config,
+            &mut config,
             &[],
             Box::new(|_| {}),
         )
@@ -504,7 +544,7 @@ mod tests {
         ]);
         let model = mock_model();
         let mut context = basic_context();
-        let config = AgentConfig::default();
+        let mut config = AgentConfig::default();
         let mut worker = InProcessWorker::new();
 
         let result = run(
@@ -513,7 +553,7 @@ mod tests {
             &mut context,
             &mut worker,
             &StreamOptions::default(),
-            &config,
+            &mut config,
             &[],
             Box::new(|_| {}),
         )
@@ -566,7 +606,7 @@ mod tests {
             ],
             tools: Vec::new(),
         };
-        let config = AgentConfig::default();
+        let mut config = AgentConfig::default();
 
         assert!(needs_continuation(&context.messages));
 
@@ -576,7 +616,7 @@ mod tests {
             &mut context,
             &mut worker,
             &StreamOptions::default(),
-            &config,
+            &mut config,
             &[],
             Box::new(|_| {}),
         )

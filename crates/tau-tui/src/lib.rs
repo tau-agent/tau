@@ -268,6 +268,15 @@ async fn run_inner(
             .map_err(|e| tau::Error::Io(e.to_string()))?;
     }
 
+    // Cancel any in-flight agent turn so it doesn't keep running after exit
+    if app.mode == AppMode::Streaming {
+        send_fire_and_forget(Request::CancelChat {
+            session_id: app.session_id.clone(),
+        })
+        .await
+        .ok();
+    }
+
     // Clean up empty sessions (no user messages sent)
     let has_user_messages = app
         .messages
