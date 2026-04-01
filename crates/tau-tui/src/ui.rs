@@ -294,6 +294,9 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
     left_parts.push(Span::styled(app.session_id.clone(), dim));
+    if app.phase != AgentPhase::Idle {
+        left_parts.push(Span::styled(format!(" ({})", app.phase.label()), dim));
+    }
     if app.child_count > 0 {
         left_parts.push(Span::styled(format!(" [{}]", app.child_count), dim));
     }
@@ -301,8 +304,6 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Build right side: model name + connection status
     let right_text = if app.server_done {
         format!("{}/{} (disconnected)", app.provider, app.model)
-    } else if app.phase != AgentPhase::Idle {
-        format!("{}/{} ({})", app.provider, app.model, app.phase.label())
     } else {
         format!("{}/{}", app.provider, app.model)
     };
