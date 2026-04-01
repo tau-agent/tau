@@ -98,6 +98,23 @@ pub struct App {
     pub pending_subscription_usage: bool,
     /// Server stream ended.
     pub server_done: bool,
+    /// Navigation stack for session switching (previous session IDs).
+    pub nav_stack: Vec<NavEntry>,
+    /// Parent session ID (if this is a child session).
+    pub parent_id: Option<String>,
+    /// Number of direct child sessions.
+    pub child_count: usize,
+}
+
+/// Saved state when navigating to a child session.
+pub struct NavEntry {
+    pub session_id: String,
+    pub model: String,
+    pub provider: String,
+    pub messages: Vec<MessageItem>,
+    pub totals: UsageTotals,
+    pub parent_id: Option<String>,
+    pub child_count: usize,
 }
 
 impl App {
@@ -129,6 +146,9 @@ impl App {
             history_saved_text: String::new(),
             pending_subscription_usage: false,
             server_done: false,
+            nav_stack: Vec::new(),
+            parent_id: None,
+            child_count: 0,
         }
     }
 
@@ -584,6 +604,54 @@ impl App {
         }
     }
 
+    /// Save current session state to navigation stack.
+    pub fn save_nav_state(&mut self) {
+        self.nav_stack.push(NavEntry {
+            session_id: self.session_id.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            messages: std::mem::take(&mut self.messages),
+            totals: std::mem::take(&mut self.totals),
+            parent_id: self.parent_id.clone(),
+            child_count: self.child_count,
+        });
+    }
+
+    /// Switch to a new session, replacing current state.
+    /// Call `save_nav_state()` first if you want to preserve the current session.
+    pub fn switch_to_session(&mut self, info: &tau::protocol::SessionInfo, messages: Vec<Message>) {
+        self.session_id = info.id.clone();
+        self.model = info.model.clone();
+        self.provider = info.provider.clone();
+        self.parent_id = info.parent_id.clone();
+        self.child_count = info.child_count;
+        self.totals = UsageTotals::default();
+        self.totals.context_window = info.stats.context_window;
+        self.totals.is_subscription = info.stats.is_subscription;
+        self.messages.clear();
+        self.restore_messages(&messages);
+        self.scroll_to_bottom();
+        self.mode = AppMode::Input;
+    }
+
+    /// Navigate back to the previous session from the nav stack.
+    pub fn navigate_back(&mut self) -> bool {
+        if let Some(entry) = self.nav_stack.pop() {
+            self.session_id = entry.session_id;
+            self.model = entry.model;
+            self.provider = entry.provider;
+            self.messages = entry.messages;
+            self.totals = entry.totals;
+            self.parent_id = entry.parent_id;
+            self.child_count = entry.child_count;
+            self.scroll_to_bottom();
+            self.mode = AppMode::Input;
+            true
+        } else {
+            false
+        }
+    }
+
     fn handle_slash_command(&mut self, text: &str) -> Option<Action> {
         let (cmd, args) = text.split_once(' ').unwrap_or((text, ""));
         let args = args.trim();
@@ -645,9 +713,32 @@ impl App {
                 }
                 None
             }
+            "/sessions" | "/children" => Some(Action::ListChildren),
+            "/session" => {
+                if args.is_empty() {
+                    self.messages.push(MessageItem::Error {
+                        text: "usage: /session <id>".into(),
+                    });
+                    None
+                } else {
+                    Some(Action::SwitchSession(args.to_string()))
+                }
+            }
+            "/back" | "/up" => {
+                if !self.nav_stack.is_empty() {
+                    Some(Action::NavigateBack)
+                } else if let Some(pid) = self.parent_id.clone() {
+                    Some(Action::SwitchSession(pid))
+                } else {
+                    self.messages.push(MessageItem::Error {
+                        text: "no parent session".into(),
+                    });
+                    None
+                }
+            }
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /sessions /session <id> /back /help /quit"
                         .into(),
                 });
                 None
@@ -861,6 +952,38 @@ impl App {
                     });
                 }
             }
+            Response::Sessions { sessions } => {
+                // Display child sessions of the current session
+                let children: Vec<_> = sessions
+                    .iter()
+                    .filter(|s| s.parent_id.as_deref() == Some(&self.session_id))
+                    .collect();
+                if children.is_empty() {
+                    self.messages.push(MessageItem::Status {
+                        text: "no child sessions".into(),
+                    });
+                } else {
+                    self.messages.push(MessageItem::Status {
+                        text: format!("{} child session(s):", children.len()),
+                    });
+                    for s in &children {
+                        let stats = tau::protocol::format_stats(&s.stats);
+                        self.messages.push(MessageItem::Status {
+                            text: format!(
+                                "  {}  {}/{}  {} msgs  {}",
+                                s.id, s.provider, s.model, s.message_count, stats
+                            ),
+                        });
+                    }
+                }
+                if let Some(pid) = &self.parent_id {
+                    self.messages.push(MessageItem::Status {
+                        text: format!("parent: {}", pid),
+                    });
+                }
+                // Update child count from fresh data
+                self.child_count = children.len();
+            }
             _ => {}
         }
     }
@@ -1049,6 +1172,12 @@ pub enum Action {
     SendQueued(String),
     /// Inject a steering message into the running agent loop.
     Steer(String),
+    /// Switch to viewing a different session.
+    SwitchSession(String),
+    /// Navigate back to previous session in nav stack.
+    NavigateBack,
+    /// List child sessions of the current session.
+    ListChildren,
 }
 
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.

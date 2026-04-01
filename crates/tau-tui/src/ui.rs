@@ -205,11 +205,8 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let totals = &app.totals;
     let dim = theme.fg(theme.dim);
 
-    // Build left side: session ID + stats
+    // Build left side: stats + session ID
     let mut left_parts: Vec<Span<'static>> = Vec::new();
-
-    // Session ID
-    left_parts.push(Span::styled(app.session_id.clone(), dim));
 
     if totals.input > 0 {
         left_parts.push(Span::styled(
@@ -275,6 +272,29 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 ));
             }
         }
+    }
+
+    // Session ID with nav context (after stats)
+    if !left_parts.is_empty() {
+        left_parts.push(Span::styled(" ", dim));
+    }
+    // Show breadcrumb: ^parent > current [N]
+    if !app.nav_stack.is_empty() || app.parent_id.is_some() {
+        if let Some(pid) = &app.parent_id {
+            left_parts.push(Span::styled(
+                format!("^{} > ", &pid[..pid.len().min(6)]),
+                dim,
+            ));
+        } else if let Some(entry) = app.nav_stack.last() {
+            left_parts.push(Span::styled(
+                format!("^{} > ", &entry.session_id[..entry.session_id.len().min(6)]),
+                dim,
+            ));
+        }
+    }
+    left_parts.push(Span::styled(app.session_id.clone(), dim));
+    if app.child_count > 0 {
+        left_parts.push(Span::styled(format!(" [{}]", app.child_count), dim));
     }
 
     // Build right side: model name + connection status

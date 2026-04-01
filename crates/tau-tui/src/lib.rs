@@ -129,11 +129,21 @@ async fn run_inner(
         app.restore_messages(&messages);
     }
 
+    // Fetch initial session info for parent/child metadata
+    if let Ok(info) = fetch_session_info(&app.session_id).await {
+        app.parent_id = info.parent_id;
+        app.child_count = info.child_count;
+    }
+
     // Channel for server responses — background recv tasks push here.
     let (server_tx, server_rx) = channel::bounded::<Response>(256);
 
     // Event loop merges terminal + server + tick
     let event_loop = EventLoop::new(server_rx);
+
+    // Channel to tell the subscribe task which session to follow.
+    // Sending a new session ID causes it to reconnect to that session.
+    let (sub_switch_tx, sub_switch_rx) = channel::bounded::<String>(4);
 
     // Subscribe to session events with automatic reconnection.
     // This is the single source of truth for all session-related responses
@@ -141,22 +151,43 @@ async fn run_inner(
     // If the connection drops, we reconnect after a short delay so the TUI
     // never permanently loses its event stream.
     let sub_tx = server_tx.clone();
-    let sub_session_id = app.session_id.clone();
+    let initial_session_id = app.session_id.clone();
     smol::spawn(async move {
+        let mut current_session = initial_session_id;
         loop {
             let connected = async {
                 let mut client = Client::connect().await?;
                 client
                     .send(&Request::Subscribe {
-                        session_id: sub_session_id.clone(),
+                        session_id: current_session.clone(),
                     })
                     .await?;
                 let stream = client.response_stream();
                 futures::pin_mut!(stream);
-                while let Some(Ok(resp)) = stream.next().await {
-                    if sub_tx.send(resp).await.is_err() {
-                        // App channel closed — TUI is shutting down
-                        return Err(tau::Error::Io("app closed".into()));
+                loop {
+                    // Race: next server event vs session switch signal
+                    let either =
+                        futures::future::select(stream.next(), Box::pin(sub_switch_rx.recv()))
+                            .await;
+                    match either {
+                        futures::future::Either::Left((Some(Ok(resp)), _)) => {
+                            if sub_tx.send(resp).await.is_err() {
+                                return Err(tau::Error::Io("app closed".into()));
+                            }
+                        }
+                        futures::future::Either::Left((_, _)) => {
+                            // Stream ended
+                            break;
+                        }
+                        futures::future::Either::Right((Ok(new_session), _)) => {
+                            current_session = new_session;
+                            // Break inner loop to reconnect with new session
+                            break;
+                        }
+                        futures::future::Either::Right((Err(_), _)) => {
+                            // Switch channel closed — TUI shutting down
+                            return Err(tau::Error::Io("app closed".into()));
+                        }
                     }
                 }
                 Ok::<(), tau::Error>(())
@@ -252,6 +283,31 @@ async fn run_inner(
                     )
                     .await?;
                 }
+                Action::ListChildren => {
+                    send_request_and_recv(Request::ListSessions, server_tx.clone()).await?;
+                }
+                Action::NavigateBack => {
+                    app.navigate_back();
+                    // Tell subscribe task to follow the restored session
+                    sub_switch_tx.send(app.session_id.clone()).await.ok();
+                }
+                Action::SwitchSession(target_id) => {
+                    // Navigate forward: fetch target info + messages, save current state
+                    match fetch_session_info(&target_id).await {
+                        Ok(info) => {
+                            let messages = fetch_messages(&target_id).await.unwrap_or_default();
+                            app.save_nav_state();
+                            app.switch_to_session(&info, messages);
+                            // Tell subscribe task to follow the new session
+                            sub_switch_tx.send(target_id).await.ok();
+                        }
+                        Err(e) => {
+                            app.messages.push(crate::message::MessageItem::Error {
+                                text: format!("session not found: {}", e),
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -313,6 +369,27 @@ async fn fetch_messages(session_id: &str) -> tau::Result<Vec<tau::types::Message
         .await?;
 
     messages.ok_or_else(|| tau::Error::Io("no messages response".into()))
+}
+
+/// Fetch session info.
+async fn fetch_session_info(session_id: &str) -> tau::Result<tau::protocol::SessionInfo> {
+    let mut client = Client::connect().await?;
+    client
+        .send(&Request::GetSessionInfo {
+            session_id: session_id.to_string(),
+        })
+        .await?;
+
+    let mut info = None;
+    client
+        .recv_streaming(|resp| {
+            if let Response::SessionInfo { info: i } = resp {
+                info = Some(i.clone());
+            }
+        })
+        .await?;
+
+    info.ok_or_else(|| tau::Error::Io("no session info response".into()))
 }
 
 /// Send a request and forget — don't recv responses.
