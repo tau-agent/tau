@@ -491,6 +491,31 @@ pub async fn run() -> crate::Result<()> {
     // Spawn idle sweep task for session plugins.
     spawn_idle_sweep(plugins.clone(), state.clone(), shutdown.clone());
 
+    // Auto-resume interrupted child sessions.
+    {
+        let resume_ids = {
+            let st = state.lock().unwrap();
+            st.db.sessions_needing_resume().unwrap_or_else(|e| {
+                eprintln!("failed to query sessions needing resume: {}", e);
+                Vec::new()
+            })
+        };
+        for sid in resume_ids {
+            eprintln!("auto-resuming session {}", sid);
+            let s = state.clone();
+            let p = plugins.clone();
+            let sh = shutdown.clone();
+            let sl = session_locks.clone();
+            let th = throttle.clone();
+            smol::spawn(async move {
+                if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone()).await {
+                    eprintln!("auto-resume session {} error: {}", sid, e);
+                }
+            })
+            .detach();
+        }
+    }
+
     loop {
         let (stream, _) = listener
             .accept()
@@ -2022,6 +2047,192 @@ async fn run_child_chat(
             );
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
             // Notify parent about error.
+            notify_parent_of_child_completion(&state, &session_id, &format!("error: {}", e), None);
+        }
+    }
+
+    emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+
+    Ok(())
+}
+
+/// Resume an interrupted child session. Unlike `run_child_chat`, this does
+/// not append a new user message — it just runs the agent on the existing
+/// message history. Used for auto-resume on server restart.
+async fn resume_child_session(
+    state: SharedState,
+    plugins: Arc<Mutex<crate::plugin::PluginManager>>,
+    shutdown: ShutdownHandle,
+    session_locks: SessionLocks,
+    throttle: crate::throttle::ProviderThrottle,
+    session_id: String,
+) -> crate::Result<()> {
+    if shutdown.is_shutting_down() {
+        return Ok(());
+    }
+
+    // Acquire per-session lock
+    let _session_guard = session_lock(&session_locks, &session_id).lock_arc().await;
+
+    // Set up cancel flag
+    let cancel_flag: Arc<AtomicBool> = {
+        let mut st = state.lock().unwrap();
+        let flag = st
+            .cancel_flags
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(false, Ordering::Relaxed);
+        flag.clone()
+    };
+
+    let chat_result: Result<(bool, bool), crate::Error> = async {
+        // Load session
+        let (stored, mut messages, cwd) = {
+            let st = state.lock().unwrap();
+            match st.db.get_session(&session_id) {
+                Ok(Some(stored)) => {
+                    let messages = st.db.get_messages(&session_id)?;
+                    let cwd = stored.cwd.clone().unwrap_or_else(|| "/tmp".to_string());
+                    Ok((stored, messages, cwd))
+                }
+                Ok(None) => Err(crate::Error::Io(format!(
+                    "session not found: {}",
+                    session_id
+                ))),
+                Err(e) => Err(e),
+            }
+        }?;
+        let model = stored.model.clone();
+
+        // Ensure session plugins
+        {
+            let mut pm = plugins.lock().unwrap();
+            if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
+                eprintln!("resume session {} plugin spawn error: {}", session_id, e);
+            }
+            pm.notify_session_start_once(&cwd, &session_id);
+        }
+
+        // Repair any corrupted message history
+        let repair_stubs = crate::agent::repair_messages(&messages);
+        if !repair_stubs.is_empty() {
+            eprintln!(
+                "session {}: repaired {} missing tool_result message(s)",
+                session_id,
+                repair_stubs.len()
+            );
+            let st = state.lock().unwrap();
+            for stub in &repair_stubs {
+                if let Err(e) = st.db.append_message(&session_id, stub) {
+                    eprintln!("db error persisting repair stub: {}", e);
+                }
+            }
+            messages.extend(repair_stubs);
+        }
+
+        // Build system prompt if not set
+        let system_prompt = stored.system_prompt.clone().or_else(|| {
+            let pm = plugins.lock().unwrap();
+            let tool_prompts = pm.tool_prompts(&session_id, stored.child_budget);
+            Some(crate::system_prompt::build(
+                &crate::system_prompt::PromptOptions {
+                    cwd: Some(cwd.clone()),
+                    tools: tool_prompts,
+                    ..Default::default()
+                },
+            ))
+        });
+
+        // No user message appended — resume on existing messages.
+        let mut context = Context {
+            system_prompt,
+            messages,
+            tools: Vec::new(),
+        };
+
+        // Use a sink writer (no direct client connection).
+        let mut sink = futures::io::sink();
+        let result = run_agent_turn(
+            &state,
+            &plugins,
+            &shutdown,
+            cancel_flag.clone(),
+            &model,
+            &mut context,
+            &cwd,
+            &session_id,
+            &mut sink,
+            &throttle,
+            &session_locks,
+        )
+        .await;
+
+        let max_turns_reached = match result {
+            Ok(ref agent_result) => agent_result.max_turns_reached,
+            Err(crate::Error::Cancelled) => {
+                cancel_flag.store(true, Ordering::Relaxed);
+                false
+            }
+            Err(e) => return Err(e),
+        };
+
+        Ok((cancel_flag.load(Ordering::Relaxed), max_turns_reached))
+    }
+    .await;
+
+    // Broadcast terminal response and notify parent (same as run_child_chat).
+    match chat_result {
+        Ok((true, _)) => {
+            broadcast_to_subscribers(&state, &session_id, &Response::Cancelled);
+            notify_parent_of_child_completion(&state, &session_id, "cancelled", None);
+        }
+        Ok((false, max_turns_reached)) => {
+            if max_turns_reached {
+                let parent_id = {
+                    let st = state.lock().unwrap();
+                    st.db
+                        .get_session(&session_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.parent_id)
+                };
+                if let Some(pid) = parent_id {
+                    let notice = format!(
+                        "Child session {} reached its tool use limit. \
+                         Use session_read to check progress and send a follow-up message to continue, \
+                         or session_cancel to stop it.",
+                        session_id
+                    );
+                    let sent = {
+                        let st = state.lock().unwrap();
+                        if let Some(tx) = st.steer_txs.get(&pid) {
+                            tx.try_send(notice.clone()).is_ok()
+                        } else {
+                            false
+                        }
+                    };
+                    if !sent {
+                        let status_resp = Response::Stream {
+                            event: Box::new(StreamEvent::Status { message: notice }),
+                        };
+                        broadcast_to_subscribers(&state, &pid, &status_resp);
+                    }
+                }
+            } else {
+                notify_parent_of_child_completion(&state, &session_id, "completed", None);
+            }
+            broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
+        }
+        Err(ref e) => {
+            let err_msg = format!("child agent error: {}", e);
+            broadcast_to_subscribers(
+                &state,
+                &session_id,
+                &Response::Error {
+                    message: err_msg.clone(),
+                },
+            );
+            broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
             notify_parent_of_child_completion(&state, &session_id, &format!("error: {}", e), None);
         }
     }

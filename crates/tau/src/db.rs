@@ -290,6 +290,43 @@ impl Db {
         Ok(sessions)
     }
 
+    /// Return IDs of child sessions whose last message is User or ToolResult,
+    /// indicating they were interrupted mid-work and should be auto-resumed.
+    pub fn sessions_needing_resume(&self) -> crate::Result<Vec<String>> {
+        // Only consider child sessions (parent_id IS NOT NULL).
+        // For each, get the last message and check its role.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.id, m.message_json
+                 FROM sessions s
+                 JOIN messages m ON m.session_id = s.id
+                 WHERE s.parent_id IS NOT NULL
+                   AND m.id = (SELECT MAX(m2.id) FROM messages m2 WHERE m2.session_id = s.id)",
+            )
+            .map_err(|e| crate::Error::Io(format!("prepare sessions_needing_resume: {}", e)))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((id, json))
+            })
+            .map_err(|e| crate::Error::Io(format!("query sessions_needing_resume: {}", e)))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (id, json) =
+                row.map_err(|e| crate::Error::Io(format!("read resume row: {}", e)))?;
+            if let Ok(msg) = serde_json::from_str::<Message>(&json)
+                && matches!(msg, Message::User(_) | Message::ToolResult(_))
+            {
+                result.push(id);
+            }
+        }
+        Ok(result)
+    }
+
     /// Count direct children of a session.
     pub fn child_count(&self, session_id: &str) -> crate::Result<usize> {
         let count: i64 = self
@@ -784,5 +821,103 @@ mod tests {
         assert!(db.get_session("root").unwrap().is_some());
         assert!(db.get_session("c1").unwrap().is_none());
         assert_eq!(db.budget_used("root").unwrap(), 0);
+    }
+
+    #[test]
+    fn sessions_needing_resume() {
+        let db = Db::open_memory().unwrap();
+
+        // Create a top-level session ending with User message (should NOT be resumed)
+        db.create_session(&StoredSession {
+            id: "top".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 5,
+        })
+        .unwrap();
+        db.append_message("top", &Message::User(UserMessage::text("hello")))
+            .unwrap();
+
+        // Create a child session ending with User message (should be resumed)
+        db.create_session(&StoredSession {
+            id: "child1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 2000,
+            parent_id: Some("top".into()),
+            child_budget: 0,
+        })
+        .unwrap();
+        db.append_message("child1", &Message::User(UserMessage::text("work")))
+            .unwrap();
+
+        // Create a child session ending with Assistant message (should NOT be resumed)
+        db.create_session(&StoredSession {
+            id: "child2".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 3000,
+            parent_id: Some("top".into()),
+            child_budget: 0,
+        })
+        .unwrap();
+        db.append_message(
+            "child2",
+            &Message::Assistant(AssistantMessage::empty("test", "test", "test-model")),
+        )
+        .unwrap();
+
+        // Create a child session ending with ToolResult (should be resumed)
+        db.create_session(&StoredSession {
+            id: "child3".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 4000,
+            parent_id: Some("top".into()),
+            child_budget: 0,
+        })
+        .unwrap();
+        db.append_message(
+            "child3",
+            &Message::ToolResult(ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "bash".into(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "ok".into(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: 4001,
+            }),
+        )
+        .unwrap();
+
+        // Create a child session with no messages (should NOT be resumed)
+        db.create_session(&StoredSession {
+            id: "child4".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 5000,
+            parent_id: Some("top".into()),
+            child_budget: 0,
+        })
+        .unwrap();
+
+        let mut ids = db.sessions_needing_resume().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["child1", "child3"]);
     }
 }
