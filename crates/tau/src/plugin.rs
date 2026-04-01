@@ -606,6 +606,14 @@ impl Drop for SessionPlugins {
 // Plugin manager: global plugins + per-session plugin tracking
 // ---------------------------------------------------------------------------
 
+/// Where a borrowed plugin handle came from (for returning it).
+pub enum PluginSource {
+    /// From session plugins, at this Vec index.
+    Session { session_id: String, index: usize },
+    /// From global plugins, at this Vec index.
+    Global { index: usize },
+}
+
 /// Manages global plugins and per-session plugin sets.
 pub struct PluginManager {
     /// Global plugins (spawned once at server start).
@@ -779,8 +787,58 @@ impl PluginManager {
         }
     }
 
+    /// Take a plugin handle out of the manager for tool execution.
+    /// Returns the handle and a source token for returning it.
+    /// While taken, no other caller can use this specific plugin.
+    pub fn take_tool_plugin(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+    ) -> Option<(PluginHandle, PluginSource)> {
+        // Try session plugins first
+        if let Some(sp) = self.session_plugins.get_mut(session_id)
+            && let Some(idx) = sp.plugins.iter().position(|p| p.has_tool(tool_name))
+        {
+            let handle = sp.plugins.remove(idx);
+            return Some((
+                handle,
+                PluginSource::Session {
+                    session_id: session_id.to_string(),
+                    index: idx,
+                },
+            ));
+        }
+        // Try global plugins
+        if let Some(idx) = self
+            .global_plugins
+            .iter()
+            .position(|p| p.has_tool(tool_name))
+        {
+            let handle = self.global_plugins.remove(idx);
+            return Some((handle, PluginSource::Global { index: idx }));
+        }
+        None
+    }
+
+    /// Return a previously taken plugin handle.
+    pub fn return_tool_plugin(&mut self, source: PluginSource, handle: PluginHandle) {
+        match source {
+            PluginSource::Session { session_id, index } => {
+                if let Some(sp) = self.session_plugins.get_mut(&session_id) {
+                    let idx = index.min(sp.plugins.len());
+                    sp.plugins.insert(idx, handle);
+                }
+                // If session was destroyed while plugin was taken, handle drops
+            }
+            PluginSource::Global { index } => {
+                let idx = index.min(self.global_plugins.len());
+                self.global_plugins.insert(idx, handle);
+            }
+        }
+    }
+
     /// Run after_tool_result hooks on all plugins (global + session).
-    fn run_after_tool_hooks(
+    pub fn run_after_tool_hooks(
         &mut self,
         session_id: &str,
         tool_call: &ToolCall,

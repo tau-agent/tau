@@ -1297,6 +1297,9 @@ struct PluginExecutor {
     plugins: Arc<Mutex<crate::plugin::PluginManager>>,
     state: SharedState,
     session_locks: SessionLocks,
+    /// Channel for spawning child Chat requests (session_id, text).
+    /// Received by the server to spawn async agent turns.
+    chat_spawn_tx: smol::channel::Sender<(String, String)>,
     session_id: String,
     cwd: String,
 }
@@ -1308,38 +1311,101 @@ impl crate::worker::ToolExecutor for PluginExecutor {
         tool_call: &ToolCall,
         output_tx: &smol::channel::Sender<String>,
     ) -> crate::Result<ToolResultMessage> {
-        // Plugin IO is still blocking -- offload to thread pool
+        // Take the plugin handle out of the manager (brief lock).
+        // This lets us execute tool I/O without holding the PluginManager lock,
+        // preventing deadlocks when tools make ServerRequest calls that need
+        // to interact with other sessions (which also need plugin access).
+        let taken = {
+            let mut pm = self.plugins.lock().unwrap();
+            pm.take_tool_plugin(&self.session_id, &tool_call.name)
+        };
+        let (mut handle, source) = match taken {
+            Some(t) => t,
+            None => {
+                return Err(crate::Error::Io(format!(
+                    "no plugin provides tool '{}'",
+                    tool_call.name
+                )));
+            }
+        };
+
+        // Execute tool I/O without holding the PluginManager lock.
         let state = self.state.clone();
         let session_locks = self.session_locks.clone();
-        let plugins = self.plugins.clone();
+        let chat_spawn_tx = self.chat_spawn_tx.clone();
         let session_id = self.session_id.clone();
         let cwd = self.cwd.clone();
         let tool_call = tool_call.clone();
+        let tool_call_for_hooks = tool_call.clone();
         let output_tx_clone = output_tx.clone();
 
-        smol::unblock(move || {
+        let (result, handle) = smol::unblock(move || {
             let mut server_handler =
                 move |req: &crate::protocol::Request| -> crate::protocol::Response {
-                    handle_server_request_sync(&state, &session_locks, req)
+                    handle_server_request_sync(&state, &session_locks, &chat_spawn_tx, req)
                 };
-            let mut pm = plugins.lock().unwrap();
             let mut output_fn = |delta: &str| {
                 let _ = output_tx_clone.send_blocking(delta.to_string());
             };
-            pm.execute_tool_with_server(
-                &session_id,
+            let result = handle.execute_tool_with_server(
                 &tool_call,
-                &cwd,
+                Some(&cwd),
+                Some(&session_id),
                 &mut output_fn,
                 Some(&mut server_handler),
-            )
+            );
+            (result, handle)
         })
-        .await
+        .await;
+
+        // Always return the plugin handle, even on error (brief lock).
+        {
+            let mut pm = self.plugins.lock().unwrap();
+            pm.return_tool_plugin(source, handle);
+        }
+
+        // Run after_tool_hooks only on success.
+        let mut result = result?;
+        {
+            let mut pm = self.plugins.lock().unwrap();
+            pm.run_after_tool_hooks(&self.session_id, &tool_call_for_hooks, &mut result);
+        }
+
+        Ok(result)
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
+fn run_agent_turn<'a, W: futures::io::AsyncWrite + Unpin + Send + 'a>(
+    state: &'a SharedState,
+    plugins: &'a Arc<Mutex<crate::plugin::PluginManager>>,
+    shutdown: &'a ShutdownHandle,
+    cancel_flag: Arc<AtomicBool>,
+    model: &'a Model,
+    context: &'a mut Context,
+    cwd: &'a str,
+    session_id: &'a str,
+    writer: &'a mut W,
+    throttle: &'a crate::throttle::ProviderThrottle,
+    session_locks: &'a SessionLocks,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<Vec<Message>>> + Send + 'a>> {
+    Box::pin(run_agent_turn_inner(
+        state,
+        plugins,
+        shutdown,
+        cancel_flag,
+        model,
+        context,
+        cwd,
+        session_id,
+        writer,
+        throttle,
+        session_locks,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     state: &SharedState,
     plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
     shutdown: &ShutdownHandle,
@@ -1441,6 +1507,36 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     let session_locks_clone = session_locks.clone();
     let in_flight = shutdown.clone();
     let session_id_for_executor = session_id.to_string();
+
+    // Channel for child Chat requests spawned by orchestration tools.
+    // The receiver task spawns async agent turns for each queued chat.
+    let (chat_spawn_tx, chat_spawn_rx) = smol::channel::unbounded::<(String, String)>();
+
+    // Spawn a task that processes queued child chats.
+    let spawn_state = state.clone();
+    let spawn_plugins = plugins.clone();
+    let spawn_shutdown = shutdown.clone();
+    let spawn_session_locks = session_locks.clone();
+    let spawn_throttle = throttle.clone();
+    smol::spawn(async move {
+        while let Ok((child_session_id, text)) = chat_spawn_rx.recv().await {
+            // Each child chat gets its own async task (fire-and-forget).
+            let s = spawn_state.clone();
+            let p = spawn_plugins.clone();
+            let sh = spawn_shutdown.clone();
+            let sl = spawn_session_locks.clone();
+            let th = spawn_throttle.clone();
+            smol::spawn(async move {
+                let sid = child_session_id;
+                if let Err(e) = run_child_chat(s, p, sh, sl, th, sid.clone(), text).await {
+                    eprintln!("child chat {} error: {}", sid, e);
+                }
+            })
+            .detach();
+        }
+    })
+    .detach();
+
     let agent_handle = {
         async move {
             in_flight.enter();
@@ -1448,6 +1544,7 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
                 plugins: plugins_clone,
                 state: state_clone_exec,
                 session_locks: session_locks_clone,
+                chat_spawn_tx,
                 session_id: session_id_for_executor,
                 cwd: cwd_clone,
             };
@@ -1517,6 +1614,149 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
     }
 
     Ok(agent_result.new_messages)
+}
+
+/// Run an agent turn for a child session (spawned by orchestration tools).
+/// This is a fire-and-forget async task -- output goes to subscribers only.
+async fn run_child_chat(
+    state: SharedState,
+    plugins: Arc<Mutex<crate::plugin::PluginManager>>,
+    shutdown: ShutdownHandle,
+    session_locks: SessionLocks,
+    throttle: crate::throttle::ProviderThrottle,
+    session_id: String,
+    text: String,
+) -> crate::Result<()> {
+    if shutdown.is_shutting_down() {
+        return Ok(());
+    }
+
+    // Acquire per-session lock
+    let _session_guard = session_lock(&session_locks, &session_id).lock_arc().await;
+
+    // Set up cancel flag
+    let cancel_flag: Arc<AtomicBool> = {
+        let mut st = state.lock().unwrap();
+        let flag = st
+            .cancel_flags
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(false, Ordering::Relaxed);
+        flag.clone()
+    };
+
+    let chat_result: Result<bool, crate::Error> = async {
+        // Load session
+        let (stored, mut messages, cwd) = {
+            let st = state.lock().unwrap();
+            match st.db.get_session(&session_id) {
+                Ok(Some(stored)) => {
+                    let messages = st.db.get_messages(&session_id)?;
+                    let cwd = stored.cwd.clone().unwrap_or_else(|| "/tmp".to_string());
+                    Ok((stored, messages, cwd))
+                }
+                Ok(None) => Err(crate::Error::Io(format!(
+                    "session not found: {}",
+                    session_id
+                ))),
+                Err(e) => Err(e),
+            }
+        }?;
+        let model = stored.model.clone();
+
+        // Ensure session plugins
+        {
+            let mut pm = plugins.lock().unwrap();
+            if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
+                eprintln!("child session {} plugin spawn error: {}", session_id, e);
+            }
+            pm.notify_session_start_once(&cwd, &session_id);
+        }
+
+        // Build system prompt if not set
+        let system_prompt = stored.system_prompt.clone().or_else(|| {
+            let pm = plugins.lock().unwrap();
+            let tool_prompts = pm.tool_prompts(&session_id);
+            Some(crate::system_prompt::build(
+                &crate::system_prompt::PromptOptions {
+                    cwd: Some(cwd.clone()),
+                    tools: tool_prompts,
+                    ..Default::default()
+                },
+            ))
+        });
+
+        // Append user message
+        let user_msg = Message::User(UserMessage::text(&text));
+        {
+            let st = state.lock().unwrap();
+            st.db.append_message(&session_id, &user_msg)?;
+        }
+        messages.push(user_msg);
+
+        // Broadcast user message to subscribers
+        broadcast_to_subscribers(
+            &state,
+            &session_id,
+            &Response::UserMessage { text: text.clone() },
+        );
+
+        let mut context = Context {
+            system_prompt,
+            messages,
+            tools: Vec::new(),
+        };
+
+        // Use a sink writer that discards output (no direct client connection).
+        let mut sink = futures::io::sink();
+        let result = run_agent_turn(
+            &state,
+            &plugins,
+            &shutdown,
+            cancel_flag.clone(),
+            &model,
+            &mut context,
+            &cwd,
+            &session_id,
+            &mut sink,
+            &throttle,
+            &session_locks,
+        )
+        .await;
+
+        match result {
+            Ok(_) => {}
+            Err(crate::Error::Cancelled) => {
+                cancel_flag.store(true, Ordering::Relaxed);
+            }
+            Err(e) => return Err(e),
+        }
+
+        Ok(cancel_flag.load(Ordering::Relaxed))
+    }
+    .await;
+
+    // Broadcast terminal response
+    match chat_result {
+        Ok(true) => {
+            broadcast_to_subscribers(&state, &session_id, &Response::Cancelled);
+        }
+        Ok(false) => {
+            broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
+        }
+        Err(e) => {
+            broadcast_to_subscribers(
+                &state,
+                &session_id,
+                &Response::Error {
+                    message: format!("child agent error: {}", e),
+                },
+            );
+            broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
@@ -1624,6 +1864,7 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
 fn handle_server_request_sync(
     state: &SharedState,
     _session_locks: &SessionLocks,
+    chat_spawn_tx: &smol::channel::Sender<(String, String)>,
     req: &crate::protocol::Request,
 ) -> crate::protocol::Response {
     use crate::protocol::{Request, Response};
@@ -1778,17 +2019,13 @@ fn handle_server_request_sync(
             Response::Ok
         }
         Request::Chat { session_id, text } => {
-            // For spawned sessions: just persist the user message and note that
-            // the session needs to be run. The actual agent turn is kicked off
-            // by the server's handle_client when it sees a Chat request.
-            // Here we queue it by sending a Chat over the unix socket.
-            // For now, return Ok -- the session_join will wait for completion.
-            let st = state.lock().unwrap();
-            let user_msg = Message::User(crate::types::UserMessage::text(text));
-            match st.db.append_message(session_id, &user_msg) {
+            // Queue a Chat request for the server to process asynchronously.
+            // The chat_spawn channel is received by the server's main loop
+            // which spawns an agent turn task for the child session.
+            match chat_spawn_tx.send_blocking((session_id.clone(), text.clone())) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error {
-                    message: e.to_string(),
+                    message: format!("failed to queue chat: {}", e),
                 },
             }
         }
@@ -1796,19 +2033,17 @@ fn handle_server_request_sync(
             session_ids,
             timeout_secs,
         } => {
-            // Synchronous poll -- check if sessions are idle
+            // Synchronous poll -- check if sessions are idle via session locks.
+            // A session is "done" if its async lock is not held (no active Chat).
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
             loop {
-                let st = state.lock().unwrap();
                 let mut all_done = true;
                 let mut results = Vec::new();
                 for sid in session_ids {
-                    // Check if there's an active cancel flag that's been reset (meaning active)
-                    let is_busy = st
-                        .cancel_flags
-                        .get(sid)
-                        .is_some_and(|f| !f.load(Ordering::Relaxed));
+                    let lock = session_lock(_session_locks, sid);
+                    let is_busy = lock.try_lock().is_none();
+
                     if is_busy {
                         all_done = false;
                         results.push(crate::protocol::SessionResult {
@@ -1817,10 +2052,12 @@ fn handle_server_request_sync(
                             summary: String::new(),
                         });
                     } else {
+                        let st = state.lock().unwrap();
                         let summary = match st.db.get_messages(sid) {
                             Ok(msgs) => last_assistant_text(&msgs),
                             Err(_) => String::new(),
                         };
+                        drop(st);
                         results.push(crate::protocol::SessionResult {
                             session_id: sid.clone(),
                             status: "done".into(),
@@ -1828,7 +2065,6 @@ fn handle_server_request_sync(
                         });
                     }
                 }
-                drop(st);
 
                 if all_done || std::time::Instant::now() >= deadline {
                     if !all_done {
