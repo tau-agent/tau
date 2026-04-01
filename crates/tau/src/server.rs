@@ -624,7 +624,7 @@ async fn handle_client(
                         if let Err(e) = pm.ensure_session_plugins(&id, cwd_str) {
                             eprintln!("failed to spawn session plugins: {}", e);
                         }
-                        let tool_prompts = pm.tool_prompts(&id);
+                        let tool_prompts = pm.tool_prompts(&id, child_budget);
                         Some(crate::system_prompt::build(
                             &crate::system_prompt::PromptOptions {
                                 cwd: cwd.clone(),
@@ -1492,9 +1492,18 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         let st = state.lock().unwrap();
         st.registry.clone()
     };
+    let child_budget = {
+        let st = state.lock().unwrap();
+        st.db
+            .get_session(session_id)
+            .ok()
+            .flatten()
+            .map(|s| s.child_budget)
+            .unwrap_or(0)
+    };
     let plugin_tools = {
         let pm = plugins.lock().unwrap();
-        pm.tool_schemas(session_id)
+        pm.tool_schemas(session_id, child_budget)
     };
 
     let model_clone = model.clone();
@@ -1676,7 +1685,7 @@ async fn run_child_chat(
         // Build system prompt if not set
         let system_prompt = stored.system_prompt.clone().or_else(|| {
             let pm = plugins.lock().unwrap();
-            let tool_prompts = pm.tool_prompts(&session_id);
+            let tool_prompts = pm.tool_prompts(&session_id, stored.child_budget);
             Some(crate::system_prompt::build(
                 &crate::system_prompt::PromptOptions {
                     cwd: Some(cwd.clone()),

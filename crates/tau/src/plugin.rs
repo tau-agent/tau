@@ -683,22 +683,34 @@ impl PluginManager {
     }
 
     /// Get all tool schemas (global + session).
-    pub fn tool_schemas(&self, session_id: &str) -> Vec<Tool> {
+    /// When `child_budget` is 0, session orchestration tools (session_*) are excluded.
+    pub fn tool_schemas(&self, session_id: &str, child_budget: u32) -> Vec<Tool> {
         let mut schemas = Vec::new();
         if let Some(sp) = self.session_plugins.get(session_id) {
             schemas.extend(sp.tool_schemas());
         }
         schemas.extend(collect_tool_schemas(&self.global_plugins));
+        if child_budget == 0 {
+            schemas.retain(|t| !t.name.starts_with("session_"));
+        }
         schemas
     }
 
     /// Get all tool prompt contributions (global + session).
-    pub fn tool_prompts(&self, session_id: &str) -> Vec<crate::system_prompt::ToolPrompt> {
+    /// When `child_budget` is 0, session orchestration tools (session_*) are excluded.
+    pub fn tool_prompts(
+        &self,
+        session_id: &str,
+        child_budget: u32,
+    ) -> Vec<crate::system_prompt::ToolPrompt> {
         let mut prompts = Vec::new();
         if let Some(sp) = self.session_plugins.get(session_id) {
             prompts.extend(sp.tool_prompts());
         }
         prompts.extend(collect_tool_prompts(&self.global_plugins));
+        if child_budget == 0 {
+            prompts.retain(|t| !t.name.starts_with("session_"));
+        }
         prompts
     }
 

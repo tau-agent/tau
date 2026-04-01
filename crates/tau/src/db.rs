@@ -55,7 +55,7 @@ impl Db {
                 is_subscription INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL,
                 parent_id      TEXT,
-                child_budget   INTEGER NOT NULL DEFAULT 0
+                child_budget   INTEGER NOT NULL DEFAULT 16
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY,
@@ -71,7 +71,7 @@ impl Db {
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN cwd TEXT;");
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN parent_id TEXT;");
         let _ = conn.execute_batch(
-            "ALTER TABLE sessions ADD COLUMN child_budget INTEGER NOT NULL DEFAULT 0;",
+            "ALTER TABLE sessions ADD COLUMN child_budget INTEGER NOT NULL DEFAULT 16;",
         );
 
         // Create index after migrations ensure the column exists
@@ -101,7 +101,7 @@ impl Db {
                 is_subscription INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL,
                 parent_id      TEXT,
-                child_budget   INTEGER NOT NULL DEFAULT 0
+                child_budget   INTEGER NOT NULL DEFAULT 16
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,

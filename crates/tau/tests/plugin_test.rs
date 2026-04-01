@@ -273,11 +273,11 @@ fn plugin_manager_integration() {
     let session_id = "test-session";
 
     // Check tool schemas
-    let schemas = manager.tool_schemas(session_id);
+    let schemas = manager.tool_schemas(session_id, 16);
     assert_eq!(schemas.len(), 3);
 
     // Check tool prompts
-    let prompts = manager.tool_prompts(session_id);
+    let prompts = manager.tool_prompts(session_id, 16);
     assert_eq!(prompts.len(), 2);
 
     // Check commands

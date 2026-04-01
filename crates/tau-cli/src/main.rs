@@ -27,7 +27,7 @@ enum Commands {
         #[arg(long)]
         no_tui: bool,
         /// Max child sessions this session can spawn (0 = no children)
-        #[arg(long, default_value = "0")]
+        #[arg(long, default_value = "16")]
         child_budget: u32,
     },
     /// Log in to an LLM provider (OAuth)
