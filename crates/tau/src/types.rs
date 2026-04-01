@@ -56,6 +56,16 @@ pub enum ToolResultContent {
     Image(ImageContent),
 }
 
+impl ToolResultContent {
+    /// Return the text if this is a Text variant, empty string otherwise.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Text(t) => &t.text,
+            Self::Image(_) => "",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Usage & cost
 // ---------------------------------------------------------------------------

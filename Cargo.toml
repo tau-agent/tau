@@ -27,6 +27,7 @@ toml = "1.1"
 base64 = "0.22"
 rand = "0.10"
 fs2 = "0.4"
+nix = { version = "0.30", features = ["signal", "process"] }
 tau-tui = { path = "crates/tau-tui" }
 
 [profile.release]
