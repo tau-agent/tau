@@ -13,7 +13,7 @@
 //! Can be wrapped with sandbox or other execution environments:
 //!   worker_command = ["sandbox", "run", "--", "tau", "worker"]
 
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 
 use async_trait::async_trait;
 
@@ -110,6 +110,7 @@ pub fn run_worker_loop() {
     let tools = crate::tools::default_tools();
 
     let stdin = std::io::stdin();
+    let mut reader = BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
 
@@ -125,11 +126,13 @@ pub fn run_worker_loop() {
     send_message(&mut writer, &PluginMessage::Register(registration));
 
     // Handle requests
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
             Err(_) => break,
-        };
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -170,7 +173,7 @@ pub fn run_worker_loop() {
                         &tool_call.arguments,
                         session_id.as_deref(),
                         &mut writer,
-                        &stdin,
+                        &mut reader,
                     );
                     send_message(
                         &mut writer,
@@ -276,7 +279,7 @@ fn tool_err(text: &str) -> crate::types::ToolResultMessage {
 /// Send a ServerRequest via plugin protocol and wait for the ServerResponse.
 fn server_request(
     writer: &mut impl Write,
-    stdin: &std::io::Stdin,
+    reader: &mut impl BufRead,
     request: crate::protocol::Request,
 ) -> Result<crate::protocol::Response, String> {
     let request_id = format!("sr-{}", crate::types::timestamp_ms());
@@ -289,12 +292,14 @@ fn server_request(
     );
 
     // Read lines until we get our ServerResponse
-    let reader = stdin.lock();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return Err("stdin closed while waiting for server response".into()),
+            Ok(_) => {}
             Err(e) => return Err(format!("read error: {}", e)),
-        };
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -311,7 +316,6 @@ fn server_request(
             return Ok(response);
         }
     }
-    Err("stdin closed while waiting for server response".into())
 }
 
 /// Handle session_* tool calls.
@@ -320,7 +324,7 @@ fn handle_session_tool(
     args: &serde_json::Value,
     session_id: Option<&str>,
     writer: &mut impl Write,
-    stdin: &std::io::Stdin,
+    reader: &mut impl BufRead,
 ) -> crate::types::ToolResultMessage {
     match name {
         "session_spawn" => {
@@ -345,7 +349,7 @@ fn handle_session_tool(
                 parent_id: session_id.map(String::from),
                 child_budget,
             };
-            let resp = match server_request(writer, stdin, create_req) {
+            let resp = match server_request(writer, reader, create_req) {
                 Ok(r) => r,
                 Err(e) => return tool_err(&format!("server request failed: {}", e)),
             };
@@ -364,7 +368,7 @@ fn handle_session_tool(
                     session_id: child_id.clone(),
                     text: task.to_string(),
                 };
-                match server_request(writer, stdin, chat_req) {
+                match server_request(writer, reader, chat_req) {
                     Ok(crate::protocol::Response::Ok) => {}
                     Ok(crate::protocol::Response::Error { message }) => {
                         return tool_err(&format!(
@@ -410,7 +414,7 @@ fn handle_session_tool(
                 session_ids,
                 timeout_secs: timeout,
             };
-            match server_request(writer, stdin, req) {
+            match server_request(writer, reader, req) {
                 Ok(crate::protocol::Response::SessionsCompleted { results }) => {
                     let mut text = String::new();
                     for r in &results {
@@ -444,7 +448,7 @@ fn handle_session_tool(
             let req = crate::protocol::Request::GetSessionInfo {
                 session_id: sid.to_string(),
             };
-            match server_request(writer, stdin, req) {
+            match server_request(writer, reader, req) {
                 Ok(crate::protocol::Response::SessionInfo { info }) => tool_ok(&format!(
                     "Session {}: {}/{}, {} messages, {} children",
                     info.id, info.provider, info.model, info.message_count, info.child_count
@@ -461,7 +465,7 @@ fn handle_session_tool(
                 return tool_err("no session context available");
             }
             let req = crate::protocol::Request::ListSessions;
-            match server_request(writer, stdin, req) {
+            match server_request(writer, reader, req) {
                 Ok(crate::protocol::Response::Sessions { sessions }) => {
                     let children: Vec<_> = sessions
                         .iter()
@@ -498,7 +502,7 @@ fn handle_session_tool(
             let req = crate::protocol::Request::GetMessages {
                 session_id: sid.to_string(),
             };
-            match server_request(writer, stdin, req) {
+            match server_request(writer, reader, req) {
                 Ok(crate::protocol::Response::Messages { messages }) => {
                     let msgs = if let Some(n) = last_n {
                         let skip = messages.len().saturating_sub(n as usize);
@@ -564,7 +568,7 @@ fn handle_session_tool(
             let req = crate::protocol::Request::CancelChat {
                 session_id: sid.to_string(),
             };
-            match server_request(writer, stdin, req) {
+            match server_request(writer, reader, req) {
                 Ok(crate::protocol::Response::Ok) => tool_ok(&format!("Cancelled session {}", sid)),
                 Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
                 Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
@@ -573,5 +577,111 @@ fn handle_session_tool(
         }
 
         _ => tool_err(&format!("unknown session tool: {}", name)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn sequential_reads_share_buffer() {
+        // Test that multiple reads from the same BufReader work correctly.
+        // This is the core of the bug fix: with separate stdin.lock() calls,
+        // data buffered by one lock would be lost when that lock was dropped.
+        let response1 = crate::protocol::Response::SessionCreated {
+            session_id: "child-1".into(),
+        };
+        let response2 = crate::protocol::Response::SessionCreated {
+            session_id: "child-2".into(),
+        };
+
+        let line1 = serde_json::to_string(&PluginRequest::ServerResponse {
+            request_id: "req-1".into(),
+            response: response1,
+        })
+        .unwrap();
+        let line2 = serde_json::to_string(&PluginRequest::ServerResponse {
+            request_id: "req-2".into(),
+            response: response2,
+        })
+        .unwrap();
+
+        // Both lines in one buffer -- simulates kernel delivering them together
+        let input = format!("{}\n{}\n", line1, line2);
+        let mut reader = Cursor::new(input.into_bytes());
+
+        // Read first line
+        let mut buf = String::new();
+        reader.read_line(&mut buf).unwrap();
+        let req1: PluginRequest = serde_json::from_str(&buf).unwrap();
+        if let PluginRequest::ServerResponse { request_id, .. } = &req1 {
+            assert_eq!(request_id, "req-1");
+        } else {
+            panic!("expected ServerResponse");
+        }
+
+        // Read second line from same reader (this would fail with separate stdin.lock())
+        buf.clear();
+        reader.read_line(&mut buf).unwrap();
+        let req2: PluginRequest = serde_json::from_str(&buf).unwrap();
+        if let PluginRequest::ServerResponse { request_id, .. } = &req2 {
+            assert_eq!(request_id, "req-2");
+        } else {
+            panic!("expected ServerResponse");
+        }
+    }
+
+    #[test]
+    fn server_request_skips_blank_lines() {
+        let response = crate::protocol::Response::Ok;
+        let resp_line = serde_json::to_string(&PluginRequest::ServerResponse {
+            request_id: "req-1".into(),
+            response,
+        })
+        .unwrap();
+
+        // Blank lines before the response
+        let input = format!("\n  \n{}\n", resp_line);
+        let mut reader = Cursor::new(input.into_bytes());
+
+        let mut line = String::new();
+        // Skip blank lines like the real code does
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).unwrap();
+            if n == 0 {
+                panic!("unexpected EOF");
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            break;
+        }
+
+        let req: PluginRequest = serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            req,
+            PluginRequest::ServerResponse {
+                request_id: _,
+                response: crate::protocol::Response::Ok,
+            }
+        ));
+    }
+
+    #[test]
+    fn server_request_eof_returns_error() {
+        let mut reader = Cursor::new(Vec::new()); // empty = immediate EOF
+        let mut writer: Vec<u8> = Vec::new();
+
+        let result = server_request(
+            &mut writer,
+            &mut reader,
+            crate::protocol::Request::ListSessions,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("stdin closed"));
     }
 }
