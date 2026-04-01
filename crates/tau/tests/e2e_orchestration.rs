@@ -1,9 +1,138 @@
-//! End-to-end tests for tau server.
+//! End-to-end tests for session orchestration.
 //!
-//! These tests start a real server (with mock LLM provider), connect via
-//! unix socket, and exercise the full protocol.
+//! Tests cover both DB-level operations (budget, tree delete, inheritance)
+//! and server-level orchestration (spawn child sessions, run agent turns,
+//! wait for completion).
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use tau::protocol::{Request, Response};
+use tau::providers::mock::{MockProvider, MockResponse, mock_model};
+
+// ---------------------------------------------------------------------------
+// Test server helpers (same pattern as e2e_server.rs)
+// ---------------------------------------------------------------------------
+
+fn send_recv(stream: &UnixStream, req: &Request) -> Response {
+    let mut stream = stream.try_clone().unwrap();
+    let mut line = serde_json::to_string(req).unwrap();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).unwrap();
+    serde_json::from_str(&resp_line).unwrap()
+}
+
+fn send_recv_all(stream: &UnixStream, req: &Request) -> Vec<Response> {
+    let mut stream = stream.try_clone().unwrap();
+    let mut line = serde_json::to_string(req).unwrap();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut reader = BufReader::new(stream);
+    let mut responses = Vec::new();
+    loop {
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).unwrap();
+        if resp_line.trim().is_empty() {
+            continue;
+        }
+        let resp: Response = serde_json::from_str(&resp_line).unwrap();
+        let is_terminal = matches!(
+            &resp,
+            Response::SessionCreated { .. }
+                | Response::SessionInfo { .. }
+                | Response::Sessions { .. }
+                | Response::SessionDeleted
+                | Response::SessionsCompleted { .. }
+                | Response::AgentDone
+                | Response::Cancelled
+                | Response::Ok
+                | Response::Models { .. }
+                | Response::Messages { .. }
+        );
+        responses.push(resp);
+        if is_terminal {
+            break;
+        }
+    }
+    responses
+}
+
+struct TestServer {
+    sock_path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl TestServer {
+    fn start(mock_responses: Vec<MockResponse>) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("tau-test.sock");
+        let db_path = dir.path().join("test.db");
+        let sock_clone = sock_path.clone();
+
+        let model = mock_model();
+        let mut registry = tau::provider::ProviderRegistry::new();
+        registry.register(MockProvider::new(mock_responses));
+
+        let config = tau::server::TestServerConfig {
+            registry,
+            models: vec![model],
+            socket_path: sock_clone,
+            db_path,
+        };
+
+        std::thread::spawn(move || {
+            smol::block_on(async {
+                if let Err(e) = tau::server::run_with_config(config).await {
+                    eprintln!("test server error: {}", e);
+                }
+            });
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(sock_path.exists(), "server socket did not appear");
+
+        TestServer {
+            sock_path,
+            _dir: dir,
+        }
+    }
+
+    fn connect(&self) -> UnixStream {
+        let conn = UnixStream::connect(&self.sock_path).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        conn
+    }
+
+    fn shutdown(&self) {
+        let conn = self.connect();
+        send_recv(&conn, &Request::Shutdown { restart: false });
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if let Ok(mut conn) = UnixStream::connect(&self.sock_path) {
+            let req = serde_json::to_string(&Request::Shutdown { restart: false }).unwrap();
+            let _ = conn.write_all(format!("{}\n", req).as_bytes());
+            let _ = conn.flush();
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests that don't need a running server (protocol-level / DB-level)
@@ -332,4 +461,558 @@ fn protocol_session_info_tree_fields() {
     assert_eq!(parsed.parent_id.as_deref(), Some("s0"));
     assert_eq!(parsed.child_count, 2);
     assert_eq!(parsed.child_budget, 10);
+}
+
+// ---------------------------------------------------------------------------
+// E2E server tests: child session spawn + agent turn
+// ---------------------------------------------------------------------------
+
+/// Spawn a child session, send Chat, verify it runs the agent turn and
+/// produces messages. This simulates what session_spawn does at the protocol level.
+#[test]
+fn spawn_child_chat_produces_messages() {
+    // Two mock responses: one for the child's agent turn
+    let server = TestServer::start(vec![MockResponse::Text("Child response".into())]);
+
+    // Create parent with budget
+    let conn = server.connect();
+    let parent_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("parent".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 5,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Create child under parent
+    let conn2 = server.connect();
+    let child_id = match send_recv(
+        &conn2,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("child".into()),
+            cwd: None, // inherit
+            parent_id: Some(parent_id.clone()),
+            child_budget: 0,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Send Chat to child -- collect responses until AgentDone
+    let conn3 = server.connect();
+    let responses = send_recv_all(
+        &conn3,
+        &Request::Chat {
+            session_id: child_id.clone(),
+            text: "do work".into(),
+        },
+    );
+
+    let has_done = responses.iter().any(|r| matches!(r, Response::AgentDone));
+    assert!(
+        has_done,
+        "expected AgentDone in child responses: {:?}",
+        responses
+    );
+
+    // Verify child has messages (user + assistant)
+    let conn4 = server.connect();
+    let resp = send_recv(
+        &conn4,
+        &Request::GetMessages {
+            session_id: child_id.clone(),
+        },
+    );
+    match resp {
+        Response::Messages { messages } => {
+            assert!(
+                messages.len() >= 2,
+                "expected at least 2 messages in child, got {}: {:?}",
+                messages.len(),
+                messages
+            );
+            assert!(matches!(&messages[0], tau::types::Message::User(_)));
+            assert!(
+                matches!(&messages[1], tau::types::Message::Assistant(a) if a.text().contains("Child response"))
+            );
+        }
+        other => panic!("expected Messages, got {:?}", other),
+    }
+
+    // Parent should have no messages (we never chatted with it)
+    let conn5 = server.connect();
+    let resp = send_recv(
+        &conn5,
+        &Request::GetMessages {
+            session_id: parent_id.clone(),
+        },
+    );
+    match resp {
+        Response::Messages { messages } => {
+            assert_eq!(messages.len(), 0, "parent should have no messages");
+        }
+        other => panic!("expected Messages, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// Spawn multiple children, send Chat to each, wait for all with WaitSessions.
+#[test]
+fn spawn_multiple_children_wait_all() {
+    // Three mock responses: one for each child
+    let server = TestServer::start(vec![
+        MockResponse::Text("child-1 done".into()),
+        MockResponse::Text("child-2 done".into()),
+        MockResponse::Text("child-3 done".into()),
+    ]);
+
+    // Create parent
+    let conn = server.connect();
+    let parent_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("parent".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 10,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Spawn 3 children
+    let mut child_ids = Vec::new();
+    for i in 0..3 {
+        let c = server.connect();
+        let cid = match send_recv(
+            &c,
+            &Request::CreateSession {
+                model: None,
+                provider: None,
+                system_prompt: Some(format!("child-{}", i)),
+                cwd: None,
+                parent_id: Some(parent_id.clone()),
+                child_budget: 0,
+            },
+        ) {
+            Response::SessionCreated { session_id } => session_id,
+            other => panic!("{:?}", other),
+        };
+        child_ids.push(cid);
+    }
+
+    // Fire Chat to each child (fire-and-forget: don't read responses)
+    for (i, cid) in child_ids.iter().enumerate() {
+        let c = server.connect();
+        let mut c2 = c.try_clone().unwrap();
+        let req = Request::Chat {
+            session_id: cid.clone(),
+            text: format!("task {}", i),
+        };
+        let mut line = serde_json::to_string(&req).unwrap();
+        line.push('\n');
+        c2.write_all(line.as_bytes()).unwrap();
+        c2.flush().unwrap();
+        // Don't read -- let it run in the background
+    }
+
+    // Wait for all children
+    let wait_conn = server.connect();
+    wait_conn
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let resp = send_recv(
+        &wait_conn,
+        &Request::WaitSessions {
+            session_ids: child_ids.clone(),
+            timeout_secs: 30,
+        },
+    );
+    match resp {
+        Response::SessionsCompleted { results } => {
+            assert_eq!(results.len(), 3);
+            for r in &results {
+                assert_eq!(
+                    r.status, "done",
+                    "session {} should be done, got {}",
+                    r.session_id, r.status
+                );
+                assert!(
+                    !r.summary.is_empty(),
+                    "session {} should have a summary",
+                    r.session_id
+                );
+            }
+        }
+        other => panic!("expected SessionsCompleted, got {:?}", other),
+    }
+
+    // Verify each child has messages
+    for cid in &child_ids {
+        let c = server.connect();
+        let resp = send_recv(
+            &c,
+            &Request::GetMessages {
+                session_id: cid.clone(),
+            },
+        );
+        match resp {
+            Response::Messages { messages } => {
+                assert!(
+                    messages.len() >= 2,
+                    "child {} should have at least 2 messages, got {}",
+                    cid,
+                    messages.len()
+                );
+            }
+            other => panic!("expected Messages for {}, got {:?}", cid, other),
+        }
+    }
+
+    // Parent child_count should be 3
+    let c = server.connect();
+    let resp = send_recv(
+        &c,
+        &Request::GetSessionInfo {
+            session_id: parent_id.clone(),
+        },
+    );
+    match resp {
+        Response::SessionInfo { info } => {
+            assert_eq!(info.child_count, 3);
+        }
+        other => panic!("{:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// Child session inherits model and cwd from parent via server.
+#[test]
+fn spawn_child_inherits_parent_model_and_cwd() {
+    let server = TestServer::start(vec![]);
+
+    // Create parent with specific cwd
+    let conn = server.connect();
+    let parent_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: Some("/home/test/project".into()),
+            parent_id: None,
+            child_budget: 5,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Create child with no model or cwd specified
+    let conn2 = server.connect();
+    let child_id = match send_recv(
+        &conn2,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: None,
+            parent_id: Some(parent_id.clone()),
+            child_budget: 0,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Verify child inherited cwd and model
+    let conn3 = server.connect();
+    let resp = send_recv(
+        &conn3,
+        &Request::GetSessionInfo {
+            session_id: child_id,
+        },
+    );
+    match resp {
+        Response::SessionInfo { info } => {
+            assert_eq!(
+                info.cwd.as_deref(),
+                Some("/home/test/project"),
+                "child should inherit parent's cwd"
+            );
+            assert_eq!(
+                info.model, "mock-model",
+                "child should inherit parent's model"
+            );
+            assert_eq!(info.parent_id.as_deref(), Some(parent_id.as_str()));
+        }
+        other => panic!("{:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// WaitSessions returns "done" immediately for idle sessions.
+#[test]
+fn wait_sessions_idle_returns_done() {
+    let server = TestServer::start(vec![]);
+
+    // Create two sessions, don't chat with either
+    let mut sids = Vec::new();
+    for _ in 0..2 {
+        let c = server.connect();
+        let sid = match send_recv(
+            &c,
+            &Request::CreateSession {
+                model: None,
+                provider: None,
+                system_prompt: None,
+                cwd: None,
+                parent_id: None,
+                child_budget: 0,
+            },
+        ) {
+            Response::SessionCreated { session_id } => session_id,
+            other => panic!("{:?}", other),
+        };
+        sids.push(sid);
+    }
+
+    let c = server.connect();
+    let resp = send_recv(
+        &c,
+        &Request::WaitSessions {
+            session_ids: sids.clone(),
+            timeout_secs: 5,
+        },
+    );
+    match resp {
+        Response::SessionsCompleted { results } => {
+            assert_eq!(results.len(), 2);
+            for r in &results {
+                assert_eq!(r.status, "done");
+            }
+        }
+        other => panic!("{:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// Delete parent cascades to children at the server level.
+#[test]
+fn spawn_delete_parent_cascades() {
+    let server = TestServer::start(vec![MockResponse::Text("child work".into())]);
+
+    // Create parent -> child, chat with child
+    let conn = server.connect();
+    let parent_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("parent".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 5,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let child_id = match send_recv(
+        &conn2,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("child".into()),
+            cwd: None,
+            parent_id: Some(parent_id.clone()),
+            child_budget: 0,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Chat with child to create messages
+    let conn3 = server.connect();
+    let responses = send_recv_all(
+        &conn3,
+        &Request::Chat {
+            session_id: child_id.clone(),
+            text: "work".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Delete parent -- should cascade to child
+    let conn4 = server.connect();
+    match send_recv(
+        &conn4,
+        &Request::DeleteSession {
+            session_id: parent_id.clone(),
+        },
+    ) {
+        Response::SessionDeleted => {}
+        other => panic!("{:?}", other),
+    }
+
+    // Both gone
+    let conn5 = server.connect();
+    match send_recv(
+        &conn5,
+        &Request::GetSessionInfo {
+            session_id: child_id,
+        },
+    ) {
+        Response::Error { .. } => {} // expected
+        other => panic!("expected error for deleted child, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// Cancel a running child session.
+#[test]
+fn spawn_cancel_child() {
+    let server = TestServer::start(vec![]);
+
+    // Create parent -> child
+    let conn = server.connect();
+    let parent_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 5,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let child_id = match send_recv(
+        &conn2,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: None,
+            parent_id: Some(parent_id),
+            child_budget: 0,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Cancel the child (even though it's idle -- should succeed)
+    let conn3 = server.connect();
+    match send_recv(
+        &conn3,
+        &Request::CancelChat {
+            session_id: child_id,
+        },
+    ) {
+        Response::Ok => {} // expected
+        other => panic!("expected Ok for cancel, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// WaitSessions after child Chat completes returns summary text.
+#[test]
+fn wait_sessions_returns_summary() {
+    let server = TestServer::start(vec![MockResponse::Text("The answer is 42.".into())]);
+
+    // Create parent -> child
+    let conn = server.connect();
+    let parent_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("parent".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 5,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let child_id = match send_recv(
+        &conn2,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("child".into()),
+            cwd: None,
+            parent_id: Some(parent_id),
+            child_budget: 0,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Chat with child and wait for completion
+    let conn3 = server.connect();
+    let responses = send_recv_all(
+        &conn3,
+        &Request::Chat {
+            session_id: child_id.clone(),
+            text: "what is the meaning of life?".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // WaitSessions should return with summary containing the assistant text
+    let conn4 = server.connect();
+    let resp = send_recv(
+        &conn4,
+        &Request::WaitSessions {
+            session_ids: vec![child_id.clone()],
+            timeout_secs: 5,
+        },
+    );
+    match resp {
+        Response::SessionsCompleted { results } => {
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].status, "done");
+            assert!(
+                results[0].summary.contains("42"),
+                "summary should contain assistant text, got: {}",
+                results[0].summary
+            );
+        }
+        other => panic!("expected SessionsCompleted, got {:?}", other),
+    }
+
+    server.shutdown();
 }
