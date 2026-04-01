@@ -284,6 +284,7 @@ async fn run_inner(
                     .await?;
                 }
                 Action::OpenSessionPicker => {
+                    app.picker_previous_mode = app.mode;
                     app.mode = AppMode::SessionPicker;
                     app.picker_sessions.clear();
                     app.picker_confirm_delete = None;

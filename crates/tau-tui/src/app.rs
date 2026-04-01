@@ -114,6 +114,8 @@ pub struct App {
     pub picker_cursor: usize,
     /// Pending deletion confirmation: Some(index) if waiting for y/n.
     pub picker_confirm_delete: Option<usize>,
+    /// Mode to restore when the session picker is closed.
+    pub picker_previous_mode: AppMode,
 }
 
 /// Saved state when navigating to a child session.
@@ -163,6 +165,7 @@ impl App {
             picker_sessions: Vec::new(),
             picker_cursor: 0,
             picker_confirm_delete: None,
+            picker_previous_mode: AppMode::Input,
         }
     }
 
@@ -588,9 +591,9 @@ impl App {
                     }
                     None
                 }
-                // TAB or ESC: close picker
+                // TAB or ESC: close picker, return to previous mode
                 (KeyCode::Tab | KeyCode::Esc, _) => {
-                    self.mode = AppMode::Input;
+                    self.mode = self.picker_previous_mode;
                     self.picker_confirm_delete = None;
                     None
                 }
@@ -601,7 +604,7 @@ impl App {
                             self.messages.push(MessageItem::Status {
                                 text: "cannot delete active session".into(),
                             });
-                            self.mode = AppMode::Input;
+                            self.mode = self.picker_previous_mode;
                             self.picker_confirm_delete = None;
                         } else {
                             self.picker_confirm_delete = Some(self.picker_cursor);
@@ -609,9 +612,9 @@ impl App {
                     }
                     None
                 }
-                // Ctrl+C: close picker
+                // Ctrl+C: close picker, return to previous mode
                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                    self.mode = AppMode::Input;
+                    self.mode = self.picker_previous_mode;
                     self.picker_confirm_delete = None;
                     None
                 }
@@ -712,6 +715,8 @@ impl App {
                 self.scroll_to_bottom();
                 None
             }
+            // TAB: open session picker
+            (KeyCode::Tab, _) => Some(Action::OpenSessionPicker),
             // All other keys go to textarea (compose steering message while streaming)
             _ => {
                 self.textarea.input(event_to_tui_textarea(key));
