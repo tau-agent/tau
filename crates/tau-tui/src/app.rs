@@ -3,7 +3,7 @@
 use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui_textarea::TextArea;
 
-use tau::protocol::Response;
+use tau::protocol::{Response, SessionInfo};
 use tau::types::{
     AgentPhase, AssistantContent, Message, StreamEvent, ToolResultMessage, UserContent,
 };
@@ -44,6 +44,8 @@ pub enum AppMode {
     Input,
     /// Streaming a response from the LLM.
     Streaming,
+    /// Session picker overlay is open.
+    SessionPicker,
 }
 
 /// A steering message is sent as the next turn right after the current one.
@@ -106,6 +108,12 @@ pub struct App {
     pub parent_id: Option<String>,
     /// Number of direct child sessions.
     pub child_count: usize,
+    /// Session list for the picker overlay.
+    pub picker_sessions: Vec<SessionInfo>,
+    /// Cursor position in the picker.
+    pub picker_cursor: usize,
+    /// Pending deletion confirmation: Some(index) if waiting for y/n.
+    pub picker_confirm_delete: Option<usize>,
 }
 
 /// Saved state when navigating to a child session.
@@ -152,6 +160,9 @@ impl App {
             nav_stack: Vec::new(),
             parent_id: None,
             child_count: 0,
+            picker_sessions: Vec::new(),
+            picker_cursor: 0,
+            picker_confirm_delete: None,
         }
     }
 
@@ -368,6 +379,7 @@ impl App {
         match self.mode {
             AppMode::Input => self.handle_input_key(key),
             AppMode::Streaming => self.handle_streaming_key(key),
+            AppMode::SessionPicker => self.handle_picker_key(key),
         }
     }
 
@@ -507,12 +519,103 @@ impl App {
                 self.scroll_to_bottom();
                 None
             }
+            // TAB: open session picker
+            (KeyCode::Tab, _) => Some(Action::OpenSessionPicker),
             // Everything else goes to textarea
             _ => {
                 // Reset history browsing on any other key
                 self.history_index = None;
                 self.textarea.input(event_to_tui_textarea(key));
                 None
+            }
+        }
+    }
+
+    fn handle_picker_key(&mut self, key: &KeyEvent) -> Option<Action> {
+        // If waiting for delete confirmation
+        if let Some(idx) = self.picker_confirm_delete {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.picker_confirm_delete = None;
+                    if let Some(session) = self.picker_sessions.get(idx) {
+                        let session_id = session.id.clone();
+                        // Remove from picker list
+                        self.picker_sessions.remove(idx);
+                        if self.picker_cursor >= self.picker_sessions.len()
+                            && self.picker_cursor > 0
+                        {
+                            self.picker_cursor -= 1;
+                        }
+                        return Some(Action::DeleteSession(session_id));
+                    }
+                    None
+                }
+                _ => {
+                    // Any other key cancels the confirmation
+                    self.picker_confirm_delete = None;
+                    None
+                }
+            }
+        } else {
+            match (key.code, key.modifiers) {
+                // Navigate up
+                (KeyCode::Up | KeyCode::Char('k'), _) => {
+                    if self.picker_cursor > 0 {
+                        self.picker_cursor -= 1;
+                    }
+                    None
+                }
+                // Navigate down
+                (KeyCode::Down | KeyCode::Char('j'), _) => {
+                    if !self.picker_sessions.is_empty()
+                        && self.picker_cursor < self.picker_sessions.len() - 1
+                    {
+                        self.picker_cursor += 1;
+                    }
+                    None
+                }
+                // Enter: switch to selected session
+                (KeyCode::Enter, _) => {
+                    if let Some(session) = self.picker_sessions.get(self.picker_cursor) {
+                        let session_id = session.id.clone();
+                        self.mode = AppMode::Input;
+                        self.picker_confirm_delete = None;
+                        if session_id == self.session_id {
+                            // Already on this session, just close picker
+                            return None;
+                        }
+                        return Some(Action::SwitchSession(session_id));
+                    }
+                    None
+                }
+                // TAB or ESC: close picker
+                (KeyCode::Tab | KeyCode::Esc, _) => {
+                    self.mode = AppMode::Input;
+                    self.picker_confirm_delete = None;
+                    None
+                }
+                // D (shift+d): delete selected session
+                (KeyCode::Char('D'), _) => {
+                    if let Some(session) = self.picker_sessions.get(self.picker_cursor) {
+                        if session.id == self.session_id {
+                            self.messages.push(MessageItem::Status {
+                                text: "cannot delete active session".into(),
+                            });
+                            self.mode = AppMode::Input;
+                            self.picker_confirm_delete = None;
+                        } else {
+                            self.picker_confirm_delete = Some(self.picker_cursor);
+                        }
+                    }
+                    None
+                }
+                // Ctrl+C: close picker
+                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                    self.mode = AppMode::Input;
+                    self.picker_confirm_delete = None;
+                    None
+                }
+                _ => None,
             }
         }
     }
@@ -982,6 +1085,28 @@ impl App {
                 }
             }
             Response::Sessions { sessions } => {
+                // If we're in picker mode, populate picker sessions.
+                if self.mode == AppMode::SessionPicker {
+                    // Sort: current session first, then by last_activity descending
+                    let mut sorted = sessions;
+                    sorted.sort_by(|a, b| {
+                        let a_current = a.id == self.session_id;
+                        let b_current = b.id == self.session_id;
+                        b_current
+                            .cmp(&a_current)
+                            .then(b.last_activity.cmp(&a.last_activity))
+                    });
+                    self.picker_sessions = sorted;
+                    // Reset cursor — find current session
+                    self.picker_cursor = self
+                        .picker_sessions
+                        .iter()
+                        .position(|s| s.id == self.session_id)
+                        .unwrap_or(0);
+                    self.picker_confirm_delete = None;
+                    return;
+                }
+
                 // Display child sessions of the current session
                 let children: Vec<_> = sessions
                     .iter()
@@ -1214,6 +1339,10 @@ pub enum Action {
     SendQueued(String),
     /// Inject a steering message into the running agent loop.
     Steer(String),
+    /// Open the session picker overlay.
+    OpenSessionPicker,
+    /// Delete a session.
+    DeleteSession(String),
     /// Switch to viewing a different session.
     SwitchSession(String),
     /// Navigate back to previous session in nav stack.
