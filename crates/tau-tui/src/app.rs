@@ -265,7 +265,7 @@ impl App {
         match event {
             Event::Terminal(ct_event) => self.handle_terminal_event(ct_event),
             Event::Server(response) => {
-                self.handle_server_response(response);
+                self.handle_server_response(*response);
                 // Fetch subscription usage if requested
                 if self.pending_subscription_usage {
                     self.pending_subscription_usage = false;

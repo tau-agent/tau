@@ -356,13 +356,13 @@ fn handle_session_tool(
             // Send initial message via unix socket (fire-and-forget).
             // This must go through the real server connection to trigger
             // an agent turn -- the ServerRequest tunnel only handles sync ops.
-            if !task.is_empty() {
-                if let Err(e) = fire_chat_via_socket(&child_id, task) {
-                    return tool_err(&format!(
-                        "session {} created but chat failed: {}",
-                        child_id, e
-                    ));
-                }
+            if !task.is_empty()
+                && let Err(e) = fire_chat_via_socket(&child_id, task)
+            {
+                return tool_err(&format!(
+                    "session {} created but chat failed: {}",
+                    child_id, e
+                ));
             }
 
             tool_ok(&format!("Spawned session {}", child_id))

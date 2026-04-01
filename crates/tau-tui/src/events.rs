@@ -15,7 +15,7 @@ pub enum Event {
     /// A crossterm terminal event (key press, resize, etc.).
     Terminal(CtEvent),
     /// A response from the tau server.
-    Server(Response),
+    Server(Box<Response>),
     /// The server stream ended (connection closed / done).
     ServerDone,
     /// Tick for periodic UI updates (spinner animation, etc.).
@@ -56,7 +56,7 @@ impl EventLoop {
         let tx_srv = tx.clone();
         tasks.push(smol::spawn(async move {
             while let Ok(resp) = server_rx.recv().await {
-                if tx_srv.send(Event::Server(resp)).await.is_err() {
+                if tx_srv.send(Event::Server(Box::new(resp))).await.is_err() {
                     break;
                 }
             }

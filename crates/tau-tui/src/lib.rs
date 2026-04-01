@@ -135,27 +135,41 @@ async fn run_inner(
     // Event loop merges terminal + server + tick
     let event_loop = EventLoop::new(server_rx);
 
-    // Subscribe to session events.
+    // Subscribe to session events with automatic reconnection.
     // This is the single source of truth for all session-related responses
     // (Stream, AgentDone, Cancelled, UserMessage). Chat requests are fire-and-forget.
+    // If the connection drops, we reconnect after a short delay so the TUI
+    // never permanently loses its event stream.
     let sub_tx = server_tx.clone();
     let sub_session_id = app.session_id.clone();
     smol::spawn(async move {
-        if let Ok(mut client) = Client::connect().await
-            && client
-                .send(&Request::Subscribe {
-                    session_id: sub_session_id,
-                })
-                .await
-                .is_ok()
-        {
-            let stream = client.response_stream();
-            futures::pin_mut!(stream);
-            while let Some(Ok(resp)) = stream.next().await {
-                if sub_tx.send(resp).await.is_err() {
-                    break;
+        loop {
+            let connected = async {
+                let mut client = Client::connect().await?;
+                client
+                    .send(&Request::Subscribe {
+                        session_id: sub_session_id.clone(),
+                    })
+                    .await?;
+                let stream = client.response_stream();
+                futures::pin_mut!(stream);
+                while let Some(Ok(resp)) = stream.next().await {
+                    if sub_tx.send(resp).await.is_err() {
+                        // App channel closed — TUI is shutting down
+                        return Err(tau::Error::Io("app closed".into()));
+                    }
                 }
+                Ok::<(), tau::Error>(())
             }
+            .await;
+
+            match connected {
+                Err(tau::Error::Io(ref msg)) if msg == "app closed" => break,
+                _ => {}
+            }
+
+            // Connection lost — wait before reconnecting
+            smol::Timer::after(std::time::Duration::from_millis(500)).await;
         }
     })
     .detach();

@@ -575,13 +575,11 @@ async fn handle_client(
             }
             Request::Chat { session_id, text } => {
                 if shutdown.is_shutting_down() {
-                    send(
-                        &mut writer,
-                        &Response::Error {
-                            message: "server is shutting down".into(),
-                        },
-                    )
-                    .await?;
+                    let resp = Response::Error {
+                        message: "server is shutting down".into(),
+                    };
+                    broadcast_to_subscribers(&state, &session_id, &resp);
+                    send(&mut writer, &resp).await.ok();
                     continue;
                 }
                 // Acquire per-session lock — serializes concurrent Chat requests.
@@ -598,55 +596,128 @@ async fn handle_client(
                     flag.store(false, Ordering::Relaxed);
                     flag.clone()
                 };
-                // Load session
-                let session_data = {
-                    let st = state.lock().unwrap();
-                    match st.db.get_session(&session_id) {
-                        Ok(Some(stored)) => {
-                            let messages = st.db.get_messages(&session_id)?;
-                            let cwd = stored.cwd.clone().unwrap_or_else(|| "/tmp".to_string());
-                            Ok((stored, messages, cwd))
+
+                // Run the Chat handler body inside a closure so that any
+                // error is caught and we *always* broadcast a terminal
+                // response (AgentDone / Cancelled / Error) to subscribers.
+                // Without this guarantee the TUI gets stuck in Streaming
+                // mode forever when an internal error (e.g. DB write)
+                // causes the handler to bail out early via `?`.
+                let chat_result: Result<bool, crate::Error> = async {
+                    // Load session
+                    let session_data = {
+                        let st = state.lock().unwrap();
+                        match st.db.get_session(&session_id) {
+                            Ok(Some(stored)) => {
+                                let messages = st.db.get_messages(&session_id)?;
+                                let cwd = stored.cwd.clone().unwrap_or_else(|| "/tmp".to_string());
+                                Ok((stored, messages, cwd))
+                            }
+                            Ok(None) => Err(crate::Error::Io(format!(
+                                "session not found: {}",
+                                session_id
+                            ))),
+                            Err(e) => Err(e),
                         }
-                        Ok(None) => Err(format!("session not found: {}", session_id)),
-                        Err(e) => Err(format!("db error: {}", e)),
-                    }
-                };
-                let (stored, mut messages, cwd) = match session_data {
-                    Ok(data) => data,
-                    Err(msg) => {
-                        send(&mut writer, &Response::Error { message: msg }).await?;
-                        continue;
-                    }
-                };
-                let model = stored.model.clone();
-
-                // Ensure session plugins are spawned and notify session start
-                let plugin_error = {
-                    let mut pm = plugins.lock().unwrap();
-                    let err = if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
-                        let msg = format!("failed to spawn session plugins: {}", e);
-                        eprintln!("{}", msg);
-                        Some(msg)
-                    } else {
-                        None
                     };
-                    pm.notify_session_start_once(&cwd, &session_id);
-                    err
-                };
-                if let Some(msg) = plugin_error {
-                    send(&mut writer, &Response::Error { message: msg })
-                        .await
-                        .ok();
-                }
+                    let (stored, mut messages, cwd) = session_data?;
+                    let model = stored.model.clone();
 
-                // If session was interrupted mid-tool-call, continue first
-                if crate::agent::needs_continuation(&messages) {
+                    // Ensure session plugins are spawned and notify session start
+                    {
+                        let mut pm = plugins.lock().unwrap();
+                        if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
+                            eprintln!("failed to spawn session plugins: {}", e);
+                        }
+                        pm.notify_session_start_once(&cwd, &session_id);
+                    }
+
+                    // If session was interrupted mid-tool-call, continue first
+                    if crate::agent::needs_continuation(&messages) {
+                        let mut context = Context {
+                            system_prompt: stored.system_prompt.clone(),
+                            messages: messages.clone(),
+                            tools: Vec::new(),
+                        };
+                        let cont_result = run_agent_turn(
+                            &state,
+                            &plugins,
+                            &shutdown,
+                            cancel_flag.clone(),
+                            &model,
+                            &mut context,
+                            &cwd,
+                            &session_id,
+                            &mut writer,
+                            &throttle,
+                            &session_locks,
+                        )
+                        .await;
+                        match cont_result {
+                            Ok(new_msgs) => {
+                                let st = state.lock().unwrap();
+                                for msg in &new_msgs {
+                                    if let Err(e) = st.db.append_message(&session_id, msg) {
+                                        eprintln!("db error persisting continuation: {}", e);
+                                    }
+                                }
+                                messages = st.db.get_messages(&session_id)?;
+                            }
+                            Err(e) => {
+                                eprintln!("continuation error: {}", e);
+                            }
+                        }
+                    }
+
+                    // Call before_agent_start hooks (plugins inject context)
+                    let mut system_prompt = stored.system_prompt.clone();
+                    {
+                        let mut pm = plugins.lock().unwrap();
+                        let hook_data = serde_json::json!({
+                            "prompt": &text,
+                            "system_prompt": &system_prompt,
+                            "session_id": &session_id,
+                            "message_count": messages.len(),
+                        });
+                        let results = pm.call_hook(&session_id, "before_agent_start", &hook_data);
+                        for result in results {
+                            if let Some(msg) = result.message {
+                                let ctx_msg = Message::User(UserMessage::text(&msg.content));
+                                {
+                                    let st = state.lock().unwrap();
+                                    if let Err(e) = st.db.append_message(&session_id, &ctx_msg) {
+                                        eprintln!("db error persisting hook context: {}", e);
+                                    }
+                                }
+                                messages.push(ctx_msg);
+                            }
+                            if let Some(sp) = result.system_prompt {
+                                system_prompt = Some(sp);
+                            }
+                        }
+                    }
+
+                    // Append user message (persisted to DB)
+                    let user_msg = Message::User(UserMessage::text(&text));
+                    {
+                        let st = state.lock().unwrap();
+                        st.db.append_message(&session_id, &user_msg)?;
+                    }
+                    messages.push(user_msg);
+
+                    // Broadcast user message to subscribers
+                    broadcast_to_subscribers(
+                        &state,
+                        &session_id,
+                        &Response::UserMessage { text: text.clone() },
+                    );
+
                     let mut context = Context {
-                        system_prompt: stored.system_prompt.clone(),
-                        messages: messages.clone(),
+                        system_prompt,
+                        messages,
                         tools: Vec::new(),
                     };
-                    let cont_result = run_agent_turn(
+                    let result = run_agent_turn(
                         &state,
                         &plugins,
                         &shutdown,
@@ -660,143 +731,80 @@ async fn handle_client(
                         &session_locks,
                     )
                     .await;
-                    match cont_result {
+
+                    match result {
                         Ok(new_msgs) => {
                             let st = state.lock().unwrap();
                             for msg in &new_msgs {
-                                st.db.append_message(&session_id, msg)?;
+                                if let Err(e) = st.db.append_message(&session_id, msg) {
+                                    eprintln!("db error persisting agent message: {}", e);
+                                }
                             }
-                            messages = st.db.get_messages(&session_id)?;
+                        }
+                        Err(crate::Error::Cancelled) => {
+                            cancel_flag.store(true, Ordering::Relaxed);
                         }
                         Err(e) => {
-                            eprintln!("continuation error: {}", e);
-                        }
-                    }
-                }
-
-                // Call before_agent_start hooks (plugins inject context before user message)
-                let mut system_prompt = stored.system_prompt.clone();
-                {
-                    let mut pm = plugins.lock().unwrap();
-                    let hook_data = serde_json::json!({
-                        "prompt": &text,
-                        "system_prompt": &system_prompt,
-                        "session_id": &session_id,
-                        "message_count": messages.len(),
-                    });
-                    let results = pm.call_hook(&session_id, "before_agent_start", &hook_data);
-                    for result in results {
-                        if let Some(msg) = result.message {
-                            // Inject context before user message. Persisted so the
-                            // assistant's response (which may reference context) makes
-                            // sense in future turns. Becomes part of the cached prefix.
-                            let ctx_msg = Message::User(UserMessage::text(&msg.content));
-                            {
-                                let st = state.lock().unwrap();
-                                st.db.append_message(&session_id, &ctx_msg)?;
+                            // Update throttle on rate limit errors
+                            if let crate::Error::Http(ref msg) = e {
+                                throttle.handle_error(&model.provider, msg, None);
                             }
-                            messages.push(ctx_msg);
-                        }
-                        if let Some(sp) = result.system_prompt {
-                            system_prompt = Some(sp);
+                            let err_msg = format!("agent error: {}", e);
+                            throttle.handle_error(&model.provider, &err_msg, None);
+                            return Err(e);
                         }
                     }
+
+                    // Check compaction
+                    let was_cancelled = cancel_flag.load(Ordering::Relaxed);
+                    if !was_cancelled {
+                        let should = {
+                            let st = state.lock().unwrap();
+                            let messages = st.db.get_messages(&session_id).unwrap_or_default();
+                            let ctx_tokens = compaction::estimate_context_tokens(&messages);
+                            compaction::should_compact(
+                                ctx_tokens,
+                                model.context_window,
+                                &compaction::CompactionSettings::default(),
+                            )
+                        };
+                        if should
+                            && let Err(e) =
+                                run_compaction(&state, &session_id, &model, &mut writer).await
+                        {
+                            eprintln!("compaction error: {}", e);
+                        }
+                    }
+
+                    Ok(was_cancelled)
                 }
-
-                // Now append user message (persisted to DB)
-                let user_msg = Message::User(UserMessage::text(&text));
-                {
-                    let st = state.lock().unwrap();
-                    st.db.append_message(&session_id, &user_msg)?;
-                }
-                messages.push(user_msg);
-
-                // Broadcast user message to subscribers
-                broadcast_to_subscribers(
-                    &state,
-                    &session_id,
-                    &Response::UserMessage { text: text.clone() },
-                );
-
-                let mut context = Context {
-                    system_prompt,
-                    messages,
-                    tools: Vec::new(),
-                };
-                let result = run_agent_turn(
-                    &state,
-                    &plugins,
-                    &shutdown,
-                    cancel_flag.clone(),
-                    &model,
-                    &mut context,
-                    &cwd,
-                    &session_id,
-                    &mut writer,
-                    &throttle,
-                    &session_locks,
-                )
                 .await;
 
-                match result {
-                    Ok(new_msgs) => {
-                        let st = state.lock().unwrap();
-                        for msg in &new_msgs {
-                            st.db.append_message(&session_id, msg)?;
-                        }
+                // Always broadcast a terminal response so subscribers
+                // (especially the TUI) never get stuck in Streaming mode.
+                match chat_result {
+                    Ok(true) => {
+                        // Cancelled
+                        let resp = Response::Cancelled;
+                        broadcast_to_subscribers(&state, &session_id, &resp);
+                        send(&mut writer, &resp).await.ok();
                     }
-                    Err(crate::Error::Cancelled) => {
-                        // Stream was aborted mid-flight by the cancel flag;
-                        // treat it the same as a normal cancellation.
-                        cancel_flag.store(true, Ordering::Relaxed);
+                    Ok(false) => {
+                        // Normal completion
+                        let resp = Response::AgentDone;
+                        broadcast_to_subscribers(&state, &session_id, &resp);
+                        send(&mut writer, &resp).await.ok();
                     }
                     Err(e) => {
-                        let err_msg = format!("agent error: {}", e);
-                        // Update throttle on rate limit errors
-                        if let crate::Error::Http(ref msg) = e {
-                            throttle.handle_error(&model.provider, msg, None);
-                        }
-                        // Also check the error string for rate limit patterns
-                        throttle.handle_error(&model.provider, &err_msg, None);
-                        let err_resp = Response::Error { message: err_msg };
+                        let err_resp = Response::Error {
+                            message: format!("agent error: {}", e),
+                        };
                         let done_resp = Response::AgentDone;
                         broadcast_to_subscribers(&state, &session_id, &err_resp);
                         broadcast_to_subscribers(&state, &session_id, &done_resp);
                         send(&mut writer, &err_resp).await.ok();
                         send(&mut writer, &done_resp).await.ok();
-                        continue;
                     }
-                }
-
-                // Check compaction
-                let was_cancelled = cancel_flag.load(Ordering::Relaxed);
-                if !was_cancelled {
-                    let should = {
-                        let st = state.lock().unwrap();
-                        let messages = st.db.get_messages(&session_id)?;
-                        let ctx_tokens = compaction::estimate_context_tokens(&messages);
-                        compaction::should_compact(
-                            ctx_tokens,
-                            model.context_window,
-                            &compaction::CompactionSettings::default(),
-                        )
-                    };
-                    if should
-                        && let Err(e) =
-                            run_compaction(&state, &session_id, &model, &mut writer).await
-                    {
-                        eprintln!("compaction error: {}", e);
-                    }
-                }
-
-                if was_cancelled {
-                    let resp = Response::Cancelled;
-                    broadcast_to_subscribers(&state, &session_id, &resp);
-                    send(&mut writer, &resp).await.ok();
-                } else {
-                    let resp = Response::AgentDone;
-                    broadcast_to_subscribers(&state, &session_id, &resp);
-                    send(&mut writer, &resp).await.ok();
                 }
 
                 if shutdown.is_shutting_down() {
@@ -1218,16 +1226,15 @@ async fn run_agent_turn<W: futures::io::AsyncWrite + Unpin>(
             "provider '{}' rate limited, retrying in {}s...",
             model.provider, secs
         );
-        // Notify subscribers about the wait (non-fatal)
-        send(
-            writer,
-            &Response::Error {
+        // Notify as a non-fatal status (not Error — Error would cause the TUI
+        // to switch out of Streaming mode prematurely).
+        let status_resp = Response::Stream {
+            event: Box::new(StreamEvent::Status {
                 message: msg.clone(),
-            },
-        )
-        .await
-        .ok();
-        broadcast_to_subscribers(state, session_id, &Response::Error { message: msg });
+            }),
+        };
+        send(writer, &status_resp).await.ok();
+        broadcast_to_subscribers(state, session_id, &status_resp);
         // Sleep with periodic cancellation checks
         let deadline = std::time::Instant::now() + remaining;
         while std::time::Instant::now() < deadline {
