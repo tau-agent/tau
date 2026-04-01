@@ -233,13 +233,17 @@ fn stream_with_retry(
                     .unwrap_or_else(|| {
                         (config.retry_base_ms * 2u64.pow(attempt as u32)).min(MAX_RETRY_DELAY_MS)
                     });
-                eprintln!(
+                let status_msg = format!(
                     "retryable error (attempt {}/{}), retrying in {}ms: {}",
                     attempt + 1,
                     config.max_retries,
                     delay,
                     err_msg
                 );
+                eprintln!("{}", status_msg);
+                on_event(StreamEvent::Status {
+                    message: status_msg,
+                });
                 std::thread::sleep(std::time::Duration::from_millis(delay));
                 continue;
             }

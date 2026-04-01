@@ -983,6 +983,9 @@ impl App {
                 self.messages.push(MessageItem::Error { text: msg });
                 self.mode = AppMode::Input;
             }
+            StreamEvent::Status { message } => {
+                self.messages.push(MessageItem::Status { text: message });
+            }
             _ => {}
         }
     }

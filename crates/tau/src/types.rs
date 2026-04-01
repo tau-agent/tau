@@ -362,6 +362,10 @@ pub enum StreamEvent {
     SteerMessage {
         message: UserMessage,
     },
+    /// Informational status message (e.g. retry notices).
+    Status {
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

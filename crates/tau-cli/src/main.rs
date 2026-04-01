@@ -688,6 +688,9 @@ async fn send_and_print(
                             eprintln!("\nerror: {}", msg);
                         }
                     }
+                    tau::StreamEvent::Status { message } => {
+                        eprintln!("[{}]", message);
+                    }
                     _ => {}
                 }
             }
