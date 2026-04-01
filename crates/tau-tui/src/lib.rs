@@ -283,6 +283,24 @@ async fn run_inner(
                     )
                     .await?;
                 }
+                Action::OpenSessionPicker => {
+                    app.mode = AppMode::SessionPicker;
+                    app.picker_sessions.clear();
+                    app.picker_confirm_delete = None;
+                    send_request_and_recv(Request::ListSessions, server_tx.clone()).await?;
+                }
+                Action::DeleteSession(session_id) => {
+                    send_request_and_recv(
+                        Request::DeleteSession {
+                            session_id: session_id.clone(),
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                    app.messages.push(crate::message::MessageItem::Status {
+                        text: format!("deleted session {}", &session_id[..session_id.len().min(8)]),
+                    });
+                }
                 Action::ListChildren => {
                     send_request_and_recv(Request::ListSessions, server_tx.clone()).await?;
                 }

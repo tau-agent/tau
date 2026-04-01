@@ -2,6 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -11,7 +12,7 @@ use tau::protocol::format_tokens;
 use tau::types::AgentPhase;
 
 use crate::app::{App, AppMode};
-use crate::theme::Theme;
+use crate::theme::{Theme, ThemeColor};
 
 /// Draw the full UI.
 pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
@@ -31,6 +32,11 @@ pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     draw_messages(frame, app, theme, chunks[0]);
     draw_input(frame, app, theme, chunks[1]);
     draw_footer(frame, app, theme, chunks[2]);
+
+    // Session picker overlay
+    if app.mode == AppMode::SessionPicker {
+        draw_session_picker(frame, app, theme, area);
+    }
 }
 
 /// Height of the input area: visual lines (accounting for wrap) + 2 borders.
@@ -328,4 +334,167 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let footer_line = Line::from(spans);
     frame.render_widget(Paragraph::new(footer_line), area);
+}
+
+// ---------------------------------------------------------------------------
+// Session Picker overlay
+// ---------------------------------------------------------------------------
+
+fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    let picker_width: u16 = 40.min(area.width.saturating_sub(2));
+    // Height: sessions + footer(1) + borders(2), clamped to area
+    let content_lines = app.picker_sessions.len().max(1) as u16;
+    let picker_height = (content_lines + 3).min(area.height.saturating_sub(2));
+
+    // Position: left side, vertically centered
+    let x = 1;
+    let y = area.height.saturating_sub(picker_height) / 2;
+    let picker_area = Rect::new(x, y, picker_width, picker_height);
+
+    // Clear the area behind the overlay
+    frame.render_widget(Clear, picker_area);
+
+    // Border
+    let border_style = Style::default().fg(theme.accent.to_ratatui());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(border_style)
+        .title(Span::styled(
+            " Sessions ",
+            Style::default()
+                .fg(theme.accent.to_ratatui())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let w = inner.width as usize;
+
+    if app.picker_sessions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (loading...)",
+            theme.fg(theme.muted),
+        )));
+    } else {
+        for (i, session) in app.picker_sessions.iter().enumerate() {
+            let is_current = session.id == app.session_id;
+            let is_selected = i == app.picker_cursor;
+            let is_confirming = app.picker_confirm_delete == Some(i);
+
+            // Indentation for child sessions
+            let indent = if session.parent_id.is_some() {
+                "  "
+            } else {
+                ""
+            };
+
+            // Truncate session ID
+            let id_len = 8.min(session.id.len());
+            let id_short = &session.id[..id_len];
+
+            // Status indicator
+            let status = if is_current { "●" } else { " " };
+
+            // Model (truncated)
+            let model_max = w.saturating_sub(indent.len() + 2 + id_len + 1 + 4);
+            let model_display = if session.model.len() > model_max {
+                &session.model[..model_max]
+            } else {
+                &session.model
+            };
+
+            // Message count
+            let msg_count = format!(" {}m", session.message_count);
+
+            let content = format!(
+                "{}{} {} {}{}",
+                indent, status, id_short, model_display, msg_count
+            );
+            // Truncate to width
+            let display: String = if content.len() > w {
+                content[..w].to_string()
+            } else {
+                content
+            };
+
+            let style = if is_confirming {
+                // Red background for delete confirmation
+                Style::default()
+                    .fg(theme.error.to_ratatui())
+                    .bg(ThemeColor::Rgb(0x3c, 0x28, 0x28).to_ratatui())
+            } else if is_selected {
+                Style::default()
+                    .fg(if is_current {
+                        theme.accent.to_ratatui()
+                    } else {
+                        theme.text.to_ratatui()
+                    })
+                    .bg(theme.selected_bg.to_ratatui())
+            } else if is_current {
+                Style::default().fg(theme.accent.to_ratatui())
+            } else {
+                Style::default().fg(theme.muted.to_ratatui())
+            };
+
+            // Pad to full width
+            let pad = w.saturating_sub(display.len());
+            let padded = format!("{}{}", display, " ".repeat(pad));
+
+            if is_confirming {
+                // Show confirmation line instead
+                let confirm_text = format!(" Delete {}? y/n", id_short);
+                let confirm_padded = if confirm_text.len() < w {
+                    format!("{}{}", confirm_text, " ".repeat(w - confirm_text.len()))
+                } else {
+                    confirm_text[..w].to_string()
+                };
+                lines.push(Line::from(Span::styled(confirm_padded, style)));
+            } else {
+                lines.push(Line::from(Span::styled(padded, style)));
+            }
+        }
+    }
+
+    // Footer hint
+    let hint = " ↑↓ nav  ⏎ switch  D del  esc close";
+    let hint_display: String = if hint.len() > w {
+        hint[..w].to_string()
+    } else {
+        hint.to_string()
+    };
+    lines.push(Line::from(Span::styled(hint_display, theme.fg(theme.dim))));
+
+    // Scroll the session list if needed
+    let available_lines = inner.height as usize;
+    // Reserve 1 line for the hint at the bottom
+    let session_lines = available_lines.saturating_sub(1);
+
+    if lines.len() > available_lines {
+        // We need to scroll so the selected item is visible
+        // lines = session_items + 1 hint line
+        let num_sessions = lines.len() - 1; // exclude hint
+        let hint_line = lines.pop().unwrap();
+
+        let scroll_start = if app.picker_cursor >= session_lines {
+            app.picker_cursor - session_lines + 1
+        } else {
+            0
+        };
+        let scroll_end = (scroll_start + session_lines).min(num_sessions);
+
+        let mut visible: Vec<Line<'static>> = lines[scroll_start..scroll_end].to_vec();
+        visible.push(hint_line);
+        lines = visible;
+    }
+
+    let text = Text::from(lines);
+    frame.render_widget(Paragraph::new(text), inner);
 }
