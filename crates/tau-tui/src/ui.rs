@@ -301,8 +301,6 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Build right side: model name + connection status
     let right_text = if app.server_done {
         format!("{}/{} (disconnected)", app.provider, app.model)
-    } else if app.phase != AgentPhase::Idle {
-        format!("{}/{} ({})", app.provider, app.model, app.phase.label())
     } else {
         format!("{}/{}", app.provider, app.model)
     };
