@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +46,8 @@ pub enum PluginRequest {
     },
     /// Notify session start.
     SessionStart { cwd: String, session_id: String },
+    /// Notify the plugin it has been idle. Plugin may exit in response.
+    Idle,
     /// Server response (server -> plugin tunnel).
     /// Response to a PluginMessage::ServerRequest.
     ServerResponse {
@@ -149,11 +152,17 @@ pub struct PluginToolResult {
 pub struct PluginHandle {
     pub name: String,
     pub registration: PluginRegistration,
-    child: Child,
-    stdin: BufWriter<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    child: Option<Child>,
+    stdin: Option<BufWriter<ChildStdin>>,
+    stdout: Option<BufReader<ChildStdout>>,
     /// Piped stderr for diagnostics.
     stderr_pipe: Option<std::process::ChildStderr>,
+    /// Command used to spawn this plugin (for respawning).
+    spawn_command: Vec<String>,
+    /// Working directory used to spawn this plugin.
+    spawn_cwd: String,
+    /// When the plugin last had activity (tool call, hook, etc.).
+    pub last_activity: Instant,
 }
 
 impl PluginHandle {
@@ -195,10 +204,13 @@ impl PluginHandle {
                 hooks: Vec::new(),
                 commands: Vec::new(),
             },
-            child,
-            stdin,
-            stdout,
+            child: Some(child),
+            stdin: Some(stdin),
+            stdout: Some(stdout),
             stderr_pipe,
+            spawn_command: command.to_vec(),
+            spawn_cwd: cwd.to_string(),
+            last_activity: Instant::now(),
         };
 
         // Read the registration message
@@ -218,21 +230,23 @@ impl PluginHandle {
                 let mut diag = format!("plugin {:?} failed during registration: {}", command, e);
                 // Give child a moment to fully exit
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                match handle.child.try_wait() {
-                    Ok(Some(exit)) => {
-                        diag.push_str(&format!("\n  exit status: {}", exit));
-                        let stderr = handle.drain_stderr();
-                        if !stderr.is_empty() {
-                            diag.push_str(&format!(
-                                "\n  stderr:\n{}",
-                                indent_lines(&stderr, "    ")
-                            ));
+                if let Some(ref mut child) = handle.child {
+                    match child.try_wait() {
+                        Ok(Some(exit)) => {
+                            diag.push_str(&format!("\n  exit status: {}", exit));
+                            let stderr = handle.drain_stderr();
+                            if !stderr.is_empty() {
+                                diag.push_str(&format!(
+                                    "\n  stderr:\n{}",
+                                    indent_lines(&stderr, "    ")
+                                ));
+                            }
                         }
-                    }
-                    _ => {
-                        // Child still running but stdout closed -- kill it
-                        let _ = handle.child.kill();
-                        let _ = handle.child.wait();
+                        _ => {
+                            // Child still running but stdout closed -- kill it
+                            let _ = child.kill();
+                            let _ = child.wait();
+                        }
                     }
                 }
                 return Err(crate::Error::Io(diag));
@@ -244,13 +258,18 @@ impl PluginHandle {
 
     /// Send a request to the plugin.
     pub fn send(&mut self, req: &PluginRequest) -> crate::Result<()> {
+        self.last_activity = Instant::now();
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| crate::Error::Io(format!("plugin {} is not running", self.name)))?;
         let mut line =
             serde_json::to_string(req).map_err(|e| crate::Error::Parse(e.to_string()))?;
         line.push('\n');
-        self.stdin
+        stdin
             .write_all(line.as_bytes())
             .map_err(|e| crate::Error::Io(format!("write to plugin {}: {}", self.name, e)))?;
-        self.stdin
+        stdin
             .flush()
             .map_err(|e| crate::Error::Io(format!("flush plugin {}: {}", self.name, e)))?;
         Ok(())
@@ -258,14 +277,20 @@ impl PluginHandle {
 
     /// Read a single message from the plugin.
     pub fn read_message(&mut self) -> crate::Result<PluginMessage> {
+        let stdout = self
+            .stdout
+            .as_mut()
+            .ok_or_else(|| crate::Error::Io(format!("plugin {} is not running", self.name)))?;
         let mut line = String::new();
-        self.stdout
+        stdout
             .read_line(&mut line)
             .map_err(|e| crate::Error::Io(format!("read from plugin {}: {}", self.name, e)))?;
         if line.is_empty() {
             let mut msg = format!("plugin {} closed unexpectedly", self.name);
             // Wait briefly for child to fully exit so we can collect stderr
-            let _ = self.child.try_wait();
+            if let Some(ref mut child) = self.child {
+                let _ = child.try_wait();
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
             if let Some(exit) = self.child_exit_status() {
                 msg.push_str(&format!(" (exit status: {})", exit));
@@ -275,6 +300,10 @@ impl PluginHandle {
                     msg.push_str(&format!("\n  stderr:\n{}", indent_lines(&stderr, "    ")));
                 }
             }
+            // Mark as dead
+            self.child = None;
+            self.stdin = None;
+            self.stdout = None;
             return Err(crate::Error::Io(msg));
         }
         serde_json::from_str(&line)
@@ -367,7 +396,7 @@ impl PluginHandle {
 
     /// Try to get the child exit status without blocking.
     fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        self.child.as_mut()?.try_wait().ok().flatten()
     }
 
     /// Drain stderr from the child process.
@@ -389,15 +418,121 @@ impl PluginHandle {
         output
     }
 
-    /// Kill the plugin process.
-    pub fn kill(&mut self) {
-        match self.child.try_wait() {
-            Ok(Some(_)) => {}
-            _ => {
-                let _ = self.child.kill();
-                let _ = self.child.wait();
+    /// Check if the plugin process is alive.
+    pub fn is_alive(&mut self) -> bool {
+        match self.child {
+            Some(ref mut child) => match child.try_wait() {
+                Ok(Some(_)) => {
+                    // Process exited -- clean up
+                    self.child = None;
+                    self.stdin = None;
+                    self.stdout = None;
+                    false
+                }
+                Ok(None) => true, // Still running
+                Err(_) => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Send an Idle notification. If the plugin exits in response, mark it dead.
+    pub fn send_idle(&mut self) {
+        if self.stdin.is_none() {
+            return; // Already dead
+        }
+        // Send the idle message; ignore errors (plugin may have already exited)
+        let _ = self.send(&PluginRequest::Idle);
+        // Give the plugin a moment to exit if it wants to
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Check if it exited
+        self.is_alive();
+    }
+
+    /// Respawn the plugin process using the original command and cwd.
+    /// Preserves the existing registration.
+    pub fn respawn(&mut self) -> crate::Result<()> {
+        if self.is_alive() {
+            return Ok(()); // Already running
+        }
+
+        let cmd = &self.spawn_command;
+        let cwd = &self.spawn_cwd;
+
+        let mut child = Command::new(&cmd[0])
+            .args(&cmd[1..])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| crate::Error::Io(format!("respawn plugin {:?}: {}", cmd, e)))?;
+
+        let stdin = BufWriter::new(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| crate::Error::Io("plugin stdin not available".into()))?,
+        );
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| crate::Error::Io("plugin stdout not available".into()))?,
+        );
+
+        self.stderr_pipe = child.stderr.take();
+        self.child = Some(child);
+        self.stdin = Some(stdin);
+        self.stdout = Some(stdout);
+        self.last_activity = Instant::now();
+
+        // Read registration (must match original, but we don't enforce that)
+        let msg = self.read_message();
+        match msg {
+            Ok(PluginMessage::Register(_reg)) => {
+                // Registration received, plugin is alive again
+                eprintln!("respawned plugin '{}'", self.name);
+                Ok(())
+            }
+            Ok(_) => Err(crate::Error::Io(
+                "respawned plugin first message must be Register".into(),
+            )),
+            Err(e) => {
+                self.child = None;
+                self.stdin = None;
+                self.stdout = None;
+                Err(crate::Error::Io(format!(
+                    "respawn plugin '{}' failed: {}",
+                    self.name, e
+                )))
             }
         }
+    }
+
+    /// Ensure this plugin is running (respawn if dead).
+    pub fn ensure_alive(&mut self) -> crate::Result<()> {
+        if self.is_alive() {
+            Ok(())
+        } else {
+            self.respawn()
+        }
+    }
+
+    /// Kill the plugin process.
+    pub fn kill(&mut self) {
+        if let Some(ref mut child) = self.child {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        self.child = None;
+        self.stdin = None;
+        self.stdout = None;
     }
 
     /// Check if plugin wants a specific hook.
@@ -568,6 +703,7 @@ impl SessionPlugins {
     }
 
     /// Execute a tool call, routing to the right session plugin.
+    /// Respawns the plugin if it has exited.
     pub fn execute_tool(
         &mut self,
         tool_call: &ToolCall,
@@ -575,18 +711,43 @@ impl SessionPlugins {
         session_id: Option<&str>,
         on_output: &mut dyn FnMut(&str),
     ) -> crate::Result<crate::types::ToolResultMessage> {
-        let plugin = find_tool_plugin(&mut self.plugins, &tool_call.name);
-        match plugin {
-            Some(p) => p.execute_tool(tool_call, Some(cwd), session_id, on_output),
-            None => Err(crate::Error::Io(format!(
+        // Ensure the target plugin is alive (respawn if idle-exited)
+        if let Some(p) = find_tool_plugin(&mut self.plugins, &tool_call.name) {
+            p.ensure_alive()?;
+            p.execute_tool(tool_call, Some(cwd), session_id, on_output)
+        } else {
+            Err(crate::Error::Io(format!(
                 "no session plugin provides tool '{}'",
                 tool_call.name
-            ))),
+            )))
         }
     }
 
     pub fn call_hook(&mut self, name: &str, data: &serde_json::Value) -> Vec<HookResult> {
+        // Ensure plugins are alive before calling hooks
+        for p in &mut self.plugins {
+            if p.wants_hook(name) && p.ensure_alive().is_err() {
+                eprintln!("plugin {} respawn for hook {} failed", p.name, name);
+            }
+        }
         call_hook_all(&mut self.plugins, name, data)
+    }
+
+    /// Send idle notification to all plugins. Plugins may exit in response.
+    pub fn send_idle_all(&mut self) {
+        for p in &mut self.plugins {
+            p.send_idle();
+        }
+    }
+
+    /// Check the oldest last_activity across all plugins.
+    pub fn last_activity(&self) -> Option<Instant> {
+        self.plugins.iter().map(|p| p.last_activity).min()
+    }
+
+    /// Check if any plugin is still alive.
+    pub fn any_alive(&mut self) -> bool {
+        self.plugins.iter_mut().any(|p| p.is_alive())
     }
 
     pub fn kill_all(&mut self) {
@@ -766,6 +927,7 @@ impl PluginManager {
         {
             let plugin = find_tool_plugin(&mut sp.plugins, &tool_call.name);
             if let Some(p) = plugin {
+                p.ensure_alive()?;
                 let mut result = p.execute_tool_with_server(
                     tool_call,
                     Some(cwd),
@@ -802,6 +964,7 @@ impl PluginManager {
     /// Take a plugin handle out of the manager for tool execution.
     /// Returns the handle and a source token for returning it.
     /// While taken, no other caller can use this specific plugin.
+    /// Respawns the plugin if it has exited.
     pub fn take_tool_plugin(
         &mut self,
         session_id: &str,
@@ -811,6 +974,11 @@ impl PluginManager {
         if let Some(sp) = self.session_plugins.get_mut(session_id)
             && let Some(idx) = sp.plugins.iter().position(|p| p.has_tool(tool_name))
         {
+            let handle = &mut sp.plugins[idx];
+            if let Err(e) = handle.ensure_alive() {
+                eprintln!("plugin '{}' respawn failed: {}", handle.name, e);
+                return None;
+            }
             let handle = sp.plugins.remove(idx);
             return Some((
                 handle,
@@ -966,6 +1134,41 @@ impl PluginManager {
             sp.kill_all();
         }
     }
+
+    /// Send idle notifications to session plugins that have been inactive
+    /// and have no active subscribers. Returns list of session IDs that were idled.
+    pub fn idle_sweep(
+        &mut self,
+        idle_timeout: std::time::Duration,
+        has_subscriber: &dyn Fn(&str) -> bool,
+    ) -> Vec<String> {
+        let now = Instant::now();
+        let mut idled = Vec::new();
+        for (session_id, sp) in &mut self.session_plugins {
+            // Skip sessions with active subscribers
+            if has_subscriber(session_id) {
+                continue;
+            }
+            // Skip sessions with no alive plugins
+            if !sp.any_alive() {
+                continue;
+            }
+            // Check if idle long enough
+            if let Some(last) = sp.last_activity()
+                && now.duration_since(last) >= idle_timeout
+            {
+                eprintln!("sending idle to session '{}' plugins", session_id);
+                sp.send_idle_all();
+                idled.push(session_id.clone());
+            }
+        }
+        idled
+    }
+
+    /// Get the configured idle timeout.
+    pub fn idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.config.idle_timeout_secs)
+    }
 }
 
 impl Drop for PluginManager {
@@ -978,7 +1181,7 @@ impl Drop for PluginManager {
 // Plugin config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginsConfig {
     /// Prefix prepended to all session plugin commands.
     /// Example: `["sandbox", "run", "--"]`
@@ -994,6 +1197,28 @@ pub struct PluginsConfig {
     /// Used in tests where the worker binary isn't available.
     #[serde(default)]
     pub no_default_worker: bool,
+    /// Idle timeout in seconds for session plugins. After this duration of
+    /// inactivity (no tool calls/hooks) with no connected subscribers,
+    /// plugins receive an Idle notification and may exit.
+    /// Default: 30 seconds. Set to 0 to disable.
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for PluginsConfig {
+    fn default() -> Self {
+        Self {
+            session_prefix: None,
+            global: HashMap::new(),
+            session: HashMap::new(),
+            no_default_worker: false,
+            idle_timeout_secs: default_idle_timeout_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

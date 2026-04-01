@@ -265,6 +265,7 @@ fn plugin_manager_integration() {
             .collect(),
         session: Default::default(),
         no_default_worker: false,
+        idle_timeout_secs: 30,
     };
 
     let mut manager = PluginManager::new(config);
@@ -338,4 +339,212 @@ fn plugin_after_tool_result_hook() {
     let append = result.tool_result_append.unwrap();
     assert!(append.contains("TEST DIAGNOSTICS"));
     assert!(append.contains("edit"));
+}
+
+#[test]
+fn plugin_send_idle_kills_worker() {
+    // The built-in worker exits on Idle. Spawn it and verify.
+    let exe = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tau-cli");
+
+    // Only run if the binary exists (it may not in all test environments)
+    if !exe.exists() {
+        eprintln!("skipping: tau-cli binary not found at {:?}", exe);
+        return;
+    }
+
+    let cmd = vec![exe.to_string_lossy().to_string(), "worker".to_string()];
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    assert!(handle.is_alive());
+
+    handle.send_idle();
+    // After idle, worker should have exited
+    // Give it a moment to fully exit
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!handle.is_alive());
+}
+
+#[test]
+fn plugin_is_alive_tracks_state() {
+    let cmd = test_plugin_command();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+
+    // Plugin should be alive after spawn
+    assert!(handle.is_alive());
+
+    // Kill it and check
+    handle.kill();
+    assert!(!handle.is_alive());
+}
+
+#[test]
+fn plugin_respawn_after_kill() {
+    let cmd = test_plugin_command();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+
+    // Kill the plugin
+    handle.kill();
+    assert!(!handle.is_alive());
+
+    // Respawn it
+    handle.respawn().unwrap();
+    assert!(handle.is_alive());
+
+    // Verify it still works -- call a hook
+    let result = handle
+        .call_hook("before_agent_start", serde_json::json!({}))
+        .unwrap();
+    assert!(result.message.is_some());
+    assert!(result.message.unwrap().content.contains("test plugin"));
+}
+
+#[test]
+fn plugin_ensure_alive_no_op_when_running() {
+    let cmd = test_plugin_command();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+
+    // Should be a no-op when already alive
+    handle.ensure_alive().unwrap();
+    assert!(handle.is_alive());
+
+    // Execute a tool to confirm it works
+    let tool_call = ToolCall {
+        id: "test-1".into(),
+        name: "echo_tool".into(),
+        arguments: serde_json::json!({"message": "alive"}),
+    };
+    let result = handle
+        .execute_tool(&tool_call, None, None, &mut |_| {})
+        .unwrap();
+    assert!(!result.is_error);
+}
+
+#[test]
+fn plugin_ensure_alive_respawns_when_dead() {
+    let cmd = test_plugin_command();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+
+    // Kill it
+    handle.kill();
+    assert!(!handle.is_alive());
+
+    // ensure_alive should respawn
+    handle.ensure_alive().unwrap();
+    assert!(handle.is_alive());
+
+    // Execute a tool to confirm it works after respawn
+    let tool_call = ToolCall {
+        id: "test-1".into(),
+        name: "echo_tool".into(),
+        arguments: serde_json::json!({"message": "respawned"}),
+    };
+    let result = handle
+        .execute_tool(&tool_call, None, None, &mut |_| {})
+        .unwrap();
+    assert!(!result.is_error);
+    let text: String = result
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(text.contains("respawned"));
+}
+
+#[test]
+fn plugin_last_activity_updates_on_send() {
+    let cmd = test_plugin_command();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+
+    let t1 = handle.last_activity;
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // Sending a hook should update last_activity
+    let _ = handle.call_hook("before_agent_start", serde_json::json!({}));
+    let t2 = handle.last_activity;
+    assert!(t2 > t1);
+}
+
+#[test]
+fn session_plugins_idle_sweep() {
+    let cmd = test_plugin_command();
+    let config = PluginsConfig {
+        session_prefix: None,
+        global: Default::default(),
+        session: [("test".into(), PluginEntry { command: cmd })]
+            .into_iter()
+            .collect(),
+        no_default_worker: true,
+        idle_timeout_secs: 0, // immediate idle
+    };
+
+    let mut manager = PluginManager::new(config);
+    let session_id = "idle-test";
+    manager.ensure_session_plugins(session_id, "/tmp").unwrap();
+
+    // Set last_activity to the past so idle sweep triggers
+    // We can't easily backdate, so use a zero idle_timeout
+    let idle_timeout = std::time::Duration::from_secs(0);
+    let no_subscribers = |_: &str| false;
+
+    let idled = manager.idle_sweep(idle_timeout, &no_subscribers);
+    assert!(idled.contains(&session_id.to_string()));
+}
+
+#[test]
+fn session_plugins_idle_sweep_skips_subscribed() {
+    let cmd = test_plugin_command();
+    let config = PluginsConfig {
+        session_prefix: None,
+        global: Default::default(),
+        session: [("test".into(), PluginEntry { command: cmd })]
+            .into_iter()
+            .collect(),
+        no_default_worker: true,
+        idle_timeout_secs: 0,
+    };
+
+    let mut manager = PluginManager::new(config);
+    let session_id = "subscribed-test";
+    manager.ensure_session_plugins(session_id, "/tmp").unwrap();
+
+    let idle_timeout = std::time::Duration::from_secs(0);
+    let has_subscriber = |sid: &str| sid == session_id;
+
+    let idled = manager.idle_sweep(idle_timeout, &has_subscriber);
+    assert!(idled.is_empty());
+}
+
+#[test]
+fn plugins_config_default_idle_timeout() {
+    let config = PluginsConfig::default();
+    assert_eq!(config.idle_timeout_secs, 30);
+}
+
+#[test]
+fn plugins_config_toml_idle_timeout() {
+    let toml_str = r#"
+idle_timeout_secs = 60
+no_default_worker = true
+"#;
+    let config: PluginsConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.idle_timeout_secs, 60);
+}
+
+#[test]
+fn plugins_config_toml_default_idle_timeout() {
+    // When idle_timeout_secs is not specified, should default to 30
+    let toml_str = r#"
+no_default_worker = true
+"#;
+    let config: PluginsConfig = toml::from_str(toml_str).unwrap();
+    assert_eq!(config.idle_timeout_secs, 30);
 }

@@ -239,6 +239,10 @@ pub fn run_worker_loop() {
                     &PluginMessage::HookResult(crate::plugin::HookResult::default()),
                 );
             }
+            PluginRequest::Idle => {
+                // Exit cleanly on idle notification
+                break;
+            }
             PluginRequest::ServerResponse { .. } => {
                 // Handled inline during server_request calls -- ignore stray ones
             }

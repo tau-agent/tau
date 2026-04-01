@@ -154,6 +154,9 @@ while True:
                 "content": [{"type": "text", "text": f"unknown tool: {tool_name}"}],
                 "is_error": True
             })
+    elif msg_type == "idle":
+        # Plugin can choose to exit on idle. For testing, we exit.
+        sys.exit(0)
     else:
         # Unknown message type, ignore
         pass

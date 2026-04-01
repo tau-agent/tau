@@ -226,6 +226,52 @@ impl ShutdownHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Idle sweep for session plugins
+// ---------------------------------------------------------------------------
+
+/// Spawn a background task that periodically sends idle notifications
+/// to session plugins that have no active subscribers.
+fn spawn_idle_sweep(
+    plugins: Arc<Mutex<crate::plugin::PluginManager>>,
+    state: SharedState,
+    shutdown: ShutdownHandle,
+) {
+    let idle_timeout = plugins.lock().unwrap().idle_timeout();
+    if idle_timeout.is_zero() {
+        return; // Idle sweep disabled
+    }
+    // Sweep interval: half the idle timeout, minimum 5s
+    let interval = std::cmp::max(idle_timeout / 2, std::time::Duration::from_secs(5));
+    smol::spawn(async move {
+        loop {
+            smol::Timer::after(interval).await;
+            if shutdown.is_shutting_down() {
+                break;
+            }
+            // Collect subscriber info on the async side (cheap, just lock state briefly)
+            let subscribed_sessions: std::collections::HashSet<String> = {
+                let st = state.lock().unwrap();
+                st.subscribers
+                    .iter()
+                    .filter(|(_, subs)| !subs.is_empty())
+                    .map(|(id, _)| id.clone())
+                    .collect()
+            };
+            // Run sweep on a blocking thread since plugin I/O is synchronous
+            let plugins_clone = plugins.clone();
+            let _ = smol::unblock(move || {
+                let mut pm = plugins_clone.lock().unwrap();
+                pm.idle_sweep(idle_timeout, &|session_id: &str| {
+                    subscribed_sessions.contains(session_id)
+                });
+            })
+            .await;
+        }
+    })
+    .detach();
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -334,6 +380,9 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     })
     .detach();
 
+    // Spawn idle sweep task for session plugins.
+    spawn_idle_sweep(plugins.clone(), state.clone(), shutdown.clone());
+
     loop {
         let (stream, _) = listener
             .accept()
@@ -432,6 +481,9 @@ pub async fn run() -> crate::Result<()> {
         let _ = Async::<UnixStream>::connect(&sock_clone).await;
     })
     .detach();
+
+    // Spawn idle sweep task for session plugins.
+    spawn_idle_sweep(plugins.clone(), state.clone(), shutdown.clone());
 
     loop {
         let (stream, _) = listener
