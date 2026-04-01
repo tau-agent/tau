@@ -968,15 +968,14 @@ async fn handle_client(
                 }
 
                 // Send current agent phase so newly connected TUI shows correct state.
-                {
+                let phase_resp = {
                     let st = state.lock().unwrap();
                     let phase = st.phases.get(&session_id).copied().unwrap_or_default();
-                    let phase_resp = Response::Stream {
+                    Response::Stream {
                         event: Box::new(crate::types::StreamEvent::Phase { phase }),
-                    };
-                    drop(st);
-                    send(&mut writer, &phase_resp).await.ok();
-                }
+                    }
+                };
+                send(&mut writer, &phase_resp).await.ok();
 
                 // Forward events until the channel closes or client disconnects.
                 loop {
