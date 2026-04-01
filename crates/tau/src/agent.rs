@@ -407,16 +407,20 @@ async fn stream_with_retry(
                     .unwrap_or_else(|| {
                         (config.retry_base_ms * 2u64.pow(attempt as u32)).min(MAX_RETRY_DELAY_MS)
                     });
+                let delay_human = format_duration_human(delay_ms);
                 let status_msg = format!(
-                    "retryable error (attempt {}/{}), retrying in {}ms: {}",
+                    "retryable error (attempt {}/{}), retrying in {}: {}",
                     attempt + 1,
                     config.max_retries,
-                    delay_ms,
+                    delay_human,
                     err_msg
                 );
                 eprintln!("{}", status_msg);
                 let _ = event_tx.try_send(StreamEvent::Status {
                     message: status_msg,
+                });
+                let _ = event_tx.try_send(StreamEvent::Phase {
+                    phase: crate::types::AgentPhase::RateLimited,
                 });
                 // Async cancellable sleep
                 cancellable_sleep(
@@ -445,6 +449,30 @@ fn parse_retry_after(err_msg: &str) -> Option<u64> {
     let rest = &err_msg[start..];
     let end = rest.find('s')?;
     rest[..end].parse().ok()
+}
+
+/// Format milliseconds as a human-readable duration string.
+pub fn format_duration_human(ms: u64) -> String {
+    let total_secs = ms / 1000;
+    if total_secs < 60 {
+        format!("{}s", total_secs)
+    } else if total_secs < 3600 {
+        let m = total_secs / 60;
+        let s = total_secs % 60;
+        if s == 0 {
+            format!("{}m", m)
+        } else {
+            format!("{}m{}s", m, s)
+        }
+    } else {
+        let h = total_secs / 3600;
+        let m = (total_secs % 3600) / 60;
+        if m == 0 {
+            format!("{}h", h)
+        } else {
+            format!("{}h{}m", h, m)
+        }
+    }
 }
 
 /// Consume a stream, forwarding events to the channel and returning the final message.

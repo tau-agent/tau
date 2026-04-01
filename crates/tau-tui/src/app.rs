@@ -85,6 +85,8 @@ pub struct App {
     pub textarea: TextArea<'static>,
     /// Spinner frame counter.
     pub spinner_frame: usize,
+    /// Tick sub-counter for slowing spinner during rate limits.
+    pub tick_counter: usize,
     /// Last escape press time for double-escape detection.
     pub last_escape: std::time::Instant,
     /// Messages queued while the agent is working.
@@ -138,6 +140,7 @@ impl App {
             should_quit: false,
             textarea,
             spinner_frame: 0,
+            tick_counter: 0,
             last_escape: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(10))
                 .unwrap(),
@@ -330,7 +333,16 @@ impl App {
             }
             Event::Tick => {
                 if self.mode == AppMode::Streaming {
-                    self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                    // Slow spinner during rate limit (advance ~2x/sec instead of ~15x/sec)
+                    if self.phase == AgentPhase::RateLimited {
+                        self.tick_counter += 1;
+                        if self.tick_counter >= 8 {
+                            self.tick_counter = 0;
+                            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                        }
+                    } else {
+                        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+                    }
                 }
                 None
             }

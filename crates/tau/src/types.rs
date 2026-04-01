@@ -321,6 +321,8 @@ pub enum AgentPhase {
     ToolExec,
     /// Running context compaction.
     Compacting,
+    /// Waiting for rate limit / retry backoff.
+    RateLimited,
 }
 
 impl AgentPhase {
@@ -335,6 +337,7 @@ impl AgentPhase {
             Self::Responding => "working...",
             Self::ToolExec => "running tools...",
             Self::Compacting => "compacting...",
+            Self::RateLimited => "rate limited...",
         }
     }
 }

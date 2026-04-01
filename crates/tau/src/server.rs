@@ -1505,11 +1505,11 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
 ) -> crate::Result<Vec<Message>> {
     // Check provider throttle — sleep if rate limited
     if let Some(remaining) = throttle.check(&model.provider) {
-        let secs = remaining.as_secs();
-        eprintln!("provider '{}' throttled, waiting {}s", model.provider, secs);
+        let human = crate::agent::format_duration_human(remaining.as_millis() as u64);
+        eprintln!("provider '{}' throttled, waiting {}", model.provider, human);
         let msg = format!(
-            "provider '{}' rate limited, retrying in {}s...",
-            model.provider, secs
+            "provider '{}' rate limited, retrying in {}...",
+            model.provider, human
         );
         // Notify as a non-fatal status (not Error — Error would cause the TUI
         // to switch out of Streaming mode prematurely).
@@ -1520,6 +1520,8 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         };
         send(writer, &status_resp).await.ok();
         broadcast_to_subscribers(state, session_id, &status_resp);
+        // Emit rate-limited phase
+        emit_phase(state, session_id, crate::types::AgentPhase::RateLimited);
         // Sleep with periodic cancellation checks
         let deadline = std::time::Instant::now() + remaining;
         while std::time::Instant::now() < deadline {
