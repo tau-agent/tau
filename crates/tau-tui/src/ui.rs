@@ -122,8 +122,9 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    // Add working indicator if streaming
-    if app.mode == AppMode::Streaming {
+    // Add working indicator if streaming (but not for Idle phase —
+    // Idle means no active agent; spinner would be misleading).
+    if app.mode == AppMode::Streaming && app.phase != AgentPhase::Idle {
         let needs_indicator = !matches!(
             app.messages.last(),
             Some(crate::message::MessageItem::AssistantStreaming { .. })

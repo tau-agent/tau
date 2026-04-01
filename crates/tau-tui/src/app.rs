@@ -839,6 +839,20 @@ impl App {
     fn handle_server_response(&mut self, response: Response) {
         match response {
             Response::Stream { event } => {
+                // Phase(Idle) means no active agent — if we're in Streaming
+                // mode (e.g. after a subscribe reconnect that missed AgentDone),
+                // transition back to Input.
+                if let StreamEvent::Phase {
+                    phase: AgentPhase::Idle,
+                } = *event
+                {
+                    if self.mode == AppMode::Streaming {
+                        self.finalize_in_flight();
+                        self.mode = AppMode::Input;
+                    }
+                    self.phase = AgentPhase::Idle;
+                    return;
+                }
                 // If we receive stream events while in Input mode,
                 // another client is chatting — switch to streaming view.
                 if self.mode == AppMode::Input {
