@@ -382,6 +382,13 @@ pub async fn run(
 /// Maximum retry delay in milliseconds (60 seconds).
 const MAX_RETRY_DELAY_MS: u64 = 60_000;
 
+/// Maximum retries for timeout errors (fewer than rate limits, since each
+/// timeout already consumed 30-120s of waiting).
+const MAX_TIMEOUT_RETRIES: usize = 2;
+
+/// Fixed delay between timeout retries in milliseconds (first retry is immediate).
+const TIMEOUT_RETRY_DELAY_MS: u64 = 5_000;
+
 /// Stream a single LLM call with retry logic for transient errors.
 async fn stream_with_retry(
     registry: &ProviderRegistry,
@@ -391,7 +398,8 @@ async fn stream_with_retry(
     config: &AgentConfig,
     event_tx: &EventSender,
 ) -> crate::Result<AssistantMessage> {
-    for attempt in 0..=config.max_retries {
+    let max_attempts = config.max_retries + 1;
+    for attempt in 0..max_attempts {
         let rx = registry.stream(model, context, options)?;
         let should_stop = config.should_stop.as_deref();
         let message = consume_stream(rx, event_tx, should_stop).await;
@@ -405,18 +413,48 @@ async fn stream_with_retry(
         if message.stop_reason == StopReason::Error
             && let Some(ref err_msg) = message.error_message
         {
-            if is_retryable(err_msg) && attempt < config.max_retries {
-                // Use retry-after from the error if present, otherwise exponential backoff
-                let delay_ms = parse_retry_after(err_msg)
-                    .map(|secs| secs * 1000)
-                    .unwrap_or_else(|| {
-                        (config.retry_base_ms * 2u64.pow(attempt as u32)).min(MAX_RETRY_DELAY_MS)
-                    });
-                let delay_human = format_duration_human(delay_ms);
+            let timeout = is_timeout(err_msg);
+            let retryable = timeout || is_retryable(err_msg);
+
+            // Timeouts get fewer retries since each one already burned 30-120s.
+            let max_retries_for_error = if timeout {
+                MAX_TIMEOUT_RETRIES
+            } else {
+                config.max_retries
+            };
+
+            if retryable && attempt < max_retries_for_error {
+                let delay_ms = if timeout {
+                    // First timeout retry is immediate, subsequent use fixed delay.
+                    if attempt == 0 {
+                        0
+                    } else {
+                        TIMEOUT_RETRY_DELAY_MS
+                    }
+                } else {
+                    // Rate limit / 5xx: use retry-after header or exponential backoff.
+                    parse_retry_after(err_msg)
+                        .map(|secs| secs * 1000)
+                        .unwrap_or_else(|| {
+                            (config.retry_base_ms * 2u64.pow(attempt as u32))
+                                .min(MAX_RETRY_DELAY_MS)
+                        })
+                };
+
+                let delay_human = if delay_ms == 0 {
+                    "immediately".to_string()
+                } else {
+                    format!("in {}", format_duration_human(delay_ms))
+                };
                 let status_msg = format!(
-                    "retryable error (attempt {}/{}), retrying in {}: {}",
+                    "{} (attempt {}/{}), retrying {}: {}",
+                    if timeout {
+                        "timeout"
+                    } else {
+                        "retryable error"
+                    },
                     attempt + 1,
-                    config.max_retries,
+                    max_retries_for_error,
                     delay_human,
                     err_msg
                 );
@@ -427,12 +465,13 @@ async fn stream_with_retry(
                 let _ = event_tx.try_send(StreamEvent::Phase {
                     phase: crate::types::AgentPhase::RateLimited,
                 });
-                // Async cancellable sleep
-                cancellable_sleep(
-                    std::time::Duration::from_millis(delay_ms),
-                    config.should_stop.as_deref(),
-                )
-                .await?;
+                if delay_ms > 0 {
+                    cancellable_sleep(
+                        std::time::Duration::from_millis(delay_ms),
+                        config.should_stop.as_deref(),
+                    )
+                    .await?;
+                }
                 continue;
             }
             if is_context_overflow(err_msg) {
@@ -521,7 +560,14 @@ async fn consume_stream(
     }
 }
 
-/// Check if an error message indicates a transient/retryable condition.
+/// Check if an error message indicates a timeout.
+fn is_timeout(err_msg: &str) -> bool {
+    let lower = err_msg.to_lowercase();
+    lower.contains("timeout")
+}
+
+/// Check if an error message indicates a transient/retryable condition
+/// (excluding timeouts, which are handled separately).
 fn is_retryable(err_msg: &str) -> bool {
     let lower = err_msg.to_lowercase();
     lower.contains("529")
@@ -849,6 +895,17 @@ mod tests {
         assert!(is_retryable("rate limit exceeded (429)"));
         assert!(is_retryable("503 Service Unavailable"));
         assert!(!is_retryable("invalid api key"));
+        // Timeouts are NOT matched by is_retryable (separate function)
+        assert!(!is_retryable("timeout: connect timed out"));
+    }
+
+    #[test]
+    fn timeout_errors() {
+        assert!(is_timeout("timeout: connect timed out"));
+        assert!(is_timeout("timeout: recv_response timed out"));
+        assert!(is_timeout("Timeout: operation took too long"));
+        assert!(!is_timeout("HTTP 429 rate limit"));
+        assert!(!is_timeout("invalid api key"));
     }
 
     #[test]
@@ -1078,6 +1135,86 @@ mod tests {
         );
         assert_eq!(parse_retry_after("HTTP 500: internal error"), None);
         assert_eq!(parse_retry_after("no retry info here"), None);
+    }
+
+    #[test]
+    fn timeout_retry_succeeds_on_second_attempt() {
+        smol::block_on(async {
+            // First call times out, second succeeds
+            let registry = setup_registry(vec![
+                MockResponse::Error("timeout: recv_response timed out".into()),
+                MockResponse::Text("recovered!".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig::default();
+            let mut worker = InProcessWorker::new();
+            let (tx, rx) = smol::channel::unbounded();
+
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.new_messages.len(), 1);
+            assert!(
+                matches!(&result.new_messages[0], Message::Assistant(a) if a.text() == "recovered!")
+            );
+
+            // Check that a status event was emitted about the timeout retry
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            let has_timeout_status = events.iter().any(
+                |e| matches!(e, StreamEvent::Status { message } if message.contains("timeout")),
+            );
+            assert!(has_timeout_status, "should emit status about timeout retry");
+        });
+    }
+
+    #[test]
+    fn timeout_retry_exhausted_returns_error() {
+        smol::block_on(async {
+            // All 3 attempts (1 initial + 2 retries) time out
+            let registry = setup_registry(vec![
+                MockResponse::Error("timeout: connect timed out".into()),
+                MockResponse::Error("timeout: connect timed out".into()),
+                MockResponse::Error("timeout: connect timed out".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig::default();
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
+
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            // After exhausting retries, the error message is returned
+            assert_eq!(result.new_messages.len(), 1);
+            assert!(
+                matches!(&result.new_messages[0], Message::Assistant(a) if a.stop_reason == StopReason::Error)
+            );
+        });
     }
 
     // ------- repair_messages tests -------
