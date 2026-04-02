@@ -30,6 +30,9 @@ pub enum Request {
         /// Max descendant sessions this session can spawn.
         #[serde(default)]
         child_budget: u32,
+        /// Short description of the session's task.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tagline: Option<String>,
     },
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },
@@ -151,6 +154,15 @@ pub struct SessionInfo {
     /// Budget for descendant sessions.
     #[serde(default)]
     pub child_budget: u32,
+    /// Short description of what this session is working on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tagline: Option<String>,
+    /// Current agent phase: "idle", "thinking", "responding", "tool_exec", etc.
+    #[serde(default = "default_state")]
+    pub state: String,
+    /// Context usage as percentage (0-100), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_pct: Option<f64>,
 }
 
 /// Result for a single session in WaitSessions response.
@@ -165,6 +177,10 @@ pub struct SessionResult {
 
 fn default_wait_timeout() -> u64 {
     300
+}
+
+fn default_state() -> String {
+    "idle".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

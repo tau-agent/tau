@@ -21,6 +21,7 @@ pub struct StoredSession {
     pub created_at: i64,
     pub parent_id: Option<String>,
     pub child_budget: u32,
+    pub tagline: Option<String>,
 }
 
 pub struct Db {
@@ -55,7 +56,8 @@ impl Db {
                 is_subscription INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL,
                 parent_id      TEXT,
-                child_budget   INTEGER NOT NULL DEFAULT 16
+                child_budget   INTEGER NOT NULL DEFAULT 16,
+                tagline        TEXT
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY,
@@ -73,6 +75,7 @@ impl Db {
         let _ = conn.execute_batch(
             "ALTER TABLE sessions ADD COLUMN child_budget INTEGER NOT NULL DEFAULT 16;",
         );
+        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN tagline TEXT;");
 
         // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
@@ -101,7 +104,8 @@ impl Db {
                 is_subscription INTEGER NOT NULL DEFAULT 0,
                 created_at     INTEGER NOT NULL,
                 parent_id      TEXT,
-                child_budget   INTEGER NOT NULL DEFAULT 16
+                child_budget   INTEGER NOT NULL DEFAULT 16,
+                tagline        TEXT
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,
@@ -126,8 +130,8 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     session.id,
                     model_json,
@@ -137,6 +141,7 @@ impl Db {
                     session.created_at,
                     session.parent_id,
                     session.child_budget,
+                    session.tagline,
                 ],
             )
             .map_err(|e| crate::Error::Io(format!("insert session: {}", e)))?;
@@ -147,7 +152,7 @@ impl Db {
     pub fn get_session(&self, id: &str) -> crate::Result<Option<StoredSession>> {
         self.conn
             .query_row(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline
                  FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -168,6 +173,7 @@ impl Db {
                         created_at: row.get(5)?,
                         parent_id: row.get(6)?,
                         child_budget: row.get::<_, i32>(7)? as u32,
+                        tagline: row.get(8)?,
                     })
                 },
             )
@@ -180,7 +186,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline
                  FROM sessions ORDER BY created_at",
             )
             .map_err(|e| crate::Error::Io(format!("prepare list: {}", e)))?;
@@ -204,6 +210,7 @@ impl Db {
                     created_at: row.get(5)?,
                     parent_id: row.get(6)?,
                     child_budget: row.get::<_, i32>(7)? as u32,
+                    tagline: row.get(8)?,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list sessions: {}", e)))?;
@@ -255,7 +262,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline
                  FROM sessions WHERE parent_id = ?1 ORDER BY created_at",
             )
             .map_err(|e| crate::Error::Io(format!("prepare children: {}", e)))?;
@@ -279,6 +286,7 @@ impl Db {
                     created_at: row.get(5)?,
                     parent_id: row.get(6)?,
                     child_budget: row.get::<_, i32>(7)? as u32,
+                    tagline: row.get(8)?,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list children: {}", e)))?;
@@ -374,6 +382,17 @@ impl Db {
                 params![model_json, session_id],
             )
             .map_err(|e| crate::Error::Io(format!("update model: {}", e)))?;
+        Ok(())
+    }
+
+    /// Update the tagline for a session.
+    pub fn update_tagline(&self, session_id: &str, tagline: &str) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET tagline = ?1 WHERE id = ?2",
+                params![tagline, session_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("update tagline: {}", e)))?;
         Ok(())
     }
 
@@ -575,6 +594,7 @@ mod tests {
             created_at: 1000,
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         };
         db.create_session(&session).unwrap();
 
@@ -597,6 +617,7 @@ mod tests {
             created_at: 1000,
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         };
         db.create_session(&session).unwrap();
 
@@ -629,6 +650,7 @@ mod tests {
             created_at: 1000,
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         };
         db.create_session(&session).unwrap();
         db.append_message("s1", &Message::User(UserMessage::text("hi")))
@@ -652,6 +674,7 @@ mod tests {
                 created_at: ts,
                 parent_id: None,
                 child_budget: 0,
+                tagline: None,
             })
             .unwrap();
         }
@@ -674,6 +697,7 @@ mod tests {
             created_at: 1000,
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         })
         .unwrap();
         assert_eq!(db.next_session_id().unwrap(), "s6");
@@ -693,6 +717,7 @@ mod tests {
             created_at: 1000,
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         })
         .unwrap();
 
@@ -710,6 +735,7 @@ mod tests {
             created_at: 2000,
             parent_id: Some("root".into()),
             child_budget: 0,
+            tagline: None,
         })
         .unwrap();
 
@@ -726,6 +752,7 @@ mod tests {
             created_at: 3000,
             parent_id: Some("root".into()),
             child_budget: 2,
+            tagline: None,
         })
         .unwrap();
 
@@ -752,6 +779,7 @@ mod tests {
             created_at: 1000,
             parent_id: None,
             child_budget: 10,
+            tagline: None,
         })
         .unwrap();
 
@@ -764,6 +792,7 @@ mod tests {
             created_at: 2000,
             parent_id: Some("root".into()),
             child_budget: 3,
+            tagline: None,
         })
         .unwrap();
 
@@ -777,6 +806,7 @@ mod tests {
             created_at: 3000,
             parent_id: Some("c1".into()),
             child_budget: 0,
+            tagline: None,
         })
         .unwrap();
 
@@ -800,6 +830,7 @@ mod tests {
             created_at: 1000,
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         })
         .unwrap();
 
@@ -812,6 +843,7 @@ mod tests {
             created_at: 2000,
             parent_id: Some("root".into()),
             child_budget: 0,
+            tagline: None,
         })
         .unwrap();
 
@@ -837,6 +869,7 @@ mod tests {
             created_at: 1000,
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         })
         .unwrap();
         db.append_message("top", &Message::User(UserMessage::text("hello")))
@@ -852,6 +885,7 @@ mod tests {
             created_at: 2000,
             parent_id: Some("top".into()),
             child_budget: 0,
+            tagline: None,
         })
         .unwrap();
         db.append_message("child1", &Message::User(UserMessage::text("work")))
@@ -867,6 +901,7 @@ mod tests {
             created_at: 3000,
             parent_id: Some("top".into()),
             child_budget: 0,
+            tagline: None,
         })
         .unwrap();
         db.append_message(
@@ -885,6 +920,7 @@ mod tests {
             created_at: 4000,
             parent_id: Some("top".into()),
             child_budget: 0,
+            tagline: None,
         })
         .unwrap();
         db.append_message(
@@ -913,6 +949,7 @@ mod tests {
             created_at: 5000,
             parent_id: Some("top".into()),
             child_budget: 0,
+            tagline: None,
         })
         .unwrap();
 

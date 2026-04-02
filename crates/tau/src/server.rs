@@ -75,19 +75,36 @@ fn session_info(
     messages: &[Message],
     last_message_time: Option<i64>,
     child_count: usize,
+    phase: Option<&crate::types::AgentPhase>,
 ) -> SessionInfo {
+    let stats = compute_stats(messages, &stored.model, stored.is_subscription);
+    let context_pct = if stats.context_window > 0 {
+        stats
+            .context_tokens
+            .map(|t| (t as f64 / stats.context_window as f64) * 100.0)
+    } else {
+        None
+    };
     SessionInfo {
         id: stored.id.clone(),
         model: stored.model.id.clone(),
         provider: stored.model.provider.clone(),
         cwd: stored.cwd.clone(),
         message_count: messages.len(),
-        stats: compute_stats(messages, &stored.model, stored.is_subscription),
+        stats,
         // Timestamps in DB are milliseconds; convert to seconds for display
         last_activity: last_message_time.unwrap_or(stored.created_at) / 1000,
         parent_id: stored.parent_id.clone(),
         child_count,
         child_budget: stored.child_budget,
+        tagline: stored.tagline.clone(),
+        state: phase
+            .copied()
+            .unwrap_or_default()
+            .label()
+            .trim_end_matches("...")
+            .to_string(),
+        context_pct,
     }
 }
 
@@ -641,6 +658,7 @@ async fn handle_client(
                 cwd,
                 parent_id,
                 child_budget,
+                tagline,
             } => {
                 // Budget check (before acquiring state lock for creation)
                 let budget_error = {
@@ -729,6 +747,7 @@ async fn handle_client(
                         created_at: crate::types::timestamp_ms() as i64,
                         parent_id: parent_id.clone(),
                         child_budget,
+                        tagline,
                     };
                     st.db.create_session(&stored)?;
                     Ok::<String, crate::Error>(id)
@@ -756,7 +775,13 @@ async fn handle_client(
                             let messages = st.db.get_messages(&session_id)?;
                             let last_msg = st.db.last_message_time(&session_id)?;
                             let children = st.db.child_count(&session_id)?;
-                            Ok(session_info(&stored, &messages, last_msg, children))
+                            Ok(session_info(
+                                &stored,
+                                &messages,
+                                last_msg,
+                                children,
+                                st.phases.get(&session_id),
+                            ))
                         }
                         Ok(None) => Err(format!("session not found: {}", session_id)),
                         Err(e) => Err(format!("db error: {}", e)),
@@ -924,6 +949,16 @@ async fn handle_client(
                     {
                         let st = state.lock().unwrap();
                         st.db.append_message(&session_id, &user_msg)?;
+                        // Auto-derive tagline from first user message if not set
+                        if stored.tagline.is_none() {
+                            let tagline = text.replace('\n', " ");
+                            let tagline = if tagline.len() > 80 {
+                                format!("{}...", &tagline[..77])
+                            } else {
+                                tagline
+                            };
+                            let _ = st.db.update_tagline(&session_id, &tagline);
+                        }
                     }
                     messages.push(user_msg);
 
@@ -1155,7 +1190,8 @@ async fn handle_client(
                         let messages = st.db.get_messages(&s.id)?;
                         let last_msg = st.db.last_message_time(&s.id)?;
                         let children = st.db.child_count(&s.id)?;
-                        infos.push(session_info(s, &messages, last_msg, children));
+                        let phase = st.phases.get(&s.id);
+                        infos.push(session_info(s, &messages, last_msg, children, phase));
                     }
                     infos
                 };
@@ -2361,6 +2397,7 @@ fn handle_server_request_sync(
             cwd,
             parent_id,
             child_budget,
+            tagline,
         } => {
             let st = state.lock().unwrap();
 
@@ -2439,6 +2476,7 @@ fn handle_server_request_sync(
                 created_at: crate::types::timestamp_ms() as i64,
                 parent_id: parent_id.clone(),
                 child_budget: *child_budget,
+                tagline: tagline.clone(),
             };
             match st.db.create_session(&stored) {
                 Ok(()) => Response::SessionCreated { session_id: id },
@@ -2455,7 +2493,13 @@ fn handle_server_request_sync(
                     let last_msg = st.db.last_message_time(session_id).unwrap_or(None);
                     let children = st.db.child_count(session_id).unwrap_or(0);
                     Response::SessionInfo {
-                        info: session_info(&stored, &messages, last_msg, children),
+                        info: session_info(
+                            &stored,
+                            &messages,
+                            last_msg,
+                            children,
+                            st.phases.get(session_id),
+                        ),
                     }
                 }
                 Ok(None) => Response::Error {
@@ -2484,7 +2528,13 @@ fn handle_server_request_sync(
                         let messages = st.db.get_messages(&s.id).unwrap_or_default();
                         let last_msg = st.db.last_message_time(&s.id).unwrap_or(None);
                         let children = st.db.child_count(&s.id).unwrap_or(0);
-                        infos.push(session_info(s, &messages, last_msg, children));
+                        infos.push(session_info(
+                            s,
+                            &messages,
+                            last_msg,
+                            children,
+                            st.phases.get(&s.id),
+                        ));
                     }
                     Response::Sessions { sessions: infos }
                 }

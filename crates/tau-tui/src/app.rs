@@ -1089,17 +1089,9 @@ impl App {
             Response::Sessions { sessions } => {
                 // If we're in picker mode, populate picker sessions.
                 if self.mode == AppMode::SessionPicker {
-                    // Sort: current session first, then by last_activity descending
-                    let mut sorted = sessions;
-                    sorted.sort_by(|a, b| {
-                        let a_current = a.id == self.session_id;
-                        let b_current = b.id == self.session_id;
-                        b_current
-                            .cmp(&a_current)
-                            .then(b.last_activity.cmp(&a.last_activity))
-                    });
-                    self.picker_sessions = sorted;
-                    // Reset cursor — find current session
+                    // Sort sessions into tree order (parents before children, siblings by last_activity)
+                    self.picker_sessions = tree_sort_sessions(sessions);
+                    // Reset cursor -- find current session
                     self.picker_cursor = self
                         .picker_sessions
                         .iter()
@@ -1354,4 +1346,66 @@ pub enum Action {
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.
 fn event_to_tui_textarea(key: &KeyEvent) -> crossterm::event::Event {
     crossterm::event::Event::Key(*key)
+}
+
+/// Sort sessions into tree order: roots first (by last_activity desc),
+/// each followed by its children recursively (also by last_activity desc).
+fn tree_sort_sessions(sessions: Vec<SessionInfo>) -> Vec<SessionInfo> {
+    use std::collections::HashMap;
+
+    // Build parent -> children index map
+    let mut children_of: HashMap<Option<&str>, Vec<usize>> = HashMap::new();
+    for (i, s) in sessions.iter().enumerate() {
+        children_of
+            .entry(s.parent_id.as_deref())
+            .or_default()
+            .push(i);
+    }
+
+    // Sort children within each group by last_activity descending
+    for group in children_of.values_mut() {
+        group.sort_by(|&a, &b| sessions[b].last_activity.cmp(&sessions[a].last_activity));
+    }
+
+    // DFS walk to build ordered index list
+    let mut order: Vec<usize> = Vec::with_capacity(sessions.len());
+    fn walk(
+        parent: Option<&str>,
+        sessions: &[SessionInfo],
+        children_of: &HashMap<Option<&str>, Vec<usize>>,
+        order: &mut Vec<usize>,
+    ) {
+        if let Some(children) = children_of.get(&parent) {
+            for &idx in children {
+                order.push(idx);
+                walk(Some(&sessions[idx].id), sessions, children_of, order);
+            }
+        }
+    }
+    walk(None, &sessions, &children_of, &mut order);
+
+    // Add any orphans (parent_id set but parent not in list)
+    let in_tree: std::collections::HashSet<usize> = order.iter().copied().collect();
+    for i in 0..sessions.len() {
+        if !in_tree.contains(&i) {
+            order.push(i);
+        }
+    }
+
+    // Reorder sessions by extracting in order (swap-based to avoid clone)
+    // Use a simpler approach: collect into a new Vec
+    let mut result = Vec::with_capacity(sessions.len());
+    // Mark slots as taken
+    let mut taken = vec![false; sessions.len()];
+    for &idx in &order {
+        taken[idx] = true;
+    }
+    // We need to move out of sessions by index. Use Option wrapping.
+    let mut slots: Vec<Option<SessionInfo>> = sessions.into_iter().map(Some).collect();
+    for &idx in &order {
+        if let Some(s) = slots[idx].take() {
+            result.push(s);
+        }
+    }
+    result
 }

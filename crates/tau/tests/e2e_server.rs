@@ -150,6 +150,7 @@ fn server_create_session_and_list() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         },
     );
     let session_id = match resp {
@@ -189,6 +190,7 @@ fn server_create_child_session_with_budget() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 3,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -206,6 +208,7 @@ fn server_create_child_session_with_budget() {
             cwd: None, // should inherit /tmp
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -261,6 +264,7 @@ fn server_budget_exceeded() {
             cwd: None,
             parent_id: None,
             child_budget: 1,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -278,6 +282,7 @@ fn server_budget_exceeded() {
             cwd: None,
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { .. } => {}
@@ -295,6 +300,7 @@ fn server_budget_exceeded() {
             cwd: None,
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::Error { message } => {
@@ -325,6 +331,7 @@ fn server_delete_session_tree() {
             cwd: None,
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -341,6 +348,7 @@ fn server_delete_session_tree() {
             cwd: None,
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -400,6 +408,7 @@ fn server_wait_sessions_immediate() {
             cwd: None,
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -442,6 +451,7 @@ fn server_chat_simple_text() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -514,6 +524,7 @@ fn server_chat_tool_call_loop() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -584,6 +595,7 @@ fn server_chat_error_preserves_partial_messages() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -676,6 +688,7 @@ fn server_session_resume_after_restart() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,

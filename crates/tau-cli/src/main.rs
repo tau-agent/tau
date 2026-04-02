@@ -414,6 +414,7 @@ async fn cmd_chat(
                 cwd,
                 parent_id: None,
                 child_budget,
+                tagline: None,
             })
             .await?;
 

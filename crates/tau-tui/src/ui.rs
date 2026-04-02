@@ -337,20 +337,93 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 }
 
 // ---------------------------------------------------------------------------
-// Session Picker overlay
+// Session Picker overlay -- tree view with state, tagline, context, idle time
 // ---------------------------------------------------------------------------
+
+/// Build a flat display list from sessions, ordered as a tree.
+/// Returns (display_index, session_index, depth, is_last_sibling) tuples.
+fn build_session_tree(sessions: &[tau::protocol::SessionInfo]) -> Vec<(usize, usize, bool)> {
+    // Map parent_id -> children indices
+    let mut children_of: std::collections::HashMap<Option<&str>, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, s) in sessions.iter().enumerate() {
+        children_of
+            .entry(s.parent_id.as_deref())
+            .or_default()
+            .push(i);
+    }
+
+    let mut result = Vec::new();
+    fn walk_recursive(
+        parent: Option<&str>,
+        depth: usize,
+        sessions: &[tau::protocol::SessionInfo],
+        children_of: &std::collections::HashMap<Option<&str>, Vec<usize>>,
+        result: &mut Vec<(usize, usize, bool)>,
+    ) {
+        let Some(children) = children_of.get(&parent) else {
+            return;
+        };
+        let count = children.len();
+        for (pos, &idx) in children.iter().enumerate() {
+            let is_last = pos + 1 == count;
+            result.push((idx, depth, is_last));
+            walk_recursive(
+                Some(&sessions[idx].id),
+                depth + 1,
+                sessions,
+                children_of,
+                result,
+            );
+        }
+    }
+
+    walk_recursive(None, 0, sessions, &children_of, &mut result);
+
+    // If there are orphans (parent_id set but parent not in list), add them at root level
+    let in_tree: std::collections::HashSet<usize> = result.iter().map(|&(i, _, _)| i).collect();
+    for (i, _s) in sessions.iter().enumerate() {
+        if !in_tree.contains(&i) {
+            result.push((i, 0, true));
+        }
+    }
+
+    result
+}
+
+/// Format a duration as a compact idle time string.
+fn format_idle_time(last_activity: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let delta = (now - last_activity).max(0);
+    if delta < 60 {
+        return String::new(); // too recent, don't show
+    }
+    if delta < 3600 {
+        format!("{}m", delta / 60)
+    } else if delta < 86400 {
+        format!("{}h", delta / 3600)
+    } else {
+        format!("{}d", delta / 86400)
+    }
+}
 
 fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     use ratatui::widgets::Clear;
 
-    let picker_width: u16 = 40.min(area.width.saturating_sub(2));
+    // Use most of the screen width
+    let picker_width: u16 = (area.width * 3 / 4)
+        .max(50)
+        .min(area.width.saturating_sub(2));
     // Height: sessions + footer(1) + borders(2), clamped to area
     let content_lines = app.picker_sessions.len().max(1) as u16;
     let picker_height = (content_lines + 3).min(area.height.saturating_sub(2));
 
-    // Position: left side, vertically centered
-    let x = 1;
-    let y = area.height.saturating_sub(picker_height) / 2;
+    // Position: centered
+    let x = (area.width.saturating_sub(picker_width)) / 2;
+    let y = (area.height.saturating_sub(picker_height)) / 2;
     let picker_area = Rect::new(x, y, picker_width, picker_height);
 
     // Clear the area behind the overlay
@@ -384,87 +457,141 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             theme.fg(theme.muted),
         )));
     } else {
-        for (i, session) in app.picker_sessions.iter().enumerate() {
+        let tree = build_session_tree(&app.picker_sessions);
+
+        for &(session_idx, depth, _is_last) in &tree {
+            let session = &app.picker_sessions[session_idx];
             let is_current = session.id == app.session_id;
-            let is_selected = i == app.picker_cursor;
-            let is_confirming = app.picker_confirm_delete == Some(i);
+            let is_selected = session_idx == app.picker_cursor;
+            let is_confirming = app.picker_confirm_delete == Some(session_idx);
 
-            // Indentation for child sessions
-            let indent = if session.parent_id.is_some() {
-                "  "
-            } else {
-                ""
-            };
-
-            // Truncate session ID
-            let id_len = 8.min(session.id.len());
-            let id_short = &session.id[..id_len];
-
-            // Status indicator
-            let status = if is_current { "●" } else { " " };
-
-            // Model (truncated)
-            let model_max = w.saturating_sub(indent.len() + 2 + id_len + 1 + 4);
-            let model_display = if session.model.len() > model_max {
-                &session.model[..model_max]
-            } else {
-                &session.model
-            };
-
-            // Message count
-            let msg_count = format!(" {}m", session.message_count);
-
-            let content = format!(
-                "{}{} {} {}{}",
-                indent, status, id_short, model_display, msg_count
-            );
-            // Truncate to width
-            let display: String = if content.len() > w {
-                content[..w].to_string()
-            } else {
-                content
-            };
-
-            let style = if is_confirming {
-                // Red background for delete confirmation
-                Style::default()
-                    .fg(theme.error.to_ratatui())
-                    .bg(ThemeColor::Rgb(0x3c, 0x28, 0x28).to_ratatui())
-            } else if is_selected {
-                Style::default()
-                    .fg(if is_current {
-                        theme.accent.to_ratatui()
-                    } else {
-                        theme.text.to_ratatui()
-                    })
-                    .bg(theme.selected_bg.to_ratatui())
-            } else if is_current {
-                Style::default().fg(theme.accent.to_ratatui())
-            } else {
-                Style::default().fg(theme.muted.to_ratatui())
-            };
-
-            // Pad to full width
-            let pad = w.saturating_sub(display.len());
-            let padded = format!("{}{}", display, " ".repeat(pad));
-
+            // Delete confirmation
             if is_confirming {
-                // Show confirmation line instead
+                let id_short = &session.id[..session.id.len().min(8)];
                 let confirm_text = format!(" Delete {}? y/n", id_short);
                 let confirm_padded = if confirm_text.len() < w {
                     format!("{}{}", confirm_text, " ".repeat(w - confirm_text.len()))
                 } else {
                     confirm_text[..w].to_string()
                 };
+                let style = Style::default()
+                    .fg(theme.error.to_ratatui())
+                    .bg(ThemeColor::Rgb(0x3c, 0x28, 0x28).to_ratatui());
                 lines.push(Line::from(Span::styled(confirm_padded, style)));
-            } else {
-                lines.push(Line::from(Span::styled(padded, style)));
+                continue;
             }
+
+            // Build spans for this row
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut used = 0usize;
+
+            // Tree indent
+            let indent = "  ".repeat(depth);
+            spans.push(Span::raw(format!(" {}", indent)));
+            used += 1 + indent.len();
+
+            // State indicator
+            let (state_char, state_color) = if is_current {
+                ("*", theme.accent)
+            } else if session.state == "idle" {
+                (".", theme.dim)
+            } else {
+                // Active states: thinking, responding, tool_exec, etc.
+                (">", theme.success)
+            };
+            spans.push(Span::styled(
+                format!("{} ", state_char),
+                theme.fg(state_color),
+            ));
+            used += 2;
+
+            // Session ID
+            let id_len = 8.min(session.id.len());
+            let id_short = &session.id[..id_len];
+            let id_style = if is_current || is_selected {
+                theme.fg(theme.text)
+            } else {
+                theme.fg(theme.muted)
+            };
+            spans.push(Span::styled(id_short.to_string(), id_style));
+            used += id_len;
+
+            // Right-side info: context%, idle, msgs -- build from right
+            let ctx_str = session
+                .context_pct
+                .map(|p| format!("{:.0}%", p))
+                .unwrap_or_default();
+            let idle_str = format_idle_time(session.last_activity);
+            let msg_str = format!("{}m", session.message_count);
+
+            // Compose right part: "  42%  3m  12m"
+            let mut right_parts: Vec<String> = Vec::new();
+            if !ctx_str.is_empty() {
+                right_parts.push(ctx_str);
+            }
+            if !idle_str.is_empty() {
+                right_parts.push(idle_str);
+            }
+            right_parts.push(msg_str);
+            let right_text = format!("  {}", right_parts.join("  "));
+            let right_len = right_text.len();
+
+            // Tagline fills the middle
+            let tagline_space = w.saturating_sub(used + 1 + right_len + 1);
+            let tagline_display = if tagline_space >= 4 {
+                if let Some(ref tl) = session.tagline {
+                    if tl.len() > tagline_space {
+                        format!(" {}...", &tl[..tagline_space.saturating_sub(3)])
+                    } else {
+                        format!(" {}", tl)
+                    }
+                } else {
+                    // Fall back to model name
+                    let m = &session.model;
+                    if m.len() + 1 > tagline_space {
+                        format!(" {}...", &m[..tagline_space.saturating_sub(3).min(m.len())])
+                    } else {
+                        format!(" {}", m)
+                    }
+                }
+            } else {
+                String::new()
+            };
+            let tagline_actual_len = tagline_display.len();
+
+            spans.push(Span::styled(tagline_display, theme.italic_fg(theme.dim)));
+            used += tagline_actual_len;
+
+            // Pad between tagline and right info
+            let pad = w.saturating_sub(used + right_len);
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+
+            spans.push(Span::styled(right_text, theme.fg(theme.dim)));
+
+            // Row style (selection background)
+            let row_style = if is_selected {
+                Style::default().bg(theme.selected_bg.to_ratatui())
+            } else {
+                Style::default()
+            };
+
+            let mut line = Line::from(spans);
+            // Pad the entire line to full width for selection highlight
+            let line_w = line.width();
+            if line_w < w {
+                line.spans
+                    .push(Span::styled(" ".repeat(w - line_w), row_style));
+            }
+            line = line.style(row_style);
+
+            lines.push(line);
         }
     }
 
     // Footer hint
-    let hint = " ↑↓ nav  ⏎ switch  D del  esc close";
+    let hint = " j/k nav  enter switch  D del  tab/esc close";
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()
     } else {
@@ -474,12 +601,9 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
 
     // Scroll the session list if needed
     let available_lines = inner.height as usize;
-    // Reserve 1 line for the hint at the bottom
-    let session_lines = available_lines.saturating_sub(1);
+    let session_lines = available_lines.saturating_sub(1); // reserve 1 for hint
 
     if lines.len() > available_lines {
-        // We need to scroll so the selected item is visible
-        // lines = session_items + 1 hint line
         let num_sessions = lines.len() - 1; // exclude hint
         let hint_line = lines.pop().unwrap();
 

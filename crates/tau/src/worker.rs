@@ -349,6 +349,10 @@ fn handle_session_tool(
                 .get("child_budget")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
+            let tagline = args
+                .get("tagline")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             // Create session
             let create_req = crate::protocol::Request::CreateSession {
@@ -358,6 +362,7 @@ fn handle_session_tool(
                 cwd,
                 parent_id: session_id.map(String::from),
                 child_budget,
+                tagline,
             };
             let resp = match server_request(writer, reader, create_req) {
                 Ok(r) => r,

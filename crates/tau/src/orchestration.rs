@@ -36,6 +36,10 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                     "child_budget": {
                         "type": "integer",
                         "description": "Max descendant sessions the child can spawn (default 0 = leaf)"
+                    },
+                    "tagline": {
+                        "type": "string",
+                        "description": "Short description of what the child session will work on (shown in session picker)"
                     }
                 },
                 "required": ["task"]

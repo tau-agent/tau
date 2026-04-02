@@ -153,6 +153,7 @@ fn session_tree_budget_enforcement() {
         created_at: 1000,
         parent_id: None,
         child_budget: 3,
+        tagline: None,
     };
     db.create_session(&root).unwrap();
 
@@ -166,6 +167,7 @@ fn session_tree_budget_enforcement() {
         created_at: 2000,
         parent_id: Some("root".into()),
         child_budget: 0,
+        tagline: None,
     };
     db.create_session(&c1).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 1);
@@ -180,6 +182,7 @@ fn session_tree_budget_enforcement() {
         created_at: 3000,
         parent_id: Some("root".into()),
         child_budget: 1,
+        tagline: None,
     };
     db.create_session(&c2).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 3); // 1 + (1+1) = 3
@@ -204,6 +207,7 @@ fn session_tree_budget_enforcement() {
         created_at: 4000,
         parent_id: Some("c2".into()),
         child_budget: 0,
+        tagline: None,
     };
     db.create_session(&gc1).unwrap();
     assert_eq!(db.budget_used("c2").unwrap(), 1);
@@ -240,6 +244,7 @@ fn session_tree_recursive_delete() {
             created_at: 1000,
             parent_id: parent.map(String::from),
             child_budget: budget,
+            tagline: None,
         })
         .unwrap();
     }
@@ -283,6 +288,7 @@ fn session_model_inheritance() {
         created_at: 1000,
         parent_id: None,
         child_budget: 5,
+        tagline: None,
     })
     .unwrap();
 
@@ -318,6 +324,7 @@ fn session_info_includes_tree_fields() {
         created_at: 1000,
         parent_id: None,
         child_budget: 5,
+        tagline: None,
     })
     .unwrap();
 
@@ -330,6 +337,7 @@ fn session_info_includes_tree_fields() {
         created_at: 2000,
         parent_id: Some("root".into()),
         child_budget: 0,
+        tagline: None,
     })
     .unwrap();
 
@@ -385,6 +393,7 @@ fn protocol_create_session_with_parent() {
         cwd: None,
         parent_id: Some("s1".into()),
         child_budget: 5,
+        tagline: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains("parent_id"));
@@ -453,6 +462,9 @@ fn protocol_session_info_tree_fields() {
         parent_id: Some("s0".into()),
         child_count: 2,
         child_budget: 10,
+        tagline: None,
+        state: "idle".into(),
+        context_pct: None,
     };
     let json = serde_json::to_string(&info).unwrap();
     assert!(json.contains("parent_id"));
@@ -487,6 +499,7 @@ fn spawn_child_chat_produces_messages() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -504,6 +517,7 @@ fn spawn_child_chat_produces_messages() {
             cwd: None, // inherit
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -590,6 +604,7 @@ fn spawn_multiple_children_wait_all() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 10,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -609,6 +624,7 @@ fn spawn_multiple_children_wait_all() {
                 cwd: None,
                 parent_id: Some(parent_id.clone()),
                 child_budget: 0,
+                tagline: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -719,6 +735,7 @@ fn spawn_child_inherits_parent_model_and_cwd() {
             cwd: Some("/home/test/project".into()),
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -736,6 +753,7 @@ fn spawn_child_inherits_parent_model_and_cwd() {
             cwd: None,
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -787,6 +805,7 @@ fn wait_sessions_idle_returns_done() {
                 cwd: None,
                 parent_id: None,
                 child_budget: 0,
+                tagline: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -832,6 +851,7 @@ fn spawn_delete_parent_cascades() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -848,6 +868,7 @@ fn spawn_delete_parent_cascades() {
             cwd: None,
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -908,6 +929,7 @@ fn spawn_cancel_child() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -924,6 +946,7 @@ fn spawn_cancel_child() {
             cwd: None,
             parent_id: Some(parent_id),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -961,6 +984,7 @@ fn wait_sessions_returns_summary() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 5,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -977,6 +1001,7 @@ fn wait_sessions_returns_summary() {
             cwd: None,
             parent_id: Some(parent_id),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1061,6 +1086,7 @@ fn wait_any_sessions_idle_returns_all() {
                 cwd: None,
                 parent_id: None,
                 child_budget: 0,
+                tagline: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -1109,6 +1135,7 @@ fn wait_any_sessions_returns_only_completed() {
             cwd: Some("/tmp".into()),
             parent_id: None,
             child_budget: 10,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1126,6 +1153,7 @@ fn wait_any_sessions_returns_only_completed() {
             cwd: None,
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1154,6 +1182,7 @@ fn wait_any_sessions_returns_only_completed() {
             cwd: None,
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
+            tagline: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
