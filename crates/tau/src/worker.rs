@@ -708,6 +708,11 @@ fn handle_session_tool(
             }
         }
 
+        "session_id" => match session_id {
+            Some(sid) => tool_ok(&serde_json::json!({"session_id": sid}).to_string()),
+            None => tool_err("session_id not available"),
+        },
+
         _ => tool_err(&format!("unknown session tool: {}", name)),
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Provides tool schemas and prompt guidelines for session management tools
 //! (session_spawn, session_join, session_status, session_list_children,
-//! session_read, session_cancel). These tools communicate with the server
+//! session_read, session_cancel, session_id). These tools communicate with the server
 //! via the plugin protocol's ServerRequest/ServerResponse tunnel.
 
 use crate::plugin::{PluginRegistration, PluginToolDef};
@@ -195,6 +195,16 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                 "The message appears as a user message in the target session's conversation.".into(),
                 "Fire-and-forget: returns immediately, does not wait for a response. Use session_read to check for responses later.".into(),
             ],
+        },
+        PluginToolDef {
+            name: "session_id".into(),
+            description: "Get the current session's ID.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            prompt_snippet: None,
+            prompt_guidelines: vec![],
         },
     ]
 }
