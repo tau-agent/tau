@@ -678,24 +678,52 @@ fn handle_session_tool(
         }
 
         "session_archive" => {
-            let sid = args
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if sid.is_empty() {
-                return tool_err("session_id is required");
-            }
-            let req = crate::protocol::Request::ArchiveSession {
-                session_id: sid.to_string(),
-                require_ancestor: session_id.map(|s| s.to_string()),
+            let sids: Vec<String> = match args.get("session_id") {
+                Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
+                Some(serde_json::Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
+                _ => return tool_err("session_id is required (string or array of strings)"),
             };
-            match server_request(writer, reader, req) {
-                Ok(crate::protocol::Response::SessionArchived) => {
-                    tool_ok(&format!("Archived session {}", sid))
+            if sids.is_empty() {
+                return tool_err("session_id is required (string or array of strings)");
+            }
+            let mut archived = Vec::new();
+            let mut errors = Vec::new();
+            for sid in &sids {
+                let req = crate::protocol::Request::ArchiveSession {
+                    session_id: sid.clone(),
+                    require_ancestor: session_id.map(|s| s.to_string()),
+                };
+                match server_request(writer, reader, req) {
+                    Ok(crate::protocol::Response::SessionArchived) => archived.push(sid.as_str()),
+                    Ok(crate::protocol::Response::Error { message }) => {
+                        errors.push(format!("{}: {}", sid, message));
+                    }
+                    Ok(other) => {
+                        errors.push(format!("{}: unexpected response: {:?}", sid, other));
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {}", sid, e));
+                    }
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+            }
+            if errors.is_empty() {
+                if archived.len() == 1 {
+                    tool_ok(&format!("Archived session {}", archived[0]))
+                } else {
+                    tool_ok(&format!("Archived {} sessions", archived.len()))
+                }
+            } else if archived.is_empty() {
+                tool_err(&errors.join("; "))
+            } else {
+                tool_ok(&format!(
+                    "Archived {} session(s); {} failed: {}",
+                    archived.len(),
+                    errors.len(),
+                    errors.join("; ")
+                ))
             }
         }
 

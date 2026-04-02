@@ -180,13 +180,15 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                 "type": "object",
                 "properties": {
                     "session_id": {
-                        "type": "string",
-                        "description": "Session ID to archive"
+                        "oneOf": [
+                            { "type": "string", "description": "Session ID to archive" },
+                            { "type": "array", "items": { "type": "string" }, "description": "Session IDs to archive" }
+                        ]
                     }
                 },
                 "required": ["session_id"]
             }),
-            prompt_snippet: Some("Use session_archive to clean up completed child sessions. Only works on descendants of the current session.".into()),
+            prompt_snippet: Some("Use session_archive to clean up completed child sessions. Only works on descendants of the current session. Accepts a single session ID or an array of session IDs.".into()),
             prompt_guidelines: vec![
                 "Archive children after collecting their results to keep session listings clean.".into(),
             ],
