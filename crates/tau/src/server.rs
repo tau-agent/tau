@@ -1223,15 +1223,27 @@ async fn handle_client(
                 send(&mut writer, &Response::Sessions { sessions }).await?;
             }
             Request::DeleteSession { session_id } => {
-                {
+                // Collect all session IDs in the subtree before deleting
+                let subtree_ids = {
                     let st = state.lock().unwrap();
+                    let ids = st.db.get_subtree_ids(&session_id)?;
                     // Delete session and all descendants
                     st.db.delete_session_tree(&session_id)?;
+                    // Clean up waited_sessions for deleted IDs
+                    ids
+                };
+                {
+                    let mut st = state.lock().unwrap();
+                    for id in &subtree_ids {
+                        st.waited_sessions.remove(id);
+                    }
                 }
-                // Clean up session plugins for deleted sessions
+                // Clean up session plugins for all deleted sessions
                 {
                     let mut pm = plugins.lock().unwrap();
-                    pm.destroy_session_plugins(&session_id);
+                    for id in &subtree_ids {
+                        pm.destroy_session_plugins(id);
+                    }
                 }
                 send(&mut writer, &Response::SessionDeleted).await?;
             }
@@ -1435,16 +1447,16 @@ async fn handle_client(
                         } else {
                             // Session is idle -- get its last assistant message as summary
                             let st = state.lock().unwrap();
-                            let summary = match st.db.get_session(sid) {
+                            let (status, summary) = match st.db.get_session(sid) {
                                 Ok(Some(_)) => {
                                     let msgs = st.db.get_messages(sid).unwrap_or_default();
-                                    last_assistant_text(&msgs)
+                                    ("done".to_string(), last_assistant_text(&msgs))
                                 }
-                                _ => String::new(),
+                                _ => ("deleted".to_string(), String::new()),
                             };
                             results.push(crate::protocol::SessionResult {
                                 session_id: sid.clone(),
-                                status: "done".into(),
+                                status,
                                 summary,
                             });
                         }
@@ -1507,16 +1519,16 @@ async fn handle_client(
                             pending.push(sid.clone());
                         } else {
                             let st = state.lock().unwrap();
-                            let summary = match st.db.get_session(sid) {
+                            let (status, summary) = match st.db.get_session(sid) {
                                 Ok(Some(_)) => {
                                     let msgs = st.db.get_messages(sid).unwrap_or_default();
-                                    last_assistant_text(&msgs)
+                                    ("done".to_string(), last_assistant_text(&msgs))
                                 }
-                                _ => String::new(),
+                                _ => ("deleted".to_string(), String::new()),
                             };
                             done.push(crate::protocol::SessionResult {
                                 session_id: sid.clone(),
-                                status: "done".into(),
+                                status,
                                 summary,
                             });
                         }
@@ -2604,14 +2616,17 @@ fn handle_server_request_sync(
                         });
                     } else {
                         let st = state.lock().unwrap();
-                        let summary = match st.db.get_messages(sid) {
-                            Ok(msgs) => last_assistant_text(&msgs),
-                            Err(_) => String::new(),
+                        let (status, summary) = match st.db.get_session(sid) {
+                            Ok(Some(_)) => {
+                                let msgs = st.db.get_messages(sid).unwrap_or_default();
+                                ("done".to_string(), last_assistant_text(&msgs))
+                            }
+                            _ => ("deleted".to_string(), String::new()),
                         };
                         drop(st);
                         results.push(crate::protocol::SessionResult {
                             session_id: sid.clone(),
-                            status: "done".into(),
+                            status,
                             summary,
                         });
                     }
@@ -2645,14 +2660,17 @@ fn handle_server_request_sync(
 
                     if !is_busy {
                         let st = state.lock().unwrap();
-                        let summary = match st.db.get_messages(sid) {
-                            Ok(msgs) => last_assistant_text(&msgs),
-                            Err(_) => String::new(),
+                        let (status, summary) = match st.db.get_session(sid) {
+                            Ok(Some(_)) => {
+                                let msgs = st.db.get_messages(sid).unwrap_or_default();
+                                ("done".to_string(), last_assistant_text(&msgs))
+                            }
+                            _ => ("deleted".to_string(), String::new()),
                         };
                         drop(st);
                         done.push(crate::protocol::SessionResult {
                             session_id: sid.clone(),
-                            status: "done".into(),
+                            status,
                             summary,
                         });
                     }

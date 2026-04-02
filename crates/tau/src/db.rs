@@ -285,6 +285,16 @@ impl Db {
         Ok(())
     }
 
+    /// Collect all session IDs in the subtree rooted at `id` (inclusive).
+    pub fn get_subtree_ids(&self, id: &str) -> crate::Result<Vec<String>> {
+        let mut ids = vec![id.to_string()];
+        let children = self.get_children(id)?;
+        for child in &children {
+            ids.extend(self.get_subtree_ids(&child.id)?);
+        }
+        Ok(ids)
+    }
+
     /// Get direct children of a session.
     pub fn get_children(&self, parent_id: &str) -> crate::Result<Vec<StoredSession>> {
         let mut stmt = self
