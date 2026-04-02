@@ -35,7 +35,7 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                     },
                     "child_budget": {
                         "type": "integer",
-                        "description": "Max descendant sessions the child can spawn (default 0 = leaf)"
+                        "description": "Max descendant sessions the child can spawn (default 4)"
                     },
                     "tagline": {
                         "type": "string",
@@ -47,7 +47,7 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Use session_spawn to delegate independent subtasks to child sessions that run in parallel. Each child has its own tools and conversation context. Use session_join to wait for results.".into()),
             prompt_guidelines: vec![
                 "Spawn children for parallelizable work (e.g., reviewing multiple files)".into(),
-                "Each child is a leaf by default (child_budget=0). Set child_budget>0 to allow grandchildren.".into(),
+                "Children can spawn grandchildren by default (child_budget=4). Set child_budget=0 to make a leaf.".into(),
                 "The task should be self-contained -- the child has no access to the parent's conversation.".into(),
             ],
         },
