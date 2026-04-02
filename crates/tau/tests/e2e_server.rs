@@ -773,3 +773,151 @@ fn server_session_resume_after_restart() {
         let _ = c.flush();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Message queue tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn steer_queues_message_for_idle_session() {
+    // Steer a message to an idle session. On next Chat, the queued message
+    // should be picked up by the agent loop (appears in context).
+    let server = TestServer::start(vec![MockResponse::Text(
+        "I see the steering message.".into(),
+    )]);
+    let conn = server.connect();
+
+    // Create session
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: None,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Steer a message while session is idle -- should succeed now
+    let steer_resp = send_recv(
+        &conn,
+        &Request::Steer {
+            session_id: sid.clone(),
+            text: "injected message".into(),
+        },
+    );
+    assert!(
+        matches!(steer_resp, Response::Ok),
+        "Steer should succeed for idle session, got: {:?}",
+        steer_resp
+    );
+
+    // Start a Chat -- the queued message should be drained and injected
+    let conn2 = server.connect();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello".into(),
+        },
+    );
+
+    // Should have a UserMessage event for the injected message in the responses
+    let has_injected = responses
+        .iter()
+        .any(|r| matches!(r, Response::UserMessage { text } if text.contains("injected message")));
+    assert!(
+        has_injected,
+        "should see injected UserMessage in responses: {:?}",
+        responses
+    );
+
+    // Verify final messages include the injected message
+    let conn3 = server.connect();
+    let resp = send_recv(
+        &conn3,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
+    match resp {
+        Response::Messages { messages } => {
+            // Should have: chat user msg + queued user msg + assistant reply = 3
+            assert!(
+                messages.len() >= 3,
+                "expected at least 3 messages, got {}: {:?}",
+                messages.len(),
+                messages
+            );
+            // The injected message should appear somewhere (drained at top of agent turn)
+            let has_injected = messages.iter().any(|m| {
+                if let tau::types::Message::User(u) = m {
+                    u.content.iter().any(|c| match c {
+                        tau::types::UserContent::Text(t) => t.text.contains("injected message"),
+                        _ => false,
+                    })
+                } else {
+                    false
+                }
+            });
+            assert!(
+                has_injected,
+                "should contain injected message in persisted messages: {:?}",
+                messages
+            );
+        }
+        other => panic!("{:?}", other),
+    }
+
+    server.shutdown();
+}
+
+#[test]
+fn queue_message_persists_across_operations() {
+    // Queue a message, verify it's in the DB, drain it, verify it's gone.
+    // This tests the DB methods directly without needing a server.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test.db");
+    let db = tau::db::Db::open(&db_path).unwrap();
+
+    // Create a session
+    let model = tau::providers::mock::mock_model();
+    db.create_session(&tau::db::StoredSession {
+        id: "s1".into(),
+        model,
+        system_prompt: None,
+        cwd: None,
+        is_subscription: false,
+        created_at: 1000,
+        parent_id: None,
+        child_budget: 0,
+        tagline: None,
+    })
+    .unwrap();
+
+    // Queue a message
+    let id = db
+        .queue_message("s1", "test content", "test_sender")
+        .unwrap();
+    assert!(id > 0);
+
+    // Verify it's there
+    assert!(db.has_queued_messages("s1").unwrap());
+    let sessions = db.sessions_with_queued_messages().unwrap();
+    assert_eq!(sessions, vec!["s1"]);
+
+    // Drain it
+    let messages = db.drain_queued_messages("s1").unwrap();
+    assert_eq!(messages.len(), 1);
+
+    // Verify queue is empty but message is persisted in messages table
+    assert!(!db.has_queued_messages("s1").unwrap());
+    let persisted = db.get_messages("s1").unwrap();
+    assert_eq!(persisted.len(), 1);
+}

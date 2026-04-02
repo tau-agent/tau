@@ -18,9 +18,11 @@ pub struct AgentConfig {
     pub retry_base_ms: u64,
     /// Optional shutdown check — if returns true, stop after current turn.
     pub should_stop: Option<Box<dyn Fn() -> bool + Send + Sync>>,
-    /// Channel for receiving steering messages injected mid-loop.
-    /// Checked at the top of each turn (after tool results, before next LLM call).
-    pub steer_rx: Option<smol::channel::Receiver<String>>,
+    /// Callback to drain queued messages for this session.
+    /// Called at the top of each turn (after tool results, before next LLM call).
+    /// Returns persisted `Message::User` entries that should be added to context.
+    #[allow(clippy::type_complexity)]
+    pub drain_queued: Option<Box<dyn Fn() -> Vec<Message> + Send + Sync>>,
     /// Called for each message produced by the agent (assistant, tool result, steering).
     /// Used for incremental persistence so partial progress survives errors.
     /// Wrapped in Mutex so AgentConfig is Send+Sync across async boundaries.
@@ -35,7 +37,7 @@ impl Default for AgentConfig {
             max_retries: 5,
             retry_base_ms: 1000,
             should_stop: None,
-            steer_rx: None,
+            drain_queued: None,
             on_message: None,
         }
     }
@@ -179,18 +181,19 @@ pub async fn run(
     context.tools = extra_tools.to_vec();
 
     for turn in 0..config.max_turns {
-        // Drain any pending steering messages before the next LLM call.
-        // These are user messages injected mid-loop via Request::Steer.
-        if let Some(ref rx) = config.steer_rx {
-            while let Ok(text) = rx.try_recv() {
-                let user_msg = UserMessage::text(&text);
-                let _ = event_tx.try_send(StreamEvent::SteerMessage {
-                    message: user_msg.clone(),
-                });
-                let msg = Message::User(user_msg);
-                if let Some(ref on_msg) = config.on_message {
-                    on_msg.lock().unwrap()(&msg);
+        // Drain any pending queued messages before the next LLM call.
+        // These are user messages injected mid-loop via Request::Steer or
+        // child session completion notifications.
+        if let Some(ref drain_fn) = config.drain_queued {
+            let queued = drain_fn();
+            for msg in queued {
+                if let Message::User(ref user_msg) = msg {
+                    let _ = event_tx.try_send(StreamEvent::SteerMessage {
+                        message: user_msg.clone(),
+                    });
                 }
+                // Messages are already persisted by drain_queued_messages,
+                // so do NOT call on_message here.
                 new_messages.push(msg.clone());
                 context.messages.push(msg);
             }

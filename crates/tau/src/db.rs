@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::types::{Message, Model};
+use crate::types::{Message, Model, UserMessage};
 
 /// Stored session metadata (no messages — those live in the messages table).
 #[derive(Debug, Clone)]
@@ -65,7 +65,15 @@ impl Db {
                 message_json TEXT NOT NULL,
                 created_at  INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);",
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            CREATE TABLE IF NOT EXISTS queued_messages (
+                id INTEGER PRIMARY KEY,
+                target_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                sender_info TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_queued_target ON queued_messages(target_session_id);",
         )
         .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
 
@@ -80,6 +88,18 @@ impl Db {
         // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_id);",
+        );
+
+        // queued_messages migration for existing DBs
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS queued_messages (
+                id INTEGER PRIMARY KEY,
+                target_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                sender_info TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_queued_target ON queued_messages(target_session_id);",
         );
 
         Ok(Self { conn })
@@ -114,7 +134,15 @@ impl Db {
                 created_at  INTEGER NOT NULL
             );
             CREATE INDEX idx_messages_session ON messages(session_id);
-            CREATE INDEX idx_sessions_parent ON sessions(parent_id);",
+            CREATE INDEX idx_sessions_parent ON sessions(parent_id);
+            CREATE TABLE queued_messages (
+                id INTEGER PRIMARY KEY,
+                target_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                sender_info TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX idx_queued_target ON queued_messages(target_session_id);",
         )
         .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
 
@@ -541,6 +569,144 @@ impl Db {
             .map_err(|e| crate::Error::Io(format!("count messages: {}", e)))?;
         Ok(count as usize)
     }
+
+    // ----- queued_messages -----
+
+    /// Queue a message for delivery to a target session.
+    /// Returns the row id of the inserted message.
+    pub fn queue_message(
+        &self,
+        target_session_id: &str,
+        content: &str,
+        sender_info: &str,
+    ) -> crate::Result<i64> {
+        let now = crate::types::timestamp_ms() as i64;
+        self.conn
+            .execute(
+                "INSERT INTO queued_messages (target_session_id, content, sender_info, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![target_session_id, content, sender_info, now],
+            )
+            .map_err(|e| crate::Error::Io(format!("queue_message: {}", e)))?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Drain all queued messages for a session: atomically SELECT, INSERT as
+    /// User messages into the messages table, and DELETE from queued_messages.
+    /// Returns the persisted `Message::User` entries.
+    pub fn drain_queued_messages(&self, session_id: &str) -> crate::Result<Vec<Message>> {
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(|e| crate::Error::Io(format!("drain begin: {}", e)))?;
+
+        let rows: Vec<(i64, String, Option<String>)> = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT id, content, sender_info FROM queued_messages
+                     WHERE target_session_id = ?1 ORDER BY id",
+                )
+                .map_err(|e| {
+                    self.conn.execute_batch("ROLLBACK").ok();
+                    crate::Error::Io(format!("drain select: {}", e))
+                })?;
+            let mapped = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|e| {
+                    self.conn.execute_batch("ROLLBACK").ok();
+                    crate::Error::Io(format!("drain query: {}", e))
+                })?;
+            let mut v = Vec::new();
+            for r in mapped {
+                v.push(r.map_err(|e| {
+                    self.conn.execute_batch("ROLLBACK").ok();
+                    crate::Error::Io(format!("drain row: {}", e))
+                })?);
+            }
+            v
+        };
+
+        if rows.is_empty() {
+            self.conn.execute_batch("ROLLBACK").ok();
+            return Ok(Vec::new());
+        }
+
+        let mut messages = Vec::with_capacity(rows.len());
+        let now = crate::types::timestamp_ms() as i64;
+        let mut ids = Vec::with_capacity(rows.len());
+
+        for (id, content, sender_info) in &rows {
+            ids.push(*id);
+            let text = if let Some(info) = sender_info {
+                format!("[from {}] {}", info, content)
+            } else {
+                content.clone()
+            };
+            let msg = Message::User(UserMessage::text(&text));
+            let json =
+                serde_json::to_string(&msg).map_err(|e| crate::Error::Parse(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO messages (session_id, message_json, created_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![session_id, json, now],
+                )
+                .map_err(|e| {
+                    self.conn.execute_batch("ROLLBACK").ok();
+                    crate::Error::Io(format!("drain insert message: {}", e))
+                })?;
+            messages.push(msg);
+        }
+
+        // Delete drained rows by collected IDs
+        for id in &ids {
+            self.conn
+                .execute("DELETE FROM queued_messages WHERE id = ?1", params![id])
+                .map_err(|e| {
+                    self.conn.execute_batch("ROLLBACK").ok();
+                    crate::Error::Io(format!("drain delete: {}", e))
+                })?;
+        }
+
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|e| crate::Error::Io(format!("drain commit: {}", e)))?;
+
+        Ok(messages)
+    }
+
+    /// Check whether a session has any queued messages.
+    pub fn has_queued_messages(&self, session_id: &str) -> crate::Result<bool> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM queued_messages WHERE target_session_id = ?1)",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| crate::Error::Io(format!("has_queued_messages: {}", e)))?;
+        Ok(exists)
+    }
+
+    /// Return session IDs that have pending queued messages.
+    pub fn sessions_with_queued_messages(&self) -> crate::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT target_session_id FROM queued_messages")
+            .map_err(|e| crate::Error::Io(format!("sessions_with_queued: {}", e)))?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))
+            .map_err(|e| crate::Error::Io(format!("sessions_with_queued query: {}", e)))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(
+                row.map_err(|e| crate::Error::Io(format!("sessions_with_queued row: {}", e)))?,
+            );
+        }
+        Ok(result)
+    }
 }
 
 fn default_db_path() -> PathBuf {
@@ -956,5 +1122,154 @@ mod tests {
         let mut ids = db.sessions_needing_resume().unwrap();
         ids.sort();
         assert_eq!(ids, vec!["child1", "child3"]);
+    }
+
+    #[test]
+    fn queue_message_basic() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&StoredSession {
+            id: "s1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        })
+        .unwrap();
+
+        let id = db
+            .queue_message("s1", "hello from parent", "parent:s0")
+            .unwrap();
+        assert!(id > 0);
+        assert!(db.has_queued_messages("s1").unwrap());
+        assert!(!db.has_queued_messages("s_nonexistent").unwrap());
+
+        let sessions = db.sessions_with_queued_messages().unwrap();
+        assert_eq!(sessions, vec!["s1"]);
+    }
+
+    #[test]
+    fn drain_queued_messages_basic() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&StoredSession {
+            id: "s1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        })
+        .unwrap();
+
+        db.queue_message("s1", "msg1", "sender1").unwrap();
+        db.queue_message("s1", "msg2", "sender2").unwrap();
+
+        let messages = db.drain_queued_messages("s1").unwrap();
+        assert_eq!(messages.len(), 2);
+
+        // Messages should be User messages with sender_info prefix
+        if let Message::User(u) = &messages[0] {
+            let text: String = u
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    UserContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(text.contains("[from sender1]"));
+            assert!(text.contains("msg1"));
+        } else {
+            panic!("expected User message");
+        }
+
+        // Queue should be empty now
+        assert!(!db.has_queued_messages("s1").unwrap());
+        assert!(db.sessions_with_queued_messages().unwrap().is_empty());
+
+        // Messages should have been persisted to the messages table
+        let persisted = db.get_messages("s1").unwrap();
+        assert_eq!(persisted.len(), 2);
+    }
+
+    #[test]
+    fn drain_empty_queue() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&StoredSession {
+            id: "s1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        })
+        .unwrap();
+
+        let messages = db.drain_queued_messages("s1").unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn drain_does_not_affect_other_sessions() {
+        let db = Db::open_memory().unwrap();
+        for id in ["s1", "s2"] {
+            db.create_session(&StoredSession {
+                id: id.into(),
+                model: test_model(),
+                system_prompt: None,
+                cwd: None,
+                is_subscription: false,
+                created_at: 1000,
+                parent_id: None,
+                child_budget: 0,
+                tagline: None,
+            })
+            .unwrap();
+        }
+
+        db.queue_message("s1", "for s1", "x").unwrap();
+        db.queue_message("s2", "for s2", "y").unwrap();
+
+        let drained = db.drain_queued_messages("s1").unwrap();
+        assert_eq!(drained.len(), 1);
+
+        // s2 still has its message
+        assert!(db.has_queued_messages("s2").unwrap());
+        let s2_msgs = db.drain_queued_messages("s2").unwrap();
+        assert_eq!(s2_msgs.len(), 1);
+    }
+
+    #[test]
+    fn queued_messages_cascade_on_session_delete() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&StoredSession {
+            id: "s1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        })
+        .unwrap();
+
+        db.queue_message("s1", "will be deleted", "x").unwrap();
+        assert!(db.has_queued_messages("s1").unwrap());
+
+        db.delete_session("s1").unwrap();
+        // CASCADE should have removed queued messages too
+        assert!(!db.has_queued_messages("s1").unwrap());
     }
 }

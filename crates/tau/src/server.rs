@@ -156,8 +156,8 @@ struct State {
     usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
     /// Per-session cancel flags.  Set by CancelChat, cleared on Chat start.
     cancel_flags: HashMap<String, Arc<AtomicBool>>,
-    /// Per-session steering channels for injecting messages into running agent loops.
-    steer_txs: HashMap<String, smol::channel::Sender<String>>,
+    /// Per-session flag indicating queued messages are pending.
+    has_queued: HashMap<String, Arc<AtomicBool>>,
     /// Per-session broadcast subscribers.
     /// Other clients watching a session receive streamed responses.
     subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
@@ -384,8 +384,8 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         all_models: config.models,
         usage_cache: None,
         cancel_flags: HashMap::new(),
+        has_queued: HashMap::new(),
         subscribers: HashMap::new(),
-        steer_txs: HashMap::new(),
         phases: HashMap::new(),
         waited_sessions: HashSet::new(),
     }));
@@ -484,7 +484,7 @@ pub async fn run() -> crate::Result<()> {
         all_models,
         usage_cache: None,
         cancel_flags: HashMap::new(),
-        steer_txs: HashMap::new(),
+        has_queued: HashMap::new(),
         subscribers: HashMap::new(),
         phases: HashMap::new(),
         waited_sessions: HashSet::new(),
@@ -517,6 +517,7 @@ pub async fn run() -> crate::Result<()> {
                 Vec::new()
             })
         };
+        let mut resuming: std::collections::HashSet<String> = resume_ids.iter().cloned().collect();
         for sid in resume_ids {
             eprintln!("auto-resuming session {}", sid);
             let s = state.clone();
@@ -530,6 +531,40 @@ pub async fn run() -> crate::Result<()> {
                 }
             })
             .detach();
+        }
+
+        // Also resume sessions that have pending queued messages but aren't
+        // already being auto-resumed.
+        let queued_ids = {
+            let st = state.lock().unwrap();
+            st.db.sessions_with_queued_messages().unwrap_or_else(|e| {
+                eprintln!("failed to query sessions with queued messages: {}", e);
+                Vec::new()
+            })
+        };
+        for sid in queued_ids {
+            if resuming.insert(sid.clone()) {
+                eprintln!("auto-resuming session {} (has queued messages)", sid);
+                // Set the has_queued flag so the agent loop will drain them.
+                {
+                    let mut st = state.lock().unwrap();
+                    st.has_queued
+                        .entry(sid.clone())
+                        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                        .store(true, Ordering::Release);
+                }
+                let s = state.clone();
+                let p = plugins.clone();
+                let sh = shutdown.clone();
+                let sl = session_locks.clone();
+                let th = throttle.clone();
+                smol::spawn(async move {
+                    if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone()).await {
+                        eprintln!("auto-resume session {} error: {}", sid, e);
+                    }
+                })
+                .detach();
+            }
         }
     }
 
@@ -596,6 +631,17 @@ pub fn is_running() -> bool {
 // ---------------------------------------------------------------------------
 // Client handler
 // ---------------------------------------------------------------------------
+
+/// Queue a message for delivery to a target session.
+/// Persists immediately and sets the has_queued flag for in-flight agent loops.
+fn queue_message_to_session(state: &SharedState, target: &str, content: &str, sender_info: &str) {
+    let mut st = state.lock().unwrap();
+    st.db.queue_message(target, content, sender_info).ok();
+    st.has_queued
+        .entry(target.to_string())
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .store(true, Ordering::Release);
+}
 
 async fn handle_client(
     stream: Async<UnixStream>,
@@ -1155,31 +1201,10 @@ async fn handle_client(
                 send(&mut writer, &Response::Ok).await.ok();
             }
             Request::Steer { session_id, text } => {
-                let sent = {
-                    let st = state.lock().unwrap();
-                    if let Some(tx) = st.steer_txs.get(&session_id) {
-                        tx.try_send(text.clone()).is_ok()
-                    } else {
-                        false
-                    }
-                };
-                if sent {
-                    // Steering message will be picked up by the agent loop
-                    send(&mut writer, &Response::Ok).await.ok();
-                } else {
-                    // No active agent loop — treat as a regular chat message
-                    // Re-dispatch as Chat by pushing it back. We handle it inline
-                    // to avoid recursion: just send an error telling the client
-                    // to send a Chat instead.
-                    send(
-                        &mut writer,
-                        &Response::Error {
-                            message: "no active agent loop, use Chat instead".into(),
-                        },
-                    )
-                    .await
-                    .ok();
-                }
+                // Queue the message persistently; the agent loop will drain it
+                // at the top of its next turn.
+                queue_message_to_session(&state, &session_id, &text, "steer");
+                send(&mut writer, &Response::Ok).await.ok();
             }
             Request::ListSessions => {
                 let sessions = {
@@ -1719,22 +1744,36 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
 
     let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
 
-    // Create steering channel for this session's agent loop
-    let (steer_tx, steer_rx) = smol::channel::bounded::<String>(16);
-    {
+    // Set up has_queued flag for this session
+    let has_queued_flag = {
         let mut st = state.lock().unwrap();
-        st.steer_txs.insert(session_id.to_string(), steer_tx);
-    }
+        st.has_queued
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    };
 
     let shutdown_flag = shutdown.flag.clone();
     let cancel_flag_clone = cancel_flag.clone();
     let state_clone_persist = state.clone();
     let session_id_persist = session_id.to_string();
+    let state_clone_drain = state.clone();
+    let session_id_drain = session_id.to_string();
+    let has_queued_clone = has_queued_flag.clone();
     let agent_config = crate::agent::AgentConfig {
         should_stop: Some(Box::new(move || {
             shutdown_flag.load(Ordering::Relaxed) || cancel_flag_clone.load(Ordering::Relaxed)
         })),
-        steer_rx: Some(steer_rx),
+        drain_queued: Some(Box::new(move || {
+            if has_queued_clone.swap(false, Ordering::Acquire) {
+                let st = state_clone_drain.lock().unwrap();
+                st.db
+                    .drain_queued_messages(&session_id_drain)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })),
         on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
             let st = state_clone_persist.lock().unwrap();
             if let Err(e) = st.db.append_message(&session_id_persist, msg) {
@@ -1895,12 +1934,6 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
 
     let agent_result = agent_result?;
 
-    // Clean up steering channel
-    {
-        let mut st = state.lock().unwrap();
-        st.steer_txs.remove(session_id);
-    }
-
     Ok(agent_result)
 }
 
@@ -2050,21 +2083,12 @@ async fn run_child_chat(
                          or session_cancel to stop it.",
                         session_id
                     );
-                    let sent = {
-                        let st = state.lock().unwrap();
-                        if let Some(tx) = st.steer_txs.get(&pid) {
-                            tx.try_send(notice.clone()).is_ok()
-                        } else {
-                            false
-                        }
-                    };
-                    if !sent {
-                        // Parent agent loop not running -- broadcast as status
-                        let status_resp = Response::Stream {
-                            event: Box::new(StreamEvent::Status { message: notice }),
-                        };
-                        broadcast_to_subscribers(&state, &pid, &status_resp);
-                    }
+                    queue_message_to_session(
+                        &state,
+                        &pid,
+                        &notice,
+                        &format!("child:{}", session_id),
+                    );
                 }
             } else {
                 // Normal completion -- notify parent.
@@ -2239,20 +2263,12 @@ async fn resume_child_session(
                          or session_cancel to stop it.",
                         session_id
                     );
-                    let sent = {
-                        let st = state.lock().unwrap();
-                        if let Some(tx) = st.steer_txs.get(&pid) {
-                            tx.try_send(notice.clone()).is_ok()
-                        } else {
-                            false
-                        }
-                    };
-                    if !sent {
-                        let status_resp = Response::Stream {
-                            event: Box::new(StreamEvent::Status { message: notice }),
-                        };
-                        broadcast_to_subscribers(&state, &pid, &status_resp);
-                    }
+                    queue_message_to_session(
+                        &state,
+                        &pid,
+                        &notice,
+                        &format!("child:{}", session_id),
+                    );
                 }
             } else {
                 notify_parent_of_child_completion(&state, &session_id, "completed", None);
@@ -2719,21 +2735,7 @@ fn notify_parent_of_child_completion(
         }
     );
 
-    let sent = {
-        let st = state.lock().unwrap();
-        if let Some(tx) = st.steer_txs.get(&pid) {
-            tx.try_send(notice.clone()).is_ok()
-        } else {
-            false
-        }
-    };
-    if !sent {
-        // Parent agent loop not running -- broadcast as status.
-        let status_resp = Response::Stream {
-            event: Box::new(StreamEvent::Status { message: notice }),
-        };
-        broadcast_to_subscribers(state, &pid, &status_resp);
-    }
+    queue_message_to_session(state, &pid, &notice, &format!("child:{}", child_session_id));
 }
 
 fn last_assistant_text(messages: &[Message]) -> String {
