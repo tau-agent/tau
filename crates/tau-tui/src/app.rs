@@ -567,6 +567,7 @@ impl App {
                     self.picker_confirm_archive = None;
                     if let Some(session) = self.picker_sessions.get(idx) {
                         let session_id = session.id.clone();
+                        let parent_id = session.parent_id.clone();
                         // Remove from picker list
                         self.picker_sessions.remove(idx);
                         if self.picker_cursor >= self.picker_sessions.len()
@@ -574,7 +575,15 @@ impl App {
                         {
                             self.picker_cursor -= 1;
                         }
-                        return Some(Action::ArchiveSession(session_id));
+                        let switch_to = if session_id == self.session_id {
+                            parent_id
+                        } else {
+                            None
+                        };
+                        return Some(Action::ArchiveSession {
+                            session_id,
+                            switch_to,
+                        });
                     }
                     None
                 }
@@ -642,7 +651,7 @@ impl App {
                 // A (shift+a): archive selected session
                 (KeyCode::Char('A'), _) => {
                     if let Some(session) = self.picker_sessions.get(self.picker_cursor) {
-                        if session.id == self.session_id {
+                        if session.id == self.session_id && session.parent_id.is_none() {
                             self.messages.push(MessageItem::Status {
                                 text: "cannot archive active session".into(),
                             });
@@ -1382,8 +1391,11 @@ pub enum Action {
     OpenSessionPicker,
     /// Delete a session.
     DeleteSession(String),
-    /// Archive a session.
-    ArchiveSession(String),
+    /// Archive a session, optionally switching to another session first.
+    ArchiveSession {
+        session_id: String,
+        switch_to: Option<String>,
+    },
     /// Switch to viewing a different session.
     SwitchSession(String),
     /// Navigate back to previous session in nav stack.

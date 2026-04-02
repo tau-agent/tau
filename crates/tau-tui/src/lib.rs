@@ -318,7 +318,26 @@ async fn run_inner(
                         text: format!("deleted session {}", &session_id[..session_id.len().min(8)]),
                     });
                 }
-                Action::ArchiveSession(session_id) => {
+                Action::ArchiveSession {
+                    session_id,
+                    switch_to,
+                } => {
+                    // If archiving the active session, switch to parent first
+                    if let Some(target_id) = switch_to {
+                        match fetch_session_info(&target_id).await {
+                            Ok(info) => {
+                                let messages = fetch_messages(&target_id).await.unwrap_or_default();
+                                app.save_nav_state();
+                                app.switch_to_session(&info, messages);
+                                sub_switch_tx.send(target_id).await.ok();
+                            }
+                            Err(e) => {
+                                app.messages.push(crate::message::MessageItem::Error {
+                                    text: format!("failed to switch to parent: {}", e),
+                                });
+                            }
+                        }
+                    }
                     send_request_and_recv(
                         Request::ArchiveSession {
                             session_id: session_id.clone(),
