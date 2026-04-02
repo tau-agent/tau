@@ -288,7 +288,13 @@ async fn run_inner(
                     app.mode = AppMode::SessionPicker;
                     app.picker_sessions.clear();
                     app.picker_confirm_delete = None;
-                    send_request_and_recv(Request::ListSessions, server_tx.clone()).await?;
+                    send_request_and_recv(
+                        Request::ListSessions {
+                            include_archived: false,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
                 }
                 Action::DeleteSession(session_id) => {
                     send_request_and_recv(
@@ -303,7 +309,13 @@ async fn run_inner(
                     });
                 }
                 Action::ListChildren => {
-                    send_request_and_recv(Request::ListSessions, server_tx.clone()).await?;
+                    send_request_and_recv(
+                        Request::ListSessions {
+                            include_archived: false,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
                 }
                 Action::NavigateBack => {
                     app.navigate_back();

@@ -25,7 +25,9 @@ fn query(req: &Request) -> Option<Response> {
 
 /// Complete session IDs (with model + message count as help text).
 pub fn session_completer() -> Vec<CompletionCandidate> {
-    let Some(Response::Sessions { sessions }) = query(&Request::ListSessions) else {
+    let Some(Response::Sessions { sessions }) = query(&Request::ListSessions {
+        include_archived: false,
+    }) else {
         return vec![];
     };
     sessions

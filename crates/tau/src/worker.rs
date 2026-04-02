@@ -563,7 +563,9 @@ fn handle_session_tool(
             if parent.is_empty() {
                 return tool_err("no session context available");
             }
-            let req = crate::protocol::Request::ListSessions;
+            let req = crate::protocol::Request::ListSessions {
+                include_archived: false,
+            };
             match server_request(writer, reader, req) {
                 Ok(crate::protocol::Response::Sessions { sessions }) => {
                     let children: Vec<_> = sessions
@@ -808,7 +810,9 @@ mod tests {
         let result = server_request(
             &mut writer,
             &mut reader,
-            crate::protocol::Request::ListSessions,
+            crate::protocol::Request::ListSessions {
+                include_archived: false,
+            },
         );
 
         assert!(result.is_err());

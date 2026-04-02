@@ -22,6 +22,7 @@ pub struct StoredSession {
     pub parent_id: Option<String>,
     pub child_budget: u32,
     pub tagline: Option<String>,
+    pub archived: bool,
 }
 
 pub struct Db {
@@ -57,7 +58,8 @@ impl Db {
                 created_at     INTEGER NOT NULL,
                 parent_id      TEXT,
                 child_budget   INTEGER NOT NULL DEFAULT 16,
-                tagline        TEXT
+                tagline        TEXT,
+                archived       INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS messages (
                 id          INTEGER PRIMARY KEY,
@@ -84,6 +86,8 @@ impl Db {
             "ALTER TABLE sessions ADD COLUMN child_budget INTEGER NOT NULL DEFAULT 16;",
         );
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN tagline TEXT;");
+        let _ = conn
+            .execute_batch("ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
 
         // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
@@ -125,7 +129,8 @@ impl Db {
                 created_at     INTEGER NOT NULL,
                 parent_id      TEXT,
                 child_budget   INTEGER NOT NULL DEFAULT 16,
-                tagline        TEXT
+                tagline        TEXT,
+                archived       INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,
@@ -158,8 +163,8 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     session.id,
                     model_json,
@@ -170,6 +175,7 @@ impl Db {
                     session.parent_id,
                     session.child_budget,
                     session.tagline,
+                    session.archived as i32,
                 ],
             )
             .map_err(|e| crate::Error::Io(format!("insert session: {}", e)))?;
@@ -180,7 +186,7 @@ impl Db {
     pub fn get_session(&self, id: &str) -> crate::Result<Option<StoredSession>> {
         self.conn
             .query_row(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived
                  FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -202,6 +208,7 @@ impl Db {
                         parent_id: row.get(6)?,
                         child_budget: row.get::<_, i32>(7)? as u32,
                         tagline: row.get(8)?,
+                        archived: row.get::<_, i32>(9)? != 0,
                     })
                 },
             )
@@ -210,13 +217,19 @@ impl Db {
     }
 
     /// List all sessions (metadata only, no messages).
-    pub fn list_sessions(&self) -> crate::Result<Vec<StoredSession>> {
+    /// List sessions (metadata only, no messages).
+    /// If `include_archived` is false, archived sessions are excluded.
+    pub fn list_sessions(&self, include_archived: bool) -> crate::Result<Vec<StoredSession>> {
+        let sql = if include_archived {
+            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived
+             FROM sessions ORDER BY created_at"
+        } else {
+            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived
+             FROM sessions WHERE archived = 0 ORDER BY created_at"
+        };
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline
-                 FROM sessions ORDER BY created_at",
-            )
+            .prepare(sql)
             .map_err(|e| crate::Error::Io(format!("prepare list: {}", e)))?;
 
         let rows = stmt
@@ -239,6 +252,7 @@ impl Db {
                     parent_id: row.get(6)?,
                     child_budget: row.get::<_, i32>(7)? as u32,
                     tagline: row.get(8)?,
+                    archived: row.get::<_, i32>(9)? != 0,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list sessions: {}", e)))?;
@@ -285,6 +299,21 @@ impl Db {
         Ok(())
     }
 
+    /// Archive a session and all its descendants (recursive).
+    /// Sets the `archived` flag to 1 for the entire subtree.
+    pub fn archive_session_tree(&self, id: &str) -> crate::Result<()> {
+        let ids = self.get_subtree_ids(id)?;
+        for sid in &ids {
+            self.conn
+                .execute(
+                    "UPDATE sessions SET archived = 1 WHERE id = ?1",
+                    params![sid],
+                )
+                .map_err(|e| crate::Error::Io(format!("archive session: {}", e)))?;
+        }
+        Ok(())
+    }
+
     /// Collect all session IDs in the subtree rooted at `id` (inclusive).
     pub fn get_subtree_ids(&self, id: &str) -> crate::Result<Vec<String>> {
         let mut ids = vec![id.to_string()];
@@ -300,7 +329,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived
                  FROM sessions WHERE parent_id = ?1 ORDER BY created_at",
             )
             .map_err(|e| crate::Error::Io(format!("prepare children: {}", e)))?;
@@ -325,6 +354,7 @@ impl Db {
                     parent_id: row.get(6)?,
                     child_budget: row.get::<_, i32>(7)? as u32,
                     tagline: row.get(8)?,
+                    archived: row.get::<_, i32>(9)? != 0,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list children: {}", e)))?;
@@ -348,6 +378,7 @@ impl Db {
                  FROM sessions s
                  JOIN messages m ON m.session_id = s.id
                  WHERE s.parent_id IS NOT NULL
+                   AND s.archived = 0
                    AND m.id = (SELECT MAX(m2.id) FROM messages m2 WHERE m2.session_id = s.id)",
             )
             .map_err(|e| crate::Error::Io(format!("prepare sessions_needing_resume: {}", e)))?;
@@ -373,12 +404,12 @@ impl Db {
         Ok(result)
     }
 
-    /// Count direct children of a session.
+    /// Count direct non-archived children of a session.
     pub fn child_count(&self, session_id: &str) -> crate::Result<usize> {
         let count: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE parent_id = ?1",
+                "SELECT COUNT(*) FROM sessions WHERE parent_id = ?1 AND archived = 0",
                 params![session_id],
                 |row| row.get(0),
             )
@@ -386,12 +417,12 @@ impl Db {
         Ok(count as usize)
     }
 
-    /// Compute budget_used for a session (sum of 1 + child_budget for each direct child).
+    /// Compute budget_used for a session (sum of 1 + child_budget for each non-archived direct child).
     pub fn budget_used(&self, session_id: &str) -> crate::Result<u32> {
         let used: i64 = self
             .conn
             .query_row(
-                "SELECT COALESCE(SUM(1 + child_budget), 0) FROM sessions WHERE parent_id = ?1",
+                "SELECT COALESCE(SUM(1 + child_budget), 0) FROM sessions WHERE parent_id = ?1 AND archived = 0",
                 params![session_id],
                 |row| row.get(0),
             )
@@ -771,6 +802,7 @@ mod tests {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            archived: false,
         };
         db.create_session(&session).unwrap();
 
@@ -794,6 +826,7 @@ mod tests {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            archived: false,
         };
         db.create_session(&session).unwrap();
 
@@ -827,6 +860,7 @@ mod tests {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            archived: false,
         };
         db.create_session(&session).unwrap();
         db.append_message("s1", &Message::User(UserMessage::text("hi")))
@@ -851,10 +885,11 @@ mod tests {
                 parent_id: None,
                 child_budget: 0,
                 tagline: None,
+                archived: false,
             })
             .unwrap();
         }
-        let sessions = db.list_sessions().unwrap();
+        let sessions = db.list_sessions(true).unwrap();
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["s1", "s2", "s3"]);
     }
@@ -874,6 +909,7 @@ mod tests {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
         assert_eq!(db.next_session_id().unwrap(), "s6");
@@ -894,6 +930,7 @@ mod tests {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -912,6 +949,7 @@ mod tests {
             parent_id: Some("root".into()),
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -929,6 +967,7 @@ mod tests {
             parent_id: Some("root".into()),
             child_budget: 2,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -956,6 +995,7 @@ mod tests {
             parent_id: None,
             child_budget: 10,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -969,6 +1009,7 @@ mod tests {
             parent_id: Some("root".into()),
             child_budget: 3,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -983,6 +1024,7 @@ mod tests {
             parent_id: Some("c1".into()),
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -1007,6 +1049,7 @@ mod tests {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -1020,6 +1063,7 @@ mod tests {
             parent_id: Some("root".into()),
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -1046,6 +1090,7 @@ mod tests {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            archived: false,
         })
         .unwrap();
         db.append_message("top", &Message::User(UserMessage::text("hello")))
@@ -1062,6 +1107,7 @@ mod tests {
             parent_id: Some("top".into()),
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
         db.append_message("child1", &Message::User(UserMessage::text("work")))
@@ -1078,6 +1124,7 @@ mod tests {
             parent_id: Some("top".into()),
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
         db.append_message(
@@ -1097,6 +1144,7 @@ mod tests {
             parent_id: Some("top".into()),
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
         db.append_message(
@@ -1126,6 +1174,7 @@ mod tests {
             parent_id: Some("top".into()),
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -1147,6 +1196,7 @@ mod tests {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -1174,6 +1224,7 @@ mod tests {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -1222,6 +1273,7 @@ mod tests {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 
@@ -1243,6 +1295,7 @@ mod tests {
                 parent_id: None,
                 child_budget: 0,
                 tagline: None,
+                archived: false,
             })
             .unwrap();
         }
@@ -1272,6 +1325,7 @@ mod tests {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            archived: false,
         })
         .unwrap();
 

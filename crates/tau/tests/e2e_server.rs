@@ -160,7 +160,12 @@ fn server_create_session_and_list() {
 
     // List sessions -- should show the one we created
     let conn2 = server.connect();
-    let resp = send_recv(&conn2, &Request::ListSessions);
+    let resp = send_recv(
+        &conn2,
+        &Request::ListSessions {
+            include_archived: false,
+        },
+    );
     match resp {
         Response::Sessions { sessions } => {
             assert_eq!(sessions.len(), 1);
@@ -898,6 +903,7 @@ fn queue_message_persists_across_operations() {
         parent_id: None,
         child_budget: 0,
         tagline: None,
+        archived: false,
     })
     .unwrap();
 

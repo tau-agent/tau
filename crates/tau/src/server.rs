@@ -105,6 +105,7 @@ fn session_info(
             .trim_end_matches("...")
             .to_string(),
         context_pct,
+        archived: stored.archived,
     }
 }
 
@@ -794,6 +795,7 @@ async fn handle_client(
                         parent_id: parent_id.clone(),
                         child_budget,
                         tagline,
+                        archived: false,
                     };
                     st.db.create_session(&stored)?;
                     Ok::<String, crate::Error>(id)
@@ -1206,10 +1208,10 @@ async fn handle_client(
                 queue_message_to_session(&state, &session_id, &text, "steer");
                 send(&mut writer, &Response::Ok).await.ok();
             }
-            Request::ListSessions => {
+            Request::ListSessions { include_archived } => {
                 let sessions = {
                     let st = state.lock().unwrap();
-                    let stored = st.db.list_sessions()?;
+                    let stored = st.db.list_sessions(include_archived)?;
                     let mut infos = Vec::with_capacity(stored.len());
                     for s in &stored {
                         let messages = st.db.get_messages(&s.id)?;
@@ -1221,6 +1223,77 @@ async fn handle_client(
                     infos
                 };
                 send(&mut writer, &Response::Sessions { sessions }).await?;
+            }
+            Request::ArchiveSession { session_id } => {
+                // Validate: session must exist and all sessions in the subtree must be idle
+                let subtree_ids = {
+                    let st = state.lock().unwrap();
+                    match st.db.get_session(&session_id)? {
+                        Some(_) => Some(st.db.get_subtree_ids(&session_id)?),
+                        None => None,
+                    }
+                };
+                let subtree_ids = match subtree_ids {
+                    Some(ids) => ids,
+                    None => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("session not found: {}", session_id),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                };
+
+                // Check all sessions in the subtree are idle (not locked)
+                let mut busy_id = None;
+                for sid in &subtree_ids {
+                    let lock = session_lock(&session_locks, sid);
+                    if lock.try_lock().is_none() {
+                        busy_id = Some(sid.clone());
+                        break;
+                    }
+                }
+                if let Some(busy) = busy_id {
+                    send(
+                        &mut writer,
+                        &Response::Error {
+                            message: format!("cannot archive: session {} is busy", busy),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+
+                // Archive in DB
+                {
+                    let st = state.lock().unwrap();
+                    st.db.archive_session_tree(&session_id)?;
+                }
+
+                // Idle all session plugins for archived sessions
+                {
+                    let mut pm = plugins.lock().unwrap();
+                    for sid in &subtree_ids {
+                        pm.destroy_session_plugins(sid);
+                    }
+                }
+
+                // Clean up in-memory state for archived sessions
+                {
+                    let mut st = state.lock().unwrap();
+                    for sid in &subtree_ids {
+                        st.cancel_flags.remove(sid);
+                        st.has_queued.remove(sid);
+                        st.subscribers.remove(sid);
+                        st.phases.remove(sid);
+                        st.waited_sessions.remove(sid);
+                    }
+                }
+
+                send(&mut writer, &Response::SessionArchived).await?;
             }
             Request::DeleteSession { session_id } => {
                 // Collect all session IDs in the subtree before deleting
@@ -2542,6 +2615,7 @@ fn handle_server_request_sync(
                 parent_id: parent_id.clone(),
                 child_budget: *child_budget,
                 tagline: tagline.clone(),
+                archived: false,
             };
             match st.db.create_session(&stored) {
                 Ok(()) => Response::SessionCreated { session_id: id },
@@ -2584,9 +2658,9 @@ fn handle_server_request_sync(
                 },
             }
         }
-        Request::ListSessions => {
+        Request::ListSessions { include_archived } => {
             let st = state.lock().unwrap();
-            match st.db.list_sessions() {
+            match st.db.list_sessions(*include_archived) {
                 Ok(stored) => {
                     let mut infos = Vec::new();
                     for s in &stored {

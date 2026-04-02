@@ -154,6 +154,7 @@ fn session_tree_budget_enforcement() {
         parent_id: None,
         child_budget: 3,
         tagline: None,
+        archived: false,
     };
     db.create_session(&root).unwrap();
 
@@ -168,6 +169,7 @@ fn session_tree_budget_enforcement() {
         parent_id: Some("root".into()),
         child_budget: 0,
         tagline: None,
+        archived: false,
     };
     db.create_session(&c1).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 1);
@@ -183,6 +185,7 @@ fn session_tree_budget_enforcement() {
         parent_id: Some("root".into()),
         child_budget: 1,
         tagline: None,
+        archived: false,
     };
     db.create_session(&c2).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 3); // 1 + (1+1) = 3
@@ -208,6 +211,7 @@ fn session_tree_budget_enforcement() {
         parent_id: Some("c2".into()),
         child_budget: 0,
         tagline: None,
+        archived: false,
     };
     db.create_session(&gc1).unwrap();
     assert_eq!(db.budget_used("c2").unwrap(), 1);
@@ -245,6 +249,7 @@ fn session_tree_recursive_delete() {
             parent_id: parent.map(String::from),
             child_budget: budget,
             tagline: None,
+            archived: false,
         })
         .unwrap();
     }
@@ -289,6 +294,7 @@ fn session_model_inheritance() {
         parent_id: None,
         child_budget: 5,
         tagline: None,
+        archived: false,
     })
     .unwrap();
 
@@ -325,6 +331,7 @@ fn session_info_includes_tree_fields() {
         parent_id: None,
         child_budget: 5,
         tagline: None,
+        archived: false,
     })
     .unwrap();
 
@@ -338,6 +345,7 @@ fn session_info_includes_tree_fields() {
         parent_id: Some("root".into()),
         child_budget: 0,
         tagline: None,
+        archived: false,
     })
     .unwrap();
 
@@ -464,6 +472,7 @@ fn protocol_session_info_tree_fields() {
         child_count: 2,
         child_budget: 10,
         tagline: None,
+        archived: false,
         state: "idle".into(),
         context_pct: None,
     };

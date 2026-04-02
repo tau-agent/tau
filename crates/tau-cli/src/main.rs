@@ -156,9 +156,19 @@ enum ServerAction {
 
 #[derive(Subcommand)]
 enum SessionAction {
-    /// List all sessions
+    /// List sessions
     #[command(alias = "l")]
-    List,
+    List {
+        /// Include archived sessions
+        #[arg(long, short = 'a')]
+        all: bool,
+    },
+    /// Archive a session (and all its children)
+    Archive {
+        /// Session ID
+        #[arg(add = ArgValueCandidates::new(completer::session_completer))]
+        id: String,
+    },
     /// Delete a session
     #[command(aliases = ["del", "rm"])]
     Delete {
@@ -232,8 +242,11 @@ async fn run(cli: Cli) -> tau::Result<()> {
             }
         },
         Commands::Sessions { action } => match action {
-            SessionAction::List => {
-                cmd_sessions_list().await?;
+            SessionAction::List { all } => {
+                cmd_sessions_list(all).await?;
+            }
+            SessionAction::Archive { id } => {
+                cmd_sessions_archive(&id).await?;
             }
             SessionAction::Delete { id } => {
                 cmd_sessions_delete(&id).await?;
@@ -1157,9 +1170,11 @@ async fn cmd_auth_status() -> tau::Result<()> {
     Ok(())
 }
 
-async fn cmd_sessions_list() -> tau::Result<()> {
+async fn cmd_sessions_list(include_archived: bool) -> tau::Result<()> {
     let mut client = tau::client::Client::connect_or_start().await?;
-    client.send(&tau::protocol::Request::ListSessions).await?;
+    client
+        .send(&tau::protocol::Request::ListSessions { include_archived })
+        .await?;
 
     client
         .recv_streaming(|resp| {
@@ -1204,9 +1219,10 @@ fn print_session_tree(
     } else {
         String::new()
     };
+    let archived_tag = if session.archived { " [archived]" } else { "" };
     println!(
-        "{}{}\t{}/{}\t{}\t{}\t{}{}",
-        indent, session.id, session.provider, session.model, ago, cwd, stats, budget
+        "{}{}\t{}/{}\t{}\t{}\t{}{}{}",
+        indent, session.id, session.provider, session.model, ago, cwd, stats, budget, archived_tag
     );
     // Print children
     let children: Vec<_> = all
@@ -1216,6 +1232,18 @@ fn print_session_tree(
     for child in children {
         print_session_tree(child, all, depth + 1);
     }
+}
+
+async fn cmd_sessions_archive(id: &str) -> tau::Result<()> {
+    let mut client = tau::client::Client::connect_or_start().await?;
+    client
+        .send(&tau::protocol::Request::ArchiveSession {
+            session_id: id.to_string(),
+        })
+        .await?;
+    client.recv_streaming(|_| {}).await?;
+    eprintln!("archived session {}", id);
+    Ok(())
 }
 
 async fn cmd_sessions_delete(id: &str) -> tau::Result<()> {

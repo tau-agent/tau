@@ -37,7 +37,13 @@ pub enum Request {
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },
     /// List sessions.
-    ListSessions,
+    ListSessions {
+        /// Include archived sessions in the listing.
+        #[serde(default)]
+        include_archived: bool,
+    },
+    /// Archive a session (and all its children).
+    ArchiveSession { session_id: String },
     /// Delete a session.
     DeleteSession { session_id: String },
     /// List available models.
@@ -107,6 +113,8 @@ pub enum Response {
     Sessions { sessions: Vec<SessionInfo> },
     /// Session deleted.
     SessionDeleted,
+    /// Session archived.
+    SessionArchived,
     /// Available models.
     Models { models: Vec<ModelInfo> },
     /// Model changed.
@@ -169,6 +177,9 @@ pub struct SessionInfo {
     /// Context usage as percentage (0-100), if known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_pct: Option<f64>,
+    /// Whether this session is archived.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 /// Result for a single session in WaitSessions response.
