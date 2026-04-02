@@ -901,9 +901,10 @@ impl App {
                     None
                 }
             }
+            "/reload" => Some(Action::ReloadPlugins),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /sessions /session <id> /back /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /reload /sessions /session <id> /back /help /quit"
                         .into(),
                 });
                 None
@@ -1389,6 +1390,8 @@ pub enum Action {
     NavigateBack,
     /// List child sessions of the current session.
     ListChildren,
+    /// Reload plugins for the current session.
+    ReloadPlugins,
 }
 
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.

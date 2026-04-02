@@ -797,8 +797,20 @@ impl PluginManager {
         }
     }
 
+    /// Reload the plugin configuration from disk.
+    pub fn reload_config(&mut self) {
+        self.config = load_plugins_config();
+    }
+
     /// Load global plugins from config.
+    /// Kills any existing global plugins first.
     pub fn load_global_plugins(&mut self, cwd: &str) {
+        // Kill existing global plugins before reloading
+        for p in &mut self.global_plugins {
+            p.kill();
+        }
+        self.global_plugins.clear();
+
         for (name, entry) in &self.config.global {
             match PluginHandle::spawn(&entry.command, cwd) {
                 Ok(handle) => {

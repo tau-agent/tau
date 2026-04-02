@@ -1664,6 +1664,38 @@ async fn handle_client(
                 }
                 send(&mut writer, &Response::Ok).await?;
             }
+            Request::ReloadPlugins { session_id } => {
+                let cwd = {
+                    let st = state.lock().unwrap();
+                    st.db
+                        .get_session(&session_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.cwd)
+                        .unwrap_or_else(|| "/tmp".to_string())
+                };
+                let result = {
+                    let mut pm = plugins.lock().unwrap();
+                    pm.reload_config();
+                    pm.destroy_session_plugins(&session_id);
+                    pm.ensure_session_plugins(&session_id, &cwd)
+                        .map(|()| pm.load_global_plugins(&cwd))
+                };
+                match result {
+                    Ok(()) => {
+                        send(&mut writer, &Response::Ok).await?;
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("reload session plugins: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             Request::Shutdown { restart } => {
                 shutdown.request_shutdown(restart);
                 send(&mut writer, &Response::Ok).await?;

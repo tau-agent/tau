@@ -283,6 +283,16 @@ async fn run_inner(
                     )
                     .await?;
                 }
+                Action::ReloadPlugins => {
+                    send_request_and_recv(
+                        Request::ReloadPlugins { session_id: sid },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                    app.messages.push(crate::message::MessageItem::Status {
+                        text: "Plugins reloaded".into(),
+                    });
+                }
                 Action::OpenSessionPicker => {
                     app.picker_previous_mode = app.mode;
                     app.mode = AppMode::SessionPicker;

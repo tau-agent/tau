@@ -1039,8 +1039,19 @@ async fn handle_slash_command(
             println!("  /model <id>    switch to a different model");
             println!("  /cwd           show working directory");
             println!("  /cwd <path>    change working directory");
+            println!("  /reload        reload plugins");
             println!("  /help          show this help");
             println!("  /quit          exit");
+        }
+
+        "/reload" => {
+            client
+                .send(&tau::protocol::Request::ReloadPlugins {
+                    session_id: session_id.to_string(),
+                })
+                .await?;
+            client.recv_streaming(|_| {}).await?;
+            eprintln!("Plugins reloaded");
         }
 
         _ => {

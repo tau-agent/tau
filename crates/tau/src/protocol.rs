@@ -90,6 +90,8 @@ pub enum Request {
         content: String,
         sender_info: String,
     },
+    /// Reload plugins for a session (destroy + re-init).
+    ReloadPlugins { session_id: String },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
