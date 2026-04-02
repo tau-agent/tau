@@ -644,6 +644,41 @@ fn queue_message_to_session(state: &SharedState, target: &str, content: &str, se
         .store(true, Ordering::Release);
 }
 
+/// Queue a message and, if the target session is idle, spawn a resume task so
+/// the message is processed without waiting for the next user interaction.
+#[allow(clippy::too_many_arguments)]
+fn queue_and_maybe_resume(
+    state: &SharedState,
+    session_locks: &SessionLocks,
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
+    shutdown: &ShutdownHandle,
+    throttle: &crate::throttle::ProviderThrottle,
+    target: &str,
+    content: &str,
+    sender_info: &str,
+) {
+    queue_message_to_session(state, target, content, sender_info);
+    // If the target session is idle (lock is free), spawn a resume task.
+    let needs_resume = {
+        let lock = session_lock(session_locks, target);
+        lock.try_lock().is_some()
+    };
+    if needs_resume {
+        let s = state.clone();
+        let p = plugins.clone();
+        let sh = shutdown.clone();
+        let sl = session_locks.clone();
+        let th = throttle.clone();
+        let sid = target.to_string();
+        smol::spawn(async move {
+            if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone()).await {
+                eprintln!("resume session {} after queued message: {}", sid, e);
+            }
+        })
+        .detach();
+    }
+}
+
 async fn handle_client(
     stream: Async<UnixStream>,
     state: SharedState,
@@ -1203,9 +1238,18 @@ async fn handle_client(
                 send(&mut writer, &Response::Ok).await.ok();
             }
             Request::Steer { session_id, text } => {
-                // Queue the message persistently; the agent loop will drain it
-                // at the top of its next turn.
-                queue_message_to_session(&state, &session_id, &text, "steer");
+                // Queue the message persistently; if the session is idle,
+                // spawn a resume so it gets processed immediately.
+                queue_and_maybe_resume(
+                    &state,
+                    &session_locks,
+                    &plugins,
+                    &shutdown,
+                    &throttle,
+                    &session_id,
+                    &text,
+                    "steer",
+                );
                 send(&mut writer, &Response::Ok).await.ok();
             }
             Request::ListSessions { include_archived } => {
@@ -1679,26 +1723,16 @@ async fn handle_client(
                 content,
                 sender_info,
             } => {
-                queue_message_to_session(&state, &target_session_id, &content, &sender_info);
-                // If session is idle, trigger a resume so the message gets processed.
-                let needs_resume = {
-                    let lock = session_lock(&session_locks, &target_session_id);
-                    lock.try_lock().is_some()
-                };
-                if needs_resume {
-                    let s = state.clone();
-                    let p = plugins.clone();
-                    let sh = shutdown.clone();
-                    let sl = session_locks.clone();
-                    let th = throttle.clone();
-                    let sid = target_session_id.clone();
-                    smol::spawn(async move {
-                        if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone()).await {
-                            eprintln!("resume session {} after message: {}", sid, e);
-                        }
-                    })
-                    .detach();
-                }
+                queue_and_maybe_resume(
+                    &state,
+                    &session_locks,
+                    &plugins,
+                    &shutdown,
+                    &throttle,
+                    &target_session_id,
+                    &content,
+                    &sender_info,
+                );
                 send(&mut writer, &Response::Ok).await?;
             }
             Request::ReloadPlugins { session_id } => {
@@ -2254,7 +2288,16 @@ async fn run_child_chat(
         Ok((true, _)) => {
             broadcast_to_subscribers(&state, &session_id, &Response::Cancelled);
             // Notify parent about cancellation.
-            notify_parent_of_child_completion(&state, &session_id, "cancelled", None);
+            notify_parent_of_child_completion(
+                &state,
+                &session_locks,
+                &plugins,
+                &shutdown,
+                &throttle,
+                &session_id,
+                "cancelled",
+                None,
+            );
         }
         Ok((false, max_turns_reached)) => {
             if max_turns_reached {
@@ -2274,8 +2317,12 @@ async fn run_child_chat(
                          or session_cancel to stop it.",
                         session_id
                     );
-                    queue_message_to_session(
+                    queue_and_maybe_resume(
                         &state,
+                        &session_locks,
+                        &plugins,
+                        &shutdown,
+                        &throttle,
                         &pid,
                         &notice,
                         &format!("child:{}", session_id),
@@ -2283,7 +2330,16 @@ async fn run_child_chat(
                 }
             } else {
                 // Normal completion -- notify parent.
-                notify_parent_of_child_completion(&state, &session_id, "completed", None);
+                notify_parent_of_child_completion(
+                    &state,
+                    &session_locks,
+                    &plugins,
+                    &shutdown,
+                    &throttle,
+                    &session_id,
+                    "completed",
+                    None,
+                );
             }
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
         }
@@ -2298,7 +2354,16 @@ async fn run_child_chat(
             );
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
             // Notify parent about error.
-            notify_parent_of_child_completion(&state, &session_id, &format!("error: {}", e), None);
+            notify_parent_of_child_completion(
+                &state,
+                &session_locks,
+                &plugins,
+                &shutdown,
+                &throttle,
+                &session_id,
+                &format!("error: {}", e),
+                None,
+            );
         }
     }
 
@@ -2435,7 +2500,16 @@ async fn resume_child_session(
     match chat_result {
         Ok((true, _)) => {
             broadcast_to_subscribers(&state, &session_id, &Response::Cancelled);
-            notify_parent_of_child_completion(&state, &session_id, "cancelled", None);
+            notify_parent_of_child_completion(
+                &state,
+                &session_locks,
+                &plugins,
+                &shutdown,
+                &throttle,
+                &session_id,
+                "cancelled",
+                None,
+            );
         }
         Ok((false, max_turns_reached)) => {
             if max_turns_reached {
@@ -2454,15 +2528,28 @@ async fn resume_child_session(
                          or session_cancel to stop it.",
                         session_id
                     );
-                    queue_message_to_session(
+                    queue_and_maybe_resume(
                         &state,
+                        &session_locks,
+                        &plugins,
+                        &shutdown,
+                        &throttle,
                         &pid,
                         &notice,
                         &format!("child:{}", session_id),
                     );
                 }
             } else {
-                notify_parent_of_child_completion(&state, &session_id, "completed", None);
+                notify_parent_of_child_completion(
+                    &state,
+                    &session_locks,
+                    &plugins,
+                    &shutdown,
+                    &throttle,
+                    &session_id,
+                    "completed",
+                    None,
+                );
             }
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
         }
@@ -2476,7 +2563,16 @@ async fn resume_child_session(
                 },
             );
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
-            notify_parent_of_child_completion(&state, &session_id, &format!("error: {}", e), None);
+            notify_parent_of_child_completion(
+                &state,
+                &session_locks,
+                &plugins,
+                &shutdown,
+                &throttle,
+                &session_id,
+                &format!("error: {}", e),
+                None,
+            );
         }
     }
 
@@ -2942,8 +3038,13 @@ fn handle_server_request_sync(
 
 /// Notify a child session's parent that the child has completed.
 /// Skipped if the parent is actively waiting on this child via WaitSessions/WaitAnySessions.
+#[allow(clippy::too_many_arguments)]
 fn notify_parent_of_child_completion(
     state: &SharedState,
+    session_locks: &SessionLocks,
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
+    shutdown: &ShutdownHandle,
+    throttle: &crate::throttle::ProviderThrottle,
     child_session_id: &str,
     status: &str,
     error_detail: Option<&str>,
@@ -2993,7 +3094,16 @@ fn notify_parent_of_child_completion(
         }
     );
 
-    queue_message_to_session(state, &pid, &notice, &format!("child:{}", child_session_id));
+    queue_and_maybe_resume(
+        state,
+        session_locks,
+        plugins,
+        shutdown,
+        throttle,
+        &pid,
+        &notice,
+        &format!("child:{}", child_session_id),
+    );
 }
 
 fn last_assistant_text(messages: &[Message]) -> String {
