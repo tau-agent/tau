@@ -610,6 +610,33 @@ impl App {
                     }
                     None
                 }
+                // Page up: jump up by a page
+                (KeyCode::PageUp, _) => {
+                    const PAGE_SIZE: usize = 10;
+                    self.picker_cursor = self.picker_cursor.saturating_sub(PAGE_SIZE);
+                    None
+                }
+                // Page down: jump down by a page
+                (KeyCode::PageDown, _) => {
+                    if !self.picker_sessions.is_empty() {
+                        const PAGE_SIZE: usize = 10;
+                        self.picker_cursor =
+                            (self.picker_cursor + PAGE_SIZE).min(self.picker_sessions.len() - 1);
+                    }
+                    None
+                }
+                // Home: jump to first item
+                (KeyCode::Home, _) => {
+                    self.picker_cursor = 0;
+                    None
+                }
+                // End: jump to last item
+                (KeyCode::End, _) => {
+                    if !self.picker_sessions.is_empty() {
+                        self.picker_cursor = self.picker_sessions.len() - 1;
+                    }
+                    None
+                }
                 // Enter: switch to selected session
                 (KeyCode::Enter, _) => {
                     if let Some(session) = self.picker_sessions.get(self.picker_cursor) {
