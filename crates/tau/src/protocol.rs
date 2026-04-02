@@ -78,6 +78,12 @@ pub enum Request {
     /// The message is inserted as a user message between tool results
     /// and the next LLM call. If no agent is running, treated as Chat.
     Steer { session_id: String, text: String },
+    /// Queue a message for delivery to a target session (fire-and-forget).
+    QueueMessage {
+        target_session_id: String,
+        content: String,
+        sender_info: String,
+    },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).

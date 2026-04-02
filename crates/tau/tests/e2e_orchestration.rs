@@ -356,7 +356,7 @@ fn session_info_includes_tree_fields() {
 #[test]
 fn orchestration_tool_definitions() {
     let tools = tau::orchestration::orchestration_tools();
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 9);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"session_spawn"));
@@ -367,6 +367,7 @@ fn orchestration_tool_definitions() {
     assert!(names.contains(&"session_list_children"));
     assert!(names.contains(&"session_read"));
     assert!(names.contains(&"session_cancel"));
+    assert!(names.contains(&"session_message"));
 
     // session_spawn has prompt snippet
     let spawn = tools.iter().find(|t| t.name == "session_spawn").unwrap();

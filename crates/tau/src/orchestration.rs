@@ -173,6 +173,29 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             prompt_snippet: None,
             prompt_guidelines: vec![],
         },
+        PluginToolDef {
+            name: "session_message".into(),
+            description: "Send a message to another session. The message is injected as a user message into the target session's conversation. If the target is idle, it will resume processing. Fire-and-forget: does not wait for a response.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Target session ID to send the message to"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Message content to send"
+                    }
+                },
+                "required": ["session_id", "content"]
+            }),
+            prompt_snippet: Some("Use session_message to send information to another session (parent, child, or sibling).".into()),
+            prompt_guidelines: vec![
+                "The message appears as a user message in the target session's conversation.".into(),
+                "Fire-and-forget: returns immediately, does not wait for a response. Use session_read to check for responses later.".into(),
+            ],
+        },
     ]
 }
 

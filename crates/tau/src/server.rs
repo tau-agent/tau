@@ -1564,6 +1564,33 @@ async fn handle_client(
 
                 send(&mut writer, &Response::SessionsCompleted { results }).await?;
             }
+            Request::QueueMessage {
+                target_session_id,
+                content,
+                sender_info,
+            } => {
+                queue_message_to_session(&state, &target_session_id, &content, &sender_info);
+                // If session is idle, trigger a resume so the message gets processed.
+                let needs_resume = {
+                    let lock = session_lock(&session_locks, &target_session_id);
+                    lock.try_lock().is_some()
+                };
+                if needs_resume {
+                    let s = state.clone();
+                    let p = plugins.clone();
+                    let sh = shutdown.clone();
+                    let sl = session_locks.clone();
+                    let th = throttle.clone();
+                    let sid = target_session_id.clone();
+                    smol::spawn(async move {
+                        if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone()).await {
+                            eprintln!("resume session {} after message: {}", sid, e);
+                        }
+                    })
+                    .detach();
+                }
+                send(&mut writer, &Response::Ok).await?;
+            }
             Request::Shutdown { restart } => {
                 shutdown.request_shutdown(restart);
                 send(&mut writer, &Response::Ok).await?;
@@ -2703,6 +2730,18 @@ fn handle_server_request_sync(
                 }
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
+        }
+        Request::QueueMessage {
+            target_session_id,
+            content,
+            sender_info,
+        } => {
+            queue_message_to_session(state, target_session_id, content, sender_info);
+            // Note: resume of idle sessions is handled by the caller (async context)
+            // since we can't spawn async tasks from a sync handler. The has_queued
+            // flag is set, so if the session is already running it will pick up the
+            // message.
+            Response::Ok
         }
         _ => Response::Error {
             message: "request not supported in plugin context".into(),

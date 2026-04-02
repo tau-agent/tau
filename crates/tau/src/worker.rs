@@ -675,6 +675,37 @@ fn handle_session_tool(
             }
         }
 
+        "session_message" => {
+            let target = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if target.is_empty() {
+                return tool_err("session_id is required");
+            }
+            if content.is_empty() {
+                return tool_err("content is required");
+            }
+            let sender_info = match session_id {
+                Some(sid) => format!("session:{}", sid),
+                None => "session:unknown".to_string(),
+            };
+            let req = crate::protocol::Request::QueueMessage {
+                target_session_id: target.to_string(),
+                content: content.to_string(),
+                sender_info,
+            };
+            match server_request(writer, reader, req) {
+                Ok(crate::protocol::Response::Ok) => {
+                    tool_ok(&format!("Message sent to session {}", target))
+                }
+                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
+                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(&e),
+            }
+        }
+
         _ => tool_err(&format!("unknown session tool: {}", name)),
     }
 }
