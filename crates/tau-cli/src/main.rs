@@ -1250,6 +1250,7 @@ async fn cmd_sessions_archive(id: &str) -> tau::Result<()> {
     client
         .send(&tau::protocol::Request::ArchiveSession {
             session_id: id.to_string(),
+            require_ancestor: None,
         })
         .await?;
     client.recv_streaming(|_| {}).await?;

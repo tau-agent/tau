@@ -341,6 +341,7 @@ async fn run_inner(
                     send_request_and_recv(
                         Request::ArchiveSession {
                             session_id: session_id.clone(),
+                            require_ancestor: None,
                         },
                         server_tx.clone(),
                     )

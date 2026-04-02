@@ -2,7 +2,7 @@
 //!
 //! Provides tool schemas and prompt guidelines for session management tools
 //! (session_spawn, session_join, session_status, session_list_children,
-//! session_read, session_cancel, session_id). These tools communicate with the server
+//! session_read, session_cancel, session_archive, session_id). These tools communicate with the server
 //! via the plugin protocol's ServerRequest/ServerResponse tunnel.
 
 use crate::plugin::{PluginRegistration, PluginToolDef};
@@ -172,6 +172,24 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: None,
             prompt_guidelines: vec![],
+        },
+        PluginToolDef {
+            name: "session_archive".into(),
+            description: "Archive a child session. The session must be a descendant of the current session. Archived sessions are soft-deleted: hidden from listings but preserved in the database.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID to archive"
+                    }
+                },
+                "required": ["session_id"]
+            }),
+            prompt_snippet: Some("Use session_archive to clean up completed child sessions. Only works on descendants of the current session.".into()),
+            prompt_guidelines: vec![
+                "Archive children after collecting their results to keep session listings clean.".into(),
+            ],
         },
         PluginToolDef {
             name: "session_message".into(),

@@ -1224,7 +1224,44 @@ async fn handle_client(
                 };
                 send(&mut writer, &Response::Sessions { sessions }).await?;
             }
-            Request::ArchiveSession { session_id } => {
+            Request::ArchiveSession {
+                session_id,
+                require_ancestor,
+            } => {
+                // If require_ancestor is set, verify the target is a descendant
+                if let Some(ref ancestor) = require_ancestor {
+                    let is_desc = {
+                        let st = state.lock().unwrap();
+                        st.db.is_descendant(&session_id, ancestor)
+                    };
+                    match is_desc {
+                        Ok(false) => {
+                            send(
+                                &mut writer,
+                                &Response::Error {
+                                    message: format!(
+                                        "session {} is not a descendant of {}",
+                                        session_id, ancestor
+                                    ),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Err(e) => {
+                            send(
+                                &mut writer,
+                                &Response::Error {
+                                    message: e.to_string(),
+                                },
+                            )
+                            .await?;
+                            continue;
+                        }
+                        Ok(true) => {} // proceed
+                    }
+                }
+
                 // Validate: session must exist and all sessions in the subtree must be idle
                 let subtree_ids = {
                     let st = state.lock().unwrap();
@@ -2848,6 +2885,54 @@ fn handle_server_request_sync(
             // flag is set, so if the session is already running it will pick up the
             // message.
             Response::Ok
+        }
+        Request::ArchiveSession {
+            session_id,
+            require_ancestor,
+        } => {
+            // If require_ancestor is set, verify the target is a descendant
+            if let Some(ancestor) = require_ancestor {
+                let st = state.lock().unwrap();
+                match st.db.is_descendant(session_id, ancestor) {
+                    Ok(false) => {
+                        return Response::Error {
+                            message: format!(
+                                "session {} is not a descendant of {}",
+                                session_id, ancestor
+                            ),
+                        };
+                    }
+                    Err(e) => {
+                        return Response::Error {
+                            message: e.to_string(),
+                        };
+                    }
+                    Ok(true) => {} // proceed
+                }
+            }
+
+            let st = state.lock().unwrap();
+            // Validate: session must exist
+            match st.db.get_session(session_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Response::Error {
+                        message: format!("session not found: {}", session_id),
+                    };
+                }
+                Err(e) => {
+                    return Response::Error {
+                        message: e.to_string(),
+                    };
+                }
+            }
+            // Archive in DB
+            match st.db.archive_session_tree(session_id) {
+                Ok(()) => Response::SessionArchived,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
         }
         _ => Response::Error {
             message: "request not supported in plugin context".into(),

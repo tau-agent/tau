@@ -677,6 +677,28 @@ fn handle_session_tool(
             }
         }
 
+        "session_archive" => {
+            let sid = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if sid.is_empty() {
+                return tool_err("session_id is required");
+            }
+            let req = crate::protocol::Request::ArchiveSession {
+                session_id: sid.to_string(),
+                require_ancestor: session_id.map(|s| s.to_string()),
+            };
+            match server_request(writer, reader, req) {
+                Ok(crate::protocol::Response::SessionArchived) => {
+                    tool_ok(&format!("Archived session {}", sid))
+                }
+                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
+                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(&e),
+            }
+        }
+
         "session_message" => {
             let target = args
                 .get("session_id")

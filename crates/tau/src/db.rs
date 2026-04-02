@@ -366,6 +366,24 @@ impl Db {
         Ok(sessions)
     }
 
+    /// Check if `session_id` is a descendant of `ancestor_id` by walking the
+    /// parent_id chain.
+    pub fn is_descendant(&self, session_id: &str, ancestor_id: &str) -> crate::Result<bool> {
+        let mut current = session_id.to_string();
+        loop {
+            if current == ancestor_id {
+                return Ok(true);
+            }
+            match self.get_session(&current)? {
+                Some(session) => match session.parent_id {
+                    Some(pid) => current = pid,
+                    None => return Ok(false),
+                },
+                None => return Ok(false),
+            }
+        }
+    }
+
     /// Return IDs of child sessions whose last message is User or ToolResult,
     /// indicating they were interrupted mid-work and should be auto-resumed.
     pub fn sessions_needing_resume(&self) -> crate::Result<Vec<String>> {

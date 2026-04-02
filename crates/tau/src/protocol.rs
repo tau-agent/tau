@@ -43,7 +43,14 @@ pub enum Request {
         include_archived: bool,
     },
     /// Archive a session (and all its children).
-    ArchiveSession { session_id: String },
+    ArchiveSession {
+        session_id: String,
+        /// If set, the server verifies that `session_id` is a descendant of
+        /// this ancestor before archiving.  The TUI sends `None` (no
+        /// restriction); orchestration tools send `Some(current_session_id)`.
+        #[serde(default)]
+        require_ancestor: Option<String>,
+    },
     /// Delete a session.
     DeleteSession { session_id: String },
     /// List available models.
