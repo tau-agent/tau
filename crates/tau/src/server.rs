@@ -1771,73 +1771,71 @@ impl crate::worker::ToolExecutor for PluginExecutor {
             }
         };
 
-        // Channel bridge: server requests from the blocking plugin I/O thread
-        // are bounced to this async context for handling.
-        let (req_tx, req_rx) = smol::channel::bounded::<crate::protocol::Request>(1);
-        let (resp_tx, resp_rx) = smol::channel::bounded::<crate::protocol::Response>(1);
+        // Upgrade sync pipes to async for non-blocking I/O on the executor.
+        if !handle.has_async_io()
+            && let Err(e) = handle.upgrade_to_async()
+        {
+            // Return the (broken) handle before propagating error.
+            let mut pm = self.plugins.lock().unwrap();
+            pm.return_tool_plugin(source, handle);
+            return Err(e);
+        }
 
-        // Execute tool I/O on a blocking thread (plugin uses std::io pipes).
-        let session_id = self.session_id.clone();
-        let cwd = self.cwd.clone();
-        let tool_call = tool_call.clone();
+        // Send tool call to plugin.
+        handle
+            .send_async(&crate::plugin::PluginRequest::ToolCall {
+                tool_call_id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                arguments: tool_call.arguments.clone(),
+                cwd: Some(self.cwd.clone()),
+                session_id: Some(self.session_id.clone()),
+            })
+            .await?;
+
+        // Read messages from plugin until we get a ToolResult.
         let tool_call_for_hooks = tool_call.clone();
-        let output_tx_clone = output_tx.clone();
-
-        let tool_fut = smol::unblock(move || {
-            let mut server_handler =
-                move |req: &crate::protocol::Request| -> crate::protocol::Response {
-                    if req_tx.send_blocking(req.clone()).is_err() {
-                        return crate::protocol::Response::Error {
-                            message: "server handler channel closed".into(),
-                        };
-                    }
-                    resp_rx
-                        .recv_blocking()
-                        .unwrap_or_else(|_| crate::protocol::Response::Error {
-                            message: "server handler response channel closed".into(),
+        let result = loop {
+            let msg = handle.read_message_async().await?;
+            match msg {
+                crate::plugin::PluginMessage::OutputDelta { text, .. } => {
+                    let _ = output_tx.send(text).await;
+                }
+                crate::plugin::PluginMessage::ToolResult(result) => {
+                    break Ok(crate::types::ToolResultMessage {
+                        tool_call_id: result.tool_call_id,
+                        tool_name: tool_call.name.clone(),
+                        content: result.content,
+                        details: None,
+                        is_error: result.is_error,
+                        timestamp: crate::types::timestamp_ms(),
+                    });
+                }
+                crate::plugin::PluginMessage::ServerRequest {
+                    request_id,
+                    request,
+                } => {
+                    let response = handle_server_request(
+                        &self.state,
+                        &self.session_locks,
+                        &self.plugins,
+                        &self.shutdown,
+                        &self.throttle,
+                        &self.chat_spawn_tx,
+                        &request,
+                    )
+                    .await;
+                    handle
+                        .send_async(&crate::plugin::PluginRequest::ServerResponse {
+                            request_id,
+                            response,
                         })
-                };
-            let mut output_fn = |delta: &str| {
-                let _ = output_tx_clone.send_blocking(delta.to_string());
-            };
-            let result = handle.execute_tool_with_server(
-                &tool_call,
-                Some(&cwd),
-                Some(&session_id),
-                &mut output_fn,
-                Some(&mut server_handler),
-            );
-            (result, handle)
-        });
-
-        // Async handler: process server requests from the plugin.
-        // When tool_fut completes, req_tx drops, req_rx returns Err, and
-        // this task exits.
-        let state = self.state.clone();
-        let session_locks = self.session_locks.clone();
-        let plugins = self.plugins.clone();
-        let shutdown = self.shutdown.clone();
-        let throttle = self.throttle.clone();
-        let chat_spawn_tx = self.chat_spawn_tx.clone();
-        let handler_fut = async {
-            while let Ok(request) = req_rx.recv().await {
-                let response = handle_server_request(
-                    &state,
-                    &session_locks,
-                    &plugins,
-                    &shutdown,
-                    &throttle,
-                    &chat_spawn_tx,
-                    &request,
-                )
-                .await;
-                if resp_tx.send(response).await.is_err() {
-                    break;
+                        .await?;
+                }
+                _ => {
+                    // Ignore unexpected messages during tool execution
                 }
             }
         };
-
-        let ((result, handle), ()) = futures::future::join(tool_fut, handler_fut).await;
 
         // Always return the plugin handle, even on error (brief lock).
         {
