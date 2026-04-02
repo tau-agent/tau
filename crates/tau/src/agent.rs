@@ -28,6 +28,9 @@ pub struct AgentConfig {
     /// Wrapped in Mutex so AgentConfig is Send+Sync across async boundaries.
     #[allow(clippy::type_complexity)]
     pub on_message: Option<std::sync::Mutex<Box<dyn FnMut(&Message) + Send>>>,
+    /// Callback to refresh the API key after an auth error (e.g. expired OAuth token).
+    /// Called on 401/auth errors before retrying. Returns the new API key if refresh succeeded.
+    pub refresh_api_key: Option<Box<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
 impl Default for AgentConfig {
@@ -39,6 +42,7 @@ impl Default for AgentConfig {
             should_stop: None,
             drain_queued: None,
             on_message: None,
+            refresh_api_key: None,
         }
     }
 }
@@ -402,8 +406,13 @@ async fn stream_with_retry(
     event_tx: &EventSender,
 ) -> crate::Result<AssistantMessage> {
     let max_attempts = config.max_retries + 1;
+    // Track whether we've already retried after an auth refresh (only once).
+    let mut auth_retried = false;
+    // Owned copy of options so we can update api_key on auth refresh.
+    let mut options = options.clone();
+
     for attempt in 0..max_attempts {
-        let rx = registry.stream(model, context, options)?;
+        let rx = registry.stream(model, context, &options)?;
         let should_stop = config.should_stop.as_deref();
         let message = consume_stream(rx, event_tx, should_stop).await;
 
@@ -416,6 +425,22 @@ async fn stream_with_retry(
         if message.stop_reason == StopReason::Error
             && let Some(ref err_msg) = message.error_message
         {
+            // Auth errors (401 / expired token): refresh and retry once.
+            if !auth_retried
+                && is_auth_error(err_msg)
+                && let Some(ref refresh_fn) = config.refresh_api_key
+                && let Some(new_key) = refresh_fn()
+            {
+                auth_retried = true;
+                options.api_key = Some(new_key);
+                let status_msg = format!("auth error, refreshed token, retrying: {}", err_msg);
+                eprintln!("{}", status_msg);
+                let _ = event_tx.try_send(StreamEvent::Status {
+                    message: status_msg,
+                });
+                continue;
+            }
+
             let timeout = is_timeout(err_msg);
             let retryable = timeout || is_retryable(err_msg);
 
@@ -561,6 +586,19 @@ async fn consume_stream(
             Err(_) => return Err(crate::Error::ChannelClosed),
         }
     }
+}
+
+/// Check if an error message indicates an authentication/authorization error
+/// (expired token, invalid credentials, HTTP 401).
+fn is_auth_error(err_msg: &str) -> bool {
+    let lower = err_msg.to_lowercase();
+    lower.contains("401")
+        || lower.contains("authentication_error")
+        || lower.contains("token has expired")
+        || lower.contains("token expired")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid.*token")
+        || lower.contains("expired token")
 }
 
 /// Check if an error message indicates a timeout.
@@ -909,6 +947,20 @@ mod tests {
         assert!(is_timeout("Timeout: operation took too long"));
         assert!(!is_timeout("HTTP 429 rate limit"));
         assert!(!is_timeout("invalid api key"));
+    }
+
+    #[test]
+    fn auth_errors() {
+        assert!(is_auth_error("HTTP 401 Unauthorized"));
+        assert!(is_auth_error("authentication_error: invalid token"));
+        assert!(is_auth_error("OAuth token has expired"));
+        assert!(is_auth_error("token expired"));
+        assert!(is_auth_error("401: unauthorized"));
+        assert!(is_auth_error("expired token"));
+        // Should not match unrelated errors
+        assert!(!is_auth_error("HTTP 429 rate limit"));
+        assert!(!is_auth_error("503 Service Unavailable"));
+        assert!(!is_auth_error("timeout: connect timed out"));
     }
 
     #[test]

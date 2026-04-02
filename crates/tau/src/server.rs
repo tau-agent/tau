@@ -1792,6 +1792,16 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                 eprintln!("db error persisting agent message: {}", e);
             }
         }))),
+        refresh_api_key: {
+            let state_clone_refresh = state.clone();
+            let provider_name = model.provider.clone();
+            Some(Box::new(move || {
+                let st = state_clone_refresh.lock().unwrap();
+                resolve_api_key(&st.auth, &st.config, &provider_name)
+                    .ok()
+                    .flatten()
+            }))
+        },
         ..Default::default()
     };
 
