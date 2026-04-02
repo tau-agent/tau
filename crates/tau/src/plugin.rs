@@ -14,6 +14,8 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
+use futures::io::AsyncBufReadExt;
+use futures::io::AsyncWriteExt;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Tool, ToolCall, ToolResultContent};
@@ -155,6 +157,9 @@ pub struct PluginHandle {
     child: Option<Child>,
     stdin: Option<BufWriter<ChildStdin>>,
     stdout: Option<BufReader<ChildStdout>>,
+    /// Async pipe fields for non-blocking I/O (used by server-side tool execution).
+    async_stdin: Option<futures::io::BufWriter<smol::Async<std::fs::File>>>,
+    async_stdout: Option<futures::io::BufReader<smol::Async<std::fs::File>>>,
     /// Piped stderr for diagnostics.
     stderr_pipe: Option<std::process::ChildStderr>,
     /// Command used to spawn this plugin (for respawning).
@@ -207,6 +212,8 @@ impl PluginHandle {
             child: Some(child),
             stdin: Some(stdin),
             stdout: Some(stdout),
+            async_stdin: None,
+            async_stdout: None,
             stderr_pipe,
             spawn_command: command.to_vec(),
             spawn_cwd: cwd.to_string(),
@@ -304,10 +311,98 @@ impl PluginHandle {
             self.child = None;
             self.stdin = None;
             self.stdout = None;
+            self.async_stdin = None;
+            self.async_stdout = None;
             return Err(crate::Error::Io(msg));
         }
         serde_json::from_str(&line)
             .map_err(|e| crate::Error::Parse(format!("plugin {} message: {}", self.name, e)))
+    }
+
+    // -------------------------------------------------------------------
+    // Async I/O methods (for server-side tool execution without blocking)
+    // -------------------------------------------------------------------
+
+    /// Convert sync I/O pipes to async. After this, `send_async` and
+    /// `read_message_async` are available, and the sync `send`/`read_message`
+    /// will no longer work (the sync pipes are consumed).
+    ///
+    /// This uses `smol::Async` to wrap the raw file descriptors for
+    /// non-blocking I/O on the smol executor.
+    pub fn upgrade_to_async(&mut self) -> crate::Result<()> {
+        use std::os::unix::io::{FromRawFd, IntoRawFd};
+
+        // Take the sync pipes (consuming them).
+        let sync_stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| crate::Error::Io("no sync stdin to upgrade".into()))?
+            .into_inner()
+            .map_err(|e| crate::Error::Io(format!("flush stdin: {}", e.error())))?;
+        let sync_stdout = self
+            .stdout
+            .take()
+            .ok_or_else(|| crate::Error::Io("no sync stdout to upgrade".into()))?
+            .into_inner();
+
+        // Convert to raw fds and wrap in smol::Async for non-blocking I/O.
+        let raw_in = sync_stdin.into_raw_fd();
+        let raw_out = sync_stdout.into_raw_fd();
+
+        // Safety: these are valid fds from the child process pipes.
+        let async_stdin = unsafe { smol::Async::new(std::fs::File::from_raw_fd(raw_in)) }
+            .map_err(|e| crate::Error::Io(format!("async wrap stdin: {}", e)))?;
+        let async_stdout = unsafe { smol::Async::new(std::fs::File::from_raw_fd(raw_out)) }
+            .map_err(|e| crate::Error::Io(format!("async wrap stdout: {}", e)))?;
+
+        self.async_stdin = Some(futures::io::BufWriter::new(async_stdin));
+        self.async_stdout = Some(futures::io::BufReader::new(async_stdout));
+        Ok(())
+    }
+
+    /// Send a request to the plugin asynchronously.
+    pub async fn send_async(&mut self, req: &PluginRequest) -> crate::Result<()> {
+        self.last_activity = Instant::now();
+        let stdin = self.async_stdin.as_mut().ok_or_else(|| {
+            crate::Error::Io(format!("plugin {} async stdin not available", self.name))
+        })?;
+        let mut line =
+            serde_json::to_string(req).map_err(|e| crate::Error::Parse(e.to_string()))?;
+        line.push('\n');
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| crate::Error::Io(format!("write to plugin {}: {}", self.name, e)))?;
+        stdin
+            .flush()
+            .await
+            .map_err(|e| crate::Error::Io(format!("flush plugin {}: {}", self.name, e)))?;
+        Ok(())
+    }
+
+    /// Read a single message from the plugin asynchronously.
+    pub async fn read_message_async(&mut self) -> crate::Result<PluginMessage> {
+        let stdout = self.async_stdout.as_mut().ok_or_else(|| {
+            crate::Error::Io(format!("plugin {} async stdout not available", self.name))
+        })?;
+        let mut line = String::new();
+        let n = stdout
+            .read_line(&mut line)
+            .await
+            .map_err(|e| crate::Error::Io(format!("read from plugin {}: {}", self.name, e)))?;
+        if n == 0 {
+            let msg = format!("plugin {} closed unexpectedly", self.name);
+            self.async_stdin = None;
+            self.async_stdout = None;
+            return Err(crate::Error::Io(msg));
+        }
+        serde_json::from_str(&line)
+            .map_err(|e| crate::Error::Parse(format!("plugin {} message: {}", self.name, e)))
+    }
+
+    /// Check if this handle has async I/O pipes available.
+    pub fn has_async_io(&self) -> bool {
+        self.async_stdin.is_some() && self.async_stdout.is_some()
     }
 
     /// Execute a tool call, calling on_output for streaming deltas.
@@ -427,6 +522,8 @@ impl PluginHandle {
                     self.child = None;
                     self.stdin = None;
                     self.stdout = None;
+                    self.async_stdin = None;
+                    self.async_stdout = None;
                     false
                 }
                 Ok(None) => true, // Still running
@@ -485,6 +582,8 @@ impl PluginHandle {
         self.child = Some(child);
         self.stdin = Some(stdin);
         self.stdout = Some(stdout);
+        self.async_stdin = None;
+        self.async_stdout = None;
         self.last_activity = Instant::now();
 
         // Read registration (must match original, but we don't enforce that)
@@ -502,6 +601,8 @@ impl PluginHandle {
                 self.child = None;
                 self.stdin = None;
                 self.stdout = None;
+                self.async_stdin = None;
+                self.async_stdout = None;
                 Err(crate::Error::Io(format!(
                     "respawn plugin '{}' failed: {}",
                     self.name, e
@@ -533,6 +634,8 @@ impl PluginHandle {
         self.child = None;
         self.stdin = None;
         self.stdout = None;
+        self.async_stdin = None;
+        self.async_stdout = None;
     }
 
     /// Check if plugin wants a specific hook.
