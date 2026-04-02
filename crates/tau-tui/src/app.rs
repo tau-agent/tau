@@ -114,6 +114,8 @@ pub struct App {
     pub picker_cursor: usize,
     /// Pending deletion confirmation: Some(index) if waiting for y/n.
     pub picker_confirm_delete: Option<usize>,
+    /// Pending archive confirmation: Some(index) if waiting for y/n.
+    pub picker_confirm_archive: Option<usize>,
     /// Mode to restore when the session picker is closed.
     pub picker_previous_mode: AppMode,
 }
@@ -165,6 +167,7 @@ impl App {
             picker_sessions: Vec::new(),
             picker_cursor: 0,
             picker_confirm_delete: None,
+            picker_confirm_archive: None,
             picker_previous_mode: AppMode::Input,
         }
     }
@@ -558,6 +561,28 @@ impl App {
                     None
                 }
             }
+        } else if let Some(idx) = self.picker_confirm_archive {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.picker_confirm_archive = None;
+                    if let Some(session) = self.picker_sessions.get(idx) {
+                        let session_id = session.id.clone();
+                        // Remove from picker list
+                        self.picker_sessions.remove(idx);
+                        if self.picker_cursor >= self.picker_sessions.len()
+                            && self.picker_cursor > 0
+                        {
+                            self.picker_cursor -= 1;
+                        }
+                        return Some(Action::ArchiveSession(session_id));
+                    }
+                    None
+                }
+                _ => {
+                    self.picker_confirm_archive = None;
+                    None
+                }
+            }
         } else {
             match (key.code, key.modifiers) {
                 // Navigate up
@@ -582,6 +607,7 @@ impl App {
                         let session_id = session.id.clone();
                         self.mode = AppMode::Input;
                         self.picker_confirm_delete = None;
+                        self.picker_confirm_archive = None;
                         if session_id == self.session_id {
                             // Already on this session, just close picker
                             return None;
@@ -594,6 +620,7 @@ impl App {
                 (KeyCode::Tab | KeyCode::Esc, _) => {
                     self.mode = self.picker_previous_mode;
                     self.picker_confirm_delete = None;
+                    self.picker_confirm_archive = None;
                     None
                 }
                 // D (shift+d): delete selected session
@@ -605,8 +632,25 @@ impl App {
                             });
                             self.mode = self.picker_previous_mode;
                             self.picker_confirm_delete = None;
+                            self.picker_confirm_archive = None;
                         } else {
                             self.picker_confirm_delete = Some(self.picker_cursor);
+                        }
+                    }
+                    None
+                }
+                // A (shift+a): archive selected session
+                (KeyCode::Char('A'), _) => {
+                    if let Some(session) = self.picker_sessions.get(self.picker_cursor) {
+                        if session.id == self.session_id {
+                            self.messages.push(MessageItem::Status {
+                                text: "cannot archive active session".into(),
+                            });
+                            self.mode = self.picker_previous_mode;
+                            self.picker_confirm_delete = None;
+                            self.picker_confirm_archive = None;
+                        } else {
+                            self.picker_confirm_archive = Some(self.picker_cursor);
                         }
                     }
                     None
@@ -615,6 +659,7 @@ impl App {
                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                     self.mode = self.picker_previous_mode;
                     self.picker_confirm_delete = None;
+                    self.picker_confirm_archive = None;
                     None
                 }
                 _ => None,
@@ -1098,6 +1143,7 @@ impl App {
                         .position(|s| s.id == self.session_id)
                         .unwrap_or(0);
                     self.picker_confirm_delete = None;
+                    self.picker_confirm_archive = None;
                     return;
                 }
 
@@ -1335,6 +1381,8 @@ pub enum Action {
     OpenSessionPicker,
     /// Delete a session.
     DeleteSession(String),
+    /// Archive a session.
+    ArchiveSession(String),
     /// Switch to viewing a different session.
     SwitchSession(String),
     /// Navigate back to previous session in nav stack.

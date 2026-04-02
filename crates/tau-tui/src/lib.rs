@@ -308,6 +308,21 @@ async fn run_inner(
                         text: format!("deleted session {}", &session_id[..session_id.len().min(8)]),
                     });
                 }
+                Action::ArchiveSession(session_id) => {
+                    send_request_and_recv(
+                        Request::ArchiveSession {
+                            session_id: session_id.clone(),
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                    app.messages.push(crate::message::MessageItem::Status {
+                        text: format!(
+                            "archived session {}",
+                            &session_id[..session_id.len().min(8)]
+                        ),
+                    });
+                }
                 Action::ListChildren => {
                     send_request_and_recv(
                         Request::ListSessions {

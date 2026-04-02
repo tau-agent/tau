@@ -463,10 +463,11 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             let session = &app.picker_sessions[session_idx];
             let is_current = session.id == app.session_id;
             let is_selected = session_idx == app.picker_cursor;
-            let is_confirming = app.picker_confirm_delete == Some(session_idx);
+            let is_confirming_delete = app.picker_confirm_delete == Some(session_idx);
+            let is_confirming_archive = app.picker_confirm_archive == Some(session_idx);
 
             // Delete confirmation
-            if is_confirming {
+            if is_confirming_delete {
                 let id_short = &session.id[..session.id.len().min(8)];
                 let confirm_text = format!(" Delete {}? y/n", id_short);
                 let confirm_padded = if confirm_text.len() < w {
@@ -477,6 +478,22 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
                 let style = Style::default()
                     .fg(theme.error.to_ratatui())
                     .bg(ThemeColor::Rgb(0x3c, 0x28, 0x28).to_ratatui());
+                lines.push(Line::from(Span::styled(confirm_padded, style)));
+                continue;
+            }
+
+            // Archive confirmation
+            if is_confirming_archive {
+                let id_short = &session.id[..session.id.len().min(8)];
+                let confirm_text = format!(" Archive {}? y/n", id_short);
+                let confirm_padded = if confirm_text.len() < w {
+                    format!("{}{}", confirm_text, " ".repeat(w - confirm_text.len()))
+                } else {
+                    confirm_text[..w].to_string()
+                };
+                let style = Style::default()
+                    .fg(theme.muted.to_ratatui())
+                    .bg(ThemeColor::Rgb(0x28, 0x28, 0x3c).to_ratatui());
                 lines.push(Line::from(Span::styled(confirm_padded, style)));
                 continue;
             }
@@ -591,7 +608,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     }
 
     // Footer hint
-    let hint = " j/k nav  enter switch  D del  tab/esc close";
+    let hint = " j/k nav  enter switch  A archive  D del  tab/esc close";
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()
     } else {
