@@ -15,8 +15,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use smol::channel::{Receiver, Sender};
@@ -174,7 +174,7 @@ async fn async_main() -> crate::Result<()> {
                                 arguments,
                             };
                             smol::unblock(move || crate::tools::execute_tool(&tools, &tc, &cwd))
-                                    .await
+                                .await
                         };
 
                         let _ = msg_tx
@@ -331,10 +331,7 @@ async fn server_request(
 
     // Register a oneshot channel for the response.
     let (resp_tx, resp_rx) = smol::channel::bounded(1);
-    pending
-        .lock()
-        .await
-        .insert(request_id.clone(), resp_tx);
+    pending.lock().await.insert(request_id.clone(), resp_tx);
 
     // Send the request.
     msg_tx
@@ -365,10 +362,7 @@ async fn execute_bash_async(
     let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
         return tool_err(tool_call_id, "missing 'command' argument");
     };
-    let timeout_secs = args
-        .get("timeout")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(120);
+    let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
 
     // Spawn child with setsid for process-group kill.
     let child = {
@@ -393,12 +387,7 @@ async fn execute_bash_async(
 
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => {
-            return tool_err(
-                tool_call_id,
-                &format!("failed to execute command: {}", e),
-            )
-        }
+        Err(e) => return tool_err(tool_call_id, &format!("failed to execute command: {}", e)),
     };
 
     let child_id = child.id();
@@ -407,8 +396,10 @@ async fn execute_bash_async(
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
 
-    let async_stdout = unsafe { smol::Async::new(std::fs::File::from_raw_fd(stdout.into_raw_fd())) };
-    let async_stderr = unsafe { smol::Async::new(std::fs::File::from_raw_fd(stderr.into_raw_fd())) };
+    let async_stdout =
+        unsafe { smol::Async::new(std::fs::File::from_raw_fd(stdout.into_raw_fd())) };
+    let async_stderr =
+        unsafe { smol::Async::new(std::fs::File::from_raw_fd(stderr.into_raw_fd())) };
 
     let (async_stdout, async_stderr) = match (async_stdout, async_stderr) {
         (Ok(o), Ok(e)) => (o, e),
@@ -560,10 +551,7 @@ async fn handle_session_tool(
     match name {
         "session_spawn" => {
             let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
-            let model = args
-                .get("model")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            let model = args.get("model").and_then(|v| v.as_str()).map(String::from);
             let system_prompt = args
                 .get("system_prompt")
                 .and_then(|v| v.as_str())
@@ -613,10 +601,7 @@ async fn handle_session_tool(
                     Ok(crate::protocol::Response::Error { message }) => {
                         return tool_err(
                             tcid,
-                            &format!(
-                                "session {} created but chat failed: {}",
-                                child_id, message
-                            ),
+                            &format!("session {} created but chat failed: {}", child_id, message),
                         );
                     }
                     Ok(other) => {
@@ -631,10 +616,7 @@ async fn handle_session_tool(
                     Err(e) => {
                         return tool_err(
                             tcid,
-                            &format!(
-                                "session {} created but chat failed: {}",
-                                child_id, e
-                            ),
+                            &format!("session {} created but chat failed: {}", child_id, e),
                         );
                     }
                 }
@@ -866,9 +848,7 @@ async fn handle_session_tool(
                                     .content
                                     .iter()
                                     .filter_map(|c| match c {
-                                        crate::types::UserContent::Text(t) => {
-                                            Some(t.text.as_str())
-                                        }
+                                        crate::types::UserContent::Text(t) => Some(t.text.as_str()),
                                         _ => None,
                                     })
                                     .collect::<Vec<_>>()
@@ -935,18 +915,10 @@ async fn handle_session_tool(
                     .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect(),
-                _ => {
-                    return tool_err(
-                        tcid,
-                        "session_id is required (string or array of strings)",
-                    )
-                }
+                _ => return tool_err(tcid, "session_id is required (string or array of strings)"),
             };
             if sids.is_empty() {
-                return tool_err(
-                    tcid,
-                    "session_id is required (string or array of strings)",
-                );
+                return tool_err(tcid, "session_id is required (string or array of strings)");
             }
             let mut archived = Vec::new();
             let mut errors = Vec::new();
@@ -956,9 +928,7 @@ async fn handle_session_tool(
                     require_ancestor: session_id.map(|s| s.to_string()),
                 };
                 match server_request(msg_tx, pending, req).await {
-                    Ok(crate::protocol::Response::SessionArchived) => {
-                        archived.push(sid.as_str())
-                    }
+                    Ok(crate::protocol::Response::SessionArchived) => archived.push(sid.as_str()),
                     Ok(crate::protocol::Response::Error { message }) => {
                         errors.push(format!("{}: {}", sid, message));
                     }
@@ -1023,9 +993,7 @@ async fn handle_session_tool(
         }
 
         "session_id" => match session_id {
-            Some(sid) => {
-                tool_ok(tcid, &serde_json::json!({"session_id": sid}).to_string())
-            }
+            Some(sid) => tool_ok(tcid, &serde_json::json!({"session_id": sid}).to_string()),
             None => tool_err(tcid, "session_id not available"),
         },
 

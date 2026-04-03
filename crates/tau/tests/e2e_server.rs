@@ -1,7 +1,7 @@
 //! End-to-end test: start a server with mock provider, spawn sessions.
 
 mod common;
-use common::{send_recv, send_recv_all, TestServer};
+use common::{TestServer, send_recv, send_recv_all};
 
 use std::io::Write;
 use std::os::unix::net::UnixStream;
@@ -851,9 +851,7 @@ fn queue_message_persists_across_operations() {
 #[test]
 fn server_chat_with_mock_tool_success() {
     use std::sync::Arc;
-    use tau::providers::mock::{
-        MockToolExecutor, MockToolResponse, mock_tool,
-    };
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -902,13 +900,16 @@ fn server_chat_with_mock_tool_success() {
     });
 
     for _ in 0..50 {
-        if sock_path.exists() { break; }
+        if sock_path.exists() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(sock_path.exists(), "server socket did not appear");
 
     let conn = UnixStream::connect(&sock_path).unwrap();
-    conn.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
 
     // Create session
     let sid = match send_recv(
@@ -929,7 +930,9 @@ fn server_chat_with_mock_tool_success() {
 
     // Chat -- triggers tool call → mock tool result → final response
     let conn2 = UnixStream::connect(&sock_path).unwrap();
-    conn2.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     let responses = send_recv_all(
         &conn2,
         &Request::Chat {
@@ -943,7 +946,9 @@ fn server_chat_with_mock_tool_success() {
 
     // Verify messages: user + assistant(tool_call) + tool_result(success) + assistant(text)
     let conn3 = UnixStream::connect(&sock_path).unwrap();
-    conn3.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    conn3
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let resp = send_recv(
         &conn3,
         &Request::GetMessages {
@@ -953,15 +958,19 @@ fn server_chat_with_mock_tool_success() {
     match resp {
         Response::Messages { messages } => {
             assert_eq!(
-                messages.len(), 4,
+                messages.len(),
+                4,
                 "expected 4 messages (user + assistant + tool_result + assistant), got {}: {:?}",
-                messages.len(), messages
+                messages.len(),
+                messages
             );
             assert!(matches!(&messages[0], tau::types::Message::User(_)));
             assert!(matches!(&messages[1], tau::types::Message::Assistant(_)));
             // Tool result should NOT be an error (mock returned Success)
             assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if !tr.is_error));
-            assert!(matches!(&messages[3], tau::types::Message::Assistant(a) if a.text().contains("hello world")));
+            assert!(
+                matches!(&messages[3], tau::types::Message::Assistant(a) if a.text().contains("hello world"))
+            );
         }
         other => panic!("expected Messages, got {:?}", other),
     }
@@ -975,15 +984,17 @@ fn server_chat_with_mock_tool_success() {
     let captures = provider_handle.captures();
     assert_eq!(captures.len(), 2);
     let second_ctx = &captures[1].context;
-    assert!(second_ctx.messages.iter().any(|m|
-        matches!(m, tau::types::Message::ToolResult(tr) if tr.content.iter().any(|c|
+    assert!(second_ctx.messages.iter().any(
+        |m| matches!(m, tau::types::Message::ToolResult(tr) if tr.content.iter().any(|c|
             matches!(c, tau::types::ToolResultContent::Text(t) if t.text.contains("hello world"))
         ))
     ));
 
     // Shutdown
     let conn4 = UnixStream::connect(&sock_path).unwrap();
-    conn4.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    conn4
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     send_recv(&conn4, &Request::Shutdown { restart: false });
 }
 
@@ -997,7 +1008,10 @@ fn server_chat_with_mock_tool_error() {
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
     let tool_handle_for_assert = mock_executor.handle();
-    tool_handle.on_tool("read_file", MockToolResponse::ToolError("permission denied".into()));
+    tool_handle.on_tool(
+        "read_file",
+        MockToolResponse::ToolError("permission denied".into()),
+    );
 
     let provider = MockProvider::new(vec![
         MockResponse::ToolCalls(vec![tau::types::ToolCall {
@@ -1055,7 +1069,12 @@ fn server_chat_with_mock_tool_error() {
 
     // Verify tool result has is_error=true
     let conn3 = server.connect();
-    let resp = send_recv(&conn3, &Request::GetMessages { session_id: sid.clone() });
+    let resp = send_recv(
+        &conn3,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
     match resp {
         Response::Messages { messages } => {
             assert_eq!(messages.len(), 4);
@@ -1093,8 +1112,14 @@ fn server_chat_multi_tool_calls() {
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
     let tool_handle_for_assert = mock_executor.handle();
-    tool_handle.on_tool("read_file", MockToolResponse::Success("file content A".into()));
-    tool_handle.on_tool("list_dir", MockToolResponse::Success("file1.txt\nfile2.txt".into()));
+    tool_handle.on_tool(
+        "read_file",
+        MockToolResponse::Success("file content A".into()),
+    );
+    tool_handle.on_tool(
+        "list_dir",
+        MockToolResponse::Success("file1.txt\nfile2.txt".into()),
+    );
 
     let provider = MockProvider::new(vec![
         MockResponse::ToolCalls(vec![
@@ -1162,7 +1187,12 @@ fn server_chat_multi_tool_calls() {
 
     // Verify messages: user + assistant(2 tool calls) + 2 tool results + assistant(text)
     let conn3 = server.connect();
-    let resp = send_recv(&conn3, &Request::GetMessages { session_id: sid.clone() });
+    let resp = send_recv(
+        &conn3,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
     match resp {
         Response::Messages { messages } => {
             // user + assistant + tool_result + tool_result + assistant = 5
@@ -1182,7 +1212,10 @@ fn server_chat_multi_tool_calls() {
     // Provider's second call sees both tool results
     let captures = provider_handle.captures();
     assert_eq!(captures.len(), 2);
-    let tool_results: Vec<_> = captures[1].context.messages.iter()
+    let tool_results: Vec<_> = captures[1]
+        .context
+        .messages
+        .iter()
         .filter(|m| matches!(m, tau::types::Message::ToolResult(_)))
         .collect();
     assert_eq!(tool_results.len(), 2);
@@ -1200,8 +1233,14 @@ fn server_chat_multi_turn_tool_loop() {
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
     let tool_handle_for_assert = mock_executor.handle();
-    tool_handle.on_tool("list_dir", MockToolResponse::Success("readme.md\nsrc/".into()));
-    tool_handle.on_tool("read_file", MockToolResponse::Success("# My Project\nHello world".into()));
+    tool_handle.on_tool(
+        "list_dir",
+        MockToolResponse::Success("readme.md\nsrc/".into()),
+    );
+    tool_handle.on_tool(
+        "read_file",
+        MockToolResponse::Success("# My Project\nHello world".into()),
+    );
 
     let provider = MockProvider::new(vec![
         // Turn 1: LLM calls list_dir
@@ -1271,18 +1310,29 @@ fn server_chat_multi_turn_tool_loop() {
     // Verify messages:
     // user + assistant(tc1) + tool_result_1 + assistant(tc2) + tool_result_2 + assistant(text) = 6
     let conn3 = server.connect();
-    let resp = send_recv(&conn3, &Request::GetMessages { session_id: sid.clone() });
+    let resp = send_recv(
+        &conn3,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
     match resp {
         Response::Messages { messages } => {
-            assert_eq!(messages.len(), 6,
+            assert_eq!(
+                messages.len(),
+                6,
                 "expected 6 messages (user + 2*(assistant+tool_result) + final_assistant), got {}: {:?}",
-                messages.len(), messages);
+                messages.len(),
+                messages
+            );
             assert!(matches!(&messages[0], tau::types::Message::User(_)));
             assert!(matches!(&messages[1], tau::types::Message::Assistant(_)));
             assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if !tr.is_error));
             assert!(matches!(&messages[3], tau::types::Message::Assistant(_)));
             assert!(matches!(&messages[4], tau::types::Message::ToolResult(tr) if !tr.is_error));
-            assert!(matches!(&messages[5], tau::types::Message::Assistant(a) if a.text().contains("Hello world")));
+            assert!(
+                matches!(&messages[5], tau::types::Message::Assistant(a) if a.text().contains("Hello world"))
+            );
         }
         other => panic!("{:?}", other),
     }
@@ -1324,9 +1374,7 @@ fn server_chat_tool_schemas_in_context() {
     let tool_handle = mock_executor.handle();
     tool_handle.set_default(MockToolResponse::Success("ok".into()));
 
-    let provider = MockProvider::new(vec![
-        MockResponse::Text("I see the tools.".into()),
-    ]);
+    let provider = MockProvider::new(vec![MockResponse::Text("I see the tools.".into())]);
     let provider_handle = provider.handle();
 
     let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
@@ -1381,12 +1429,22 @@ fn server_chat_tool_schemas_in_context() {
     let captures = provider_handle.captures();
     assert_eq!(captures.len(), 1);
     let tools = &captures[0].context.tools;
-    assert_eq!(tools.len(), 3, "expected 3 mock tools, got {}: {:?}", tools.len(), tools);
+    assert_eq!(
+        tools.len(),
+        3,
+        "expected 3 mock tools, got {}: {:?}",
+        tools.len(),
+        tools
+    );
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(tool_names.contains(&"bash"), "tools: {:?}", tool_names);
     assert!(tool_names.contains(&"read_file"), "tools: {:?}", tool_names);
-    assert!(tool_names.contains(&"write_file"), "tools: {:?}", tool_names);
+    assert!(
+        tool_names.contains(&"write_file"),
+        "tools: {:?}",
+        tool_names
+    );
 
     server.shutdown();
 }
@@ -1444,13 +1502,16 @@ fn session_dump_and_replay() {
     });
 
     for _ in 0..50 {
-        if sock_path.exists() { break; }
+        if sock_path.exists() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 
     // Create session and chat
     let conn = UnixStream::connect(&sock_path).unwrap();
-    conn.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     let sid = match send_recv(
         &conn,
         &Request::CreateSession {
@@ -1468,7 +1529,9 @@ fn session_dump_and_replay() {
     };
 
     let conn2 = UnixStream::connect(&sock_path).unwrap();
-    conn2.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     let responses = send_recv_all(
         &conn2,
         &Request::Chat {
@@ -1480,7 +1543,9 @@ fn session_dump_and_replay() {
 
     // Shutdown server so we can access the DB directly
     let conn3 = UnixStream::connect(&sock_path).unwrap();
-    conn3.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    conn3
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     send_recv(&conn3, &Request::Shutdown { restart: false });
     std::thread::sleep(Duration::from_millis(200));
 
@@ -1489,12 +1554,24 @@ fn session_dump_and_replay() {
     let recording = tau::replay::dump_session(&db, &sid).unwrap();
 
     // Verify recording structure
-    assert_eq!(recording.turns.len(), 2, "expected 2 turns (tool_call + text)");
-    assert_eq!(recording.turns[0].user_message.as_deref(), Some("run echo hello world"));
+    assert_eq!(
+        recording.turns.len(),
+        2,
+        "expected 2 turns (tool_call + text)"
+    );
+    assert_eq!(
+        recording.turns[0].user_message.as_deref(),
+        Some("run echo hello world")
+    );
     assert_eq!(recording.turns[0].tool_results.len(), 1);
     assert!(!recording.turns[0].tool_results[0].is_error);
     assert!(recording.turns[1].user_message.is_none()); // continuation
-    assert!(recording.turns[1].assistant_message.text().contains("hello world"));
+    assert!(
+        recording.turns[1]
+            .assistant_message
+            .text()
+            .contains("hello world")
+    );
 
     // Verify JSON roundtrip
     let json = serde_json::to_string_pretty(&recording).unwrap();
@@ -1509,7 +1586,19 @@ fn session_dump_and_replay() {
         result.error, result.turn_results
     );
     assert_eq!(result.turn_results.len(), 2);
-    assert!(result.turn_results[0].tool_calls_match, "turn 0: {:?}", result.turn_results[0]);
-    assert!(result.turn_results[0].tool_results_match, "turn 0: {:?}", result.turn_results[0]);
-    assert!(result.turn_results[1].text_match, "turn 1: {:?}", result.turn_results[1]);
+    assert!(
+        result.turn_results[0].tool_calls_match,
+        "turn 0: {:?}",
+        result.turn_results[0]
+    );
+    assert!(
+        result.turn_results[0].tool_results_match,
+        "turn 0: {:?}",
+        result.turn_results[0]
+    );
+    assert!(
+        result.turn_results[1].text_match,
+        "turn 1: {:?}",
+        result.turn_results[1]
+    );
 }

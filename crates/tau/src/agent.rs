@@ -1446,15 +1446,16 @@ mod tests {
             .unwrap();
 
             let captures = handle.captures();
-            assert_eq!(captures.len(), 2, "should capture context for each LLM call");
+            assert_eq!(
+                captures.len(),
+                2,
+                "should capture context for each LLM call"
+            );
 
             // First call: just user message
             assert_eq!(captures[0].index, 0);
             assert_eq!(captures[0].context.messages.len(), 1);
-            assert!(matches!(
-                &captures[0].context.messages[0],
-                Message::User(_)
-            ));
+            assert!(matches!(&captures[0].context.messages[0], Message::User(_)));
 
             // Second call: user + assistant(tool_call) + tool_result
             assert_eq!(captures[1].index, 1);
@@ -1478,9 +1479,8 @@ mod tests {
     #[test]
     fn capture_system_prompt_in_context() {
         smol::block_on(async {
-            let (registry, handle) = setup_registry_with_handle(vec![
-                MockResponse::Text("Hello!".into()),
-            ]);
+            let (registry, handle) =
+                setup_registry_with_handle(vec![MockResponse::Text("Hello!".into())]);
             let model = mock_model();
             let mut context = Context {
                 system_prompt: Some("You are a test assistant.".into()),

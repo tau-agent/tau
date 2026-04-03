@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tau::protocol::{Request, Response};
-use tau::providers::mock::{mock_model, MockProvider, MockResponse};
+use tau::providers::mock::{MockProvider, MockResponse, mock_model};
 
 /// Send a request and read one response line.
 pub fn send_recv(stream: &UnixStream, req: &Request) -> Response {

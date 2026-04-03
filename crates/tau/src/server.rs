@@ -550,7 +550,7 @@ pub async fn run() -> crate::Result<()> {
             let sh = shutdown.clone();
             let sl = session_locks.clone();
             let th = throttle.clone();
-        let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
+            let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
             smol::spawn(async move {
                 if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
                     eprintln!("auto-resume session {} error: {}", sid, e);
@@ -584,7 +584,7 @@ pub async fn run() -> crate::Result<()> {
                 let sh = shutdown.clone();
                 let sl = session_locks.clone();
                 let th = throttle.clone();
-            let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
+                let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
                 smol::spawn(async move {
                     if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
                         eprintln!("auto-resume session {} error: {}", sid, e);
@@ -3119,7 +3119,7 @@ async fn handle_server_request(
                 target_session_id,
                 content,
                 sender_info,
-                &test_overrides,
+                test_overrides,
             );
             Response::Ok
         }
@@ -3288,7 +3288,7 @@ fn notify_parent_of_child_completion(
         &pid,
         &notice,
         &format!("child:{}", child_session_id),
-        &test_overrides,
+        test_overrides,
     );
 }
 

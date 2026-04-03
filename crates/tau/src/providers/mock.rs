@@ -309,6 +309,12 @@ pub struct MockToolExecutorHandle {
     inner: Arc<MockToolExecutorInner>,
 }
 
+impl Default for MockToolExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockToolExecutor {
     pub fn new() -> Self {
         Self {
@@ -362,7 +368,9 @@ impl MockToolExecutorHandle {
 fn execute_mock_tool_response(
     tool_call: &ToolCall,
     resp: MockToolResponse,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::Result<ToolResultMessage>> + Send + '_>> {
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::Result<ToolResultMessage>> + Send + '_>,
+> {
     Box::pin(async move {
         match resp {
             MockToolResponse::Success(text) => Ok(ToolResultMessage {

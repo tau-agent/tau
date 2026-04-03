@@ -206,12 +206,12 @@ pub async fn replay_session(recording: &SessionRecording) -> ReplayResult {
     };
 
     // Add initial user message from first turn
-    if let Some(ref first_turn) = recording.turns.first() {
-        if let Some(ref text) = first_turn.user_message {
-            context
-                .messages
-                .push(Message::User(UserMessage::text(text)));
-        }
+    if let Some(first_turn) = recording.turns.first()
+        && let Some(text) = &first_turn.user_message
+    {
+        context
+            .messages
+            .push(Message::User(UserMessage::text(text)));
     }
 
     // Run agent loop
@@ -235,14 +235,12 @@ pub async fn replay_session(recording: &SessionRecording) -> ReplayResult {
     match result {
         Ok(agent_result) => {
             // Compare recorded turns with replayed messages
-            let replayed_turns = extract_turns_from_new_messages(
-                &agent_result.new_messages,
-                &recording.turns,
-            );
+            let replayed_turns =
+                extract_turns_from_new_messages(&agent_result.new_messages, &recording.turns);
             let turn_results = compare_turns(&recording.turns, &replayed_turns);
-            let success = turn_results.iter().all(|tc| {
-                tc.text_match && tc.tool_calls_match && tc.tool_results_match
-            });
+            let success = turn_results
+                .iter()
+                .all(|tc| tc.text_match && tc.tool_calls_match && tc.tool_results_match);
             ReplayResult {
                 success,
                 turn_results,
@@ -267,10 +265,7 @@ fn extract_turns_from_new_messages(
 }
 
 /// Compare recorded turns with replayed turns.
-fn compare_turns(
-    recorded: &[RecordedTurn],
-    replayed: &[RecordedTurn],
-) -> Vec<TurnComparison> {
+fn compare_turns(recorded: &[RecordedTurn], replayed: &[RecordedTurn]) -> Vec<TurnComparison> {
     let max_len = recorded.len().max(replayed.len());
     let mut results = Vec::new();
 
@@ -385,11 +380,10 @@ mod tests {
             Message::User(UserMessage::text("hello")),
             Message::Assistant({
                 let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
-                a.content
-                    .push(AssistantContent::Text(TextContent {
-                        text: "Hi there!".into(),
-                        text_signature: None,
-                    }));
+                a.content.push(AssistantContent::Text(TextContent {
+                    text: "Hi there!".into(),
+                    text_signature: None,
+                }));
                 a
             }),
         ];
@@ -406,12 +400,11 @@ mod tests {
             Message::User(UserMessage::text("read file")),
             Message::Assistant({
                 let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
-                a.content
-                    .push(AssistantContent::ToolCall(ToolCall {
-                        id: "tc1".into(),
-                        name: "read_file".into(),
-                        arguments: serde_json::json!({"path": "test.txt"}),
-                    }));
+                a.content.push(AssistantContent::ToolCall(ToolCall {
+                    id: "tc1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "test.txt"}),
+                }));
                 a.stop_reason = StopReason::ToolUse;
                 a
             }),
@@ -428,11 +421,10 @@ mod tests {
             }),
             Message::Assistant({
                 let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
-                a.content
-                    .push(AssistantContent::Text(TextContent {
-                        text: "The file says: file contents".into(),
-                        text_signature: None,
-                    }));
+                a.content.push(AssistantContent::Text(TextContent {
+                    text: "The file says: file contents".into(),
+                    text_signature: None,
+                }));
                 a
             }),
         ];
@@ -464,11 +456,10 @@ mod tests {
             Message::User(UserMessage::text("continue")),
             Message::Assistant({
                 let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
-                a.content
-                    .push(AssistantContent::Text(TextContent {
-                        text: "Sure!".into(),
-                        text_signature: None,
-                    }));
+                a.content.push(AssistantContent::Text(TextContent {
+                    text: "Sure!".into(),
+                    text_signature: None,
+                }));
                 a
             }),
         ];
@@ -486,11 +477,10 @@ mod tests {
                 user_message: Some("hello".into()),
                 assistant_message: {
                     let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
-                    a.content
-                        .push(AssistantContent::Text(TextContent {
-                            text: "Hi!".into(),
-                            text_signature: None,
-                        }));
+                    a.content.push(AssistantContent::Text(TextContent {
+                        text: "Hi!".into(),
+                        text_signature: None,
+                    }));
                     a
                 },
                 tool_results: Vec::new(),
@@ -502,10 +492,7 @@ mod tests {
 
         assert_eq!(parsed.turns.len(), 1);
         assert_eq!(parsed.turns[0].assistant_message.text(), "Hi!");
-        assert_eq!(
-            parsed.system_prompt.as_deref(),
-            Some("You are helpful.")
-        );
+        assert_eq!(parsed.system_prompt.as_deref(), Some("You are helpful."));
     }
 
     #[test]
@@ -517,8 +504,7 @@ mod tests {
                 turns: vec![RecordedTurn {
                     user_message: Some("hello".into()),
                     assistant_message: {
-                        let mut a =
-                            AssistantMessage::empty("mock", "mock", "mock-model");
+                        let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
                         a.content.push(AssistantContent::Text(TextContent {
                             text: "Hello back!".into(),
                             text_signature: None,
@@ -551,11 +537,7 @@ mod tests {
                     RecordedTurn {
                         user_message: Some("read test.txt".into()),
                         assistant_message: {
-                            let mut a = AssistantMessage::empty(
-                                "mock",
-                                "mock",
-                                "mock-model",
-                            );
+                            let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
                             a.content.push(AssistantContent::ToolCall(ToolCall {
                                 id: "tc1".into(),
                                 name: "read_file".into(),
@@ -579,11 +561,7 @@ mod tests {
                     RecordedTurn {
                         user_message: None,
                         assistant_message: {
-                            let mut a = AssistantMessage::empty(
-                                "mock",
-                                "mock",
-                                "mock-model",
-                            );
+                            let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
                             a.content.push(AssistantContent::Text(TextContent {
                                 text: "The file says: file contents here".into(),
                                 text_signature: None,

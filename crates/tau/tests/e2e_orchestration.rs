@@ -1,7 +1,7 @@
 //! End-to-end tests for session orchestration.
 
 mod common;
-use common::{send_recv, send_recv_all, TestServer};
+use common::{TestServer, send_recv, send_recv_all};
 
 use std::io::Write;
 use std::time::Duration;
