@@ -1,7 +1,9 @@
-//! Agent loop — stream LLM response, execute tool calls, repeat.
+//! Agent loop -- stream LLM response, execute tool calls, repeat.
 //!
 //! The loop continues until the LLM stops without tool calls, or an
-//! unrecoverable error occurs, or max_turns is reached.
+//! unrecoverable error occurs. Every `review_interval` turns, an inline
+//! LLM call reviews the last few messages to detect stuck loops. If stuck,
+//! a nudge message is injected; otherwise the loop continues uninterrupted.
 
 use crate::provider::{EventReceiver, EventSender, ProviderRegistry};
 
@@ -10,8 +12,10 @@ use crate::worker::ToolExecutor;
 
 /// Configuration for the agent loop.
 pub struct AgentConfig {
-    /// Maximum number of LLM turns (each tool-call-and-response is one turn).
-    pub max_turns: usize,
+    /// Number of turns between loop-review checkpoints.
+    /// Every `review_interval` turns, the agent pauses and asks a reviewer LLM
+    /// whether the session is making progress or stuck in a loop.
+    pub review_interval: usize,
     /// Maximum retries for transient errors (429, 529, 5xx).
     pub max_retries: usize,
     /// Base delay for retry backoff in milliseconds.
@@ -35,6 +39,8 @@ pub struct AgentConfig {
     /// Callback to refresh the API key after an auth error (e.g. expired OAuth token).
     /// Called on 401/auth errors before retrying. Returns the new API key if refresh succeeded.
     pub refresh_api_key: Option<Box<dyn Fn() -> Option<String> + Send + Sync>>,
+    /// Model to use for loop-review checkpoints. If `None`, uses the session's own model.
+    pub review_model: Option<Model>,
 }
 
 /// Default idle timeout for SSE stream chunks (90 seconds).
@@ -43,7 +49,7 @@ const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 90;
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_turns: 50,
+            review_interval: 50,
             max_retries: 10,
             retry_base_ms: 500,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -51,6 +57,7 @@ impl Default for AgentConfig {
             drain_queued: None,
             on_message: None,
             refresh_api_key: None,
+            review_model: None,
         }
     }
 }
@@ -174,7 +181,7 @@ async fn cancellable_sleep(
 /// Run the agent loop.
 ///
 /// Streams LLM responses, executes tool calls via the worker,
-/// and loops until the model stops or max_turns is reached.
+/// and loops until the model stops or is cancelled.
 /// All stream events are sent to `event_tx`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -192,7 +199,8 @@ pub async fn run(
     // All tools come from plugins (session + global)
     context.tools = extra_tools.to_vec();
 
-    for turn in 0..config.max_turns {
+    let mut turn: usize = 0;
+    loop {
         // Drain any pending queued messages before the next LLM call.
         // These are user messages injected mid-loop via Request::Steer or
         // child session completion notifications.
@@ -373,25 +381,215 @@ pub async fn run(
             context.messages.push(Message::ToolResult(result));
         }
 
-        // Check if we should stop (shutdown or max turns)
+        // Check if we should stop (shutdown)
         if config.should_stop.as_ref().is_some_and(|f| f()) {
             return Ok(AgentResult {
                 new_messages,
                 max_turns_reached: false,
             });
         }
-        if turn + 1 >= config.max_turns {
-            return Ok(AgentResult {
-                new_messages,
-                max_turns_reached: true,
-            });
+
+        turn += 1;
+
+        // Loop-review checkpoint: every review_interval turns, ask a reviewer
+        // LLM whether the session is making progress or stuck in a loop.
+        if config.review_interval > 0 && turn % config.review_interval == 0 {
+            let review_model = config.review_model.as_ref().unwrap_or(model);
+            let is_stuck = run_loop_review(
+                registry,
+                review_model,
+                &context.messages,
+                options,
+                config,
+                &event_tx,
+            )
+            .await;
+
+            if is_stuck {
+                // Inject a nudge message so the LLM knows it should change approach.
+                let nudge = Message::User(UserMessage {
+                    content: vec![UserContent::Text(TextContent {
+                        text: "You seem to be stuck in a loop repeating the same actions. \
+                               Step back, reassess your approach, and try a different strategy."
+                            .into(),
+                        text_signature: None,
+                    })],
+                    timestamp: crate::types::timestamp_ms(),
+                });
+                if let Some(ref on_msg) = config.on_message {
+                    on_msg.lock().unwrap()(&nudge);
+                }
+                let _ = event_tx.try_send(StreamEvent::Status {
+                    message: format!(
+                        "Loop review at turn {}: session appears stuck, injecting nudge.",
+                        turn
+                    ),
+                });
+                new_messages.push(nudge.clone());
+                context.messages.push(nudge);
+            } else {
+                let _ = event_tx.try_send(StreamEvent::Status {
+                    message: format!(
+                        "Loop review at turn {}: session making progress, continuing.",
+                        turn
+                    ),
+                });
+            }
         }
     }
+}
 
-    Ok(AgentResult {
-        new_messages,
-        max_turns_reached: true,
-    })
+/// System prompt for the loop-review LLM call.
+const LOOP_REVIEW_SYSTEM_PROMPT: &str = "\
+You are a progress reviewer. You will be shown the last few messages from an AI coding assistant session.
+
+Your job: determine whether the session is making progress or is stuck in a loop (repeating the same actions without advancing).
+
+Respond with EXACTLY one word:
+- PROGRESS if the session is making meaningful progress
+- STUCK if the session is repeating itself or going in circles";
+
+/// Number of recent messages to include in the loop review context.
+const LOOP_REVIEW_MESSAGE_COUNT: usize = 6;
+
+/// Run an inline LLM call to review whether the session is stuck.
+/// Returns `true` if the session appears stuck.
+async fn run_loop_review(
+    registry: &ProviderRegistry,
+    review_model: &Model,
+    messages: &[Message],
+    options: &StreamOptions,
+    config: &AgentConfig,
+    event_tx: &EventSender,
+) -> bool {
+    let _ = event_tx.try_send(StreamEvent::Phase {
+        phase: crate::types::AgentPhase::Compacting,
+    });
+
+    // Extract the last N messages for review.
+    let recent: Vec<Message> = messages
+        .iter()
+        .rev()
+        .take(LOOP_REVIEW_MESSAGE_COUNT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    // Format them as a single user message for the reviewer.
+    let mut review_text = String::from("Here are the last messages from the session:\n\n");
+    for (i, msg) in recent.iter().enumerate() {
+        review_text.push_str(&format!("--- Message {} ---\n", i + 1));
+        match msg {
+            Message::User(u) => {
+                review_text.push_str("Role: User\n");
+                for c in &u.content {
+                    if let UserContent::Text(t) = c {
+                        review_text.push_str(&t.text);
+                        review_text.push('\n');
+                    }
+                }
+            }
+            Message::Assistant(a) => {
+                review_text.push_str("Role: Assistant\n");
+                for c in &a.content {
+                    match c {
+                        AssistantContent::Text(t) => {
+                            review_text.push_str(&t.text);
+                            review_text.push('\n');
+                        }
+                        AssistantContent::ToolCall(tc) => {
+                            review_text
+                                .push_str(&format!("Tool call: {}({})\n", tc.name, tc.arguments));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Message::ToolResult(tr) => {
+                review_text.push_str(&format!("Role: ToolResult ({})\n", tr.tool_name));
+                let content: String = tr
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ToolResultContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // Truncate long tool results for the review.
+                if content.len() > 1000 {
+                    review_text.push_str(&content[..1000]);
+                    review_text.push_str("\n[...truncated...]\n");
+                } else {
+                    review_text.push_str(&content);
+                    review_text.push('\n');
+                }
+            }
+            Message::CompactionSummary(s) => {
+                review_text.push_str("Role: CompactionSummary\n");
+                review_text.push_str(&s.summary);
+                review_text.push('\n');
+            }
+        }
+        review_text.push('\n');
+    }
+    review_text.push_str("Is this session making PROGRESS or is it STUCK?");
+
+    let review_context = Context {
+        system_prompt: Some(LOOP_REVIEW_SYSTEM_PROMPT.into()),
+        messages: vec![Message::User(UserMessage {
+            content: vec![UserContent::Text(TextContent {
+                text: review_text,
+                text_signature: None,
+            })],
+            timestamp: crate::types::timestamp_ms(),
+        })],
+        tools: vec![],
+    };
+
+    // Use a minimal StreamOptions — no thinking, just a quick text response.
+    let review_options = StreamOptions {
+        api_key: options.api_key.clone(),
+        headers: options.headers.clone(),
+        max_tokens: Some(16),
+        temperature: Some(0.0),
+        thinking_budget: None,
+    };
+
+    // Single-shot LLM call with retry.
+    let (discard_tx, _discard_rx) = smol::channel::unbounded();
+    let result = stream_with_retry(
+        registry,
+        review_model,
+        &review_context,
+        &review_options,
+        config,
+        &discard_tx,
+    )
+    .await;
+
+    match result {
+        Ok(msg) => {
+            let text: String = msg
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    AssistantContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            let verdict = text.trim().to_uppercase();
+            verdict.contains("STUCK")
+        }
+        Err(e) => {
+            // If the review call fails, log and assume progress (don't block the loop).
+            eprintln!("loop review failed, assuming progress: {}", e);
+            false
+        }
+    }
 }
 
 /// Maximum retry delay in milliseconds (32 seconds).
@@ -788,21 +986,29 @@ mod tests {
     }
 
     #[test]
-    fn max_turns_limit() {
+    fn loop_review_progress_continues() {
+        // review_interval=3: 3 tool-call turns, then review says PROGRESS,
+        // then 1 more turn that ends with Text (natural stop).
         smol::block_on(async {
-            let mut responses = Vec::new();
-            for i in 0..10 {
+            let mut responses: Vec<MockResponse> = Vec::new();
+            // Turns 0, 1, 2 — tool calls
+            for i in 0..3 {
                 responses.push(MockResponse::ToolCalls(vec![ToolCall {
                     id: format!("tc{}", i),
                     name: "bash".into(),
                     arguments: serde_json::json!({"command": "echo loop"}),
                 }]));
             }
+            // Review call after turn 2 — says PROGRESS
+            responses.push(MockResponse::Text("PROGRESS".into()));
+            // Turn 3 — natural stop
+            responses.push(MockResponse::Text("All done.".into()));
+
             let registry = setup_registry(responses);
             let model = mock_model();
             let mut context = basic_context();
             let config = AgentConfig {
-                max_turns: 3,
+                review_interval: 3,
                 ..Default::default()
             };
             let mut worker = InProcessWorker::new();
@@ -821,8 +1027,122 @@ mod tests {
             .await
             .unwrap();
 
-            assert!(result.max_turns_reached);
+            assert!(!result.max_turns_reached);
+            // 3 tool turns (assistant + tool_result each = 6) + 1 final assistant = 7
+            assert_eq!(result.new_messages.len(), 7);
+        });
+    }
+
+    #[test]
+    fn loop_review_stuck_injects_nudge() {
+        // review_interval=2: 2 tool-call turns, then review says STUCK,
+        // nudge is injected, then 1 more turn that ends with Text.
+        smol::block_on(async {
+            let mut responses: Vec<MockResponse> = Vec::new();
+            // Turns 0, 1 — tool calls
+            for i in 0..2 {
+                responses.push(MockResponse::ToolCalls(vec![ToolCall {
+                    id: format!("tc{}", i),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo loop"}),
+                }]));
+            }
+            // Review call — says STUCK
+            responses.push(MockResponse::Text("STUCK".into()));
+            // Turn 2 — natural stop (after nudge was injected)
+            responses.push(MockResponse::Text("Trying different approach.".into()));
+
+            let registry = setup_registry(responses);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig {
+                review_interval: 2,
+                ..Default::default()
+            };
+            let mut worker = InProcessWorker::new();
+            let (tx, rx) = smol::channel::unbounded();
+
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            assert!(!result.max_turns_reached);
+            // 2 tool turns (4 msgs) + 1 nudge + 1 final assistant = 6
             assert_eq!(result.new_messages.len(), 6);
+            // The nudge should be a User message
+            assert!(matches!(result.new_messages[4], Message::User(_)));
+            if let Message::User(ref u) = result.new_messages[4] {
+                let text = match &u.content[0] {
+                    UserContent::Text(t) => &t.text,
+                    _ => panic!("expected text content"),
+                };
+                assert!(text.contains("stuck in a loop"));
+            }
+
+            // Check that a Status event was emitted mentioning "stuck"
+            let mut found_stuck_status = false;
+            while let Ok(event) = rx.try_recv() {
+                if let StreamEvent::Status { message } = event {
+                    if message.contains("stuck") {
+                        found_stuck_status = true;
+                    }
+                }
+            }
+            assert!(
+                found_stuck_status,
+                "expected a Status event about being stuck"
+            );
+        });
+    }
+
+    #[test]
+    fn loop_review_disabled_when_interval_zero() {
+        // review_interval=0 means no review — loop should run until
+        // there are no more responses (which causes an error and stops).
+        smol::block_on(async {
+            let responses = vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc0".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                }]),
+                MockResponse::Text("Done.".into()),
+            ];
+            let registry = setup_registry(responses);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig {
+                review_interval: 0,
+                ..Default::default()
+            };
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
+
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            assert!(!result.max_turns_reached);
+            // 1 tool turn (2 msgs) + 1 final text = 3
+            assert_eq!(result.new_messages.len(), 3);
         });
     }
 
