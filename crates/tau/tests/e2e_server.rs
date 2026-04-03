@@ -1390,3 +1390,126 @@ fn server_chat_tool_schemas_in_context() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Session dump and replay tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_dump_and_replay() {
+    use std::sync::Arc;
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+
+    // Set up a server with mock tools
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    tool_handle.on_tool("bash", MockToolResponse::Success("hello world".into()));
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || {
+            let h = tool_handle.clone();
+            Box::new(h.executor())
+        });
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-test.sock");
+    let db_path = dir.path().join("test.db");
+
+    let model = mock_model();
+    let mut registry = tau::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "echo hello world"}),
+        }]),
+        MockResponse::Text("The command output hello world.".into()),
+    ]));
+
+    let config = tau::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.clone(),
+        db_path: db_path.clone(),
+        tool_executor_factory: Some(tool_factory),
+        mock_tools: vec![mock_tool("bash", "Run a command")],
+    };
+
+    std::thread::spawn(move || {
+        smol::block_on(async {
+            if let Err(e) = tau::server::run_with_config(config).await {
+                eprintln!("test server error: {}", e);
+            }
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() { break; }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Create session and chat
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("You are helpful.".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn2 = UnixStream::connect(&sock_path).unwrap();
+    conn2.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "run echo hello world".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Shutdown server so we can access the DB directly
+    let conn3 = UnixStream::connect(&sock_path).unwrap();
+    conn3.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send_recv(&conn3, &Request::Shutdown { restart: false });
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Dump the session from DB
+    let db = tau::db::Db::open(&db_path).unwrap();
+    let recording = tau::replay::dump_session(&db, &sid).unwrap();
+
+    // Verify recording structure
+    assert_eq!(recording.turns.len(), 2, "expected 2 turns (tool_call + text)");
+    assert_eq!(recording.turns[0].user_message.as_deref(), Some("run echo hello world"));
+    assert_eq!(recording.turns[0].tool_results.len(), 1);
+    assert!(!recording.turns[0].tool_results[0].is_error);
+    assert!(recording.turns[1].user_message.is_none()); // continuation
+    assert!(recording.turns[1].assistant_message.text().contains("hello world"));
+
+    // Verify JSON roundtrip
+    let json = serde_json::to_string_pretty(&recording).unwrap();
+    let parsed: tau::replay::SessionRecording = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed.turns.len(), 2);
+
+    // Replay the recording
+    let result = smol::block_on(tau::replay::replay_session(&recording));
+    assert!(
+        result.success,
+        "replay should succeed: error={:?}, turns={:?}",
+        result.error, result.turn_results
+    );
+    assert_eq!(result.turn_results.len(), 2);
+    assert!(result.turn_results[0].tool_calls_match, "turn 0: {:?}", result.turn_results[0]);
+    assert!(result.turn_results[0].tool_results_match, "turn 0: {:?}", result.turn_results[0]);
+    assert!(result.turn_results[1].text_match, "turn 1: {:?}", result.turn_results[1]);
+}

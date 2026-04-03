@@ -179,6 +179,15 @@ enum SessionAction {
         #[arg(add = ArgValueCandidates::new(completer::session_completer))]
         id: String,
     },
+    /// Dump a session as a JSON recording (for replay testing)
+    Dump {
+        /// Session ID
+        #[arg(add = ArgValueCandidates::new(completer::session_completer))]
+        id: String,
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -257,6 +266,9 @@ async fn run(cli: Cli) -> tau::Result<()> {
             }
             SessionAction::Delete { id } => {
                 cmd_sessions_delete(&id).await?;
+            }
+            SessionAction::Dump { id, output } => {
+                cmd_sessions_dump(&id, output.as_deref())?;
             }
         },
         Commands::Providers { action } => match action {
@@ -1274,6 +1286,22 @@ async fn cmd_sessions_delete(id: &str) -> tau::Result<()> {
         .await?;
     client.recv_streaming(|_| {}).await?;
     eprintln!("deleted session {}", id);
+    Ok(())
+}
+
+fn cmd_sessions_dump(id: &str, output: Option<&str>) -> tau::Result<()> {
+    let db = tau::db::Db::open_default()?;
+    let recording = tau::replay::dump_session(&db, id)?;
+    let json = serde_json::to_string_pretty(&recording)
+        .map_err(|e| tau::Error::Io(format!("serialize recording: {}", e)))?;
+
+    if let Some(path) = output {
+        std::fs::write(path, &json)
+            .map_err(|e| tau::Error::Io(format!("write {}: {}", path, e)))?;
+        eprintln!("dumped session {} to {}", id, path);
+    } else {
+        println!("{}", json);
+    }
     Ok(())
 }
 

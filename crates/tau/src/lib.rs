@@ -9,6 +9,7 @@ pub mod plugin;
 pub mod protocol;
 pub mod provider;
 pub mod providers;
+pub mod replay;
 pub mod server;
 pub mod system_prompt;
 pub mod throttle;
