@@ -259,6 +259,17 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         };
         left_parts.push(Span::styled(cost_str, dim));
     }
+
+    // Subscription usage limits: (5h 50% 16h | 7d 12% 2d | sonnet 6% 1d)
+    if let Some(ref usage) = app.subscription_usage
+        && let Some(usage_str) = tau::protocol::format_subscription_usage(usage)
+    {
+        if !left_parts.is_empty() {
+            left_parts.push(Span::styled(" ", dim));
+        }
+        left_parts.push(Span::styled(usage_str, dim));
+    }
+
     if totals.context_window > 0 {
         if !left_parts.is_empty() {
             left_parts.push(Span::styled(" ", dim));

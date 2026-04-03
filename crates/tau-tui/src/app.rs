@@ -3,6 +3,7 @@
 use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui_textarea::TextArea;
 
+use tau::auth::SubscriptionUsage;
 use tau::protocol::{Response, SessionInfo};
 use tau::types::{
     AgentPhase, AssistantContent, Message, StreamEvent, ToolResultMessage, UserContent,
@@ -100,6 +101,10 @@ pub struct App {
     pub history_saved_text: String,
     /// Whether to fetch subscription usage after session info.
     pub pending_subscription_usage: bool,
+    /// Cached subscription usage data for footer display.
+    pub subscription_usage: Option<SubscriptionUsage>,
+    /// Last time subscription usage was fetched.
+    pub last_usage_fetch: std::time::Instant,
     /// Server stream ended.
     pub server_done: bool,
     /// Navigation stack for session switching (previous session IDs).
@@ -133,6 +138,8 @@ pub struct NavEntry {
     pub totals: UsageTotals,
     pub parent_id: Option<String>,
     pub child_count: usize,
+    pub subscription_usage: Option<SubscriptionUsage>,
+    pub last_usage_fetch: std::time::Instant,
 }
 
 impl App {
@@ -164,6 +171,10 @@ impl App {
             history_index: None,
             history_saved_text: String::new(),
             pending_subscription_usage: false,
+            subscription_usage: None,
+            last_usage_fetch: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(3600))
+                .unwrap(),
             server_done: false,
             nav_stack: Vec::new(),
             parent_id: None,
@@ -904,6 +915,8 @@ impl App {
             totals: std::mem::take(&mut self.totals),
             parent_id: self.parent_id.clone(),
             child_count: self.child_count,
+            subscription_usage: self.subscription_usage.take(),
+            last_usage_fetch: self.last_usage_fetch,
         });
     }
 
@@ -934,6 +947,8 @@ impl App {
             self.totals = entry.totals;
             self.parent_id = entry.parent_id;
             self.child_count = entry.child_count;
+            self.subscription_usage = entry.subscription_usage;
+            self.last_usage_fetch = entry.last_usage_fetch;
             self.scroll_to_bottom();
             self.mode = AppMode::Input;
             true
@@ -1233,31 +1248,8 @@ impl App {
                 }
             }
             Response::SubscriptionUsage { usage } => {
-                use tau::auth::UsageBucket;
-                let fmt_bucket = |b: &Option<UsageBucket>| -> String {
-                    match b.as_ref().and_then(|b| b.utilization) {
-                        Some(u) => format!("{:.0}%", u),
-                        None => "?".into(),
-                    }
-                };
-                let mut parts = Vec::new();
-                if usage.five_hour.is_some() {
-                    parts.push(format!("5h: {}", fmt_bucket(&usage.five_hour)));
-                }
-                if usage.seven_day.is_some() {
-                    parts.push(format!("7d: {}", fmt_bucket(&usage.seven_day)));
-                }
-                if usage.seven_day_sonnet.is_some() {
-                    parts.push(format!("sonnet: {}", fmt_bucket(&usage.seven_day_sonnet)));
-                }
-                if usage.seven_day_opus.is_some() {
-                    parts.push(format!("opus: {}", fmt_bucket(&usage.seven_day_opus)));
-                }
-                if !parts.is_empty() {
-                    self.messages.push(MessageItem::Status {
-                        text: format!("usage: {}", parts.join(" | ")),
-                    });
-                }
+                self.subscription_usage = Some(usage);
+                self.last_usage_fetch = std::time::Instant::now();
             }
             Response::Sessions { sessions } => {
                 // If we're in picker mode, populate picker sessions.

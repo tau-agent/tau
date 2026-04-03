@@ -330,6 +330,116 @@ pub fn format_stats(stats: &SessionStats) -> String {
     parts.join(" ")
 }
 
+/// Format a `resets_at` ISO-8601 timestamp as a compact time-until-reset string.
+/// Returns "?" if the timestamp can't be parsed or is in the past.
+fn format_resets_at(resets_at: &str) -> String {
+    // Parse ISO-8601 timestamps like "2026-04-03T18:30:00Z" or with fractional seconds.
+    // We do minimal parsing to avoid pulling in chrono.
+    let trimmed = resets_at.trim().trim_end_matches('Z');
+    let (date_part, time_part) = match trimmed.split_once('T') {
+        Some(pair) => pair,
+        None => return "?".into(),
+    };
+    let mut date_iter = date_part.split('-');
+    let year: i64 = date_iter.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let month: i64 = date_iter.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let day: i64 = date_iter.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Strip fractional seconds and timezone offset beyond 'Z'
+    let time_clean = time_part
+        .split('+')
+        .next()
+        .unwrap_or(time_part)
+        .split('.')
+        .next()
+        .unwrap_or(time_part);
+    let mut time_iter = time_clean.split(':');
+    let hour: i64 = time_iter.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minute: i64 = time_iter.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let second: i64 = time_iter.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    // Convert to Unix timestamp (approximate — ignores leap seconds, good enough for display).
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y.rem_euclid(400);
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146097 + doe - 719468
+    }
+    let reset_epoch =
+        days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let delta = reset_epoch - now;
+    if delta <= 0 {
+        return "?".into();
+    }
+    format_duration_compact(delta)
+}
+
+/// Format seconds as compact duration: "16h", "2d", "45m".
+fn format_duration_compact(secs: i64) -> String {
+    if secs >= 86400 {
+        format!("{}d", secs / 86400)
+    } else if secs >= 3600 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// Format a single usage bucket as `"LABEL PCT RESET"`.
+fn format_usage_bucket(label: &str, bucket: &crate::auth::UsageBucket) -> Option<String> {
+    let pct = bucket.utilization? * 100.0;
+    let reset = bucket
+        .resets_at
+        .as_deref()
+        .map(format_resets_at)
+        .unwrap_or_else(|| "?".into());
+    Some(format!("{} {:.0}% {}", label, pct, reset))
+}
+
+/// Format subscription usage as a compact footer string.
+///
+/// Example: `(5h 50% 16h | 7d 12% 2d | sonnet 6% 1d)`
+///
+/// Returns `None` if there's no usage data to display.
+pub fn format_subscription_usage(usage: &crate::auth::SubscriptionUsage) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(ref b) = usage.five_hour
+        && let Some(s) = format_usage_bucket("5h", b)
+    {
+        parts.push(s);
+    }
+    if let Some(ref b) = usage.seven_day
+        && let Some(s) = format_usage_bucket("7d", b)
+    {
+        parts.push(s);
+    }
+    if let Some(ref b) = usage.seven_day_sonnet
+        && let Some(s) = format_usage_bucket("sonnet", b)
+    {
+        parts.push(s);
+    }
+    if let Some(ref b) = usage.seven_day_opus
+        && let Some(s) = format_usage_bucket("opus", b)
+    {
+        parts.push(s);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("({})", parts.join(" | ")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +511,64 @@ mod tests {
         let s = format_stats(&stats);
         assert!(s.contains("$0.005"), "got: {s}");
         assert!(!s.contains("(sub)"), "got: {s}");
+    }
+
+    #[test]
+    fn format_subscription_usage_basic() {
+        use crate::auth::{SubscriptionUsage, UsageBucket};
+        let usage = SubscriptionUsage {
+            five_hour: Some(UsageBucket {
+                utilization: Some(0.5),
+                resets_at: Some("2099-01-01T16:00:00Z".into()),
+            }),
+            seven_day: Some(UsageBucket {
+                utilization: Some(0.12),
+                resets_at: Some("2099-01-03T00:00:00Z".into()),
+            }),
+            seven_day_sonnet: Some(UsageBucket {
+                utilization: Some(0.06),
+                resets_at: Some("2099-01-02T00:00:00Z".into()),
+            }),
+            seven_day_opus: None,
+            extra_usage: None,
+        };
+        let s = format_subscription_usage(&usage).unwrap();
+        assert!(s.starts_with('('), "got: {s}");
+        assert!(s.ends_with(')'), "got: {s}");
+        assert!(s.contains("5h 50%"), "got: {s}");
+        assert!(s.contains("7d 12%"), "got: {s}");
+        assert!(s.contains("sonnet 6%"), "got: {s}");
+        assert!(s.contains(" | "), "got: {s}");
+    }
+
+    #[test]
+    fn format_subscription_usage_empty() {
+        use crate::auth::SubscriptionUsage;
+        let usage = SubscriptionUsage::default();
+        assert!(format_subscription_usage(&usage).is_none());
+    }
+
+    #[test]
+    fn format_subscription_usage_no_utilization() {
+        use crate::auth::{SubscriptionUsage, UsageBucket};
+        let usage = SubscriptionUsage {
+            five_hour: Some(UsageBucket {
+                utilization: None,
+                resets_at: Some("2099-01-01T16:00:00Z".into()),
+            }),
+            ..Default::default()
+        };
+        // Bucket with no utilization is skipped
+        assert!(format_subscription_usage(&usage).is_none());
+    }
+
+    #[test]
+    fn format_duration_compact_units() {
+        assert_eq!(format_duration_compact(30), "30s");
+        assert_eq!(format_duration_compact(90), "1m");
+        assert_eq!(format_duration_compact(3600), "1h");
+        assert_eq!(format_duration_compact(7200), "2h");
+        assert_eq!(format_duration_compact(86400), "1d");
+        assert_eq!(format_duration_compact(172800), "2d");
     }
 }

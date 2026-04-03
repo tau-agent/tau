@@ -205,6 +205,12 @@ async fn run_inner(
     })
     .detach();
 
+    // Fetch initial subscription usage if applicable
+    if is_subscription {
+        send_request_and_recv(Request::GetSubscriptionUsage, server_tx.clone()).await?;
+        app.last_usage_fetch = std::time::Instant::now();
+    }
+
     // Initial draw
     terminal
         .draw(|f| ui::draw(f, &app, &app.theme))
@@ -454,6 +460,14 @@ async fn run_inner(
 
         // Only tick when streaming (spinner animation)
         event_loop.set_ticking(app.mode == AppMode::Streaming);
+
+        // Periodic subscription usage refresh (every 60s)
+        if app.totals.is_subscription
+            && app.last_usage_fetch.elapsed() >= std::time::Duration::from_secs(60)
+        {
+            app.last_usage_fetch = std::time::Instant::now();
+            send_request_and_recv(Request::GetSubscriptionUsage, server_tx.clone()).await?;
+        }
 
         // Draw
         terminal
