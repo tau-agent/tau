@@ -15,6 +15,7 @@ pub mod throttle;
 pub mod tools;
 pub mod types;
 pub mod worker;
+pub mod worker2;
 
 pub use provider::{Provider, ProviderRegistry};
 pub use types::*;

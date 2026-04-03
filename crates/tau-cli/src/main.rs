@@ -39,6 +39,9 @@ enum Commands {
     /// Tool execution worker (internal, used by daemon)
     #[command(hide = true)]
     Worker,
+    /// Async tool execution worker (internal, used by daemon)
+    #[command(hide = true)]
+    Worker2,
     /// Manage the tau server
     #[command(alias = "srv")]
     Server {
@@ -222,6 +225,10 @@ async fn run(cli: Cli) -> tau::Result<()> {
         }
         Commands::Worker => {
             tau::worker::run_worker_loop();
+            return Ok(());
+        }
+        Commands::Worker2 => {
+            tau::worker2::run();
             return Ok(());
         }
         Commands::Login { provider } => {
