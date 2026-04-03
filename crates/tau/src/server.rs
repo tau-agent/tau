@@ -227,6 +227,9 @@ struct State {
     /// Maps child_session_id -> parent_session_id. Used to suppress redundant
     /// completion notifications when parent is actively joining.
     waited_sessions: HashSet<String>,
+    /// Waiters notified when any session's agent turn completes.
+    /// Each entry is a one-shot-ish sender; closed/full senders are pruned on notify.
+    session_done_waiters: Vec<smol::channel::Sender<()>>,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -479,6 +482,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         subscribers: HashMap::new(),
         phases: HashMap::new(),
         waited_sessions: HashSet::new(),
+        session_done_waiters: Vec::new(),
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -581,6 +585,7 @@ pub async fn run() -> crate::Result<()> {
         subscribers: HashMap::new(),
         phases: HashMap::new(),
         waited_sessions: HashSet::new(),
+        session_done_waiters: Vec::new(),
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -1208,6 +1213,7 @@ async fn handle_client(
                 }
 
                 emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+                notify_session_done_waiters(&state);
 
                 // Before the session lock drops, check whether new messages
                 // arrived during post-turn cleanup.  See doc on the function.
@@ -1614,13 +1620,14 @@ async fn handle_client(
                     std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
                 let mut results = Vec::new();
 
-                // Track waited sessions so child completion doesn't send
-                // redundant notifications.
+                // Register a waiter channel to be notified on session completion.
+                let (notify_tx, notify_rx) = smol::channel::bounded::<()>(1);
                 {
                     let mut st = lock_state(&state);
                     for sid in &session_ids {
                         st.waited_sessions.insert(sid.clone());
                     }
+                    st.session_done_waiters.push(notify_tx);
                 }
 
                 loop {
@@ -1669,17 +1676,24 @@ async fn handle_client(
                         break;
                     }
 
-                    // Poll every second
-                    smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                    // Wait for a session-done notification or timeout.
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let _ = futures::future::select(
+                        std::pin::pin!(notify_rx.recv()),
+                        std::pin::pin!(smol::Timer::after(remaining)),
+                    )
+                    .await;
                 }
 
-                // Remove from waited set.
+                // Remove from waited set and drop our notifier.
                 {
                     let mut st = lock_state(&state);
                     for sid in &session_ids {
                         st.waited_sessions.remove(sid);
                     }
                 }
+                // Close receiver so the sender is pruned on next notify.
+                drop(notify_rx);
 
                 send(&mut writer, &Response::SessionsCompleted { results }).await?;
             }
@@ -1693,26 +1707,24 @@ async fn handle_client(
                     std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
                 let results;
 
-                // Track waited sessions so child completion doesn't send
-                // redundant notifications.
+                // Register a waiter channel to be notified on session completion.
+                let (notify_tx, notify_rx) = smol::channel::bounded::<()>(1);
                 {
                     let mut st = lock_state(&state);
                     for sid in &session_ids {
                         st.waited_sessions.insert(sid.clone());
                     }
+                    st.session_done_waiters.push(notify_tx);
                 }
 
                 loop {
                     let mut done = Vec::new();
-                    let mut pending = Vec::new();
 
                     for sid in &session_ids {
                         let lock = session_lock(&session_locks, sid);
                         let is_busy = lock.try_lock().is_none();
 
-                        if is_busy {
-                            pending.push(sid.clone());
-                        } else {
+                        if !is_busy {
                             let st = lock_state(&state);
                             let (status, summary) = match st.db.get_session(sid) {
                                 Ok(Some(_)) => {
@@ -1746,16 +1758,23 @@ async fn handle_client(
                         break;
                     }
 
-                    smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                    // Wait for a session-done notification or timeout.
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let _ = futures::future::select(
+                        std::pin::pin!(notify_rx.recv()),
+                        std::pin::pin!(smol::Timer::after(remaining)),
+                    )
+                    .await;
                 }
 
-                // Remove from waited set.
+                // Remove from waited set and drop our notifier.
                 {
                     let mut st = lock_state(&state);
                     for sid in &session_ids {
                         st.waited_sessions.remove(sid);
                     }
                 }
+                drop(notify_rx);
 
                 send(&mut writer, &Response::SessionsCompleted { results }).await?;
             }
@@ -2509,6 +2528,7 @@ async fn run_child_chat(
     }
 
     emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+    notify_session_done_waiters(&state);
 
     // Before the session lock drops, check whether new messages arrived while
     // we were in post-turn cleanup (broadcast / notify / emit_phase).  If so,
@@ -2737,6 +2757,7 @@ async fn resume_child_session(
     }
 
     emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+    notify_session_done_waiters(&state);
 
     // Before the session lock drops, check whether new messages arrived while
     // we were in post-turn cleanup.  See `maybe_respawn_for_queued` doc.
@@ -3443,6 +3464,18 @@ fn emit_phase(state: &SharedState, session_id: &str, phase: crate::types::AgentP
         event: Box::new(crate::types::StreamEvent::Phase { phase }),
     };
     broadcast_to_subscribers(state, session_id, &resp);
+}
+
+/// Wake all registered session-done waiters so they re-check completion.
+fn notify_session_done_waiters(state: &SharedState) {
+    let mut st = lock_state(state);
+    st.session_done_waiters.retain(|tx| {
+        // Try to send; drop closed channels.
+        !tx.is_closed() && {
+            let _ = tx.try_send(());
+            true
+        }
+    });
 }
 
 fn broadcast_to_subscribers(state: &SharedState, session_id: &str, resp: &Response) {
