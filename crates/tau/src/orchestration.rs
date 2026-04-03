@@ -206,6 +206,10 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                     "content": {
                         "type": "string",
                         "description": "Message content to send"
+                    },
+                    "await_reply": {
+                        "type": "boolean",
+                        "description": "If true, block until the target session replies via session_reply (default false)"
                     }
                 },
                 "required": ["session_id", "content"]
@@ -214,6 +218,30 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "The message appears as a user message in the target session's conversation.".into(),
                 "Fire-and-forget: returns immediately, does not wait for a response. Use session_read to check for responses later.".into(),
+                "Use session_message with await_reply=true to send a message and block until the target calls session_reply.".into(),
+            ],
+        },
+        PluginToolDef {
+            name: "session_reply".into(),
+            description: "Reply to a pending await_reply message. The sender of the original message is unblocked and receives this reply.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "msg_id": {
+                        "type": "string",
+                        "description": "The msg_id from the incoming message (e.g. \"m42\")"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Reply content to send back to the sender"
+                    }
+                },
+                "required": ["msg_id", "content"]
+            }),
+            prompt_snippet: Some("Use session_reply to respond to a message that has await_reply set. The sender is blocked waiting for this reply.".into()),
+            prompt_guidelines: vec![
+                "Only use when you received a message containing 'awaits reply, msg_id=...' — extract the msg_id and call session_reply.".into(),
+                "The sender's session_message call will return with your reply content.".into(),
             ],
         },
         PluginToolDef {

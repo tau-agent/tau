@@ -733,6 +733,10 @@ fn handle_session_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let await_reply = args
+                .get("await_reply")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if target.is_empty() {
                 return tool_err("session_id is required");
             }
@@ -747,10 +751,38 @@ fn handle_session_tool(
                 target_session_id: target.to_string(),
                 content: content.to_string(),
                 sender_info,
+                await_reply,
+                reply_to: None,
             };
             match server_request(writer, reader, req) {
                 Ok(crate::protocol::Response::Ok) => {
                     tool_ok(&format!("Message sent to session {}", target))
+                }
+                Ok(crate::protocol::Response::MessageReply {
+                    content: reply_content,
+                }) => tool_ok(&reply_content),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
+                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(&e),
+            }
+        }
+
+        "session_reply" => {
+            let msg_id = args.get("msg_id").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            if msg_id.is_empty() {
+                return tool_err("msg_id is required");
+            }
+            if content.is_empty() {
+                return tool_err("content is required");
+            }
+            let req = crate::protocol::Request::ReplyToMessage {
+                msg_id: msg_id.to_string(),
+                content: content.to_string(),
+            };
+            match server_request(writer, reader, req) {
+                Ok(crate::protocol::Response::Ok) => {
+                    tool_ok(&format!("Reply sent for msg_id={}", msg_id))
                 }
                 Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
                 Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),

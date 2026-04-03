@@ -247,7 +247,7 @@ fn session_info_includes_tree_fields() {
 #[test]
 fn orchestration_tool_definitions() {
     let tools = tau::orchestration::orchestration_tools();
-    assert_eq!(tools.len(), 11);
+    assert_eq!(tools.len(), 12);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"session_spawn"));
@@ -260,6 +260,7 @@ fn orchestration_tool_definitions() {
     assert!(names.contains(&"session_cancel"));
     assert!(names.contains(&"session_archive"));
     assert!(names.contains(&"session_message"));
+    assert!(names.contains(&"session_reply"));
     assert!(names.contains(&"session_id"));
 
     // session_spawn has prompt snippet
@@ -1241,6 +1242,8 @@ fn second_child_completion_notifies_parent() {
             target_session_id: child_id.clone(),
             content: "do first task".into(),
             sender_info: "test".into(),
+            await_reply: false,
+            reply_to: None,
         },
     );
     assert!(
@@ -1262,6 +1265,8 @@ fn second_child_completion_notifies_parent() {
             target_session_id: child_id.clone(),
             content: "do second task".into(),
             sender_info: "test".into(),
+            await_reply: false,
+            reply_to: None,
         },
     );
     assert!(
@@ -1361,6 +1366,249 @@ fn second_child_completion_notifies_parent() {
         child_id,
         second_text
     );
+
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Await/Reply protocol tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn protocol_queue_message_await_reply_roundtrip() {
+    let req = Request::QueueMessage {
+        target_session_id: "s2".into(),
+        content: "hello".into(),
+        sender_info: "session:s1".into(),
+        await_reply: true,
+        reply_to: None,
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains("await_reply"));
+    let parsed: Request = serde_json::from_str(&json).unwrap();
+    if let Request::QueueMessage { await_reply, .. } = parsed {
+        assert!(await_reply);
+    } else {
+        panic!("wrong variant");
+    }
+}
+
+#[test]
+fn protocol_reply_to_message_roundtrip() {
+    let req = Request::ReplyToMessage {
+        msg_id: "m42".into(),
+        content: "the answer".into(),
+    };
+    let json = serde_json::to_string(&req).unwrap();
+    assert!(json.contains("reply_to_message"));
+    let parsed: Request = serde_json::from_str(&json).unwrap();
+    if let Request::ReplyToMessage { msg_id, content } = parsed {
+        assert_eq!(msg_id, "m42");
+        assert_eq!(content, "the answer");
+    } else {
+        panic!("wrong variant");
+    }
+}
+
+#[test]
+fn protocol_message_reply_response_roundtrip() {
+    let resp = Response::MessageReply {
+        content: "reply content".into(),
+    };
+    let json = serde_json::to_string(&resp).unwrap();
+    assert!(json.contains("message_reply"));
+    let parsed: Response = serde_json::from_str(&json).unwrap();
+    if let Response::MessageReply { content } = parsed {
+        assert_eq!(content, "reply content");
+    } else {
+        panic!("wrong variant");
+    }
+}
+
+#[test]
+fn protocol_queue_message_backward_compat() {
+    // Old-style QueueMessage without await_reply should default to false
+    let json =
+        r#"{"type":"queue_message","target_session_id":"s1","content":"hi","sender_info":"test"}"#;
+    let parsed: Request = serde_json::from_str(json).unwrap();
+    if let Request::QueueMessage {
+        await_reply,
+        reply_to,
+        ..
+    } = parsed
+    {
+        assert!(!await_reply);
+        assert!(reply_to.is_none());
+    } else {
+        panic!("wrong variant");
+    }
+}
+
+/// ReplyToMessage with no pending waiter returns an error.
+#[test]
+fn reply_to_message_no_waiter() {
+    let server = TestServer::start(vec![]);
+
+    let conn = server.connect();
+    let resp = send_recv(
+        &conn,
+        &Request::ReplyToMessage {
+            msg_id: "m999".into(),
+            content: "orphan reply".into(),
+        },
+    );
+    match resp {
+        Response::Error { message } => {
+            assert!(message.contains("no pending waiter"), "got: {}", message);
+        }
+        other => panic!("expected Error, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// End-to-end: QueueMessage with await_reply=true blocks until
+/// ReplyToMessage is sent, then returns MessageReply.
+#[test]
+fn await_reply_e2e() {
+    use std::os::unix::net::UnixStream;
+
+    let server = TestServer::start(vec![]);
+
+    // Create sender and target sessions
+    let conn = server.connect();
+    let sender_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("sender".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn = server.connect();
+    let target_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("target".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Send QueueMessage with await_reply=true in a background thread
+    // (it will block waiting for reply)
+    let sock_path = server.sock_path.clone();
+    let target_clone = target_id.clone();
+    let sender_clone = sender_id.clone();
+    let handle = std::thread::spawn(move || {
+        let conn = UnixStream::connect(&sock_path).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        send_recv(
+            &conn,
+            &Request::QueueMessage {
+                target_session_id: target_clone,
+                content: "what is 2+2?".into(),
+                sender_info: format!("session:{}", sender_clone),
+                await_reply: true,
+                reply_to: None,
+            },
+        )
+    });
+
+    // Give the server a moment to register the waiter
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Find the msg_id by checking the target's messages
+    let conn = server.connect();
+    let messages = match send_recv(
+        &conn,
+        &Request::GetMessages {
+            session_id: target_id.clone(),
+        },
+    ) {
+        Response::Messages { messages } => messages,
+        other => panic!("expected Messages, got {:?}", other),
+    };
+
+    // Find the msg_id in the injected user message
+    let msg_text = messages
+        .iter()
+        .find_map(|m| {
+            if let tau::types::Message::User(u) = m {
+                let text: String = u
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        tau::types::UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if text.contains("msg_id=") {
+                    Some(text)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .expect("should find a message with msg_id");
+
+    // Extract msg_id from "[Message from session:sN, msg_id=mN, awaits reply]"
+    let msg_id = msg_text
+        .split("msg_id=")
+        .nth(1)
+        .unwrap()
+        .split([',', ']'])
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        msg_id.starts_with('m'),
+        "msg_id should start with 'm': {}",
+        msg_id
+    );
+
+    // Reply to the message
+    let conn = server.connect();
+    let resp = send_recv(
+        &conn,
+        &Request::ReplyToMessage {
+            msg_id: msg_id.clone(),
+            content: "4".into(),
+        },
+    );
+    assert!(
+        matches!(resp, Response::Ok),
+        "expected Ok from ReplyToMessage, got {:?}",
+        resp
+    );
+
+    // The sender thread should have received the reply
+    let sender_resp = handle.join().unwrap();
+    match sender_resp {
+        Response::MessageReply { content } => {
+            assert_eq!(content, "4");
+        }
+        other => panic!("expected MessageReply, got {:?}", other),
+    }
 
     server.shutdown();
 }

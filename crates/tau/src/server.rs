@@ -232,6 +232,11 @@ struct State {
     /// Waiters notified when any session's agent turn completes.
     /// Each entry is a one-shot-ish sender; closed/full senders are pruned on notify.
     session_done_waiters: Vec<smol::channel::Sender<()>>,
+    /// Pending reply waiters for `await_reply` messages.
+    /// Key is msg_id, value is a oneshot sender for the reply content.
+    reply_waiters: HashMap<String, smol::channel::Sender<String>>,
+    /// Monotonic counter for generating unique msg_ids.
+    next_msg_id: u64,
 }
 
 type SharedState = Arc<Mutex<State>>;
@@ -485,6 +490,8 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         phases: HashMap::new(),
         waited_sessions: HashSet::new(),
         session_done_waiters: Vec::new(),
+        reply_waiters: HashMap::new(),
+        next_msg_id: 0,
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -588,6 +595,8 @@ pub async fn run() -> crate::Result<()> {
         phases: HashMap::new(),
         waited_sessions: HashSet::new(),
         session_done_waiters: Vec::new(),
+        reply_waiters: HashMap::new(),
+        next_msg_id: 0,
     }));
 
     let shutdown = ShutdownHandle::new();
@@ -1801,19 +1810,98 @@ async fn handle_client(
                 target_session_id,
                 content,
                 sender_info,
+                await_reply,
+                reply_to: _,
             } => {
-                queue_and_maybe_resume(
-                    &state,
-                    &session_locks,
-                    &plugins,
-                    &shutdown,
-                    &throttle,
-                    &target_session_id,
-                    &content,
-                    &sender_info,
-                    &test_overrides,
-                );
-                send(&mut writer, &Response::Ok).await?;
+                if await_reply {
+                    // Generate a unique msg_id, create a oneshot channel,
+                    // prefix the message so the target knows to reply.
+                    let (msg_id, rx) = {
+                        let mut st = lock_state(&state);
+                        st.next_msg_id += 1;
+                        let id = format!("m{}", st.next_msg_id);
+                        let (tx, rx) = smol::channel::bounded::<String>(1);
+                        st.reply_waiters.insert(id.clone(), tx);
+                        (id, rx)
+                    };
+
+                    let prefixed = format!(
+                        "[Message from {}, msg_id={}, awaits reply]\n{}",
+                        sender_info, msg_id, content
+                    );
+                    queue_and_maybe_resume(
+                        &state,
+                        &session_locks,
+                        &plugins,
+                        &shutdown,
+                        &throttle,
+                        &target_session_id,
+                        &prefixed,
+                        &sender_info,
+                        &test_overrides,
+                    );
+
+                    // Wait for reply with a timeout (default 5 min).
+                    let timeout = std::time::Duration::from_secs(300);
+                    match futures::future::select(
+                        std::pin::pin!(rx.recv()),
+                        std::pin::pin!(smol::Timer::after(timeout)),
+                    )
+                    .await
+                    {
+                        futures::future::Either::Left((Ok(reply), _)) => {
+                            send(&mut writer, &Response::MessageReply { content: reply }).await?;
+                        }
+                        _ => {
+                            // Timeout or channel closed — clean up waiter.
+                            {
+                                let mut st = lock_state(&state);
+                                st.reply_waiters.remove(&msg_id);
+                            }
+                            send(
+                                &mut writer,
+                                &Response::Error {
+                                    message: format!("await_reply timed out (msg_id={})", msg_id),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                } else {
+                    queue_and_maybe_resume(
+                        &state,
+                        &session_locks,
+                        &plugins,
+                        &shutdown,
+                        &throttle,
+                        &target_session_id,
+                        &content,
+                        &sender_info,
+                        &test_overrides,
+                    );
+                    send(&mut writer, &Response::Ok).await?;
+                }
+            }
+            Request::ReplyToMessage { msg_id, content } => {
+                let result = {
+                    let mut st = lock_state(&state);
+                    st.reply_waiters.remove(&msg_id)
+                };
+                match result {
+                    Some(tx) => {
+                        let _ = tx.send(content).await;
+                        send(&mut writer, &Response::Ok).await?;
+                    }
+                    None => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("no pending waiter for msg_id={}", msg_id),
+                            },
+                        )
+                        .await?;
+                    }
+                }
             }
             Request::ReloadPlugins { session_id } => {
                 let cwd = {
@@ -3264,19 +3352,83 @@ async fn handle_server_request(
             target_session_id,
             content,
             sender_info,
+            await_reply,
+            reply_to: _,
         } => {
-            queue_and_maybe_resume(
-                state,
-                session_locks,
-                plugins,
-                shutdown,
-                throttle,
-                target_session_id,
-                content,
-                sender_info,
-                test_overrides,
-            );
-            Response::Ok
+            if *await_reply {
+                let (msg_id, rx) = {
+                    let mut st = lock_state(state);
+                    st.next_msg_id += 1;
+                    let id = format!("m{}", st.next_msg_id);
+                    let (tx, rx) = smol::channel::bounded::<String>(1);
+                    st.reply_waiters.insert(id.clone(), tx);
+                    (id, rx)
+                };
+
+                let prefixed = format!(
+                    "[Message from {}, msg_id={}, awaits reply]\n{}",
+                    sender_info, msg_id, content
+                );
+                queue_and_maybe_resume(
+                    state,
+                    session_locks,
+                    plugins,
+                    shutdown,
+                    throttle,
+                    target_session_id,
+                    &prefixed,
+                    sender_info,
+                    test_overrides,
+                );
+
+                // Wait with timeout.
+                let timeout = std::time::Duration::from_secs(300);
+                match futures::future::select(
+                    std::pin::pin!(rx.recv()),
+                    std::pin::pin!(smol::Timer::after(timeout)),
+                )
+                .await
+                {
+                    futures::future::Either::Left((Ok(reply), _)) => {
+                        Response::MessageReply { content: reply }
+                    }
+                    _ => {
+                        let mut st = lock_state(state);
+                        st.reply_waiters.remove(&msg_id);
+                        Response::Error {
+                            message: format!("await_reply timed out (msg_id={})", msg_id),
+                        }
+                    }
+                }
+            } else {
+                queue_and_maybe_resume(
+                    state,
+                    session_locks,
+                    plugins,
+                    shutdown,
+                    throttle,
+                    target_session_id,
+                    content,
+                    sender_info,
+                    test_overrides,
+                );
+                Response::Ok
+            }
+        }
+        Request::ReplyToMessage { msg_id, content } => {
+            let result = {
+                let mut st = lock_state(state);
+                st.reply_waiters.remove(msg_id.as_str())
+            };
+            match result {
+                Some(tx) => {
+                    let _ = tx.send(content.clone()).await;
+                    Response::Ok
+                }
+                None => Response::Error {
+                    message: format!("no pending waiter for msg_id={}", msg_id),
+                },
+            }
         }
         Request::ArchiveSession {
             session_id,

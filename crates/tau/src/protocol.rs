@@ -91,12 +91,22 @@ pub enum Request {
     /// The message is inserted as a user message between tool results
     /// and the next LLM call. If no agent is running, treated as Chat.
     Steer { session_id: String, text: String },
-    /// Queue a message for delivery to a target session (fire-and-forget).
+    /// Queue a message for delivery to a target session.
+    /// When `await_reply` is true the caller blocks until the target
+    /// calls `session_reply` with the corresponding `msg_id`.
     QueueMessage {
         target_session_id: String,
         content: String,
         sender_info: String,
+        /// When true, block until the target replies.
+        #[serde(default)]
+        await_reply: bool,
+        /// For threaded replies: the msg_id this message is responding to.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_to: Option<String>,
     },
+    /// Reply to a pending `await_reply` message.
+    ReplyToMessage { msg_id: String, content: String },
     /// Reload plugins for a session (destroy + re-init).
     ReloadPlugins { session_id: String },
     /// Garbage-collect archived sessions older than a threshold.
@@ -157,6 +167,8 @@ pub enum Response {
     UserMessage { text: String },
     /// Agent loop completed (all turns done).
     AgentDone,
+    /// Reply content (returned to a QueueMessage with await_reply=true).
+    MessageReply { content: String },
     /// Success (generic ack).
     Ok,
     /// Garbage-collection result.

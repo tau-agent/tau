@@ -98,6 +98,7 @@ impl Client {
                 | Response::AuthStatus { .. }
                 | Response::SubscriptionUsage { .. }
                 | Response::SessionsCompleted { .. }
+                | Response::MessageReply { .. }
                 | Response::GcComplete { .. }
                 | Response::ServerShutdown { .. } => true,
             };

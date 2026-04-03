@@ -49,6 +49,7 @@ pub fn send_recv_all(stream: &UnixStream, req: &Request) -> Vec<Response> {
                 | Response::SessionsCompleted { .. }
                 | Response::AgentDone
                 | Response::Cancelled
+                | Response::MessageReply { .. }
                 | Response::Ok
                 | Response::Models { .. }
                 | Response::Messages { .. }

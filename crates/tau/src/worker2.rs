@@ -981,6 +981,8 @@ async fn handle_session_tool(
                 target_session_id: target.to_string(),
                 content: content.to_string(),
                 sender_info,
+                await_reply: false,
+                reply_to: None,
             };
             match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::Ok) => {
