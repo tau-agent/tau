@@ -16,6 +16,10 @@ pub struct AgentConfig {
     pub max_retries: usize,
     /// Base delay for retry backoff in milliseconds.
     pub retry_base_ms: u64,
+    /// Idle timeout for SSE stream chunks in seconds.
+    /// If no event arrives within this period, the stream is aborted and
+    /// the request is eligible for retry.
+    pub idle_timeout_secs: u64,
     /// Optional shutdown check — if returns true, stop after current turn.
     pub should_stop: Option<Box<dyn Fn() -> bool + Send + Sync>>,
     /// Callback to drain queued messages for this session.
@@ -33,12 +37,16 @@ pub struct AgentConfig {
     pub refresh_api_key: Option<Box<dyn Fn() -> Option<String> + Send + Sync>>,
 }
 
+/// Default idle timeout for SSE stream chunks (90 seconds).
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 90;
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_turns: 50,
-            max_retries: 5,
-            retry_base_ms: 1000,
+            max_retries: 10,
+            retry_base_ms: 500,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             should_stop: None,
             drain_queued: None,
             on_message: None,
@@ -386,8 +394,8 @@ pub async fn run(
     })
 }
 
-/// Maximum retry delay in milliseconds (60 seconds).
-const MAX_RETRY_DELAY_MS: u64 = 60_000;
+/// Maximum retry delay in milliseconds (32 seconds).
+const MAX_RETRY_DELAY_MS: u64 = 32_000;
 
 /// Maximum retries for timeout errors (fewer than rate limits, since each
 /// timeout already consumed 30-120s of waiting).
@@ -406,34 +414,50 @@ async fn stream_with_retry(
     event_tx: &EventSender,
 ) -> crate::Result<AssistantMessage> {
     let max_attempts = config.max_retries + 1;
-    // Track whether we've already retried after an auth refresh (only once).
-    let mut auth_retried = false;
+    /// Maximum number of auth-refresh retries before giving up.
+    const MAX_AUTH_RETRIES: usize = 3;
+    // Track how many times we've retried after auth refresh.
+    let mut auth_retry_count: usize = 0;
     // Owned copy of options so we can update api_key on auth refresh.
     let mut options = options.clone();
 
     for attempt in 0..max_attempts {
         let rx = registry.stream(model, context, &options)?;
         let should_stop = config.should_stop.as_deref();
-        let message = consume_stream(rx, event_tx, should_stop).await;
+        let idle_timeout = std::time::Duration::from_secs(config.idle_timeout_secs);
+        let message = consume_stream(rx, event_tx, should_stop, idle_timeout).await;
 
         // Propagate cancellation immediately — no retry.
+        // Convert idle-timeout errors into an error AssistantMessage so the
+        // retry logic below (which checks stop_reason + error_message) can
+        // handle them uniformly with other timeout/retryable errors.
         let message = match message {
             Err(crate::Error::Cancelled) => return Err(crate::Error::Cancelled),
+            Err(crate::Error::Http(ref msg)) if is_timeout(msg) => {
+                let err_msg = msg.clone();
+                let mut m = AssistantMessage::empty(&model.api, &model.provider, &model.id);
+                m.stop_reason = StopReason::Error;
+                m.error_message = Some(err_msg);
+                m
+            }
             other => other?,
         };
 
         if message.stop_reason == StopReason::Error
             && let Some(ref err_msg) = message.error_message
         {
-            // Auth errors (401 / expired token): refresh and retry once.
-            if !auth_retried
+            // Auth errors (401 / expired token): refresh and retry up to MAX_AUTH_RETRIES times.
+            if auth_retry_count < MAX_AUTH_RETRIES
                 && is_auth_error(err_msg)
                 && let Some(ref refresh_fn) = config.refresh_api_key
                 && let Some(new_key) = refresh_fn()
             {
-                auth_retried = true;
+                auth_retry_count += 1;
                 options.api_key = Some(new_key);
-                let status_msg = format!("auth error, refreshed token, retrying: {}", err_msg);
+                let status_msg = format!(
+                    "auth error, refreshed token, retrying ({}/{}): {}",
+                    auth_retry_count, MAX_AUTH_RETRIES, err_msg
+                );
                 eprintln!("{}", status_msg);
                 let _ = event_tx.try_send(StreamEvent::Status {
                     message: status_msg,
@@ -460,12 +484,22 @@ async fn stream_with_retry(
                         TIMEOUT_RETRY_DELAY_MS
                     }
                 } else {
-                    // Rate limit / 5xx: use retry-after header or exponential backoff.
+                    // Rate limit / 5xx: use retry-after header or exponential backoff
+                    // with 25% subtractive jitter.
                     parse_retry_after(err_msg)
                         .map(|secs| secs * 1000)
                         .unwrap_or_else(|| {
-                            (config.retry_base_ms * 2u64.pow(attempt as u32))
-                                .min(MAX_RETRY_DELAY_MS)
+                            let raw = (config.retry_base_ms * 2u64.pow(attempt as u32))
+                                .min(MAX_RETRY_DELAY_MS);
+                            let jitter = (raw as f64
+                                * 0.25
+                                * (std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .subsec_nanos() as f64
+                                    / 1_000_000_000.0))
+                                as u64;
+                            raw - jitter
                         })
                 };
 
@@ -555,6 +589,7 @@ async fn consume_stream(
     rx: EventReceiver,
     event_tx: &EventSender,
     should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
+    idle_timeout: std::time::Duration,
 ) -> crate::Result<AssistantMessage> {
     loop {
         // Check cancellation between events.
@@ -569,8 +604,22 @@ async fn consume_stream(
             return Err(crate::Error::Cancelled);
         }
 
-        match rx.recv().await {
-            Ok(event) => {
+        // Race recv() against an idle timer so we detect stalled streams.
+        let recv_or_timeout = smol::future::or(async { Some(rx.recv().await) }, async {
+            smol::Timer::after(idle_timeout).await;
+            None
+        })
+        .await;
+
+        match recv_or_timeout {
+            None => {
+                // Idle timeout — no SSE event arrived in time.
+                return Err(crate::Error::Http(format!(
+                    "idle timeout: no SSE event received within {}s",
+                    idle_timeout.as_secs()
+                )));
+            }
+            Some(Ok(event)) => {
                 let is_done =
                     matches!(&event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
                 let final_msg = match &event {
@@ -583,7 +632,7 @@ async fn consume_stream(
                     return final_msg.ok_or(crate::Error::ChannelClosed);
                 }
             }
-            Err(_) => return Err(crate::Error::ChannelClosed),
+            Some(Err(_)) => return Err(crate::Error::ChannelClosed),
         }
     }
 }
@@ -1509,6 +1558,105 @@ mod tests {
             assert_eq!(
                 captures[0].context.system_prompt.as_deref(),
                 Some("You are a test assistant.")
+            );
+        });
+    }
+
+    #[test]
+    fn test_idle_timeout() {
+        smol::block_on(async {
+            // Provide enough Hang responses for the initial attempt plus
+            // MAX_TIMEOUT_RETRIES (2) retries, totalling 3 attempts.
+            let registry = setup_registry(vec![
+                MockResponse::Hang,
+                MockResponse::Hang,
+                MockResponse::Hang,
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig {
+                idle_timeout_secs: 0, // Use 0s so the timer fires on the next poll
+                ..Default::default()
+            };
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
+
+            let start = std::time::Instant::now();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            let elapsed = start.elapsed();
+            // Should complete quickly — all timeouts fire immediately.
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "idle timeout should fire quickly, took {:?}",
+                elapsed
+            );
+            // After exhausting timeout retries, the error message is returned.
+            assert_eq!(result.new_messages.len(), 1);
+            assert!(matches!(&result.new_messages[0], Message::Assistant(a)
+                    if a.stop_reason == StopReason::Error
+                    && a.error_message.as_ref().unwrap().contains("idle timeout")));
+        });
+    }
+
+    #[test]
+    fn test_idle_timeout_triggers_retry() {
+        smol::block_on(async {
+            // First call hangs (idle timeout), second succeeds.
+            let registry = setup_registry(vec![
+                MockResponse::Hang,
+                MockResponse::Text("recovered after idle timeout!".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            // Use a small but non-zero timeout so the Text response (sent
+            // instantly by the mock thread) arrives before the watchdog fires.
+            let config = AgentConfig {
+                idle_timeout_secs: 1,
+                ..Default::default()
+            };
+            let mut worker = InProcessWorker::new();
+            let (tx, rx) = smol::channel::unbounded();
+
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.new_messages.len(), 1);
+            assert!(matches!(&result.new_messages[0], Message::Assistant(a)
+                    if a.text() == "recovered after idle timeout!"));
+
+            // Check that a status event was emitted about the timeout retry.
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            let has_timeout_status = events.iter().any(
+                |e| matches!(e, StreamEvent::Status { message } if message.contains("timeout")),
+            );
+            assert!(
+                has_timeout_status,
+                "should emit status about idle timeout retry"
             );
         });
     }

@@ -36,6 +36,8 @@ pub enum MockResponse {
         delay_ms: u64,
         response: Box<MockResponse>,
     },
+    /// Send one event then hang forever (for idle timeout testing).
+    Hang,
 }
 
 // ===========================================================================
@@ -259,6 +261,22 @@ fn send_mock_response(tx: &EventSender, response: MockResponse) {
             // will send its own Start. That's intentional for simplicity; the
             // consumer should tolerate duplicate Start events.
             send_mock_response(tx, *response);
+        }
+        MockResponse::Hang => {
+            // Send a TextStart then block forever (until the channel is dropped).
+            output.content.push(AssistantContent::Text(TextContent {
+                text: "hanging...".into(),
+                text_signature: None,
+            }));
+            tx.send_blocking(StreamEvent::TextStart {
+                content_index: 0,
+                partial: output,
+            })
+            .ok();
+            // Park the thread forever; consume_stream's idle watchdog should fire.
+            loop {
+                std::thread::park();
+            }
         }
     }
 }

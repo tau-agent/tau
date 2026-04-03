@@ -2104,6 +2104,10 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                     .flatten()
             }))
         },
+        idle_timeout_secs: std::env::var("TAU_STREAM_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(crate::agent::AgentConfig::default().idle_timeout_secs),
         ..Default::default()
     };
 
