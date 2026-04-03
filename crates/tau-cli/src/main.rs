@@ -1259,9 +1259,30 @@ fn print_session_tree(
         String::new()
     };
     let archived_tag = if session.archived { " [archived]" } else { "" };
+    let tagline_str = session
+        .tagline
+        .as_deref()
+        .map(|t| {
+            let max = 60;
+            if t.len() > max {
+                format!("\t{}...", &t[..max - 3])
+            } else {
+                format!("\t{}", t)
+            }
+        })
+        .unwrap_or_default();
     println!(
-        "{}{}\t{}/{}\t{}\t{}\t{}{}{}",
-        indent, session.id, session.provider, session.model, ago, cwd, stats, budget, archived_tag
+        "{}{}\t{}/{}\t{}\t{}\t{}{}{}{}",
+        indent,
+        session.id,
+        session.provider,
+        session.model,
+        ago,
+        cwd,
+        stats,
+        budget,
+        archived_tag,
+        tagline_str
     );
     // Print children
     let children: Vec<_> = all

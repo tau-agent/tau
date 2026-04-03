@@ -579,10 +579,20 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             let idle_str = format_idle_time(session.last_activity);
             let msg_str = format!("{}m", session.message_count);
 
-            // Compose right part: "  42%  3m  12m"
+            // Cost string
+            let cost_str = if session.stats.cost > 0.0 {
+                format!("${:.2}", session.stats.cost)
+            } else {
+                String::new()
+            };
+
+            // Compose right part: "  42%  $0.42  3m  12m"
             let mut right_parts: Vec<String> = Vec::new();
             if !ctx_str.is_empty() {
                 right_parts.push(ctx_str);
+            }
+            if !cost_str.is_empty() {
+                right_parts.push(cost_str);
             }
             if !idle_str.is_empty() {
                 right_parts.push(idle_str);
