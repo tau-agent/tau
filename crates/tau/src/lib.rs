@@ -26,7 +26,7 @@ pub use types::*;
 // ---------------------------------------------------------------------------
 
 /// Truncate `s` to at most `max_bytes` bytes, rounding down to a char boundary.
-pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
+pub fn truncate_str(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }

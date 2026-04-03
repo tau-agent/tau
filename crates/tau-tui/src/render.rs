@@ -580,7 +580,7 @@ impl ToolRenderer for WriteRenderer {
 
 fn truncate_str(s: &str, max: usize) -> String {
     if s.len() > max {
-        format!("{}...", &s[..max])
+        format!("{}...", tau::truncate_str(s, max))
     } else {
         s.to_string()
     }

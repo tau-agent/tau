@@ -483,6 +483,17 @@ impl Db {
         Ok(())
     }
 
+    /// Update the system prompt for a session.
+    pub fn update_system_prompt(&self, session_id: &str, system_prompt: &str) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET system_prompt = ?1 WHERE id = ?2",
+                params![system_prompt, session_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("update system_prompt: {}", e)))?;
+        Ok(())
+    }
+
     /// Replace messages before `keep_from_id` with a compaction summary.
     /// Deletes old messages and inserts the summary in a transaction.
     pub fn compact_session(
@@ -555,7 +566,7 @@ impl Db {
         let max: Option<String> = self
             .conn
             .query_row(
-                "SELECT id FROM sessions ORDER BY created_at DESC LIMIT 1",
+                "SELECT id FROM sessions ORDER BY CAST(SUBSTR(id, 2) AS INTEGER) DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -654,41 +665,29 @@ impl Db {
     /// User messages into the messages table, and DELETE from queued_messages.
     /// Returns the persisted `Message::User` entries.
     pub fn drain_queued_messages(&self, session_id: &str) -> crate::Result<Vec<Message>> {
-        self.conn
-            .execute_batch("BEGIN")
+        let tx = self
+            .conn
+            .unchecked_transaction()
             .map_err(|e| crate::Error::Io(format!("drain begin: {}", e)))?;
 
         let rows: Vec<(i64, String, Option<String>)> = {
-            let mut stmt = self
-                .conn
+            let mut stmt = tx
                 .prepare(
                     "SELECT id, content, sender_info FROM queued_messages
                      WHERE target_session_id = ?1 ORDER BY id",
                 )
-                .map_err(|e| {
-                    self.conn.execute_batch("ROLLBACK").ok();
-                    crate::Error::Io(format!("drain select: {}", e))
-                })?;
+                .map_err(|e| crate::Error::Io(format!("drain select: {}", e)))?;
             let mapped = stmt
                 .query_map(params![session_id], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })
-                .map_err(|e| {
-                    self.conn.execute_batch("ROLLBACK").ok();
-                    crate::Error::Io(format!("drain query: {}", e))
-                })?;
-            let mut v = Vec::new();
-            for r in mapped {
-                v.push(r.map_err(|e| {
-                    self.conn.execute_batch("ROLLBACK").ok();
-                    crate::Error::Io(format!("drain row: {}", e))
-                })?);
-            }
-            v
+                .map_err(|e| crate::Error::Io(format!("drain query: {}", e)))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| crate::Error::Io(format!("drain row: {}", e)))?
         };
 
         if rows.is_empty() {
-            self.conn.execute_batch("ROLLBACK").ok();
             return Ok(Vec::new());
         }
 
@@ -706,31 +705,22 @@ impl Db {
             let msg = Message::User(UserMessage::text(&text));
             let json =
                 serde_json::to_string(&msg).map_err(|e| crate::Error::Parse(e.to_string()))?;
-            self.conn
-                .execute(
-                    "INSERT INTO messages (session_id, message_json, created_at)
+            tx.execute(
+                "INSERT INTO messages (session_id, message_json, created_at)
                      VALUES (?1, ?2, ?3)",
-                    params![session_id, json, now],
-                )
-                .map_err(|e| {
-                    self.conn.execute_batch("ROLLBACK").ok();
-                    crate::Error::Io(format!("drain insert message: {}", e))
-                })?;
+                params![session_id, json, now],
+            )
+            .map_err(|e| crate::Error::Io(format!("drain insert message: {}", e)))?;
             messages.push(msg);
         }
 
         // Delete drained rows by collected IDs
         for id in &ids {
-            self.conn
-                .execute("DELETE FROM queued_messages WHERE id = ?1", params![id])
-                .map_err(|e| {
-                    self.conn.execute_batch("ROLLBACK").ok();
-                    crate::Error::Io(format!("drain delete: {}", e))
-                })?;
+            tx.execute("DELETE FROM queued_messages WHERE id = ?1", params![id])
+                .map_err(|e| crate::Error::Io(format!("drain delete: {}", e)))?;
         }
 
-        self.conn
-            .execute_batch("COMMIT")
+        tx.commit()
             .map_err(|e| crate::Error::Io(format!("drain commit: {}", e)))?;
 
         Ok(messages)

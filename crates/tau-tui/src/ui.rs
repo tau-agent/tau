@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use tau::protocol::format_tokens;
-
+use tau::truncate_str;
 use tau::types::AgentPhase;
 
 use crate::app::{App, AppMode};
@@ -459,7 +459,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     } else {
         let tree = build_session_tree(&app.picker_sessions);
 
-        for &(session_idx, depth, _is_last) in &tree {
+        for &(session_idx, depth, is_last) in &tree {
             let session = &app.picker_sessions[session_idx];
             let is_current = session.id == app.session_id;
             let is_selected = session_idx == app.picker_cursor;
@@ -502,10 +502,16 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut used = 0usize;
 
-            // Tree indent
-            let indent = "  ".repeat(depth);
-            spans.push(Span::raw(format!(" {}", indent)));
-            used += 1 + indent.len();
+            // Tree indent with connectors
+            let connector = if depth == 0 {
+                String::new()
+            } else if is_last {
+                format!("{}└── ", "│   ".repeat(depth - 1))
+            } else {
+                format!("{}├── ", "│   ".repeat(depth - 1))
+            };
+            spans.push(Span::raw(format!(" {}", connector)));
+            used += 1 + connector.len();
 
             // State indicator
             let (state_char, state_color) = if is_current {
@@ -558,7 +564,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             let tagline_display = if tagline_space >= 4 {
                 if let Some(ref tl) = session.tagline {
                     if tl.len() > tagline_space {
-                        format!(" {}...", &tl[..tagline_space.saturating_sub(3)])
+                        format!(" {}...", truncate_str(tl, tagline_space.saturating_sub(3)))
                     } else {
                         format!(" {}", tl)
                     }
@@ -566,7 +572,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
                     // Fall back to model name
                     let m = &session.model;
                     if m.len() + 1 > tagline_space {
-                        format!(" {}...", &m[..tagline_space.saturating_sub(3).min(m.len())])
+                        format!(" {}...", truncate_str(m, tagline_space.saturating_sub(3)))
                     } else {
                         format!(" {}", m)
                     }

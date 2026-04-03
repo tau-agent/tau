@@ -825,113 +825,47 @@ async fn handle_client(
                 child_budget,
                 tagline,
             } => {
-                // Budget check (before acquiring state lock for creation)
-                let budget_error = {
-                    let st = lock_state(&state);
-                    if let Some(ref pid) = parent_id {
-                        match st.db.get_session(pid)? {
-                            Some(parent) => {
-                                let used = st.db.budget_used(&parent.id)?;
-                                let cost = 1 + child_budget;
-                                if used + cost > parent.child_budget {
-                                    Some(format!(
-                                        "child budget exceeded: need {} but only {} available (budget={}, used={})",
-                                        cost,
-                                        parent.child_budget.saturating_sub(used),
-                                        parent.child_budget,
-                                        used
-                                    ))
-                                } else {
-                                    None
-                                }
-                            }
-                            None => Some(format!("parent session not found: {}", pid)),
-                        }
-                    } else {
-                        None
+                // Atomic budget check + session creation (single lock hold)
+                let resp = create_session_impl(
+                    &state,
+                    &model_id,
+                    &provider_name,
+                    &system_prompt,
+                    &cwd,
+                    &parent_id,
+                    child_budget,
+                    &tagline,
+                );
+
+                // If created and no explicit system prompt, set up plugins
+                // and update the prompt post-creation.
+                if let Response::SessionCreated { ref session_id } = resp
+                    && system_prompt.is_none()
+                {
+                    let id = session_id.clone();
+                    let cwd_resolved = {
+                        let st = lock_state(&state);
+                        st.db.get_session(&id).ok().flatten().and_then(|s| s.cwd)
+                    };
+                    let cwd_str = cwd_resolved.as_deref().unwrap_or("/tmp");
+                    let mut pm = plugins.lock().unwrap();
+                    if let Err(e) = pm.ensure_session_plugins(&id, cwd_str) {
+                        eprintln!("failed to spawn session plugins: {}", e);
                     }
-                };
-                if let Some(msg) = budget_error {
-                    send(&mut writer, &Response::Error { message: msg }).await?;
-                    continue;
+                    let tool_prompts = pm.tool_prompts(&id, child_budget);
+                    let prompt =
+                        crate::system_prompt::build(&crate::system_prompt::PromptOptions {
+                            cwd: cwd_resolved,
+                            tools: tool_prompts,
+                            ..Default::default()
+                        });
+                    let st = lock_state(&state);
+                    if let Err(e) = st.db.update_system_prompt(&id, &prompt) {
+                        eprintln!("failed to update system prompt: {}", e);
+                    }
                 }
 
-                let result = {
-                    let st = lock_state(&state);
-
-                    // Load parent for inheritance
-                    let parent = match &parent_id {
-                        Some(pid) => st.db.get_session(pid)?,
-                        None => None,
-                    };
-
-                    // Model inheritance: None = inherit parent's model
-                    let model = match (&model_id, &provider_name) {
-                        (Some(mid), Some(prov)) => st
-                            .all_models
-                            .iter()
-                            .find(|m| m.id == *mid && m.provider == *prov)
-                            .cloned(),
-                        (Some(mid), None) => st.all_models.iter().find(|m| m.id == *mid).cloned(),
-                        _ => None,
-                    }
-                    .or_else(|| parent.as_ref().map(|p| p.model.clone()))
-                    .unwrap_or_else(|| st.default_model.clone());
-
-                    // CWD inheritance: None = inherit parent's cwd
-                    let cwd = cwd.or_else(|| parent.as_ref().and_then(|p| p.cwd.clone()));
-
-                    let is_subscription = st
-                        .auth
-                        .get(&model.provider)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|c| matches!(c, AuthCredential::Oauth(_)));
-                    let id = st.db.next_session_id()?;
-                    let system_prompt = system_prompt.or_else(|| {
-                        let mut pm = plugins.lock().unwrap();
-                        let cwd_str = cwd.as_deref().unwrap_or("/tmp");
-                        if let Err(e) = pm.ensure_session_plugins(&id, cwd_str) {
-                            eprintln!("failed to spawn session plugins: {}", e);
-                        }
-                        let tool_prompts = pm.tool_prompts(&id, child_budget);
-                        Some(crate::system_prompt::build(
-                            &crate::system_prompt::PromptOptions {
-                                cwd: cwd.clone(),
-                                tools: tool_prompts,
-                                ..Default::default()
-                            },
-                        ))
-                    });
-                    let stored = StoredSession {
-                        id: id.clone(),
-                        model,
-                        system_prompt,
-                        cwd,
-                        is_subscription,
-                        created_at: crate::types::timestamp_ms() as i64,
-                        parent_id: parent_id.clone(),
-                        child_budget,
-                        tagline,
-                        archived: false,
-                    };
-                    st.db.create_session(&stored)?;
-                    Ok::<String, crate::Error>(id)
-                };
-                match result {
-                    Ok(id) => {
-                        send(&mut writer, &Response::SessionCreated { session_id: id }).await?;
-                    }
-                    Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                send(&mut writer, &resp).await?;
             }
             Request::GetSessionInfo { session_id } => {
                 let resp = get_session_info_impl(&state, &session_id);
