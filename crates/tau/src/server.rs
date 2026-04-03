@@ -1739,6 +1739,12 @@ async fn handle_client(
                 };
                 match result {
                     Ok(()) => {
+                        queue_message_to_session(
+                            &state,
+                            &session_id,
+                            "[System: plugins reloaded. Tool definitions updated.]",
+                            "system",
+                        );
                         send(&mut writer, &Response::Ok).await?;
                     }
                     Err(e) => {
