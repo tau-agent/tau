@@ -304,31 +304,48 @@ impl Db {
     }
 
     /// Delete a session and all its descendants (recursive tree delete).
+    ///
+    /// Wrapped in a single transaction so a crash cannot leave orphaned subtrees.
     pub fn delete_session_tree(&self, id: &str) -> crate::Result<()> {
-        // Recursively delete children first
-        let children = self.get_children(id)?;
-        for child in &children {
-            self.delete_session_tree(&child.id)?;
+        let ids = self.get_subtree_ids(id)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Io(format!("delete_tree begin: {}", e)))?;
+
+        // Delete deepest nodes first (reverse order preserves FK expectations),
+        // but CASCADE handles it anyway — iterate in collected order.
+        for sid in &ids {
+            tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])
+                .map_err(|e| crate::Error::Io(format!("delete_tree session: {}", e)))?;
         }
 
-        // Delete the session itself (CASCADE deletes its messages)
-        self.delete_session(id)?;
-
+        tx.commit()
+            .map_err(|e| crate::Error::Io(format!("delete_tree commit: {}", e)))?;
         Ok(())
     }
 
     /// Archive a session and all its descendants (recursive).
-    /// Sets the `archived` flag to 1 for the entire subtree.
+    ///
+    /// Sets the `archived` flag to 1 for the entire subtree inside a single
+    /// transaction so a crash cannot leave a partially-archived tree.
     pub fn archive_session_tree(&self, id: &str) -> crate::Result<()> {
         let ids = self.get_subtree_ids(id)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Io(format!("archive_tree begin: {}", e)))?;
+
         for sid in &ids {
-            self.conn
-                .execute(
-                    "UPDATE sessions SET archived = 1 WHERE id = ?1",
-                    params![sid],
-                )
-                .map_err(|e| crate::Error::Io(format!("archive session: {}", e)))?;
+            tx.execute(
+                "UPDATE sessions SET archived = 1 WHERE id = ?1",
+                params![sid],
+            )
+            .map_err(|e| crate::Error::Io(format!("archive_tree session: {}", e)))?;
         }
+
+        tx.commit()
+            .map_err(|e| crate::Error::Io(format!("archive_tree commit: {}", e)))?;
         Ok(())
     }
 
