@@ -661,6 +661,49 @@ pub fn is_running() -> bool {
 // Client handler
 // ---------------------------------------------------------------------------
 
+/// Check whether a session has pending queued messages and, if so, spawn a
+/// `resume_child_session` task so they are processed.
+///
+/// This must be called while the session lock is still held — just before it is
+/// about to be dropped.  When `queue_and_maybe_resume` sees the lock as held it
+/// skips spawning a resume, expecting the current lock-holder to drain the
+/// messages.  But if the agent turn has already finished and we are in post-turn
+/// cleanup, the drain callback will never fire again.  Calling this function
+/// closes that gap: the spawned task will block on `lock_arc().await` and pick
+/// up the messages as soon as the current guard drops.
+fn maybe_respawn_for_queued(
+    state: &SharedState,
+    session_locks: &SessionLocks,
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
+    shutdown: &ShutdownHandle,
+    throttle: &crate::throttle::ProviderThrottle,
+    session_id: &str,
+    test_overrides: &SharedTestOverrides,
+) {
+    let has_pending = {
+        let st = state.lock().unwrap();
+        st.has_queued
+            .get(session_id)
+            .map(|f| f.load(Ordering::Acquire))
+            .unwrap_or(false)
+    };
+    if has_pending {
+        let s = state.clone();
+        let p = plugins.clone();
+        let sh = shutdown.clone();
+        let sl = session_locks.clone();
+        let th = throttle.clone();
+        let ov = test_overrides.clone();
+        let sid = session_id.to_string();
+        smol::spawn(async move {
+            if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
+                eprintln!("resume session {} for late-queued message: {}", sid, e);
+            }
+        })
+        .detach();
+    }
+}
+
 /// Queue a message for delivery to a target session.
 /// Persists immediately and sets the has_queued flag for in-flight agent loops.
 fn queue_message_to_session(state: &SharedState, target: &str, content: &str, sender_info: &str) {
@@ -1163,6 +1206,18 @@ async fn handle_client(
                 }
 
                 emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+
+                // Before the session lock drops, check whether new messages
+                // arrived during post-turn cleanup.  See doc on the function.
+                maybe_respawn_for_queued(
+                    &state,
+                    &session_locks,
+                    &plugins,
+                    &shutdown,
+                    &throttle,
+                    &session_id,
+                    &test_overrides,
+                );
 
                 if shutdown.is_shutting_down() {
                     send(
@@ -2425,6 +2480,19 @@ async fn run_child_chat(
 
     emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
 
+    // Before the session lock drops, check whether new messages arrived while
+    // we were in post-turn cleanup (broadcast / notify / emit_phase).  If so,
+    // spawn a resume task — it will acquire the lock as soon as we drop ours.
+    maybe_respawn_for_queued(
+        &state,
+        &session_locks,
+        &plugins,
+        &shutdown,
+        &throttle,
+        &session_id,
+        &test_overrides,
+    );
+
     Ok(())
 }
 
@@ -2639,6 +2707,18 @@ async fn resume_child_session(
     }
 
     emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+
+    // Before the session lock drops, check whether new messages arrived while
+    // we were in post-turn cleanup.  See `maybe_respawn_for_queued` doc.
+    maybe_respawn_for_queued(
+        &state,
+        &session_locks,
+        &plugins,
+        &shutdown,
+        &throttle,
+        &session_id,
+        &test_overrides,
+    );
 
     Ok(())
 }

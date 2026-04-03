@@ -1142,3 +1142,216 @@ fn unjoined_children_tracking() {
     assert_eq!(unjoined.len(), 1);
     assert!(unjoined.contains("c5"));
 }
+
+/// Regression test: a second child session completion notification must be
+/// delivered to the parent even when `queue_and_maybe_resume` initially sees
+/// the parent's session lock as held (parent still in post-turn cleanup or
+/// mid-turn from the first notification).
+///
+/// The bug: after `run_agent_turn` finishes (no more tool calls → agent loop
+/// exits), the session holder is in cleanup code (broadcast, notify parent,
+/// emit_phase).  During that window the lock is still held but the agent loop
+/// will never drain again.  If a second notification arrives during cleanup,
+/// `queue_and_maybe_resume` sees the lock as held and skips spawning a resume.
+/// When the lock is finally released nobody picks up the pending message.
+///
+/// Flow:
+///   1. Create parent (idle, never chatted with directly)
+///   2. Create child under parent
+///   3. QueueMessage to child → child resumes via `resume_child_session` →
+///      child completes → `notify_parent_of_child_completion` → parent resumes
+///      with a **delayed** LLM response (giving us a timing window)
+///   4. While parent is waiting for the delayed LLM response, send a second
+///      QueueMessage to child → child completes immediately → second
+///      notification queued for parent → parent lock is held → no resume
+///   5. Parent's delayed response completes → agent turn ends → cleanup →
+///      `maybe_respawn_for_queued` spawns a new resume → second notification
+///      is processed
+///   6. Verify parent received BOTH notifications in its message history
+#[test]
+fn second_child_completion_notifies_parent() {
+    // Mock responses consumed in order by the shared mock provider:
+    //   1. child first QueueMessage → immediate text
+    //   2. parent first resume → delayed 500ms (creates the timing window)
+    //   3. child second QueueMessage → immediate text
+    //   4. parent second resume → immediate text
+    let server = TestServer::start(vec![
+        MockResponse::Text("child first done".into()),
+        MockResponse::Delayed {
+            delay_ms: 500,
+            response: Box::new(MockResponse::Text("parent ack first".into())),
+        },
+        MockResponse::Text("child second done".into()),
+        MockResponse::Text("parent ack second".into()),
+    ]);
+
+    // --- Step 1: Create parent session (idle) ---
+    let conn = server.connect();
+    let parent_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("parent orchestrator".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 5,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // --- Step 2: Create child under parent ---
+    let conn = server.connect();
+    let child_id = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("child worker".into()),
+            cwd: None,
+            parent_id: Some(parent_id.clone()),
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // --- Step 3: Send first task to child via QueueMessage ---
+    // QueueMessage → resume_child_session(child) → child completes →
+    // notify_parent_of_child_completion → resume_child_session(parent) with
+    // a 500ms delayed response.
+    let conn = server.connect();
+    let resp = send_recv(
+        &conn,
+        &Request::QueueMessage {
+            target_session_id: child_id.clone(),
+            content: "do first task".into(),
+            sender_info: "test".into(),
+        },
+    );
+    assert!(
+        matches!(resp, Response::Ok),
+        "expected Ok from first QueueMessage, got {:?}",
+        resp
+    );
+
+    // --- Step 4: Wait briefly, then send second task ---
+    // The child completes almost instantly. The parent is then resumed with a
+    // 500ms delay. We wait 200ms to ensure the parent has started its delayed
+    // LLM call (lock held), then send the second QueueMessage to the child.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let conn = server.connect();
+    let resp = send_recv(
+        &conn,
+        &Request::QueueMessage {
+            target_session_id: child_id.clone(),
+            content: "do second task".into(),
+            sender_info: "test".into(),
+        },
+    );
+    assert!(
+        matches!(resp, Response::Ok),
+        "expected Ok from second QueueMessage, got {:?}",
+        resp
+    );
+
+    // --- Step 5: Poll until parent has both notifications processed ---
+    // We expect at least 4 messages on the parent:
+    //   User (1st notification) + Assistant (1st response) +
+    //   User (2nd notification) + Assistant (2nd response)
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut parent_msg_count = 0;
+    loop {
+        let conn = server.connect();
+        let resp = send_recv(
+            &conn,
+            &Request::GetMessages {
+                session_id: parent_id.clone(),
+            },
+        );
+        if let Response::Messages { ref messages } = resp {
+            parent_msg_count = messages.len();
+            if parent_msg_count >= 4 {
+                break;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for parent to process both notifications; \
+                 parent has {} messages (expected >= 4)",
+                parent_msg_count
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // --- Step 6: Assert parent has BOTH notification messages ---
+    let conn = server.connect();
+    let all_messages = match send_recv(
+        &conn,
+        &Request::GetMessages {
+            session_id: parent_id.clone(),
+        },
+    ) {
+        Response::Messages { messages } => messages,
+        other => panic!("expected Messages, got {:?}", other),
+    };
+
+    assert!(
+        all_messages.len() >= 4,
+        "parent should have >= 4 messages (2 notifications + 2 responses), got {}: {:?}",
+        all_messages.len(),
+        all_messages
+    );
+
+    // Structure: alternating User (notification) / Assistant (response)
+    assert!(matches!(&all_messages[0], tau::types::Message::User(_)));
+    assert!(matches!(
+        &all_messages[1],
+        tau::types::Message::Assistant(_)
+    ));
+    assert!(matches!(&all_messages[2], tau::types::Message::User(_)));
+    assert!(matches!(
+        &all_messages[3],
+        tau::types::Message::Assistant(_)
+    ));
+
+    // Both notifications should mention the child session id
+    let extract_user_text = |msg: &tau::types::Message| -> String {
+        match msg {
+            tau::types::Message::User(u) => u
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    tau::types::UserContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => panic!("expected User message"),
+        }
+    };
+
+    let first_text = extract_user_text(&all_messages[0]);
+    let second_text = extract_user_text(&all_messages[2]);
+    assert!(
+        first_text.contains(&child_id),
+        "first notification should reference child {}: {}",
+        child_id,
+        first_text
+    );
+    assert!(
+        second_text.contains(&child_id),
+        "second notification should reference child {}: {}",
+        child_id,
+        second_text
+    );
+
+    server.shutdown();
+}
