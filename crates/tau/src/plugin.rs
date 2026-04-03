@@ -151,7 +151,7 @@ pub struct PluginToolResult {
 // ---------------------------------------------------------------------------
 
 /// Async stdout reader type (extracted from a plugin for background reading).
-pub type AsyncPluginReader = futures::io::BufReader<smol::Async<std::fs::File>>;
+pub type AsyncPluginReader = futures::io::BufReader<Box<dyn futures::io::AsyncRead + Unpin + Send>>;
 /// Async stdin writer type (extracted from a plugin for background writing).
 pub type AsyncPluginWriter = futures::io::BufWriter<smol::Async<std::fs::File>>;
 
@@ -352,11 +352,16 @@ impl PluginHandle {
             .ok_or_else(|| crate::Error::Io("no sync stdin to upgrade".into()))?
             .into_inner()
             .map_err(|e| crate::Error::Io(format!("flush stdin: {}", e.error())))?;
-        let sync_stdout = self
+        let sync_stdout_buf = self
             .stdout
             .take()
-            .ok_or_else(|| crate::Error::Io("no sync stdout to upgrade".into()))?
-            .into_inner();
+            .ok_or_else(|| crate::Error::Io("no sync stdout to upgrade".into()))?;
+
+        // Preserve any data already buffered by the sync BufReader.
+        // BufReader::into_inner() discards its internal buffer, so we must
+        // extract the leftover bytes first.
+        let leftover = sync_stdout_buf.buffer().to_vec();
+        let sync_stdout = sync_stdout_buf.into_inner();
 
         // Convert to raw fds and wrap in smol::Async for non-blocking I/O.
         let raw_in = sync_stdin.into_raw_fd();
@@ -369,7 +374,19 @@ impl PluginHandle {
             .map_err(|e| crate::Error::Io(format!("async wrap stdout: {}", e)))?;
 
         self.async_stdin = Some(futures::io::BufWriter::new(async_stdin));
-        self.async_stdout = Some(futures::io::BufReader::new(async_stdout));
+
+        // If the sync BufReader had leftover data, chain it in front of the
+        // async reader so it gets processed first.
+        if leftover.is_empty() {
+            let boxed: Box<dyn futures::io::AsyncRead + Unpin + Send> = Box::new(async_stdout);
+            self.async_stdout = Some(futures::io::BufReader::new(boxed));
+        } else {
+            use futures::io::AsyncReadExt;
+            let cursor = futures::io::Cursor::new(leftover);
+            let chained: Box<dyn futures::io::AsyncRead + Unpin + Send> =
+                Box::new(cursor.chain(async_stdout));
+            self.async_stdout = Some(futures::io::BufReader::new(chained));
+        }
         Ok(())
     }
 

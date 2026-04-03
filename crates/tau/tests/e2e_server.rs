@@ -1629,3 +1629,431 @@ fn session_dump_and_replay() {
         result.turn_results[1]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Background ServerRequest e2e test
+// ---------------------------------------------------------------------------
+
+/// Test that a global plugin can send ServerRequests outside of tool calls.
+///
+/// Spawns a tiny bash-based global plugin that:
+/// 1. Registers (no tools, no hooks).
+/// 2. Sends three `ListSessions` ServerRequests immediately after startup.
+/// 3. Collects the ServerResponse messages and writes them to a results file.
+///
+/// The test then verifies that all three responses arrived with the correct
+/// type (`sessions`).
+#[test]
+fn global_plugin_background_server_requests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let results_file = tmp.path().join("bg_results.txt");
+    let plugin_script = tmp.path().join("bg_plugin.sh");
+
+    // Write a bash plugin that sends background ServerRequests.
+    // Protocol: JSON lines on stdin/stdout.
+    //
+    // Inside the format!() string, `{{` / `}}` produce literal braces in the
+    // generated bash script.  `{results}` is the only interpolation point.
+    let script = format!(
+        r#"#!/bin/bash
+set -eu
+RESULTS="{results}"
+
+# Registration: no tools, no hooks
+echo '{{"type":"register","name":"bg-test","tools":[],"hooks":[],"commands":[]}}'
+
+# Send three ListSessions ServerRequests (background, no tool call active)
+for i in 1 2 3; do
+    echo '{{"type":"server_request","request_id":"bg-'"$i"'","request":{{"type":"list_sessions","include_archived":false}}}}'
+done
+
+# Read responses and record them
+COUNT=0
+while IFS= read -r line; do
+    case "$line" in
+        *server_response*)
+            COUNT=$((COUNT + 1))
+            echo "$line" >> "$RESULTS"
+            if [ "$COUNT" -ge 3 ]; then
+                break
+            fi
+            ;;
+        *idle*)
+            exit 0
+            ;;
+    esac
+done
+# Keep reading so the process stays alive for the server
+while IFS= read -r line; do
+    case "$line" in
+        *idle*) exit 0 ;;
+    esac
+done
+"#,
+        results = results_file.display()
+    );
+    std::fs::write(&plugin_script, &script).unwrap();
+
+    // Make executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let plugins_config = tau::plugin::PluginsConfig {
+        no_default_worker: true,
+        global: [(
+            "bg-test".to_string(),
+            tau::plugin::PluginEntry {
+                command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.plugins_config = Some(plugins_config);
+        config
+    });
+
+    // Poll until the results file has all three responses (up to 4s).
+    for _ in 0..40 {
+        if results_file.exists() {
+            let contents = std::fs::read_to_string(&results_file).unwrap_or_default();
+            if contents.lines().filter(|l| !l.is_empty()).count() >= 3 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Verify the results file was written with three responses.
+    let contents = std::fs::read_to_string(&results_file).unwrap_or_else(|e| {
+        panic!(
+            "results file not found at {}: {}",
+            results_file.display(),
+            e
+        )
+    });
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected 3 background responses, got {}: {:?}",
+        lines.len(),
+        lines
+    );
+
+    // Each line should be a server_response with type "sessions".
+    for (i, line) in lines.iter().enumerate() {
+        let parsed: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("line {} not valid JSON: {}\n  line: {}", i, e, line));
+        assert_eq!(
+            parsed["type"].as_str(),
+            Some("server_response"),
+            "line {}: expected server_response, got {:?}",
+            i,
+            parsed
+        );
+        assert_eq!(
+            parsed["response"]["type"].as_str(),
+            Some("sessions"),
+            "line {}: expected sessions response, got {:?}",
+            i,
+            parsed["response"]
+        );
+    }
+
+    server.shutdown();
+}
+
+/// Test that a global plugin can create a session via background ServerRequest
+/// and that the session is visible via the normal client API.
+#[test]
+fn global_plugin_background_create_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let results_file = tmp.path().join("bg_create_results.txt");
+    let plugin_script = tmp.path().join("bg_create_plugin.sh");
+
+    let script = format!(
+        r#"#!/bin/bash
+set -eu
+RESULTS="{results}"
+
+# Registration
+echo '{{"type":"register","name":"bg-create-test","tools":[],"hooks":[],"commands":[]}}'
+
+# Create a session via background ServerRequest
+echo '{{"type":"server_request","request_id":"create-1","request":{{"type":"create_session","model":null,"provider":null,"system_prompt":"bg-created","cwd":"/tmp","parent_id":null,"child_budget":0,"tagline":"background-test","auto_archive":false}}}}'
+
+# Read the response
+while IFS= read -r line; do
+    case "$line" in
+        *server_response*)
+            echo "$line" >> "$RESULTS"
+            break
+            ;;
+        *idle*)
+            exit 0
+            ;;
+    esac
+done
+# Stay alive
+while IFS= read -r line; do
+    case "$line" in
+        *idle*) exit 0 ;;
+    esac
+done
+"#,
+        results = results_file.display()
+    );
+    std::fs::write(&plugin_script, &script).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let plugins_config = tau::plugin::PluginsConfig {
+        no_default_worker: true,
+        global: [(
+            "bg-create-test".to_string(),
+            tau::plugin::PluginEntry {
+                command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.plugins_config = Some(plugins_config);
+        config
+    });
+
+    // Wait for the results file.
+    for _ in 0..40 {
+        if results_file.exists() {
+            let contents = std::fs::read_to_string(&results_file).unwrap_or_default();
+            if contents.lines().filter(|l| !l.is_empty()).count() >= 1 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Parse the create-session response.
+    let contents = std::fs::read_to_string(&results_file).unwrap_or_else(|e| {
+        panic!(
+            "results file not found at {}: {}",
+            results_file.display(),
+            e
+        )
+    });
+    let line = contents.lines().next().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(line).unwrap();
+    assert_eq!(parsed["response"]["type"].as_str(), Some("session_created"));
+    let session_id = parsed["response"]["session_id"].as_str().unwrap();
+
+    // Verify the session is visible via the normal client ListSessions API.
+    let conn = server.connect();
+    let resp = send_recv(
+        &conn,
+        &Request::ListSessions {
+            include_archived: false,
+        },
+    );
+    match resp {
+        Response::Sessions { sessions } => {
+            assert!(
+                sessions.iter().any(|s| s.id == session_id),
+                "session {} created by background plugin not found in {:?}",
+                session_id,
+                sessions.iter().map(|s| &s.id).collect::<Vec<_>>()
+            );
+            let sess = sessions.iter().find(|s| s.id == session_id).unwrap();
+            assert_eq!(sess.tagline.as_deref(), Some("background-test"));
+        }
+        other => panic!("expected Sessions, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// Test that a global plugin with background I/O can still handle tool calls.
+///
+/// This verifies the channel-mediated path: once background reader/writer
+/// tasks own the async pipes, tool calls flow through the channels correctly.
+/// The plugin provides an `echo_bg` tool and also sends a background
+/// `ListSessions` ServerRequest after registration.
+#[test]
+fn global_plugin_background_io_with_tool_calls() {
+    use tau::providers::mock::MockResponse;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let bg_results_file = tmp.path().join("bg_tool_results.txt");
+    let plugin_script = tmp.path().join("bg_tool_plugin.sh");
+
+    // This plugin:
+    //  - Registers with one tool ("echo_bg")
+    //  - Sends a background ListSessions ServerRequest
+    //  - In the main loop, handles tool_call and server_response messages
+    let script = format!(
+        r#"#!/bin/bash
+set -eu
+RESULTS="{results}"
+
+# Registration with one tool
+echo '{{"type":"register","name":"bg-tool-test","tools":[{{"name":"echo_bg","description":"Echo for bg test","parameters":{{"type":"object","properties":{{"msg":{{"type":"string"}}}},"required":["msg"]}}}}],"hooks":[],"commands":[]}}'
+
+# Send a background ListSessions request immediately
+echo '{{"type":"server_request","request_id":"bg-list-1","request":{{"type":"list_sessions","include_archived":false}}}}'
+
+# Main loop: handle tool calls and server responses
+while IFS= read -r line; do
+    case "$line" in
+        *'"type":"tool_call"'*)
+            # Extract tool_call_id (simple grep - works for our test)
+            TCID=$(echo "$line" | grep -o '"tool_call_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+            echo '{{"type":"tool_result","tool_call_id":"'"$TCID"'","content":[{{"type":"text","text":"BG_ECHO_OK"}}],"is_error":false}}'
+            ;;
+        *server_response*)
+            echo "$line" >> "$RESULTS"
+            ;;
+        *idle*)
+            exit 0
+            ;;
+    esac
+done
+"#,
+        results = bg_results_file.display()
+    );
+    std::fs::write(&plugin_script, &script).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let plugins_config = tau::plugin::PluginsConfig {
+        no_default_worker: true,
+        global: [(
+            "bg-tool-test".to_string(),
+            tau::plugin::PluginEntry {
+                command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    // Mock LLM response: call the echo_bg tool, then produce final text.
+    let mock_responses = vec![
+        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+            id: "tc-bg-1".into(),
+            name: "echo_bg".into(),
+            arguments: serde_json::json!({"msg": "hello"}),
+        }]),
+        MockResponse::Text("done".into()),
+    ];
+
+    let server = TestServer::start_with_config(mock_responses, |mut config| {
+        config.plugins_config = Some(plugins_config);
+        config
+    });
+    let conn = server.connect();
+
+    // Wait for the background ServerRequest to be handled.
+    for _ in 0..40 {
+        if bg_results_file.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Verify background ListSessions response arrived.
+    let bg_contents = std::fs::read_to_string(&bg_results_file)
+        .unwrap_or_else(|e| panic!("bg results file missing: {}", e));
+    assert!(
+        bg_contents.contains("server_response"),
+        "expected server_response in bg results: {}",
+        bg_contents
+    );
+
+    // Now run a chat that triggers the echo_bg tool call through the
+    // channel-mediated path.
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "test".into(),
+        },
+    );
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::AgentDone)),
+        "expected AgentDone in {:?}",
+        responses
+    );
+
+    // Verify the tool result is in the messages.
+    let conn3 = server.connect();
+    let resp = send_recv(
+        &conn3,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
+    match resp {
+        Response::Messages { messages } => {
+            // Should have: User, Assistant(tool_call), ToolResult, Assistant(text)
+            let tool_result = messages
+                .iter()
+                .find(|m| matches!(m, tau::types::Message::ToolResult(_)));
+            assert!(
+                tool_result.is_some(),
+                "no tool result in messages: {:?}",
+                messages
+            );
+            if let tau::types::Message::ToolResult(tr) = tool_result.unwrap() {
+                let text: String = tr
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(text, "BG_ECHO_OK");
+                assert!(!tr.is_error);
+            }
+        }
+        other => panic!("expected Messages, got {:?}", other),
+    }
+
+    server.shutdown();
+}

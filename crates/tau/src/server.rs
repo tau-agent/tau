@@ -496,26 +496,10 @@ fn spawn_global_plugin_background_tasks(
         let reader_throttle = throttle.clone();
         let reader_chat_tx = chat_spawn_tx.clone();
         let reader_test_overrides = test_overrides.clone();
-        // Clone msg_tx's corresponding write channel so we can send
-        // ServerResponse back through the writer task.
-        // The write_tx was given to the plugin handle; we need our own
-        // sender for the same channel.  We'll get it from the handle.
-        // Actually, we can just clone the bg_write_tx before it's consumed.
-        // Simpler: the reader task sends ServerResponse via a dedicated clone.
-        // We already have `write_rx` consumed by the writer task above.
-        // To send responses, we need a Sender for the same channel.
-        // Let's refactor: keep a clone of write_tx for the reader.
-        //
-        // The handle already has write_tx.  We need another sender for the
-        // same channel.  Let me restructure: create write_tx outside and
-        // clone it.
-
-        // Actually, looking at the setup: the handle has a write_tx clone.
-        // We need another clone for the reader task.  Let me get it from
-        // the handle via the plugin manager.
+        // Get a sender clone for the writer channel so the reader task can
+        // send ServerResponse messages back to the plugin.
         let resp_tx = {
             let pm = plugins.lock().unwrap();
-            // Find the global plugin and get its bg_write_tx
             pm.get_global_write_tx(&plugin_name)
         };
         let resp_tx = match resp_tx {
