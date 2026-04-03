@@ -10,6 +10,24 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::types::{Message, Model, UserMessage};
 
+/// Lightweight stats computed via SQL aggregates (no full JSON deserialisation).
+#[derive(Debug, Clone, Default)]
+pub struct DbSessionStats {
+    pub message_count: usize,
+    pub user_messages: usize,
+    pub assistant_messages: usize,
+    pub tool_calls: usize,
+    pub tool_results: usize,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cache_read: u64,
+    pub tokens_cache_write: u64,
+    pub cost: f64,
+    pub last_message_time: Option<i64>,
+    /// `input + cache_read + cache_write` from the last non-error assistant msg.
+    pub last_input_tokens: Option<u64>,
+}
+
 /// Stored session metadata (no messages — those live in the messages table).
 #[derive(Debug, Clone)]
 pub struct StoredSession {
@@ -638,6 +656,109 @@ impl Db {
             )
             .map_err(|e| crate::Error::Io(format!("count messages: {}", e)))?;
         Ok(count as usize)
+    }
+
+    /// Lightweight session stats computed via SQL — avoids deserializing every
+    /// message JSON blob (the old `compute_stats` path).
+    ///
+    /// Returns `None` when the session has no messages at all.
+    pub fn session_stats(&self, session_id: &str) -> crate::Result<Option<DbSessionStats>> {
+        // Main aggregate: counts by role, token/cost sums from assistant usage.
+        let row: Option<DbSessionStats> = self
+            .conn
+            .query_row(
+                "SELECT
+                    COUNT(*)                                                          AS message_count,
+                    SUM(CASE WHEN json_extract(message_json, '$.role') = 'user'       THEN 1 ELSE 0 END) AS user_messages,
+                    SUM(CASE WHEN json_extract(message_json, '$.role') = 'assistant'  THEN 1 ELSE 0 END) AS assistant_messages,
+                    SUM(CASE WHEN json_extract(message_json, '$.role') = 'tool_result' THEN 1 ELSE 0 END) AS tool_results,
+                    COALESCE(SUM(CASE WHEN json_extract(message_json, '$.role') = 'assistant'
+                        THEN json_extract(message_json, '$.usage.input')       ELSE 0 END), 0) AS tokens_input,
+                    COALESCE(SUM(CASE WHEN json_extract(message_json, '$.role') = 'assistant'
+                        THEN json_extract(message_json, '$.usage.output')      ELSE 0 END), 0) AS tokens_output,
+                    COALESCE(SUM(CASE WHEN json_extract(message_json, '$.role') = 'assistant'
+                        THEN json_extract(message_json, '$.usage.cache_read')  ELSE 0 END), 0) AS tokens_cache_read,
+                    COALESCE(SUM(CASE WHEN json_extract(message_json, '$.role') = 'assistant'
+                        THEN json_extract(message_json, '$.usage.cache_write') ELSE 0 END), 0) AS tokens_cache_write,
+                    COALESCE(SUM(CASE WHEN json_extract(message_json, '$.role') = 'assistant'
+                        THEN json_extract(message_json, '$.usage.cost.total')  ELSE 0 END), 0.0) AS cost,
+                    MAX(created_at)                                                   AS last_message_time
+                 FROM messages
+                 WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    let count: i64 = row.get(0)?;
+                    if count == 0 {
+                        return Ok(None);
+                    }
+                    Ok(Some(DbSessionStats {
+                        message_count: count as usize,
+                        user_messages: row.get::<_, i64>(1)? as usize,
+                        assistant_messages: row.get::<_, i64>(2)? as usize,
+                        tool_results: row.get::<_, i64>(3)? as usize,
+                        tokens_input: row.get::<_, i64>(4)? as u64,
+                        tokens_output: row.get::<_, i64>(5)? as u64,
+                        tokens_cache_read: row.get::<_, i64>(6)? as u64,
+                        tokens_cache_write: row.get::<_, i64>(7)? as u64,
+                        cost: row.get(8)?,
+                        last_message_time: row.get(9)?,
+                        tool_calls: 0,           // filled in below
+                        last_input_tokens: None,  // filled in below
+                    }))
+                },
+            )
+            .map_err(|e| crate::Error::Io(format!("session_stats: {}", e)))?;
+
+        let Some(mut stats) = row else {
+            return Ok(None);
+        };
+
+        // Tool-call count: count content-array elements with type=tool_call
+        // across all assistant messages.
+        stats.tool_calls = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(tc), 0) FROM (
+                     SELECT (
+                         SELECT COUNT(*) FROM json_each(json_extract(m.message_json, '$.content'))
+                         WHERE json_extract(value, '$.type') = 'tool_call'
+                     ) AS tc
+                     FROM messages m
+                     WHERE m.session_id = ?1
+                       AND json_extract(m.message_json, '$.role') = 'assistant'
+                 )",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| crate::Error::Io(format!("session_stats tool_calls: {}", e)))?
+            as usize;
+
+        // Last input tokens: from the last assistant message that didn't error/abort.
+        stats.last_input_tokens = self
+            .conn
+            .query_row(
+                "SELECT json_extract(message_json, '$.usage.input'),
+                        json_extract(message_json, '$.usage.cache_read'),
+                        json_extract(message_json, '$.usage.cache_write')
+                 FROM messages
+                 WHERE session_id = ?1
+                   AND json_extract(message_json, '$.role') = 'assistant'
+                   AND json_extract(message_json, '$.stop_reason') NOT IN ('error', 'aborted')
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![session_id],
+                |row| {
+                    let input: i64 = row.get(0)?;
+                    let cache_read: i64 = row.get(1)?;
+                    let cache_write: i64 = row.get(2)?;
+                    Ok(Some((input + cache_read + cache_write) as u64))
+                },
+            )
+            .optional()
+            .map_err(|e| crate::Error::Io(format!("session_stats last_input: {}", e)))?
+            .flatten();
+
+        Ok(Some(stats))
     }
 
     // ----- queued_messages -----
@@ -1343,5 +1464,132 @@ mod tests {
         db.delete_session("s1").unwrap();
         // CASCADE should have removed queued messages too
         assert!(!db.has_queued_messages("s1").unwrap());
+    }
+
+    #[test]
+    fn session_stats_empty() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&StoredSession {
+            id: "s1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+        })
+        .unwrap();
+
+        // No messages → None
+        assert!(db.session_stats("s1").unwrap().is_none());
+    }
+
+    #[test]
+    fn session_stats_basic() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&StoredSession {
+            id: "s1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+        })
+        .unwrap();
+
+        // Add a user message
+        db.append_message("s1", &Message::User(UserMessage::text("hello")))
+            .unwrap();
+
+        // Add an assistant message with usage
+        let mut asst = AssistantMessage::empty("test", "test", "test-model");
+        asst.usage.input = 100;
+        asst.usage.output = 50;
+        asst.usage.cache_read = 10;
+        asst.usage.cache_write = 5;
+        asst.usage.cost.total = 0.42;
+        asst.content.push(AssistantContent::Text(TextContent {
+            text: "hi".into(),
+            text_signature: None,
+        }));
+        asst.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"cmd": "ls"}),
+        }));
+        db.append_message("s1", &Message::Assistant(asst)).unwrap();
+
+        // Add a tool result
+        db.append_message(
+            "s1",
+            &Message::ToolResult(ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "bash".into(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "ok".into(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: 2000,
+            }),
+        )
+        .unwrap();
+
+        let stats = db.session_stats("s1").unwrap().unwrap();
+        assert_eq!(stats.message_count, 3);
+        assert_eq!(stats.user_messages, 1);
+        assert_eq!(stats.assistant_messages, 1);
+        assert_eq!(stats.tool_calls, 1);
+        assert_eq!(stats.tool_results, 1);
+        assert_eq!(stats.tokens_input, 100);
+        assert_eq!(stats.tokens_output, 50);
+        assert_eq!(stats.tokens_cache_read, 10);
+        assert_eq!(stats.tokens_cache_write, 5);
+        assert!((stats.cost - 0.42).abs() < 1e-6);
+        assert!(stats.last_message_time.is_some());
+        // last_input_tokens = input + cache_read + cache_write = 115
+        assert_eq!(stats.last_input_tokens, Some(115));
+    }
+
+    #[test]
+    fn session_stats_last_input_skips_errors() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&StoredSession {
+            id: "s1".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+        })
+        .unwrap();
+
+        // Good assistant message
+        let mut good = AssistantMessage::empty("test", "test", "test-model");
+        good.usage.input = 100;
+        good.usage.cache_read = 20;
+        db.append_message("s1", &Message::Assistant(good)).unwrap();
+
+        // Error assistant message (should be skipped for last_input_tokens)
+        let mut bad = AssistantMessage::empty("test", "test", "test-model");
+        bad.usage.input = 999;
+        bad.stop_reason = StopReason::Error;
+        db.append_message("s1", &Message::Assistant(bad)).unwrap();
+
+        let stats = db.session_stats("s1").unwrap().unwrap();
+        // Should use the good message's tokens, not the error one
+        assert_eq!(stats.last_input_tokens, Some(120)); // 100 + 20 + 0
     }
 }

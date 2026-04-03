@@ -109,6 +109,65 @@ fn session_info(
     }
 }
 
+/// Build a `SessionInfo` from pre-computed DB-level stats (no message
+/// deserialisation).  Used by `list_sessions_impl` for O(1)-per-session cost.
+fn session_info_from_db_stats(
+    stored: &StoredSession,
+    db_stats: Option<&crate::db::DbSessionStats>,
+    child_count: usize,
+    phase: Option<&crate::types::AgentPhase>,
+) -> SessionInfo {
+    let empty = crate::db::DbSessionStats::default();
+    let ds = db_stats.unwrap_or(&empty);
+
+    let stats = SessionStats {
+        user_messages: ds.user_messages,
+        assistant_messages: ds.assistant_messages,
+        tool_calls: ds.tool_calls,
+        tool_results: ds.tool_results,
+        tokens: TokenStats {
+            input: ds.tokens_input,
+            output: ds.tokens_output,
+            cache_read: ds.tokens_cache_read,
+            cache_write: ds.tokens_cache_write,
+        },
+        cost: ds.cost,
+        is_subscription: stored.is_subscription,
+        context_window: stored.model.context_window,
+        context_tokens: ds.last_input_tokens,
+    };
+
+    let context_pct = if stats.context_window > 0 {
+        stats
+            .context_tokens
+            .map(|t| (t as f64 / stats.context_window as f64) * 100.0)
+    } else {
+        None
+    };
+
+    SessionInfo {
+        id: stored.id.clone(),
+        model: stored.model.id.clone(),
+        provider: stored.model.provider.clone(),
+        cwd: stored.cwd.clone(),
+        message_count: ds.message_count,
+        stats,
+        last_activity: ds.last_message_time.unwrap_or(stored.created_at) / 1000,
+        parent_id: stored.parent_id.clone(),
+        child_count,
+        child_budget: stored.child_budget,
+        tagline: stored.tagline.clone(),
+        state: phase
+            .copied()
+            .unwrap_or_default()
+            .label()
+            .trim_end_matches("...")
+            .to_string(),
+        context_pct,
+        archived: stored.archived,
+    }
+}
+
 fn model_info(m: &Model) -> ModelInfo {
     ModelInfo {
         id: m.id.clone(),
@@ -2917,13 +2976,11 @@ fn list_sessions_impl(state: &SharedState, include_archived: bool) -> crate::pro
         Ok(stored) => {
             let mut infos = Vec::new();
             for s in &stored {
-                let messages = st.db.get_messages(&s.id).unwrap_or_default();
-                let last_msg = st.db.last_message_time(&s.id).unwrap_or(None);
+                let db_stats = st.db.session_stats(&s.id).unwrap_or(None);
                 let children = st.db.child_count(&s.id).unwrap_or(0);
-                infos.push(session_info(
+                infos.push(session_info_from_db_stats(
                     s,
-                    &messages,
-                    last_msg,
+                    db_stats.as_ref(),
                     children,
                     st.phases.get(&s.id),
                 ));
