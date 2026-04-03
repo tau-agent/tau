@@ -36,10 +36,10 @@ enum Commands {
         #[arg(default_value = "anthropic")]
         provider: String,
     },
-    /// Tool execution worker (internal, used by daemon)
+    /// Tool execution worker - sync/sequential (internal, used by daemon)
     #[command(hide = true)]
     Worker,
-    /// Async tool execution worker (internal, used by daemon)
+    /// Async tool execution worker - default (internal, used by daemon)
     #[command(hide = true)]
     Worker2,
     /// Manage the tau server
