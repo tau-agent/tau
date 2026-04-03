@@ -395,15 +395,26 @@ fn format_duration_compact(secs: i64) -> String {
     }
 }
 
+/// Format utilization (already 0–100 from the API) as a compact percentage string.
+pub fn format_utilization(utilization: Option<f64>) -> String {
+    match utilization {
+        Some(u) => format!("{:.0}%", u),
+        None => "?".into(),
+    }
+}
+
 /// Format a single usage bucket as `"LABEL PCT RESET"`.
 fn format_usage_bucket(label: &str, bucket: &crate::auth::UsageBucket) -> Option<String> {
-    let pct = bucket.utilization? * 100.0;
+    let pct = format_utilization(bucket.utilization);
+    if pct == "?" {
+        return None;
+    }
     let reset = bucket
         .resets_at
         .as_deref()
         .map(format_resets_at)
         .unwrap_or_else(|| "?".into());
-    Some(format!("{} {:.0}% {}", label, pct, reset))
+    Some(format!("{} {} {}", label, pct, reset))
 }
 
 /// Format subscription usage as a compact footer string.
@@ -518,15 +529,15 @@ mod tests {
         use crate::auth::{SubscriptionUsage, UsageBucket};
         let usage = SubscriptionUsage {
             five_hour: Some(UsageBucket {
-                utilization: Some(0.5),
+                utilization: Some(50.0),
                 resets_at: Some("2099-01-01T16:00:00Z".into()),
             }),
             seven_day: Some(UsageBucket {
-                utilization: Some(0.12),
+                utilization: Some(12.0),
                 resets_at: Some("2099-01-03T00:00:00Z".into()),
             }),
             seven_day_sonnet: Some(UsageBucket {
-                utilization: Some(0.06),
+                utilization: Some(6.0),
                 resets_at: Some("2099-01-02T00:00:00Z".into()),
             }),
             seven_day_opus: None,

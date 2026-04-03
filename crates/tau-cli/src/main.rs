@@ -904,10 +904,7 @@ async fn try_reconnect(client: &mut tau::client::Client, err: &tau::Error) -> bo
 }
 
 fn pct(b: Option<&tau::auth::UsageBucket>) -> String {
-    match b.and_then(|b| b.utilization) {
-        Some(u) => format!("{:.0}%", u),
-        None => "?".into(),
-    }
+    tau::protocol::format_utilization(b.and_then(|b| b.utilization))
 }
 
 /// Parse ISO 8601 reset timestamp → "Thu 04:00 (3d 14h 15m)".
