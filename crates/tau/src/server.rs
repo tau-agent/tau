@@ -106,6 +106,7 @@ fn session_info(
             .to_string(),
         context_pct,
         archived: stored.archived,
+        last_exit_status: stored.last_exit_status.clone(),
     }
 }
 
@@ -165,6 +166,7 @@ fn session_info_from_db_stats(
             .to_string(),
         context_pct,
         archived: stored.archived,
+        last_exit_status: stored.last_exit_status.clone(),
     }
 }
 
@@ -1180,12 +1182,25 @@ async fn handle_client(
                 match chat_result {
                     Ok((true, _)) => {
                         // Cancelled
+                        {
+                            let st = lock_state(&state);
+                            let _ = st.db.update_exit_status(&session_id, "cancelled");
+                        }
                         let resp = Response::Cancelled;
                         broadcast_to_subscribers(&state, &session_id, &resp);
                         send(&mut writer, &resp).await.ok();
                     }
                     Ok((false, max_turns_reached)) => {
                         // Normal completion (or max turns reached)
+                        {
+                            let st = lock_state(&state);
+                            let status = if max_turns_reached {
+                                "max_turns"
+                            } else {
+                                "completed"
+                            };
+                            let _ = st.db.update_exit_status(&session_id, status);
+                        }
                         if max_turns_reached {
                             let status_resp = Response::Stream {
                                 event: Box::new(StreamEvent::Status {
@@ -1201,6 +1216,10 @@ async fn handle_client(
                         send(&mut writer, &resp).await.ok();
                     }
                     Err(e) => {
+                        {
+                            let st = lock_state(&state);
+                            let _ = st.db.update_exit_status(&session_id, "error");
+                        }
                         let err_resp = Response::Error {
                             message: format!("agent error: {}", e),
                         };
@@ -2970,6 +2989,7 @@ fn create_session_impl(
         child_budget,
         tagline: tagline.clone(),
         archived: false,
+        last_exit_status: None,
     };
     match st.db.create_session(&stored) {
         Ok(()) => Response::SessionCreated { session_id: id },

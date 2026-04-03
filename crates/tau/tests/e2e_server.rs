@@ -820,6 +820,7 @@ fn queue_message_persists_across_operations() {
         child_budget: 0,
         tagline: None,
         archived: false,
+        last_exit_status: None,
     })
     .unwrap();
 

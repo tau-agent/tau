@@ -30,6 +30,7 @@ fn session_tree_budget_enforcement() {
         child_budget: 3,
         tagline: None,
         archived: false,
+        last_exit_status: None,
     };
     db.create_session(&root).unwrap();
 
@@ -45,6 +46,7 @@ fn session_tree_budget_enforcement() {
         child_budget: 0,
         tagline: None,
         archived: false,
+        last_exit_status: None,
     };
     db.create_session(&c1).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 1);
@@ -61,6 +63,7 @@ fn session_tree_budget_enforcement() {
         child_budget: 1,
         tagline: None,
         archived: false,
+        last_exit_status: None,
     };
     db.create_session(&c2).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 3); // 1 + (1+1) = 3
@@ -87,6 +90,7 @@ fn session_tree_budget_enforcement() {
         child_budget: 0,
         tagline: None,
         archived: false,
+        last_exit_status: None,
     };
     db.create_session(&gc1).unwrap();
     assert_eq!(db.budget_used("c2").unwrap(), 1);
@@ -125,6 +129,7 @@ fn session_tree_recursive_delete() {
             child_budget: budget,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
     }
@@ -170,6 +175,7 @@ fn session_model_inheritance() {
         child_budget: 5,
         tagline: None,
         archived: false,
+        last_exit_status: None,
     })
     .unwrap();
 
@@ -207,6 +213,7 @@ fn session_info_includes_tree_fields() {
         child_budget: 5,
         tagline: None,
         archived: false,
+        last_exit_status: None,
     })
     .unwrap();
 
@@ -221,6 +228,7 @@ fn session_info_includes_tree_fields() {
         child_budget: 0,
         tagline: None,
         archived: false,
+        last_exit_status: None,
     })
     .unwrap();
 
@@ -350,6 +358,7 @@ fn protocol_session_info_tree_fields() {
         child_budget: 10,
         tagline: None,
         archived: false,
+        last_exit_status: None,
         state: "idle".into(),
         context_pct: None,
     };

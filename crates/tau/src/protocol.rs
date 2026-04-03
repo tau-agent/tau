@@ -196,6 +196,9 @@ pub struct SessionInfo {
     /// Whether this session is archived.
     #[serde(default)]
     pub archived: bool,
+    /// Last exit status: null (never ran), "completed", "error", "cancelled", "max_turns".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exit_status: Option<String>,
 }
 
 /// Result for a single session in WaitSessions response.

@@ -41,6 +41,8 @@ pub struct StoredSession {
     pub child_budget: u32,
     pub tagline: Option<String>,
     pub archived: bool,
+    /// Last exit status: null (never ran), "completed", "error", "cancelled", "max_turns".
+    pub last_exit_status: Option<String>,
 }
 
 pub struct Db {
@@ -106,6 +108,7 @@ impl Db {
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN tagline TEXT;");
         let _ = conn
             .execute_batch("ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;");
+        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN last_exit_status TEXT;");
 
         // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
@@ -148,7 +151,8 @@ impl Db {
                 parent_id      TEXT,
                 child_budget   INTEGER NOT NULL DEFAULT 16,
                 tagline        TEXT,
-                archived       INTEGER NOT NULL DEFAULT 0
+                archived       INTEGER NOT NULL DEFAULT 0,
+                last_exit_status TEXT
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,
@@ -181,8 +185,8 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     session.id,
                     model_json,
@@ -194,6 +198,7 @@ impl Db {
                     session.child_budget,
                     session.tagline,
                     session.archived as i32,
+                    session.last_exit_status,
                 ],
             )
             .map_err(|e| crate::Error::Io(format!("insert session: {}", e)))?;
@@ -204,7 +209,7 @@ impl Db {
     pub fn get_session(&self, id: &str) -> crate::Result<Option<StoredSession>> {
         self.conn
             .query_row(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status
                  FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -227,6 +232,7 @@ impl Db {
                         child_budget: row.get::<_, i32>(7)? as u32,
                         tagline: row.get(8)?,
                         archived: row.get::<_, i32>(9)? != 0,
+                        last_exit_status: row.get(10)?,
                     })
                 },
             )
@@ -239,10 +245,10 @@ impl Db {
     /// If `include_archived` is false, archived sessions are excluded.
     pub fn list_sessions(&self, include_archived: bool) -> crate::Result<Vec<StoredSession>> {
         let sql = if include_archived {
-            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived
+            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status
              FROM sessions ORDER BY created_at"
         } else {
-            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived
+            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status
              FROM sessions WHERE archived = 0 ORDER BY created_at"
         };
         let mut stmt = self
@@ -271,6 +277,7 @@ impl Db {
                     child_budget: row.get::<_, i32>(7)? as u32,
                     tagline: row.get(8)?,
                     archived: row.get::<_, i32>(9)? != 0,
+                    last_exit_status: row.get(10)?,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list sessions: {}", e)))?;
@@ -364,7 +371,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status
                  FROM sessions WHERE parent_id = ?1 ORDER BY created_at",
             )
             .map_err(|e| crate::Error::Io(format!("prepare children: {}", e)))?;
@@ -390,6 +397,7 @@ impl Db {
                     child_budget: row.get::<_, i32>(7)? as u32,
                     tagline: row.get(8)?,
                     archived: row.get::<_, i32>(9)? != 0,
+                    last_exit_status: row.get(10)?,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list children: {}", e)))?;
@@ -526,6 +534,17 @@ impl Db {
                 params![system_prompt, session_id],
             )
             .map_err(|e| crate::Error::Io(format!("update system_prompt: {}", e)))?;
+        Ok(())
+    }
+
+    /// Update the last exit status for a session.
+    pub fn update_exit_status(&self, session_id: &str, status: &str) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET last_exit_status = ?1 WHERE id = ?2",
+                params![status, session_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("update exit_status: {}", e)))?;
         Ok(())
     }
 
@@ -964,6 +983,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         };
         db.create_session(&session).unwrap();
 
@@ -988,6 +1008,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         };
         db.create_session(&session).unwrap();
 
@@ -1022,6 +1043,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         };
         db.create_session(&session).unwrap();
         db.append_message("s1", &Message::User(UserMessage::text("hi")))
@@ -1047,6 +1069,7 @@ mod tests {
                 child_budget: 0,
                 tagline: None,
                 archived: false,
+                last_exit_status: None,
             })
             .unwrap();
         }
@@ -1071,6 +1094,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
         assert_eq!(db.next_session_id().unwrap(), "s6");
@@ -1092,6 +1116,7 @@ mod tests {
             child_budget: 5,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1111,6 +1136,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1129,6 +1155,7 @@ mod tests {
             child_budget: 2,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1157,6 +1184,7 @@ mod tests {
             child_budget: 10,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1171,6 +1199,7 @@ mod tests {
             child_budget: 3,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1186,6 +1215,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1211,6 +1241,7 @@ mod tests {
             child_budget: 5,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1225,6 +1256,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1252,6 +1284,7 @@ mod tests {
             child_budget: 5,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
         db.append_message("top", &Message::User(UserMessage::text("hello")))
@@ -1269,6 +1302,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
         db.append_message("child1", &Message::User(UserMessage::text("work")))
@@ -1286,6 +1320,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
         db.append_message(
@@ -1306,6 +1341,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
         db.append_message(
@@ -1336,6 +1372,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1358,6 +1395,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1386,6 +1424,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1435,6 +1474,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1457,6 +1497,7 @@ mod tests {
                 child_budget: 0,
                 tagline: None,
                 archived: false,
+                last_exit_status: None,
             })
             .unwrap();
         }
@@ -1487,6 +1528,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1512,6 +1554,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1533,6 +1576,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1605,6 +1649,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1642,6 +1687,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: true,
+            last_exit_status: None,
         })
         .unwrap();
         db.append_message("old_archived", &Message::User(UserMessage::text("hello")))
@@ -1660,6 +1706,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: true,
+            last_exit_status: None,
         })
         .unwrap();
 
@@ -1675,6 +1722,7 @@ mod tests {
             child_budget: 0,
             tagline: None,
             archived: false,
+            last_exit_status: None,
         })
         .unwrap();
 
