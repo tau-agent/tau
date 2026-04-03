@@ -1973,6 +1973,17 @@ async fn handle_client(
                     }
                 }
             }
+            Request::FireHook { .. } => {
+                // FireHook is only valid from the plugin ServerRequest tunnel,
+                // not from direct client connections.
+                send(
+                    &mut writer,
+                    &Response::Error {
+                        message: "fire_hook is only available from plugins".into(),
+                    },
+                )
+                .await?;
+            }
             Request::Shutdown { restart } => {
                 shutdown.request_shutdown(restart);
                 send(&mut writer, &Response::Ok).await?;
@@ -2080,6 +2091,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                         &self.chat_spawn_tx,
                         &self.test_overrides,
                         &request,
+                        &self.session_id,
                     )
                     .await;
                     handle
@@ -3184,6 +3196,7 @@ async fn handle_server_request(
     chat_spawn_tx: &smol::channel::Sender<(String, String)>,
     test_overrides: &SharedTestOverrides,
     req: &crate::protocol::Request,
+    session_id: &str,
 ) -> crate::protocol::Response {
     use crate::protocol::{Request, Response};
     match req {
@@ -3535,6 +3548,11 @@ async fn handle_server_request(
             }
 
             Response::SessionArchived
+        }
+        Request::FireHook { name, data } => {
+            let mut pm = plugins.lock().unwrap();
+            pm.call_hook_excluding(session_id, name, data, None);
+            Response::Ok
         }
         _ => Response::Error {
             message: "request not supported in plugin context".into(),

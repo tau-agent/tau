@@ -117,6 +117,11 @@ pub enum Request {
         /// Delete archived sessions older than this many days.
         older_than_days: u64,
     },
+    /// Broadcast a hook to other plugins (plugin-to-plugin communication).
+    FireHook {
+        name: String,
+        data: serde_json::Value,
+    },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).

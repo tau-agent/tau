@@ -716,8 +716,20 @@ fn call_hook_all(
     name: &str,
     data: &serde_json::Value,
 ) -> Vec<HookResult> {
+    call_hook_all_excluding(plugins, name, data, None)
+}
+
+fn call_hook_all_excluding(
+    plugins: &mut [PluginHandle],
+    name: &str,
+    data: &serde_json::Value,
+    exclude_plugin: Option<&str>,
+) -> Vec<HookResult> {
     let mut results = Vec::new();
     for plugin in plugins {
+        if exclude_plugin == Some(plugin.name.as_str()) {
+            continue;
+        }
         if plugin.wants_hook(name) {
             match plugin.call_hook(name, data.clone()) {
                 Ok(result) => results.push(result),
@@ -1186,6 +1198,37 @@ impl PluginManager {
         let mut results = call_hook_all(&mut self.global_plugins, name, data);
         if let Some(sp) = self.session_plugins.get_mut(session_id) {
             results.extend(sp.call_hook(name, data));
+        }
+        results
+    }
+
+    /// Call a hook on all plugins except the one named `exclude_plugin`.
+    /// Used by FireHook to avoid sending the hook back to the originating plugin.
+    pub fn call_hook_excluding(
+        &mut self,
+        session_id: &str,
+        name: &str,
+        data: &serde_json::Value,
+        exclude_plugin: Option<&str>,
+    ) -> Vec<HookResult> {
+        let mut results =
+            call_hook_all_excluding(&mut self.global_plugins, name, data, exclude_plugin);
+        if let Some(sp) = self.session_plugins.get_mut(session_id) {
+            // Ensure plugins are alive before calling hooks
+            for p in &mut sp.plugins {
+                if p.wants_hook(name)
+                    && exclude_plugin != Some(p.name.as_str())
+                    && p.ensure_alive().is_err()
+                {
+                    eprintln!("plugin {} respawn for hook {} failed", p.name, name);
+                }
+            }
+            results.extend(call_hook_all_excluding(
+                &mut sp.plugins,
+                name,
+                data,
+                exclude_plugin,
+            ));
         }
         results
     }
