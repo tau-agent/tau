@@ -82,6 +82,8 @@ impl TestServer {
             models: vec![model],
             socket_path: sock_clone,
             db_path,
+            tool_executor_factory: None,
+            mock_tools: vec![],
         };
 
         std::thread::spawn(move || {
@@ -667,6 +669,8 @@ fn server_session_resume_after_restart() {
         models: vec![model],
         socket_path: sock_path.clone(),
         db_path: db_path.clone(),
+        tool_executor_factory: None,
+        mock_tools: vec![],
     };
 
     let handle = std::thread::spawn(move || {
@@ -732,6 +736,8 @@ fn server_session_resume_after_restart() {
         models: vec![model2],
         socket_path: sock_path.clone(),
         db_path: db_path.clone(),
+        tool_executor_factory: None,
+        mock_tools: vec![],
     };
 
     let _handle2 = std::thread::spawn(move || {
@@ -785,11 +791,18 @@ fn server_session_resume_after_restart() {
 
 #[test]
 fn steer_queues_message_for_idle_session() {
-    // Steer a message to an idle session. On next Chat, the queued message
-    // should be picked up by the agent loop (appears in context).
-    let server = TestServer::start(vec![MockResponse::Text(
-        "I see the steering message.".into(),
-    )]);
+    // Steer a message to an idle session.
+    // With queue_and_maybe_resume, the steered message triggers an immediate
+    // resume (agent turn) since the session is idle. We verify that:
+    // 1. The steered message is persisted as a user message
+    // 2. The resume processes it and produces an assistant response
+    // 3. A subsequent Chat also works (messages accumulate)
+    let server = TestServer::start(vec![
+        // First response: consumed by the resume triggered by Steer on idle session
+        MockResponse::Text("I processed the injected message.".into()),
+        // Second response: consumed by the explicit Chat request
+        MockResponse::Text("I see your hello.".into()),
+    ]);
     let conn = server.connect();
 
     // Create session
@@ -809,7 +822,7 @@ fn steer_queues_message_for_idle_session() {
         other => panic!("{:?}", other),
     };
 
-    // Steer a message while session is idle -- should succeed now
+    // Steer a message while session is idle -- triggers immediate resume
     let steer_resp = send_recv(
         &conn,
         &Request::Steer {
@@ -823,27 +836,23 @@ fn steer_queues_message_for_idle_session() {
         steer_resp
     );
 
-    // Start a Chat -- the queued message should be drained and injected
-    let conn2 = server.connect();
-    let responses = send_recv_all(
-        &conn2,
-        &Request::Chat {
-            session_id: sid.clone(),
-            text: "hello".into(),
+    // Wait for the resume to complete (session becomes idle again)
+    let conn_wait = server.connect();
+    let wait_resp = send_recv(
+        &conn_wait,
+        &Request::WaitSessions {
+            session_ids: vec![sid.clone()],
+            timeout_secs: 10,
         },
     );
+    match wait_resp {
+        Response::SessionsCompleted { results } => {
+            assert_eq!(results[0].status, "done");
+        }
+        other => panic!("expected SessionsCompleted, got {:?}", other),
+    }
 
-    // Should have a UserMessage event for the injected message in the responses
-    let has_injected = responses
-        .iter()
-        .any(|r| matches!(r, Response::UserMessage { text } if text.contains("injected message")));
-    assert!(
-        has_injected,
-        "should see injected UserMessage in responses: {:?}",
-        responses
-    );
-
-    // Verify final messages include the injected message
+    // Verify the steered message was persisted and processed
     let conn3 = server.connect();
     let resp = send_recv(
         &conn3,
@@ -853,14 +862,12 @@ fn steer_queues_message_for_idle_session() {
     );
     match resp {
         Response::Messages { messages } => {
-            // Should have: chat user msg + queued user msg + assistant reply = 3
             assert!(
-                messages.len() >= 3,
-                "expected at least 3 messages, got {}: {:?}",
+                messages.len() >= 2,
+                "expected at least 2 messages after steer+resume, got {}: {:?}",
                 messages.len(),
                 messages
             );
-            // The injected message should appear somewhere (drained at top of agent turn)
             let has_injected = messages.iter().any(|m| {
                 if let tau::types::Message::User(u) = m {
                     u.content.iter().any(|c| match c {
@@ -874,6 +881,38 @@ fn steer_queues_message_for_idle_session() {
             assert!(
                 has_injected,
                 "should contain injected message in persisted messages: {:?}",
+                messages
+            );
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Now send a Chat -- should work with accumulated history
+    let conn2 = server.connect();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello".into(),
+        },
+    );
+    let has_done = responses.iter().any(|r| matches!(r, Response::AgentDone));
+    assert!(has_done, "expected AgentDone in responses: {:?}", responses);
+
+    // Verify all messages: injected user + assistant + chat user + assistant = 4
+    let conn4 = server.connect();
+    let resp = send_recv(
+        &conn4,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
+    match resp {
+        Response::Messages { messages } => {
+            assert!(
+                messages.len() >= 4,
+                "expected at least 4 messages (steer+resume+chat+reply), got {}: {:?}",
+                messages.len(),
                 messages
             );
         }
@@ -926,4 +965,147 @@ fn queue_message_persists_across_operations() {
     assert!(!db.has_queued_messages("s1").unwrap());
     let persisted = db.get_messages("s1").unwrap();
     assert_eq!(persisted.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Mock tool executor tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn server_chat_with_mock_tool_success() {
+    use std::sync::Arc;
+    use tau::providers::mock::{
+        MockToolExecutor, MockToolResponse, mock_tool,
+    };
+
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    let tool_handle_for_assert = mock_executor.handle();
+    tool_handle.on_tool("read_file", MockToolResponse::Success("hello world".into()));
+
+    let provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/tmp/test.txt"}),
+        }]),
+        MockResponse::Text("The file contains hello world.".into()),
+    ]);
+    let provider_handle = provider.handle();
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || {
+            let h = tool_handle.clone();
+            Box::new(h.executor())
+        });
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-test.sock");
+    let db_path = dir.path().join("test.db");
+
+    let model = mock_model();
+    let mut registry = tau::provider::ProviderRegistry::new();
+    registry.register(provider);
+
+    let config = tau::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.clone(),
+        db_path,
+        tool_executor_factory: Some(tool_factory),
+        mock_tools: vec![mock_tool("read_file", "Read a file")],
+    };
+
+    std::thread::spawn(move || {
+        smol::block_on(async {
+            if let Err(e) = tau::server::run_with_config(config).await {
+                eprintln!("test server error: {}", e);
+            }
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() { break; }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sock_path.exists(), "server socket did not appear");
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+
+    // Create session
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("You are helpful.".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Chat -- triggers tool call → mock tool result → final response
+    let conn2 = UnixStream::connect(&sock_path).unwrap();
+    conn2.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "read /tmp/test.txt".into(),
+        },
+    );
+
+    let has_done = responses.iter().any(|r| matches!(r, Response::AgentDone));
+    assert!(has_done, "expected AgentDone in responses: {:?}", responses);
+
+    // Verify messages: user + assistant(tool_call) + tool_result(success) + assistant(text)
+    let conn3 = UnixStream::connect(&sock_path).unwrap();
+    conn3.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(
+        &conn3,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
+    match resp {
+        Response::Messages { messages } => {
+            assert_eq!(
+                messages.len(), 4,
+                "expected 4 messages (user + assistant + tool_result + assistant), got {}: {:?}",
+                messages.len(), messages
+            );
+            assert!(matches!(&messages[0], tau::types::Message::User(_)));
+            assert!(matches!(&messages[1], tau::types::Message::Assistant(_)));
+            // Tool result should NOT be an error (mock returned Success)
+            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if !tr.is_error));
+            assert!(matches!(&messages[3], tau::types::Message::Assistant(a) if a.text().contains("hello world")));
+        }
+        other => panic!("expected Messages, got {:?}", other),
+    }
+
+    // Verify mock tool was called
+    let tool_captures = tool_handle_for_assert.captures();
+    assert_eq!(tool_captures.len(), 1);
+    assert_eq!(tool_captures[0].tool_call.name, "read_file");
+
+    // Verify provider saw tool result in context on second call
+    let captures = provider_handle.captures();
+    assert_eq!(captures.len(), 2);
+    let second_ctx = &captures[1].context;
+    assert!(second_ctx.messages.iter().any(|m|
+        matches!(m, tau::types::Message::ToolResult(tr) if tr.content.iter().any(|c|
+            matches!(c, tau::types::ToolResultContent::Text(t) if t.text.contains("hello world"))
+        ))
+    ));
+
+    // Shutdown
+    let conn4 = UnixStream::connect(&sock_path).unwrap();
+    conn4.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send_recv(&conn4, &Request::Shutdown { restart: false });
 }

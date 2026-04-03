@@ -1400,4 +1400,116 @@ mod tests {
         ];
         assert!(repair_messages(&messages).is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Context capture tests (using MockProviderHandle)
+    // -----------------------------------------------------------------------
+
+    fn setup_registry_with_handle(
+        responses: Vec<MockResponse>,
+    ) -> (ProviderRegistry, MockProviderHandle) {
+        let provider = MockProvider::new(responses);
+        let handle = provider.handle();
+        let mut registry = ProviderRegistry::new();
+        registry.register(provider);
+        (registry, handle)
+    }
+
+    #[test]
+    fn capture_context_on_each_turn() {
+        smol::block_on(async {
+            let (registry, handle) = setup_registry_with_handle(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo hi"}),
+                }]),
+                MockResponse::Text("Done.".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig::default();
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
+
+            run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            let captures = handle.captures();
+            assert_eq!(captures.len(), 2, "should capture context for each LLM call");
+
+            // First call: just user message
+            assert_eq!(captures[0].index, 0);
+            assert_eq!(captures[0].context.messages.len(), 1);
+            assert!(matches!(
+                &captures[0].context.messages[0],
+                Message::User(_)
+            ));
+
+            // Second call: user + assistant(tool_call) + tool_result
+            assert_eq!(captures[1].index, 1);
+            assert!(captures[1].context.messages.len() >= 3);
+            assert!(matches!(
+                &captures[1].context.messages[1],
+                Message::Assistant(_)
+            ));
+            assert!(matches!(
+                &captures[1].context.messages[2],
+                Message::ToolResult(_)
+            ));
+
+            // Turn duration should be measurable
+            let durations = handle.turn_durations();
+            assert_eq!(durations.len(), 1);
+            assert!(durations[0] < std::time::Duration::from_secs(10));
+        });
+    }
+
+    #[test]
+    fn capture_system_prompt_in_context() {
+        smol::block_on(async {
+            let (registry, handle) = setup_registry_with_handle(vec![
+                MockResponse::Text("Hello!".into()),
+            ]);
+            let model = mock_model();
+            let mut context = Context {
+                system_prompt: Some("You are a test assistant.".into()),
+                messages: vec![Message::User(UserMessage::text("hi"))],
+                tools: Vec::new(),
+            };
+            let config = AgentConfig::default();
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
+
+            run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .unwrap();
+
+            let captures = handle.captures();
+            assert_eq!(captures.len(), 1);
+            assert_eq!(
+                captures[0].context.system_prompt.as_deref(),
+                Some("You are a test assistant.")
+            );
+        });
+    }
 }

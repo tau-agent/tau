@@ -325,12 +325,29 @@ fn build_registry() -> ProviderRegistry {
     registry
 }
 
+/// Optional test overrides that bypass the plugin executor.
+#[derive(Default)]
+pub struct TestOverrides {
+    /// Factory for mock tool executors (per agent turn).
+    pub tool_executor_factory:
+        Option<Arc<dyn Fn() -> Box<dyn crate::worker::ToolExecutor> + Send + Sync>>,
+    /// Tool schemas to pass to the agent loop when using a mock executor.
+    pub mock_tools: Vec<Tool>,
+}
+
+type SharedTestOverrides = Arc<TestOverrides>;
+
 /// Configuration for a test server instance.
 pub struct TestServerConfig {
     pub registry: ProviderRegistry,
     pub models: Vec<Model>,
     pub socket_path: PathBuf,
     pub db_path: PathBuf,
+    /// Optional: factory for mock tool executors (per agent turn).
+    pub tool_executor_factory:
+        Option<Arc<dyn Fn() -> Box<dyn crate::worker::ToolExecutor> + Send + Sync>>,
+    /// Optional: tool schemas for mock executor.
+    pub mock_tools: Vec<Tool>,
 }
 
 /// Run a server with custom config (for testing).
@@ -341,6 +358,11 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         .cloned()
         .ok_or_else(|| crate::Error::Io("no models available".into()))?;
     let sock = &config.socket_path;
+
+    let test_overrides: SharedTestOverrides = Arc::new(TestOverrides {
+        tool_executor_factory: config.tool_executor_factory,
+        mock_tools: config.mock_tools,
+    });
 
     if let Some(parent) = sock.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -421,6 +443,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         let shutdown_handle = shutdown.clone();
         let session_locks = session_locks.clone();
         let throttle = throttle.clone();
+        let overrides = test_overrides.clone();
         smol::spawn(async move {
             if let Err(e) = handle_client(
                 stream,
@@ -429,6 +452,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
                 shutdown_handle,
                 session_locks,
                 throttle,
+                overrides,
             )
             .await
             {
@@ -526,8 +550,9 @@ pub async fn run() -> crate::Result<()> {
             let sh = shutdown.clone();
             let sl = session_locks.clone();
             let th = throttle.clone();
+        let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
             smol::spawn(async move {
-                if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone()).await {
+                if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
                     eprintln!("auto-resume session {} error: {}", sid, e);
                 }
             })
@@ -559,8 +584,9 @@ pub async fn run() -> crate::Result<()> {
                 let sh = shutdown.clone();
                 let sl = session_locks.clone();
                 let th = throttle.clone();
+            let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
                 smol::spawn(async move {
-                    if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone()).await {
+                    if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
                         eprintln!("auto-resume session {} error: {}", sid, e);
                     }
                 })
@@ -584,6 +610,7 @@ pub async fn run() -> crate::Result<()> {
         let shutdown_handle = shutdown.clone();
         let session_locks = session_locks.clone();
         let throttle = throttle.clone();
+        let no_overrides: SharedTestOverrides = Arc::new(TestOverrides::default());
         smol::spawn(async move {
             if let Err(e) = handle_client(
                 stream,
@@ -592,6 +619,7 @@ pub async fn run() -> crate::Result<()> {
                 shutdown_handle,
                 session_locks,
                 throttle,
+                no_overrides,
             )
             .await
             {
@@ -656,6 +684,7 @@ fn queue_and_maybe_resume(
     target: &str,
     content: &str,
     sender_info: &str,
+    test_overrides: &SharedTestOverrides,
 ) {
     queue_message_to_session(state, target, content, sender_info);
     // If the target session is idle (lock is free), spawn a resume task.
@@ -669,9 +698,10 @@ fn queue_and_maybe_resume(
         let sh = shutdown.clone();
         let sl = session_locks.clone();
         let th = throttle.clone();
+        let ov = test_overrides.clone();
         let sid = target.to_string();
         smol::spawn(async move {
-            if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone()).await {
+            if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
                 eprintln!("resume session {} after queued message: {}", sid, e);
             }
         })
@@ -686,6 +716,7 @@ async fn handle_client(
     shutdown: ShutdownHandle,
     session_locks: SessionLocks,
     throttle: crate::throttle::ProviderThrottle,
+    test_overrides: SharedTestOverrides,
 ) -> crate::Result<()> {
     // Register for shutdown notifications
     let shutdown_rx = shutdown.register_client();
@@ -960,6 +991,7 @@ async fn handle_client(
                             &mut writer,
                             &throttle,
                             &session_locks,
+                            &test_overrides,
                         )
                         .await;
                         match cont_result {
@@ -1044,6 +1076,7 @@ async fn handle_client(
                         &mut writer,
                         &throttle,
                         &session_locks,
+                        &test_overrides,
                     )
                     .await;
 
@@ -1211,6 +1244,7 @@ async fn handle_client(
                     &session_id,
                     &text,
                     "steer",
+                    &test_overrides,
                 );
                 send(&mut writer, &Response::Ok).await.ok();
             }
@@ -1682,6 +1716,7 @@ async fn handle_client(
                     &target_session_id,
                     &content,
                     &sender_info,
+                    &test_overrides,
                 );
                 send(&mut writer, &Response::Ok).await?;
             }
@@ -1744,6 +1779,7 @@ struct PluginExecutor {
     throttle: crate::throttle::ProviderThrottle,
     session_id: String,
     cwd: String,
+    test_overrides: SharedTestOverrides,
 }
 
 #[async_trait::async_trait]
@@ -1821,6 +1857,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                         &self.shutdown,
                         &self.throttle,
                         &self.chat_spawn_tx,
+                        &self.test_overrides,
                         &request,
                     )
                     .await;
@@ -1867,6 +1904,7 @@ fn run_agent_turn<'a, W: futures::io::AsyncWrite + Unpin + Send + 'a>(
     writer: &'a mut W,
     throttle: &'a crate::throttle::ProviderThrottle,
     session_locks: &'a SessionLocks,
+    test_overrides: &'a SharedTestOverrides,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = crate::Result<crate::agent::AgentResult>> + Send + 'a>,
 > {
@@ -1882,6 +1920,7 @@ fn run_agent_turn<'a, W: futures::io::AsyncWrite + Unpin + Send + 'a>(
         writer,
         throttle,
         session_locks,
+        test_overrides,
     ))
 }
 
@@ -1898,6 +1937,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     writer: &mut W,
     throttle: &crate::throttle::ProviderThrottle,
     session_locks: &SessionLocks,
+    test_overrides: &SharedTestOverrides,
 ) -> crate::Result<crate::agent::AgentResult> {
     // Check provider throttle — sleep if rate limited
     if let Some(remaining) = throttle.check(&model.provider) {
@@ -2010,7 +2050,9 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             .map(|s| s.child_budget)
             .unwrap_or(0)
     };
-    let plugin_tools = {
+    let plugin_tools = if !test_overrides.mock_tools.is_empty() {
+        test_overrides.mock_tools.clone()
+    } else {
         let pm = plugins.lock().unwrap();
         pm.tool_schemas(session_id, child_budget)
     };
@@ -2027,6 +2069,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     let shutdown_clone = shutdown.clone();
     let throttle_clone = throttle.clone();
     let session_id_for_executor = session_id.to_string();
+    let test_overrides_clone = test_overrides.clone();
 
     // Channel for child Chat requests spawned by orchestration tools.
     // The receiver task spawns async agent turns for each queued chat.
@@ -2038,6 +2081,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     let spawn_shutdown = shutdown.clone();
     let spawn_session_locks = session_locks.clone();
     let spawn_throttle = throttle.clone();
+    let spawn_overrides = test_overrides.clone();
     smol::spawn(async move {
         while let Ok((child_session_id, text)) = chat_spawn_rx.recv().await {
             // Each child chat gets its own async task (fire-and-forget).
@@ -2046,9 +2090,10 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             let sh = spawn_shutdown.clone();
             let sl = spawn_session_locks.clone();
             let th = spawn_throttle.clone();
+            let ov = spawn_overrides.clone();
             smol::spawn(async move {
                 let sid = child_session_id;
-                if let Err(e) = run_child_chat(s, p, sh, sl, th, sid.clone(), text).await {
+                if let Err(e) = run_child_chat(s, p, sh, sl, th, sid.clone(), text, ov).await {
                     eprintln!("child chat {} error: {}", sid, e);
                 }
             })
@@ -2060,21 +2105,27 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     let agent_handle = {
         async move {
             in_flight.enter();
-            let mut executor = PluginExecutor {
-                plugins: plugins_clone,
-                state: state_clone_exec,
-                session_locks: session_locks_clone,
-                chat_spawn_tx,
-                shutdown: shutdown_clone,
-                throttle: throttle_clone,
-                session_id: session_id_for_executor,
-                cwd: cwd_clone,
-            };
+            let mut executor: Box<dyn crate::worker::ToolExecutor> =
+                if let Some(ref factory) = test_overrides_clone.tool_executor_factory {
+                    factory()
+                } else {
+                    Box::new(PluginExecutor {
+                        plugins: plugins_clone,
+                        state: state_clone_exec,
+                        session_locks: session_locks_clone,
+                        chat_spawn_tx,
+                        shutdown: shutdown_clone,
+                        throttle: throttle_clone,
+                        session_id: session_id_for_executor,
+                        cwd: cwd_clone,
+                        test_overrides: test_overrides_clone.clone(),
+                    })
+                };
             let result = crate::agent::run(
                 &registry_clone,
                 &model_clone,
                 &mut context_clone,
-                &mut executor,
+                &mut *executor,
                 &options_clone,
                 &agent_config,
                 &plugin_tools,
@@ -2165,6 +2216,7 @@ async fn run_child_chat(
     throttle: crate::throttle::ProviderThrottle,
     session_id: String,
     text: String,
+    test_overrides: SharedTestOverrides,
 ) -> crate::Result<()> {
     if shutdown.is_shutting_down() {
         return Ok(());
@@ -2260,6 +2312,7 @@ async fn run_child_chat(
             &mut sink,
             &throttle,
             &session_locks,
+            &test_overrides,
         )
         .await;
 
@@ -2290,6 +2343,7 @@ async fn run_child_chat(
                 &session_id,
                 "cancelled",
                 None,
+                &test_overrides,
             );
         }
         Ok((false, max_turns_reached)) => {
@@ -2319,6 +2373,7 @@ async fn run_child_chat(
                         &pid,
                         &notice,
                         &format!("child:{}", session_id),
+                        &test_overrides,
                     );
                 }
             } else {
@@ -2332,6 +2387,7 @@ async fn run_child_chat(
                     &session_id,
                     "completed",
                     None,
+                    &test_overrides,
                 );
             }
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
@@ -2356,6 +2412,7 @@ async fn run_child_chat(
                 &session_id,
                 &format!("error: {}", e),
                 None,
+                &test_overrides,
             );
         }
     }
@@ -2375,6 +2432,7 @@ async fn resume_child_session(
     session_locks: SessionLocks,
     throttle: crate::throttle::ProviderThrottle,
     session_id: String,
+    test_overrides: SharedTestOverrides,
 ) -> crate::Result<()> {
     if shutdown.is_shutting_down() {
         return Ok(());
@@ -2473,6 +2531,7 @@ async fn resume_child_session(
             &mut sink,
             &throttle,
             &session_locks,
+            &test_overrides,
         )
         .await;
 
@@ -2502,6 +2561,7 @@ async fn resume_child_session(
                 &session_id,
                 "cancelled",
                 None,
+                &test_overrides,
             );
         }
         Ok((false, max_turns_reached)) => {
@@ -2530,6 +2590,7 @@ async fn resume_child_session(
                         &pid,
                         &notice,
                         &format!("child:{}", session_id),
+                        &test_overrides,
                     );
                 }
             } else {
@@ -2542,6 +2603,7 @@ async fn resume_child_session(
                     &session_id,
                     "completed",
                     None,
+                    &test_overrides,
                 );
             }
             broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
@@ -2565,6 +2627,7 @@ async fn resume_child_session(
                 &session_id,
                 &format!("error: {}", e),
                 None,
+                &test_overrides,
             );
         }
     }
@@ -2865,6 +2928,7 @@ async fn handle_server_request(
     shutdown: &ShutdownHandle,
     throttle: &crate::throttle::ProviderThrottle,
     chat_spawn_tx: &smol::channel::Sender<(String, String)>,
+    test_overrides: &SharedTestOverrides,
     req: &crate::protocol::Request,
 ) -> crate::protocol::Response {
     use crate::protocol::{Request, Response};
@@ -3055,6 +3119,7 @@ async fn handle_server_request(
                 target_session_id,
                 content,
                 sender_info,
+                &test_overrides,
             );
             Response::Ok
         }
@@ -3167,6 +3232,7 @@ fn notify_parent_of_child_completion(
     child_session_id: &str,
     status: &str,
     error_detail: Option<&str>,
+    test_overrides: &SharedTestOverrides,
 ) {
     let (parent_id, summary) = {
         let st = state.lock().unwrap();
@@ -3222,6 +3288,7 @@ fn notify_parent_of_child_completion(
         &pid,
         &notice,
         &format!("child:{}", child_session_id),
+        &test_overrides,
     );
 }
 

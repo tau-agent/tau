@@ -87,6 +87,8 @@ impl TestServer {
             models: vec![model],
             socket_path: sock_clone,
             db_path,
+            tool_executor_factory: None,
+            mock_tools: vec![],
         };
 
         std::thread::spawn(move || {
