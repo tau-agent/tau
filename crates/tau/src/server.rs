@@ -172,6 +172,15 @@ struct State {
 
 type SharedState = Arc<Mutex<State>>;
 
+use crate::truncate_str;
+
+fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(|e| {
+        eprintln!("warning: recovering from poisoned mutex");
+        e.into_inner()
+    })
+}
+
 /// Per-session async locks to serialize Chat requests.
 /// The outer std::Mutex is only held briefly to get/create a lock.
 /// The inner smol::lock::Mutex is held across the entire agent turn.
@@ -272,7 +281,7 @@ fn spawn_idle_sweep(
             }
             // Collect subscriber info on the async side (cheap, just lock state briefly)
             let subscribed_sessions: std::collections::HashSet<String> = {
-                let st = state.lock().unwrap();
+                let st = lock_state(&state);
                 st.subscribers
                     .iter()
                     .filter(|(_, subs)| !subs.is_empty())
@@ -536,7 +545,7 @@ pub async fn run() -> crate::Result<()> {
     // Auto-resume interrupted child sessions.
     {
         let resume_ids = {
-            let st = state.lock().unwrap();
+            let st = lock_state(&state);
             st.db.sessions_needing_resume().unwrap_or_else(|e| {
                 eprintln!("failed to query sessions needing resume: {}", e);
                 Vec::new()
@@ -562,7 +571,7 @@ pub async fn run() -> crate::Result<()> {
         // Also resume sessions that have pending queued messages but aren't
         // already being auto-resumed.
         let queued_ids = {
-            let st = state.lock().unwrap();
+            let st = lock_state(&state);
             st.db.sessions_with_queued_messages().unwrap_or_else(|e| {
                 eprintln!("failed to query sessions with queued messages: {}", e);
                 Vec::new()
@@ -573,7 +582,7 @@ pub async fn run() -> crate::Result<()> {
                 eprintln!("auto-resuming session {} (has queued messages)", sid);
                 // Set the has_queued flag so the agent loop will drain them.
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     st.has_queued
                         .entry(sid.clone())
                         .or_insert_with(|| Arc::new(AtomicBool::new(false)))
@@ -681,7 +690,7 @@ fn maybe_respawn_for_queued(
     test_overrides: &SharedTestOverrides,
 ) {
     let has_pending = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         st.has_queued
             .get(session_id)
             .map(|f| f.load(Ordering::Acquire))
@@ -707,7 +716,7 @@ fn maybe_respawn_for_queued(
 /// Queue a message for delivery to a target session.
 /// Persists immediately and sets the has_queued flag for in-flight agent loops.
 fn queue_message_to_session(state: &SharedState, target: &str, content: &str, sender_info: &str) {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     st.db.queue_message(target, content, sender_info).ok();
     st.has_queued
         .entry(target.to_string())
@@ -818,7 +827,7 @@ async fn handle_client(
             } => {
                 // Budget check (before acquiring state lock for creation)
                 let budget_error = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     if let Some(ref pid) = parent_id {
                         match st.db.get_session(pid)? {
                             Some(parent) => {
@@ -848,7 +857,7 @@ async fn handle_client(
                 }
 
                 let result = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
 
                     // Load parent for inheritance
                     let parent = match &parent_id {
@@ -951,7 +960,7 @@ async fn handle_client(
 
                 // Reset (and create) the cancel flag for this session.
                 let cancel_flag: Arc<AtomicBool> = {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     let flag = st
                         .cancel_flags
                         .entry(session_id.clone())
@@ -971,7 +980,7 @@ async fn handle_client(
                 let chat_result: Result<(bool, bool), crate::Error> = async {
                     // Load session
                     let session_data = {
-                        let st = state.lock().unwrap();
+                        let st = lock_state(&state);
                         match st.db.get_session(&session_id) {
                             Ok(Some(stored)) => {
                                 let messages = st.db.get_messages(&session_id)?;
@@ -1006,7 +1015,7 @@ async fn handle_client(
                             session_id,
                             repair_stubs.len()
                         );
-                        let st = state.lock().unwrap();
+                        let st = lock_state(&state);
                         for stub in &repair_stubs {
                             if let Err(e) = st.db.append_message(&session_id, stub) {
                                 eprintln!("db error persisting repair stub: {}", e);
@@ -1040,7 +1049,7 @@ async fn handle_client(
                         match cont_result {
                             Ok(_agent_result) => {
                                 // Messages already persisted incrementally via on_message
-                                let st = state.lock().unwrap();
+                                let st = lock_state(&state);
                                 messages = st.db.get_messages(&session_id)?;
                             }
                             Err(e) => {
@@ -1064,7 +1073,7 @@ async fn handle_client(
                             if let Some(msg) = result.message {
                                 let ctx_msg = Message::User(UserMessage::text(&msg.content));
                                 {
-                                    let st = state.lock().unwrap();
+                                    let st = lock_state(&state);
                                     if let Err(e) = st.db.append_message(&session_id, &ctx_msg) {
                                         eprintln!("db error persisting hook context: {}", e);
                                     }
@@ -1080,13 +1089,13 @@ async fn handle_client(
                     // Append user message (persisted to DB)
                     let user_msg = Message::User(UserMessage::text(&text));
                     {
-                        let st = state.lock().unwrap();
+                        let st = lock_state(&state);
                         st.db.append_message(&session_id, &user_msg)?;
                         // Auto-derive tagline from first user message if not set
                         if stored.tagline.is_none() {
                             let tagline = text.replace('\n', " ");
                             let tagline = if tagline.len() > 80 {
-                                format!("{}...", &tagline[..77])
+                                format!("{}...", truncate_str(&tagline, 77))
                             } else {
                                 tagline
                             };
@@ -1147,7 +1156,7 @@ async fn handle_client(
                     let was_cancelled = cancel_flag.load(Ordering::Relaxed);
                     if !was_cancelled {
                         let should = {
-                            let st = state.lock().unwrap();
+                            let st = lock_state(&state);
                             let messages = st.db.get_messages(&session_id).unwrap_or_default();
                             let ctx_tokens = compaction::estimate_context_tokens(&messages);
                             compaction::should_compact(
@@ -1236,7 +1245,7 @@ async fn handle_client(
                 // No ack is sent; the client waits for Stream/AgentDone/Cancelled.
                 let (tx, rx) = smol::channel::unbounded::<Response>();
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     st.subscribers
                         .entry(session_id.clone())
                         .or_default()
@@ -1245,7 +1254,7 @@ async fn handle_client(
 
                 // Send current agent phase so newly connected TUI shows correct state.
                 let phase_resp = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     let phase = st.phases.get(&session_id).copied().unwrap_or_default();
                     Response::Stream {
                         event: Box::new(crate::types::StreamEvent::Phase { phase }),
@@ -1314,7 +1323,7 @@ async fn handle_client(
                 // If require_ancestor is set, verify the target is a descendant
                 if let Some(ref ancestor) = require_ancestor {
                     let is_desc = {
-                        let st = state.lock().unwrap();
+                        let st = lock_state(&state);
                         st.db.is_descendant(&session_id, ancestor)
                     };
                     match is_desc {
@@ -1347,7 +1356,7 @@ async fn handle_client(
 
                 // Validate: session must exist and all sessions in the subtree must be idle
                 let subtree_ids = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     match st.db.get_session(&session_id)? {
                         Some(_) => Some(st.db.get_subtree_ids(&session_id)?),
                         None => None,
@@ -1389,7 +1398,7 @@ async fn handle_client(
 
                 // Archive in DB
                 {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     st.db.archive_session_tree(&session_id)?;
                 }
 
@@ -1403,7 +1412,7 @@ async fn handle_client(
 
                 // Clean up in-memory state for archived sessions
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     for sid in &subtree_ids {
                         st.cancel_flags.remove(sid);
                         st.has_queued.remove(sid);
@@ -1418,7 +1427,7 @@ async fn handle_client(
             Request::DeleteSession { session_id } => {
                 // Collect all session IDs in the subtree before deleting
                 let subtree_ids = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     let ids = st.db.get_subtree_ids(&session_id)?;
                     // Delete session and all descendants
                     st.db.delete_session_tree(&session_id)?;
@@ -1426,7 +1435,7 @@ async fn handle_client(
                     ids
                 };
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     for id in &subtree_ids {
                         st.waited_sessions.remove(id);
                     }
@@ -1442,14 +1451,14 @@ async fn handle_client(
             }
             Request::ListModels => {
                 let models = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     st.all_models.iter().map(model_info).collect::<Vec<_>>()
                 };
                 send(&mut writer, &Response::Models { models }).await?;
             }
             Request::SetCwd { session_id, cwd } => {
                 let result = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     st.db.update_cwd(&session_id, &cwd)
                 };
                 match result {
@@ -1472,7 +1481,7 @@ async fn handle_client(
                 model_id,
             } => {
                 let result = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     if let Some(model) = st.all_models.iter().find(|m| m.id == model_id) {
                         st.db.update_model(&session_id, model)?;
                         Ok(model_info(model))
@@ -1509,7 +1518,7 @@ async fn handle_client(
                     Ok(creds) => {
                         let provider_name = "anthropic".to_string();
                         let save_result = {
-                            let st = state.lock().unwrap();
+                            let st = lock_state(&state);
                             st.auth.set(&provider_name, AuthCredential::Oauth(creds))
                         };
                         if let Err(e) = save_result {
@@ -1543,7 +1552,7 @@ async fn handle_client(
             }
             Request::AuthStatus => {
                 let providers = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     st.auth.list().unwrap_or_default()
                 };
                 send(&mut writer, &Response::AuthStatus { providers }).await?;
@@ -1551,7 +1560,7 @@ async fn handle_client(
             Request::GetSubscriptionUsage => {
                 // Check cache, fetch if stale
                 let cache_result = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     let now = crate::types::timestamp_ms();
                     if let Some((ref usage, fetched_at)) = st.usage_cache {
                         if now.saturating_sub(fetched_at) < USAGE_CACHE_TTL_MS {
@@ -1569,7 +1578,7 @@ async fn handle_client(
                 } else {
                     // Fetch outside the lock
                     let token = {
-                        let st = state.lock().unwrap();
+                        let st = lock_state(&state);
                         st.auth.get_api_key("anthropic")
                     };
                     match token {
@@ -1586,7 +1595,7 @@ async fn handle_client(
                     Ok(usage) => {
                         // Update cache
                         {
-                            let mut st = state.lock().unwrap();
+                            let mut st = lock_state(&state);
                             st.usage_cache = Some((usage.clone(), crate::types::timestamp_ms()));
                         }
                         send(&mut writer, &Response::SubscriptionUsage { usage }).await?;
@@ -1615,7 +1624,7 @@ async fn handle_client(
                 // Track waited sessions so child completion doesn't send
                 // redundant notifications.
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     for sid in &session_ids {
                         st.waited_sessions.insert(sid.clone());
                     }
@@ -1639,7 +1648,7 @@ async fn handle_client(
                             });
                         } else {
                             // Session is idle -- get its last assistant message as summary
-                            let st = state.lock().unwrap();
+                            let st = lock_state(&state);
                             let (status, summary) = match st.db.get_session(sid) {
                                 Ok(Some(_)) => {
                                     let msgs = st.db.get_messages(sid).unwrap_or_default();
@@ -1673,7 +1682,7 @@ async fn handle_client(
 
                 // Remove from waited set.
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     for sid in &session_ids {
                         st.waited_sessions.remove(sid);
                     }
@@ -1694,7 +1703,7 @@ async fn handle_client(
                 // Track waited sessions so child completion doesn't send
                 // redundant notifications.
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     for sid in &session_ids {
                         st.waited_sessions.insert(sid.clone());
                     }
@@ -1711,7 +1720,7 @@ async fn handle_client(
                         if is_busy {
                             pending.push(sid.clone());
                         } else {
-                            let st = state.lock().unwrap();
+                            let st = lock_state(&state);
                             let (status, summary) = match st.db.get_session(sid) {
                                 Ok(Some(_)) => {
                                     let msgs = st.db.get_messages(sid).unwrap_or_default();
@@ -1749,7 +1758,7 @@ async fn handle_client(
 
                 // Remove from waited set.
                 {
-                    let mut st = state.lock().unwrap();
+                    let mut st = lock_state(&state);
                     for sid in &session_ids {
                         st.waited_sessions.remove(sid);
                     }
@@ -1777,7 +1786,7 @@ async fn handle_client(
             }
             Request::ReloadPlugins { session_id } => {
                 let cwd = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     st.db
                         .get_session(&session_id)
                         .ok()
@@ -2030,7 +2039,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     }
 
     let api_key = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         resolve_api_key(&st.auth, &st.config, &model.provider)?
     };
     let api_key = match api_key {
@@ -2051,7 +2060,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
 
     // Set up has_queued flag for this session
     let has_queued_flag = {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_state(state);
         st.has_queued
             .entry(session_id.to_string())
             .or_insert_with(|| Arc::new(AtomicBool::new(false)))
@@ -2099,11 +2108,11 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     };
 
     let registry_clone = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         st.registry.clone()
     };
     let child_budget = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         st.db
             .get_session(session_id)
             .ok()
@@ -2288,7 +2297,7 @@ async fn run_child_chat(
 
     // Set up cancel flag
     let cancel_flag: Arc<AtomicBool> = {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_state(&state);
         let flag = st
             .cancel_flags
             .entry(session_id.clone())
@@ -2300,7 +2309,7 @@ async fn run_child_chat(
     let chat_result: Result<(bool, bool), crate::Error> = async {
         // Load session
         let (stored, mut messages, cwd) = {
-            let st = state.lock().unwrap();
+            let st = lock_state(&state);
             match st.db.get_session(&session_id) {
                 Ok(Some(stored)) => {
                     let messages = st.db.get_messages(&session_id)?;
@@ -2341,7 +2350,7 @@ async fn run_child_chat(
         // Append user message
         let user_msg = Message::User(UserMessage::text(&text));
         {
-            let st = state.lock().unwrap();
+            let st = lock_state(&state);
             st.db.append_message(&session_id, &user_msg)?;
         }
         messages.push(user_msg);
@@ -2411,7 +2420,7 @@ async fn run_child_chat(
             if max_turns_reached {
                 // Notify the parent session that this child hit its step limit.
                 let parent_id = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     st.db
                         .get_session(&session_id)
                         .ok()
@@ -2517,7 +2526,7 @@ async fn resume_child_session(
 
     // Set up cancel flag
     let cancel_flag: Arc<AtomicBool> = {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_state(&state);
         let flag = st
             .cancel_flags
             .entry(session_id.clone())
@@ -2529,7 +2538,7 @@ async fn resume_child_session(
     let chat_result: Result<(bool, bool), crate::Error> = async {
         // Load session
         let (stored, mut messages, cwd) = {
-            let st = state.lock().unwrap();
+            let st = lock_state(&state);
             match st.db.get_session(&session_id) {
                 Ok(Some(stored)) => {
                     let messages = st.db.get_messages(&session_id)?;
@@ -2562,7 +2571,7 @@ async fn resume_child_session(
                 session_id,
                 repair_stubs.len()
             );
-            let st = state.lock().unwrap();
+            let st = lock_state(&state);
             for stub in &repair_stubs {
                 if let Err(e) = st.db.append_message(&session_id, stub) {
                     eprintln!("db error persisting repair stub: {}", e);
@@ -2641,7 +2650,7 @@ async fn resume_child_session(
         Ok((false, max_turns_reached)) => {
             if max_turns_reached {
                 let parent_id = {
-                    let st = state.lock().unwrap();
+                    let st = lock_state(&state);
                     st.db
                         .get_session(&session_id)
                         .ok()
@@ -2735,7 +2744,7 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
 
     // Load messages and find cut point
     let (messages, cut_idx) = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         let messages = st.db.get_messages(session_id)?;
         let cut = compaction::find_cut_point(&messages, settings.keep_recent_tokens);
         (messages, cut)
@@ -2764,7 +2773,7 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
     let summary_ctx = compaction::build_summarization_context(messages_to_summarize);
 
     let api_key = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         resolve_api_key(&st.auth, &st.config, &model.provider)?
     };
 
@@ -2775,7 +2784,7 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
     };
 
     let rx = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         st.registry.stream(model, &summary_ctx, &options)?
     };
 
@@ -2788,7 +2797,7 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
 
     // Get the DB row ID of the first kept message
     let keep_from_id = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         st.db
             .get_message_row_id(session_id, cut_idx)?
             .ok_or_else(|| crate::Error::Io("cut point message not found".into()))?
@@ -2796,13 +2805,13 @@ async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
 
     // Perform compaction in DB
     {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         st.db
             .compact_session(session_id, &summary, keep_from_id, ctx_before)?;
     }
 
     let after_tokens = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         let messages = st.db.get_messages(session_id)?;
         compaction::estimate_context_tokens(&messages)
     };
@@ -2840,7 +2849,7 @@ fn create_session_impl(
     tagline: &Option<String>,
 ) -> crate::protocol::Response {
     use crate::protocol::Response;
-    let st = state.lock().unwrap();
+    let st = lock_state(state);
 
     // Budget check
     if let Some(pid) = parent_id {
@@ -2929,7 +2938,7 @@ fn create_session_impl(
 }
 
 fn get_session_info_impl(state: &SharedState, session_id: &str) -> crate::protocol::Response {
-    let st = state.lock().unwrap();
+    let st = lock_state(state);
     match st.db.get_session(session_id) {
         Ok(Some(stored)) => {
             let messages = st.db.get_messages(session_id).unwrap_or_default();
@@ -2955,7 +2964,7 @@ fn get_session_info_impl(state: &SharedState, session_id: &str) -> crate::protoc
 }
 
 fn get_messages_impl(state: &SharedState, session_id: &str) -> crate::protocol::Response {
-    let st = state.lock().unwrap();
+    let st = lock_state(state);
     match st.db.get_messages(session_id) {
         Ok(messages) => crate::protocol::Response::Messages { messages },
         Err(e) => crate::protocol::Response::Error {
@@ -2965,7 +2974,7 @@ fn get_messages_impl(state: &SharedState, session_id: &str) -> crate::protocol::
 }
 
 fn list_sessions_impl(state: &SharedState, include_archived: bool) -> crate::protocol::Response {
-    let st = state.lock().unwrap();
+    let st = lock_state(state);
     match st.db.list_sessions(include_archived) {
         Ok(stored) => {
             let mut infos = Vec::new();
@@ -2990,7 +2999,7 @@ fn list_sessions_impl(state: &SharedState, include_archived: bool) -> crate::pro
 }
 
 fn cancel_chat_impl(state: &SharedState, session_id: &str) -> crate::protocol::Response {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     if let Some(flag) = st.cancel_flags.get(session_id) {
         flag.store(true, Ordering::Relaxed);
     } else {
@@ -3060,7 +3069,7 @@ async fn handle_server_request(
             // Track waited sessions so child completion doesn't send
             // redundant notifications.
             {
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(state);
                 for sid in session_ids {
                     st.waited_sessions.insert(sid.clone());
                 }
@@ -3082,7 +3091,7 @@ async fn handle_server_request(
                             summary: String::new(),
                         });
                     } else {
-                        let st = state.lock().unwrap();
+                        let st = lock_state(state);
                         let (status, summary) = match st.db.get_session(sid) {
                             Ok(Some(_)) => {
                                 let msgs = st.db.get_messages(sid).unwrap_or_default();
@@ -3114,7 +3123,7 @@ async fn handle_server_request(
 
             // Remove from waited set.
             {
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(state);
                 for sid in session_ids {
                     st.waited_sessions.remove(sid);
                 }
@@ -3132,7 +3141,7 @@ async fn handle_server_request(
 
             // Track waited sessions.
             {
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(state);
                 for sid in session_ids {
                     st.waited_sessions.insert(sid.clone());
                 }
@@ -3146,7 +3155,7 @@ async fn handle_server_request(
                     let is_busy = lock.try_lock().is_none();
 
                     if !is_busy {
-                        let st = state.lock().unwrap();
+                        let st = lock_state(state);
                         let (status, summary) = match st.db.get_session(sid) {
                             Ok(Some(_)) => {
                                 let msgs = st.db.get_messages(sid).unwrap_or_default();
@@ -3183,7 +3192,7 @@ async fn handle_server_request(
 
             // Remove from waited set.
             {
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(state);
                 for sid in session_ids {
                     st.waited_sessions.remove(sid);
                 }
@@ -3215,7 +3224,7 @@ async fn handle_server_request(
         } => {
             // If require_ancestor is set, verify the target is a descendant
             if let Some(ancestor) = require_ancestor {
-                let st = state.lock().unwrap();
+                let st = lock_state(state);
                 match st.db.is_descendant(session_id, ancestor) {
                     Ok(false) => {
                         return Response::Error {
@@ -3236,7 +3245,7 @@ async fn handle_server_request(
 
             // Validate: session must exist, get subtree IDs
             let subtree_ids = {
-                let st = state.lock().unwrap();
+                let st = lock_state(state);
                 match st.db.get_session(session_id) {
                     Ok(Some(_)) => match st.db.get_subtree_ids(session_id) {
                         Ok(ids) => ids,
@@ -3271,7 +3280,7 @@ async fn handle_server_request(
 
             // Archive in DB
             {
-                let st = state.lock().unwrap();
+                let st = lock_state(state);
                 if let Err(e) = st.db.archive_session_tree(session_id) {
                     return Response::Error {
                         message: e.to_string(),
@@ -3289,7 +3298,7 @@ async fn handle_server_request(
 
             // Clean up in-memory state
             {
-                let mut st = state.lock().unwrap();
+                let mut st = lock_state(state);
                 for sid in &subtree_ids {
                     st.cancel_flags.remove(sid);
                     st.has_queued.remove(sid);
@@ -3321,7 +3330,7 @@ fn notify_parent_of_child_completion(
     test_overrides: &SharedTestOverrides,
 ) {
     let (parent_id, summary) = {
-        let st = state.lock().unwrap();
+        let st = lock_state(state);
         // Check if parent is already waiting on this child.
         if st.waited_sessions.contains(child_session_id) {
             return;
@@ -3339,7 +3348,7 @@ fn notify_parent_of_child_completion(
             .map(|msgs| {
                 let text = last_assistant_text(&msgs);
                 if text.len() > 200 {
-                    format!("{}...", &text[..200])
+                    format!("{}...", truncate_str(&text, 200))
                 } else {
                     text
                 }
@@ -3395,7 +3404,7 @@ fn last_assistant_text(messages: &[Message]) -> String {
             if !text.is_empty() {
                 // Truncate to ~500 chars for summary
                 return if text.len() > 500 {
-                    format!("{}...", &text[..500])
+                    format!("{}...", truncate_str(&text, 500))
                 } else {
                     text
                 };
@@ -3408,7 +3417,7 @@ fn last_assistant_text(messages: &[Message]) -> String {
 /// Update the session's phase and broadcast a Phase event to subscribers.
 fn emit_phase(state: &SharedState, session_id: &str, phase: crate::types::AgentPhase) {
     {
-        let mut st = state.lock().unwrap();
+        let mut st = lock_state(state);
         st.phases.insert(session_id.to_string(), phase);
     }
     let resp = Response::Stream {
@@ -3418,7 +3427,7 @@ fn emit_phase(state: &SharedState, session_id: &str, phase: crate::types::AgentP
 }
 
 fn broadcast_to_subscribers(state: &SharedState, session_id: &str, resp: &Response) {
-    let mut st = state.lock().unwrap();
+    let mut st = lock_state(state);
     if let Some(subs) = st.subscribers.get_mut(session_id) {
         subs.retain(|tx| {
             match tx.try_send(resp.clone()) {

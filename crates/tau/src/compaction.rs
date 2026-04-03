@@ -222,9 +222,9 @@ fn serialize_messages(messages: &[Message]) -> String {
                     if let ToolResultContent::Text(t) = c {
                         // Truncate very long tool results
                         if t.text.len() > 2000 {
-                            out.push_str(&t.text[..1000]);
+                            out.push_str(crate::truncate_str(&t.text, 1000));
                             out.push_str("\n... [truncated] ...\n");
-                            out.push_str(&t.text[t.text.len() - 1000..]);
+                            out.push_str(crate::truncate_str_end(&t.text, 1000));
                         } else {
                             out.push_str(&t.text);
                         }

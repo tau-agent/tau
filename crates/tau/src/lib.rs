@@ -22,6 +22,35 @@ pub use provider::{Provider, ProviderRegistry};
 pub use types::*;
 
 // ---------------------------------------------------------------------------
+// String utilities
+// ---------------------------------------------------------------------------
+
+/// Truncate `s` to at most `max_bytes` bytes, rounding down to a char boundary.
+pub(crate) fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Truncate `s` to at most `max_bytes` bytes from the *end*, rounding up to a
+/// char boundary.
+pub(crate) fn truncate_str_end(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    &s[start..]
+}
+
+// ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
 
