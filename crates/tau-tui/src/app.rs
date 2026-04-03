@@ -1027,9 +1027,11 @@ impl App {
                 }
             }
             "/reload" => Some(Action::ReloadPlugins),
+            "/fork" => Some(Action::ForkSession),
+            "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /reload /sessions /session <id> /back /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /reload /sessions /session <id> /back /fork /new /help /quit"
                         .into(),
                 });
                 None
@@ -1520,6 +1522,10 @@ pub enum Action {
     ListChildren,
     /// Reload plugins for the current session.
     ReloadPlugins,
+    /// Fork the current session: create a new session inheriting model/cwd/system_prompt.
+    ForkSession,
+    /// Create a fresh session with default settings.
+    NewSession,
 }
 
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.

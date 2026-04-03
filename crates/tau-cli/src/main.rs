@@ -512,7 +512,7 @@ async fn cmd_chat(
             totals.cost = info.stats.cost;
             totals.context_tokens = info.stats.context_tokens;
         }
-        interactive_loop(&mut client, &session_id, &mut totals).await?;
+        interactive_loop(&mut client, session_id, &mut totals).await?;
     } else {
         // TUI mode
         tau_tui::run(
@@ -557,6 +557,37 @@ async fn get_session_info(
         (_, Some(e)) => Err(tau::Error::Io(e)),
         _ => Err(tau::Error::Io("no response".into())),
     }
+}
+
+/// Create a new session and return its ID.
+async fn cli_create_session(
+    client: &mut tau::client::Client,
+    model: Option<String>,
+    cwd: Option<String>,
+    parent_id: Option<String>,
+) -> tau::Result<String> {
+    client
+        .send(&tau::protocol::Request::CreateSession {
+            model,
+            provider: None,
+            system_prompt: None,
+            cwd,
+            parent_id,
+            child_budget: 0,
+            tagline: None,
+        })
+        .await?;
+
+    let mut created_id = None;
+    client
+        .recv_streaming(|resp| {
+            if let tau::protocol::Response::SessionCreated { session_id } = resp {
+                created_id = Some(session_id.clone());
+            }
+        })
+        .await?;
+
+    created_id.ok_or_else(|| tau::Error::Io("failed to create session".into()))
 }
 
 async fn send_and_print(
@@ -785,7 +816,7 @@ fn history_path() -> std::path::PathBuf {
 
 async fn interactive_loop(
     client: &mut tau::client::Client,
-    session_id: &str,
+    mut session_id: String,
     totals: &mut UsageTotals,
 ) -> tau::Result<()> {
     let hist = history_path();
@@ -815,7 +846,7 @@ async fn interactive_loop(
 
         // Handle slash commands
         if line.starts_with('/') {
-            match handle_slash_command(client, session_id, line, totals).await {
+            match handle_slash_command(client, &mut session_id, line, totals).await {
                 Ok(true) => break, // /quit
                 Ok(false) => continue,
                 Err(e) => {
@@ -828,12 +859,12 @@ async fn interactive_loop(
             }
         }
 
-        match send_and_print(client, session_id, line, totals).await {
+        match send_and_print(client, &session_id, line, totals).await {
             Ok(()) => {}
             Err(e) => {
                 if try_reconnect(client, &e).await {
                     // Retry the message after reconnecting
-                    if let Err(e) = send_and_print(client, session_id, line, totals).await {
+                    if let Err(e) = send_and_print(client, &session_id, line, totals).await {
                         eprintln!("error: {}", e);
                     }
                 } else {
@@ -945,7 +976,7 @@ async fn print_subscription_usage(client: &mut tau::client::Client) {
 /// Handle a slash command. Returns Ok(true) if the loop should exit.
 async fn handle_slash_command(
     client: &mut tau::client::Client,
-    session_id: &str,
+    session_id: &mut String,
     line: &str,
     totals: &mut UsageTotals,
 ) -> tau::Result<bool> {
@@ -1067,6 +1098,8 @@ async fn handle_slash_command(
             println!("  /model <id>    switch to a different model");
             println!("  /cwd           show working directory");
             println!("  /cwd <path>    change working directory");
+            println!("  /fork          fork session (inherit model/cwd)");
+            println!("  /new           create a fresh session");
             println!("  /reload        reload plugins");
             println!("  /help          show this help");
             println!("  /quit          exit");
@@ -1080,6 +1113,28 @@ async fn handle_slash_command(
                 .await?;
             client.recv_streaming(|_| {}).await?;
             eprintln!("Plugins reloaded");
+        }
+
+        "/fork" => {
+            // Create a new session inheriting model/cwd from the current session
+            let info = get_session_info(client, session_id).await?;
+            let new_id =
+                cli_create_session(client, Some(info.model), info.cwd, Some(session_id.clone()))
+                    .await?;
+            eprintln!("Forked to session {}", &new_id[..new_id.len().min(8)]);
+            *totals = UsageTotals::default();
+            *session_id = new_id;
+        }
+
+        "/new" => {
+            // Create a fresh session with defaults
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from));
+            let new_id = cli_create_session(client, None, cwd, None).await?;
+            eprintln!("New session {}", &new_id[..new_id.len().min(8)]);
+            *totals = UsageTotals::default();
+            *session_id = new_id;
         }
 
         _ => {

@@ -386,6 +386,65 @@ async fn run_inner(
                         }
                     }
                 }
+                Action::ForkSession => {
+                    // Create a new session inheriting model/cwd from the current session
+                    let info = fetch_session_info(&sid).await.ok();
+                    let model = info.as_ref().map(|i| i.model.clone());
+                    let cwd = info.as_ref().and_then(|i| i.cwd.clone());
+                    match create_session(model, cwd, Some(sid.clone())).await {
+                        Ok(new_id) => match fetch_session_info(&new_id).await {
+                            Ok(new_info) => {
+                                app.save_nav_state();
+                                app.switch_to_session(&new_info, vec![]);
+                                sub_switch_tx.send(new_id.clone()).await.ok();
+                                app.messages.push(crate::message::MessageItem::Status {
+                                    text: format!(
+                                        "Forked to session {}",
+                                        &new_id[..new_id.len().min(8)]
+                                    ),
+                                });
+                            }
+                            Err(e) => {
+                                app.messages.push(crate::message::MessageItem::Error {
+                                    text: format!("fork: failed to fetch new session: {}", e),
+                                });
+                            }
+                        },
+                        Err(e) => {
+                            app.messages.push(crate::message::MessageItem::Error {
+                                text: format!("fork: {}", e),
+                            });
+                        }
+                    }
+                }
+                Action::NewSession => {
+                    // Create a fresh session with defaults
+                    let cwd = std::env::current_dir()
+                        .ok()
+                        .and_then(|p| p.to_str().map(String::from));
+                    match create_session(None, cwd, None).await {
+                        Ok(new_id) => match fetch_session_info(&new_id).await {
+                            Ok(new_info) => {
+                                app.save_nav_state();
+                                app.switch_to_session(&new_info, vec![]);
+                                sub_switch_tx.send(new_id.clone()).await.ok();
+                                app.messages.push(crate::message::MessageItem::Status {
+                                    text: format!("New session {}", &new_id[..new_id.len().min(8)]),
+                                });
+                            }
+                            Err(e) => {
+                                app.messages.push(crate::message::MessageItem::Error {
+                                    text: format!("new: failed to fetch session: {}", e),
+                                });
+                            }
+                        },
+                        Err(e) => {
+                            app.messages.push(crate::message::MessageItem::Error {
+                                text: format!("new: {}", e),
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -426,6 +485,37 @@ async fn run_inner(
     } else {
         Ok(Some(app.session_id.clone()))
     }
+}
+
+/// Create a new session and return its ID.
+async fn create_session(
+    model: Option<String>,
+    cwd: Option<String>,
+    parent_id: Option<String>,
+) -> tau::Result<String> {
+    let mut client = Client::connect().await?;
+    client
+        .send(&Request::CreateSession {
+            model,
+            provider: None,
+            system_prompt: None,
+            cwd,
+            parent_id,
+            child_budget: 0,
+            tagline: None,
+        })
+        .await?;
+
+    let mut created_id = None;
+    client
+        .recv_streaming(|resp| {
+            if let Response::SessionCreated { session_id } = resp {
+                created_id = Some(session_id.clone());
+            }
+        })
+        .await?;
+
+    created_id.ok_or_else(|| tau::Error::Io("failed to create session".into()))
 }
 
 /// Fetch message history for a session (blocking request/response).
