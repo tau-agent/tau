@@ -109,6 +109,52 @@ impl TestServer {
         }
     }
 
+    /// Start a test server with custom config modifications.
+    fn start_with_config<F>(mock_responses: Vec<MockResponse>, configure: F) -> Self
+    where
+        F: FnOnce(tau::server::TestServerConfig) -> tau::server::TestServerConfig,
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("tau-test.sock");
+        let db_path = dir.path().join("test.db");
+        let sock_clone = sock_path.clone();
+
+        let model = mock_model();
+        let mut registry = tau::provider::ProviderRegistry::new();
+        registry.register(MockProvider::new(mock_responses));
+
+        let base_config = tau::server::TestServerConfig {
+            registry,
+            models: vec![model],
+            socket_path: sock_clone,
+            db_path,
+            tool_executor_factory: None,
+            mock_tools: vec![],
+        };
+        let config = configure(base_config);
+
+        std::thread::spawn(move || {
+            smol::block_on(async {
+                if let Err(e) = tau::server::run_with_config(config).await {
+                    eprintln!("test server error: {}", e);
+                }
+            });
+        });
+
+        for _ in 0..50 {
+            if sock_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(sock_path.exists(), "server socket did not appear");
+
+        TestServer {
+            sock_path,
+            _dir: dir,
+        }
+    }
+
     fn connect(&self) -> UnixStream {
         let conn = UnixStream::connect(&self.sock_path).unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(30)))
@@ -1108,4 +1154,207 @@ fn server_chat_with_mock_tool_success() {
     let conn4 = UnixStream::connect(&sock_path).unwrap();
     conn4.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     send_recv(&conn4, &Request::Shutdown { restart: false });
+}
+
+#[test]
+fn server_chat_with_mock_tool_error() {
+    // Test that a tool returning is_error=true is handled correctly:
+    // the error result is passed back to the LLM which can respond.
+    use std::sync::Arc;
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    let tool_handle_for_assert = mock_executor.handle();
+    tool_handle.on_tool("read_file", MockToolResponse::ToolError("permission denied".into()));
+
+    let provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/etc/shadow"}),
+        }]),
+        MockResponse::Text("Sorry, I can't read that file.".into()),
+    ]);
+    let provider_handle = provider.handle();
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || {
+            let h = tool_handle.clone();
+            Box::new(h.executor())
+        });
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.registry = {
+            let mut r = tau::provider::ProviderRegistry::new();
+            r.register(provider);
+            r
+        };
+        config.tool_executor_factory = Some(tool_factory);
+        config.mock_tools = vec![mock_tool("read_file", "Read a file")];
+        config
+    });
+    let conn = server.connect();
+
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "read /etc/shadow".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Verify tool result has is_error=true
+    let conn3 = server.connect();
+    let resp = send_recv(&conn3, &Request::GetMessages { session_id: sid.clone() });
+    match resp {
+        Response::Messages { messages } => {
+            assert_eq!(messages.len(), 4);
+            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if tr.is_error));
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Verify provider saw the error in context
+    let captures = provider_handle.captures();
+    assert_eq!(captures.len(), 2);
+    let second_ctx = &captures[1].context;
+    assert!(second_ctx.messages.iter().any(|m|
+        matches!(m, tau::types::Message::ToolResult(tr)
+            if tr.is_error && tr.content.iter().any(|c|
+                matches!(c, tau::types::ToolResultContent::Text(t) if t.text.contains("permission denied"))
+            )
+        )
+    ));
+
+    // Verify tool capture
+    let tool_captures = tool_handle_for_assert.captures();
+    assert_eq!(tool_captures.len(), 1);
+    assert_eq!(tool_captures[0].tool_call.name, "read_file");
+
+    server.shutdown();
+}
+
+#[test]
+fn server_chat_multi_tool_calls() {
+    // Test multiple tool calls in a single turn, each with different mock results.
+    use std::sync::Arc;
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    let tool_handle_for_assert = mock_executor.handle();
+    tool_handle.on_tool("read_file", MockToolResponse::Success("file content A".into()));
+    tool_handle.on_tool("list_dir", MockToolResponse::Success("file1.txt\nfile2.txt".into()));
+
+    let provider = MockProvider::new(vec![
+        MockResponse::ToolCalls(vec![
+            tau::types::ToolCall {
+                id: "tc1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "a.txt"}),
+            },
+            tau::types::ToolCall {
+                id: "tc2".into(),
+                name: "list_dir".into(),
+                arguments: serde_json::json!({"path": "/tmp"}),
+            },
+        ]),
+        MockResponse::Text("I found 2 files and read file A.".into()),
+    ]);
+    let provider_handle = provider.handle();
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || {
+            let h = tool_handle.clone();
+            Box::new(h.executor())
+        });
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.registry = {
+            let mut r = tau::provider::ProviderRegistry::new();
+            r.register(provider);
+            r
+        };
+        config.tool_executor_factory = Some(tool_factory);
+        config.mock_tools = vec![
+            mock_tool("read_file", "Read a file"),
+            mock_tool("list_dir", "List directory"),
+        ];
+        config
+    });
+    let conn = server.connect();
+
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "read a.txt and list /tmp".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Verify messages: user + assistant(2 tool calls) + 2 tool results + assistant(text)
+    let conn3 = server.connect();
+    let resp = send_recv(&conn3, &Request::GetMessages { session_id: sid.clone() });
+    match resp {
+        Response::Messages { messages } => {
+            // user + assistant + tool_result + tool_result + assistant = 5
+            assert_eq!(messages.len(), 5, "got {:?}", messages);
+            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if !tr.is_error));
+            assert!(matches!(&messages[3], tau::types::Message::ToolResult(tr) if !tr.is_error));
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Both tools were called
+    let tool_captures = tool_handle_for_assert.captures();
+    assert_eq!(tool_captures.len(), 2);
+    assert_eq!(tool_captures[0].tool_call.name, "read_file");
+    assert_eq!(tool_captures[1].tool_call.name, "list_dir");
+
+    // Provider's second call sees both tool results
+    let captures = provider_handle.captures();
+    assert_eq!(captures.len(), 2);
+    let tool_results: Vec<_> = captures[1].context.messages.iter()
+        .filter(|m| matches!(m, tau::types::Message::ToolResult(_)))
+        .collect();
+    assert_eq!(tool_results.len(), 2);
+
+    server.shutdown();
 }
