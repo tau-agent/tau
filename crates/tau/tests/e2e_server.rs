@@ -1358,3 +1358,204 @@ fn server_chat_multi_tool_calls() {
 
     server.shutdown();
 }
+
+#[test]
+fn server_chat_multi_turn_tool_loop() {
+    // Test: LLM makes tool call → gets result → makes another tool call → gets result → text
+    // This verifies the agent loop handles multiple consecutive tool turns correctly.
+    use std::sync::Arc;
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    let tool_handle_for_assert = mock_executor.handle();
+    tool_handle.on_tool("list_dir", MockToolResponse::Success("readme.md\nsrc/".into()));
+    tool_handle.on_tool("read_file", MockToolResponse::Success("# My Project\nHello world".into()));
+
+    let provider = MockProvider::new(vec![
+        // Turn 1: LLM calls list_dir
+        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+            id: "tc1".into(),
+            name: "list_dir".into(),
+            arguments: serde_json::json!({"path": "."}),
+        }]),
+        // Turn 2: LLM sees directory listing, calls read_file
+        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+            id: "tc2".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "readme.md"}),
+        }]),
+        // Turn 3: LLM has all info, responds with text
+        MockResponse::Text("The project README says Hello world.".into()),
+    ]);
+    let provider_handle = provider.handle();
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || {
+            let h = tool_handle.clone();
+            Box::new(h.executor())
+        });
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.registry = {
+            let mut r = tau::provider::ProviderRegistry::new();
+            r.register(provider);
+            r
+        };
+        config.tool_executor_factory = Some(tool_factory);
+        config.mock_tools = vec![
+            mock_tool("list_dir", "List directory contents"),
+            mock_tool("read_file", "Read a file"),
+        ];
+        config
+    });
+    let conn = server.connect();
+
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "summarize the project".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Verify messages:
+    // user + assistant(tc1) + tool_result_1 + assistant(tc2) + tool_result_2 + assistant(text) = 6
+    let conn3 = server.connect();
+    let resp = send_recv(&conn3, &Request::GetMessages { session_id: sid.clone() });
+    match resp {
+        Response::Messages { messages } => {
+            assert_eq!(messages.len(), 6,
+                "expected 6 messages (user + 2*(assistant+tool_result) + final_assistant), got {}: {:?}",
+                messages.len(), messages);
+            assert!(matches!(&messages[0], tau::types::Message::User(_)));
+            assert!(matches!(&messages[1], tau::types::Message::Assistant(_)));
+            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if !tr.is_error));
+            assert!(matches!(&messages[3], tau::types::Message::Assistant(_)));
+            assert!(matches!(&messages[4], tau::types::Message::ToolResult(tr) if !tr.is_error));
+            assert!(matches!(&messages[5], tau::types::Message::Assistant(a) if a.text().contains("Hello world")));
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Verify 3 LLM calls with growing context
+    let captures = provider_handle.captures();
+    assert_eq!(captures.len(), 3);
+
+    // Call 1: just user message
+    assert_eq!(captures[0].context.messages.len(), 1);
+
+    // Call 2: user + assistant(tc1) + tool_result_1
+    assert_eq!(captures[1].context.messages.len(), 3);
+    assert!(matches!(&captures[1].context.messages[2],
+        tau::types::Message::ToolResult(tr) if tr.tool_name == "list_dir"));
+
+    // Call 3: user + assistant(tc1) + tool_result_1 + assistant(tc2) + tool_result_2
+    assert_eq!(captures[2].context.messages.len(), 5);
+    assert!(matches!(&captures[2].context.messages[4],
+        tau::types::Message::ToolResult(tr) if tr.tool_name == "read_file"));
+
+    // Verify both tools were called in order
+    let tool_captures = tool_handle_for_assert.captures();
+    assert_eq!(tool_captures.len(), 2);
+    assert_eq!(tool_captures[0].tool_call.name, "list_dir");
+    assert_eq!(tool_captures[1].tool_call.name, "read_file");
+
+    server.shutdown();
+}
+
+#[test]
+fn server_chat_tool_schemas_in_context() {
+    // Verify that mock tool schemas appear in the Context.tools field
+    // that the provider sees.
+    use std::sync::Arc;
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    tool_handle.set_default(MockToolResponse::Success("ok".into()));
+
+    let provider = MockProvider::new(vec![
+        MockResponse::Text("I see the tools.".into()),
+    ]);
+    let provider_handle = provider.handle();
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || {
+            let h = tool_handle.clone();
+            Box::new(h.executor())
+        });
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.registry = {
+            let mut r = tau::provider::ProviderRegistry::new();
+            r.register(provider);
+            r
+        };
+        config.tool_executor_factory = Some(tool_factory);
+        config.mock_tools = vec![
+            mock_tool("bash", "Execute a shell command"),
+            mock_tool("read_file", "Read contents of a file"),
+            mock_tool("write_file", "Write contents to a file"),
+        ];
+        config
+    });
+    let conn = server.connect();
+
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Verify mock tools appeared in the context
+    let captures = provider_handle.captures();
+    assert_eq!(captures.len(), 1);
+    let tools = &captures[0].context.tools;
+    assert_eq!(tools.len(), 3, "expected 3 mock tools, got {}: {:?}", tools.len(), tools);
+
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(tool_names.contains(&"bash"), "tools: {:?}", tool_names);
+    assert!(tool_names.contains(&"read_file"), "tools: {:?}", tool_names);
+    assert!(tool_names.contains(&"write_file"), "tools: {:?}", tool_names);
+
+    server.shutdown();
+}
