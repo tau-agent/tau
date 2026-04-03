@@ -31,6 +31,7 @@ fn session_tree_budget_enforcement() {
         tagline: None,
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     };
     db.create_session(&root).unwrap();
 
@@ -47,6 +48,7 @@ fn session_tree_budget_enforcement() {
         tagline: None,
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     };
     db.create_session(&c1).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 1);
@@ -64,6 +66,7 @@ fn session_tree_budget_enforcement() {
         tagline: None,
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     };
     db.create_session(&c2).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 3); // 1 + (1+1) = 3
@@ -91,6 +94,7 @@ fn session_tree_budget_enforcement() {
         tagline: None,
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     };
     db.create_session(&gc1).unwrap();
     assert_eq!(db.budget_used("c2").unwrap(), 1);
@@ -130,6 +134,7 @@ fn session_tree_recursive_delete() {
             tagline: None,
             archived: false,
             last_exit_status: None,
+            last_phase: None,
         })
         .unwrap();
     }
@@ -176,6 +181,7 @@ fn session_model_inheritance() {
         tagline: None,
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     })
     .unwrap();
 
@@ -214,6 +220,7 @@ fn session_info_includes_tree_fields() {
         tagline: None,
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     })
     .unwrap();
 
@@ -229,6 +236,7 @@ fn session_info_includes_tree_fields() {
         tagline: None,
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     })
     .unwrap();
 

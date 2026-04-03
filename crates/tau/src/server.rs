@@ -494,6 +494,8 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         next_msg_id: 0,
     }));
 
+    restore_phases_from_db(&state);
+
     let shutdown = ShutdownHandle::new();
 
     let shutdown_watcher = shutdown.clone();
@@ -598,6 +600,8 @@ pub async fn run() -> crate::Result<()> {
         reply_waiters: HashMap::new(),
         next_msg_id: 0,
     }));
+
+    restore_phases_from_db(&state);
 
     let shutdown = ShutdownHandle::new();
 
@@ -3078,6 +3082,7 @@ fn create_session_impl(
         tagline: tagline.clone(),
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     };
     match st.db.create_session(&stored) {
         Ok(()) => Response::SessionCreated { session_id: id },
@@ -3627,10 +3632,16 @@ fn last_assistant_text(messages: &[Message]) -> String {
 }
 
 /// Update the session's phase and broadcast a Phase event to subscribers.
+/// Also persists the phase to DB for meaningful transitions so it survives restarts.
 fn emit_phase(state: &SharedState, session_id: &str, phase: crate::types::AgentPhase) {
     {
         let mut st = lock_state(state);
         st.phases.insert(session_id.to_string(), phase);
+        // Persist meaningful phase transitions to DB.
+        let label = phase.label().trim_end_matches("...");
+        if let Err(e) = st.db.update_phase(session_id, label) {
+            eprintln!("warning: failed to persist phase for {}: {}", session_id, e);
+        }
     }
     let resp = Response::Stream {
         event: Box::new(crate::types::StreamEvent::Phase { phase }),
@@ -3684,6 +3695,39 @@ async fn send<W: futures::io::AsyncWrite + Unpin>(
         .await
         .map_err(|e| crate::Error::Io(e.to_string()))?;
     Ok(())
+}
+
+/// Restore `State.phases` from persisted `last_phase` values in the database.
+/// Called once at startup so sessions show their last-known state instead of
+/// defaulting to "idle".
+fn restore_phases_from_db(state: &SharedState) {
+    let mut st = lock_state(state);
+    let sessions = match st.db.list_sessions(false) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: failed to load sessions for phase restore: {}", e);
+            return;
+        }
+    };
+    for s in sessions {
+        if let Some(ref phase_str) = s.last_phase {
+            let phase = match phase_str.as_str() {
+                "idle" => crate::types::AgentPhase::Idle,
+                "thinking" => crate::types::AgentPhase::Thinking,
+                "working" => crate::types::AgentPhase::Responding,
+                "running tools" => crate::types::AgentPhase::ToolExec,
+                "sending request" => crate::types::AgentPhase::Connecting,
+                "preparing" => crate::types::AgentPhase::Preparing,
+                "compacting" => crate::types::AgentPhase::Compacting,
+                "rate limited" => crate::types::AgentPhase::RateLimited,
+                "waiting" => crate::types::AgentPhase::Waiting,
+                _ => crate::types::AgentPhase::Idle,
+            };
+            if phase != crate::types::AgentPhase::Idle {
+                st.phases.insert(s.id.clone(), phase);
+            }
+        }
+    }
 }
 
 fn prepare_socket_dir(sock: &Path) -> crate::Result<()> {

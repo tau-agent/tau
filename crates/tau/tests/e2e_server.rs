@@ -821,6 +821,7 @@ fn queue_message_persists_across_operations() {
         tagline: None,
         archived: false,
         last_exit_status: None,
+        last_phase: None,
     })
     .unwrap();
 
