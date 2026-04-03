@@ -903,6 +903,7 @@ async fn handle_client(
                 parent_id,
                 child_budget,
                 tagline,
+                auto_archive,
             } => {
                 // Atomic budget check + session creation (single lock hold)
                 let resp = create_session_impl(
@@ -914,6 +915,7 @@ async fn handle_client(
                     &parent_id,
                     child_budget,
                     &tagline,
+                    auto_archive,
                 );
 
                 // If created and no explicit system prompt, set up plugins
@@ -1727,6 +1729,7 @@ async fn handle_client(
                 // Close receiver so the sender is pruned on next notify.
                 drop(notify_rx);
 
+                auto_archive_done_sessions(&state, &results);
                 send(&mut writer, &Response::SessionsCompleted { results }).await?;
             }
             Request::WaitAnySessions {
@@ -1808,6 +1811,7 @@ async fn handle_client(
                 }
                 drop(notify_rx);
 
+                auto_archive_done_sessions(&state, &results);
                 send(&mut writer, &Response::SessionsCompleted { results }).await?;
             }
             Request::QueueMessage {
@@ -3000,6 +3004,7 @@ fn create_session_impl(
     parent_id: &Option<String>,
     child_budget: u32,
     tagline: &Option<String>,
+    auto_archive: bool,
 ) -> crate::protocol::Response {
     use crate::protocol::Response;
     let st = lock_state(state);
@@ -3083,6 +3088,7 @@ fn create_session_impl(
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive,
     };
     match st.db.create_session(&stored) {
         Ok(()) => Response::SessionCreated { session_id: id },
@@ -3189,6 +3195,7 @@ async fn handle_server_request(
             parent_id,
             child_budget,
             tagline,
+            auto_archive,
         } => create_session_impl(
             state,
             model_id,
@@ -3198,6 +3205,7 @@ async fn handle_server_request(
             parent_id,
             *child_budget,
             tagline,
+            *auto_archive,
         ),
         Request::GetSessionInfo { session_id } => get_session_info_impl(state, session_id),
         Request::GetMessages { session_id } => get_messages_impl(state, session_id),
@@ -3282,6 +3290,7 @@ async fn handle_server_request(
                 }
             }
 
+            auto_archive_done_sessions(state, &results);
             Response::SessionsCompleted { results }
         }
         Request::WaitAnySessions {
@@ -3351,6 +3360,7 @@ async fn handle_server_request(
                 }
             }
 
+            auto_archive_done_sessions(state, &results);
             Response::SessionsCompleted { results }
         }
         Request::QueueMessage {
@@ -3695,6 +3705,26 @@ async fn send<W: futures::io::AsyncWrite + Unpin>(
         .await
         .map_err(|e| crate::Error::Io(e.to_string()))?;
     Ok(())
+}
+
+/// Auto-archive completed sessions that have `auto_archive=true`.
+/// Called after WaitSessions/WaitAnySessions collects results.
+fn auto_archive_done_sessions(state: &SharedState, results: &[crate::protocol::SessionResult]) {
+    let st = lock_state(state);
+    for r in results {
+        if r.status != "done" {
+            continue;
+        }
+        let should_archive = st
+            .db
+            .get_session(&r.session_id)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.auto_archive);
+        if should_archive && let Err(e) = st.db.archive_session_tree(&r.session_id) {
+            eprintln!("auto-archive session {} failed: {}", r.session_id, e);
+        }
+    }
 }
 
 /// Restore `State.phases` from persisted `last_phase` values in the database.

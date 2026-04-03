@@ -40,6 +40,10 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                     "tagline": {
                         "type": "string",
                         "description": "Short description of what the child session will work on (shown in session picker)"
+                    },
+                    "auto_archive": {
+                        "type": "boolean",
+                        "description": "If true, automatically archive this child session after it completes and is joined (default false)"
                     }
                 },
                 "required": ["task"]

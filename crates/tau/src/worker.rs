@@ -363,6 +363,10 @@ fn handle_session_tool(
                 parent_id: session_id.map(String::from),
                 child_budget,
                 tagline,
+                auto_archive: args
+                    .get("auto_archive")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
             };
             let resp = match server_request(writer, reader, create_req) {
                 Ok(r) => r,

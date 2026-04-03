@@ -503,6 +503,7 @@ async fn create_session(
             parent_id,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         })
         .await?;
 

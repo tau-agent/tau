@@ -33,6 +33,9 @@ pub enum Request {
         /// Short description of the session's task.
         #[serde(skip_serializing_if = "Option::is_none")]
         tagline: Option<String>,
+        /// When true, auto-archive this session after completion+join.
+        #[serde(default)]
+        auto_archive: bool,
     },
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },

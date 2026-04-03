@@ -32,6 +32,7 @@ fn session_tree_budget_enforcement() {
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive: false,
     };
     db.create_session(&root).unwrap();
 
@@ -49,6 +50,7 @@ fn session_tree_budget_enforcement() {
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive: false,
     };
     db.create_session(&c1).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 1);
@@ -67,6 +69,7 @@ fn session_tree_budget_enforcement() {
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive: false,
     };
     db.create_session(&c2).unwrap();
     assert_eq!(db.budget_used("root").unwrap(), 3); // 1 + (1+1) = 3
@@ -95,6 +98,7 @@ fn session_tree_budget_enforcement() {
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive: false,
     };
     db.create_session(&gc1).unwrap();
     assert_eq!(db.budget_used("c2").unwrap(), 1);
@@ -135,6 +139,7 @@ fn session_tree_recursive_delete() {
             archived: false,
             last_exit_status: None,
             last_phase: None,
+            auto_archive: false,
         })
         .unwrap();
     }
@@ -182,6 +187,7 @@ fn session_model_inheritance() {
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive: false,
     })
     .unwrap();
 
@@ -221,6 +227,7 @@ fn session_info_includes_tree_fields() {
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive: false,
     })
     .unwrap();
 
@@ -237,6 +244,7 @@ fn session_info_includes_tree_fields() {
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive: false,
     })
     .unwrap();
 
@@ -297,6 +305,7 @@ fn protocol_create_session_with_parent() {
         parent_id: Some("s1".into()),
         child_budget: 5,
         tagline: None,
+        auto_archive: false,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains("parent_id"));
@@ -405,6 +414,7 @@ fn spawn_child_chat_produces_messages() {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -423,6 +433,7 @@ fn spawn_child_chat_produces_messages() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -510,6 +521,7 @@ fn spawn_multiple_children_wait_all() {
             parent_id: None,
             child_budget: 10,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -530,6 +542,7 @@ fn spawn_multiple_children_wait_all() {
                 parent_id: Some(parent_id.clone()),
                 child_budget: 0,
                 tagline: None,
+                auto_archive: false,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -641,6 +654,7 @@ fn spawn_child_inherits_parent_model_and_cwd() {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -659,6 +673,7 @@ fn spawn_child_inherits_parent_model_and_cwd() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -711,6 +726,7 @@ fn wait_sessions_idle_returns_done() {
                 parent_id: None,
                 child_budget: 0,
                 tagline: None,
+                auto_archive: false,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -757,6 +773,7 @@ fn spawn_delete_parent_cascades() {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -774,6 +791,7 @@ fn spawn_delete_parent_cascades() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -835,6 +853,7 @@ fn spawn_cancel_child() {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -852,6 +871,7 @@ fn spawn_cancel_child() {
             parent_id: Some(parent_id),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -890,6 +910,7 @@ fn wait_sessions_returns_summary() {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -907,6 +928,7 @@ fn wait_sessions_returns_summary() {
             parent_id: Some(parent_id),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -992,6 +1014,7 @@ fn wait_any_sessions_idle_returns_all() {
                 parent_id: None,
                 child_budget: 0,
                 tagline: None,
+                auto_archive: false,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -1041,6 +1064,7 @@ fn wait_any_sessions_returns_only_completed() {
             parent_id: None,
             child_budget: 10,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1059,6 +1083,7 @@ fn wait_any_sessions_returns_only_completed() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1088,6 +1113,7 @@ fn wait_any_sessions_returns_only_completed() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1215,6 +1241,7 @@ fn second_child_completion_notifies_parent() {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1233,6 +1260,7 @@ fn second_child_completion_notifies_parent() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1495,6 +1523,7 @@ fn await_reply_e2e() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1512,6 +1541,7 @@ fn await_reply_e2e() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,

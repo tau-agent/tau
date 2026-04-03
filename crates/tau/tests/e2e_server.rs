@@ -30,6 +30,7 @@ fn server_create_session_and_list() {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            auto_archive: false,
         },
     );
     let session_id = match resp {
@@ -75,6 +76,7 @@ fn server_create_child_session_with_budget() {
             parent_id: None,
             child_budget: 3,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -93,6 +95,7 @@ fn server_create_child_session_with_budget() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -149,6 +152,7 @@ fn server_budget_exceeded() {
             parent_id: None,
             child_budget: 1,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -167,6 +171,7 @@ fn server_budget_exceeded() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { .. } => {}
@@ -185,6 +190,7 @@ fn server_budget_exceeded() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::Error { message } => {
@@ -216,6 +222,7 @@ fn server_delete_session_tree() {
             parent_id: None,
             child_budget: 5,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -233,6 +240,7 @@ fn server_delete_session_tree() {
             parent_id: Some(parent_id.clone()),
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -293,6 +301,7 @@ fn server_wait_sessions_immediate() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -336,6 +345,7 @@ fn server_chat_simple_text() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -409,6 +419,7 @@ fn server_chat_tool_call_loop() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -480,6 +491,7 @@ fn server_chat_error_preserves_partial_messages() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -575,6 +587,7 @@ fn server_session_resume_after_restart() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -693,6 +706,7 @@ fn steer_queues_message_for_idle_session() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -822,6 +836,7 @@ fn queue_message_persists_across_operations() {
         archived: false,
         last_exit_status: None,
         last_phase: None,
+        auto_archive: false,
     })
     .unwrap();
 
@@ -924,6 +939,7 @@ fn server_chat_with_mock_tool_success() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1053,6 +1069,7 @@ fn server_chat_with_mock_tool_error() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1171,6 +1188,7 @@ fn server_chat_multi_tool_calls() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1293,6 +1311,7 @@ fn server_chat_multi_turn_tool_loop() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1411,6 +1430,7 @@ fn server_chat_tool_schemas_in_context() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1524,6 +1544,7 @@ fn session_dump_and_replay() {
             parent_id: None,
             child_budget: 0,
             tagline: None,
+            auto_archive: false,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
