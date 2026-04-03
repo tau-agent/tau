@@ -3512,13 +3512,14 @@ async fn handle_server_request(
                 std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
             let mut results = Vec::new();
 
-            // Track waited sessions so child completion doesn't send
-            // redundant notifications.
+            // Register a waiter channel to be notified on session completion.
+            let (notify_tx, notify_rx) = smol::channel::bounded::<()>(1);
             {
                 let mut st = lock_state(state);
                 for sid in session_ids {
                     st.waited_sessions.insert(sid.clone());
                 }
+                st.session_done_waiters.push(notify_tx);
             }
 
             loop {
@@ -3564,16 +3565,23 @@ async fn handle_server_request(
                     break;
                 }
 
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                // Wait for a session-done notification or timeout.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let _ = futures::future::select(
+                    std::pin::pin!(notify_rx.recv()),
+                    std::pin::pin!(smol::Timer::after(remaining)),
+                )
+                .await;
             }
 
-            // Remove from waited set.
+            // Remove from waited set and drop our notifier.
             {
                 let mut st = lock_state(state);
                 for sid in session_ids {
                     st.waited_sessions.remove(sid);
                 }
             }
+            drop(notify_rx);
 
             auto_archive_done_sessions(state, &results);
             Response::SessionsCompleted { results }
@@ -3586,12 +3594,14 @@ async fn handle_server_request(
                 std::time::Instant::now() + std::time::Duration::from_secs(*timeout_secs);
             let results;
 
-            // Track waited sessions.
+            // Register a waiter channel to be notified on session completion.
+            let (notify_tx, notify_rx) = smol::channel::bounded::<()>(1);
             {
                 let mut st = lock_state(state);
                 for sid in session_ids {
                     st.waited_sessions.insert(sid.clone());
                 }
+                st.session_done_waiters.push(notify_tx);
             }
 
             loop {
@@ -3634,16 +3644,23 @@ async fn handle_server_request(
                     break;
                 }
 
-                smol::Timer::after(std::time::Duration::from_secs(1)).await;
+                // Wait for a session-done notification or timeout.
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let _ = futures::future::select(
+                    std::pin::pin!(notify_rx.recv()),
+                    std::pin::pin!(smol::Timer::after(remaining)),
+                )
+                .await;
             }
 
-            // Remove from waited set.
+            // Remove from waited set and drop our notifier.
             {
                 let mut st = lock_state(state);
                 for sid in session_ids {
                     st.waited_sessions.remove(sid);
                 }
             }
+            drop(notify_rx);
 
             auto_archive_done_sessions(state, &results);
             Response::SessionsCompleted { results }
