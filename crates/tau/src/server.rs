@@ -1815,6 +1815,30 @@ async fn handle_client(
                     }
                 }
             }
+            Request::GcSessions { older_than_days } => {
+                let older_than_ms = {
+                    let now = crate::types::timestamp_ms();
+                    now.saturating_sub(older_than_days * 24 * 60 * 60 * 1000)
+                };
+                let result = {
+                    let st = lock_state(&state);
+                    st.db.gc_archived_sessions(older_than_ms)
+                };
+                match result {
+                    Ok(deleted) => {
+                        send(&mut writer, &Response::GcComplete { deleted }).await?;
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             Request::Shutdown { restart } => {
                 shutdown.request_shutdown(restart);
                 send(&mut writer, &Response::Ok).await?;

@@ -99,6 +99,11 @@ pub enum Request {
     },
     /// Reload plugins for a session (destroy + re-init).
     ReloadPlugins { session_id: String },
+    /// Garbage-collect archived sessions older than a threshold.
+    GcSessions {
+        /// Delete archived sessions older than this many days.
+        older_than_days: u64,
+    },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -154,6 +159,8 @@ pub enum Response {
     AgentDone,
     /// Success (generic ack).
     Ok,
+    /// Garbage-collection result.
+    GcComplete { deleted: usize },
     /// Error.
     Error { message: String },
 }

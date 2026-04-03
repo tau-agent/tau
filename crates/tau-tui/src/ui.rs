@@ -413,12 +413,14 @@ fn format_idle_time(last_activity: i64) -> String {
 fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     use ratatui::widgets::Clear;
 
+    let filtered = app.picker_filtered_indices();
+
     // Use most of the screen width
     let picker_width: u16 = (area.width * 3 / 4)
         .max(50)
         .min(area.width.saturating_sub(2));
     // Height: sessions + footer(1) + borders(2), clamped to area
-    let content_lines = app.picker_sessions.len().max(1) as u16;
+    let content_lines = filtered.len().max(1) as u16;
     let picker_height = (content_lines + 3).min(area.height.saturating_sub(2));
 
     // Position: centered
@@ -429,6 +431,15 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     // Clear the area behind the overlay
     frame.render_widget(Clear, picker_area);
 
+    // Title includes filter when active
+    let title = if !app.picker_filter.is_empty() {
+        format!(" Sessions [/{}] ", app.picker_filter)
+    } else if app.picker_filter_mode {
+        " Sessions [/] ".to_string()
+    } else {
+        " Sessions ".to_string()
+    };
+
     // Border
     let border_style = Style::default().fg(theme.accent.to_ratatui());
     let block = Block::default()
@@ -436,7 +447,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
         .border_set(border::ROUNDED)
         .border_style(border_style)
         .title(Span::styled(
-            " Sessions ",
+            title,
             Style::default()
                 .fg(theme.accent.to_ratatui())
                 .add_modifier(ratatui::style::Modifier::BOLD),
@@ -451,20 +462,41 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let w = inner.width as usize;
 
+    // Build a set of filtered indices for quick lookup and tree building
+    let filtered_set: std::collections::HashSet<usize> = filtered.iter().copied().collect();
+
     if app.picker_sessions.is_empty() {
         lines.push(Line::from(Span::styled(
             " (loading...)",
             theme.fg(theme.muted),
         )));
+    } else if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no matches)",
+            theme.fg(theme.muted),
+        )));
     } else {
         let tree = build_session_tree(&app.picker_sessions);
 
+        // Map from session_idx -> position in filtered list (for cursor tracking)
+        let mut filtered_pos: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        for (pos, &idx) in filtered.iter().enumerate() {
+            filtered_pos.insert(idx, pos);
+        }
+
         for &(session_idx, depth, is_last) in &tree {
+            // Skip sessions not in the filtered set
+            if !filtered_set.contains(&session_idx) {
+                continue;
+            }
+
             let session = &app.picker_sessions[session_idx];
             let is_current = session.id == app.session_id;
-            let is_selected = session_idx == app.picker_cursor;
-            let is_confirming_delete = app.picker_confirm_delete == Some(session_idx);
-            let is_confirming_archive = app.picker_confirm_archive == Some(session_idx);
+            let cursor_pos = filtered_pos.get(&session_idx).copied();
+            let is_selected = cursor_pos == Some(app.picker_cursor);
+            let is_confirming_delete = cursor_pos == app.picker_confirm_delete;
+            let is_confirming_archive = cursor_pos == app.picker_confirm_archive;
 
             // Delete confirmation
             if is_confirming_delete {
@@ -502,8 +534,8 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut used = 0usize;
 
-            // Tree indent with connectors
-            let connector = if depth == 0 {
+            // Tree indent with connectors (flatten when filtering)
+            let connector = if !app.picker_filter.is_empty() || depth == 0 {
                 String::new()
             } else if is_last {
                 format!("{}└── ", "│   ".repeat(depth - 1))
@@ -614,7 +646,11 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     }
 
     // Footer hint
-    let hint = " j/k nav  enter switch  A archive  D del  tab/esc close";
+    let hint = if app.picker_filter_mode {
+        " type to filter  enter accept  esc clear"
+    } else {
+        " /search  j/k nav  enter switch  A archive  D del  tab/esc close"
+    };
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()
     } else {

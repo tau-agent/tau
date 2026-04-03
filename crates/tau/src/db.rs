@@ -877,6 +877,21 @@ impl Db {
         Ok(exists)
     }
 
+    /// Delete archived sessions older than `older_than_ms` (millisecond timestamp).
+    ///
+    /// Relies on `ON DELETE CASCADE` to clean up associated messages and
+    /// queued_messages rows.  Returns the number of sessions deleted.
+    pub fn gc_archived_sessions(&self, older_than_ms: u64) -> crate::Result<usize> {
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM sessions WHERE archived = 1 AND created_at < ?1",
+                params![older_than_ms as i64],
+            )
+            .map_err(|e| crate::Error::Io(format!("gc_archived_sessions: {}", e)))?;
+        Ok(count)
+    }
+
     /// Return session IDs that have pending queued messages.
     pub fn sessions_with_queued_messages(&self) -> crate::Result<Vec<String>> {
         let mut stmt = self
@@ -1608,5 +1623,72 @@ mod tests {
         let stats = db.session_stats("s1").unwrap().unwrap();
         // Should use the good message's tokens, not the error one
         assert_eq!(stats.last_input_tokens, Some(120)); // 100 + 20 + 0
+    }
+
+    #[test]
+    fn gc_archived_sessions() {
+        let db = Db::open_memory().unwrap();
+
+        // Create an old archived session (created 10 days ago)
+        let ten_days_ago = (crate::types::timestamp_ms() as i64) - 10 * 86_400_000;
+        db.create_session(&StoredSession {
+            id: "old_archived".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: ten_days_ago,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: true,
+        })
+        .unwrap();
+        db.append_message("old_archived", &Message::User(UserMessage::text("hello")))
+            .unwrap();
+
+        // Create a recent archived session (created 1 day ago)
+        let one_day_ago = (crate::types::timestamp_ms() as i64) - 86_400_000;
+        db.create_session(&StoredSession {
+            id: "new_archived".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: one_day_ago,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: true,
+        })
+        .unwrap();
+
+        // Create an old non-archived session (should not be deleted)
+        db.create_session(&StoredSession {
+            id: "old_active".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: ten_days_ago,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+        })
+        .unwrap();
+
+        // GC with threshold of 7 days
+        let threshold_ms = (crate::types::timestamp_ms() as i64) - 7 * 86_400_000;
+        let deleted = db.gc_archived_sessions(threshold_ms as u64).unwrap();
+        assert_eq!(deleted, 1, "should delete only the old archived session");
+
+        // Verify correct sessions remain
+        assert!(db.get_session("old_archived").unwrap().is_none());
+        assert!(db.get_session("new_archived").unwrap().is_some());
+        assert!(db.get_session("old_active").unwrap().is_some());
+
+        // Verify cascade deleted messages
+        assert!(db.get_messages("old_archived").unwrap().is_empty());
     }
 }

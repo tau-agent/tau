@@ -188,6 +188,12 @@ enum SessionAction {
         #[arg(short, long)]
         output: Option<String>,
     },
+    /// Garbage-collect archived sessions older than a threshold
+    Gc {
+        /// Delete archived sessions older than this many days
+        #[arg(long, default_value = "7")]
+        older_than: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -269,6 +275,9 @@ async fn run(cli: Cli) -> tau::Result<()> {
             }
             SessionAction::Dump { id, output } => {
                 cmd_sessions_dump(&id, output.as_deref())?;
+            }
+            SessionAction::Gc { older_than } => {
+                cmd_sessions_gc(older_than).await?;
             }
         },
         Commands::Providers { action } => match action {
@@ -1302,6 +1311,28 @@ fn cmd_sessions_dump(id: &str, output: Option<&str>) -> tau::Result<()> {
     } else {
         println!("{}", json);
     }
+    Ok(())
+}
+
+async fn cmd_sessions_gc(older_than: u64) -> tau::Result<()> {
+    let mut client = tau::client::Client::connect_or_start().await?;
+    client
+        .send(&tau::protocol::Request::GcSessions {
+            older_than_days: older_than,
+        })
+        .await?;
+
+    client
+        .recv_streaming(|resp| match resp {
+            tau::protocol::Response::GcComplete { deleted } => {
+                eprintln!("gc: deleted {} archived session(s)", deleted);
+            }
+            tau::protocol::Response::Error { message } => {
+                eprintln!("error: {}", message);
+            }
+            _ => {}
+        })
+        .await?;
     Ok(())
 }
 

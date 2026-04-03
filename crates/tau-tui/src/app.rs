@@ -118,6 +118,10 @@ pub struct App {
     pub picker_confirm_archive: Option<usize>,
     /// Mode to restore when the session picker is closed.
     pub picker_previous_mode: AppMode,
+    /// Search filter text for the session picker.
+    pub picker_filter: String,
+    /// Whether the picker is in filter-input mode (`/` was pressed).
+    pub picker_filter_mode: bool,
 }
 
 /// Saved state when navigating to a child session.
@@ -169,6 +173,8 @@ impl App {
             picker_confirm_delete: None,
             picker_confirm_archive: None,
             picker_previous_mode: AppMode::Input,
+            picker_filter: String::new(),
+            picker_filter_mode: false,
         }
     }
 
@@ -536,45 +542,110 @@ impl App {
         }
     }
 
+    /// Return indices into `picker_sessions` that match the current filter.
+    /// If the filter is empty, all indices are returned.
+    pub fn picker_filtered_indices(&self) -> Vec<usize> {
+        if self.picker_filter.is_empty() {
+            return (0..self.picker_sessions.len()).collect();
+        }
+        let needle = self.picker_filter.to_lowercase();
+        self.picker_sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                s.id.to_lowercase().contains(&needle)
+                    || s.tagline
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&needle)
+                    || s.model.to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Clamp picker_cursor to remain valid within filtered results.
+    fn picker_clamp_cursor(&mut self) {
+        let filtered = self.picker_filtered_indices();
+        if filtered.is_empty() {
+            self.picker_cursor = 0;
+        } else if self.picker_cursor >= filtered.len() {
+            self.picker_cursor = filtered.len() - 1;
+        }
+    }
+
+    /// Resolve the picker cursor to a session index in `picker_sessions`.
+    /// Returns `None` if no matching sessions or cursor is out of range.
+    pub fn picker_selected_session_idx(&self) -> Option<usize> {
+        let filtered = self.picker_filtered_indices();
+        filtered.get(self.picker_cursor).copied()
+    }
+
     fn handle_picker_key(&mut self, key: &KeyEvent) -> Option<Action> {
+        // If in filter input mode, handle keys for text editing
+        if self.picker_filter_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    // Clear filter and exit filter mode
+                    self.picker_filter.clear();
+                    self.picker_filter_mode = false;
+                    self.picker_cursor = 0;
+                    return None;
+                }
+                KeyCode::Enter => {
+                    // Exit filter mode, keep filter text
+                    self.picker_filter_mode = false;
+                    self.picker_clamp_cursor();
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    self.picker_filter.pop();
+                    self.picker_cursor = 0;
+                    return None;
+                }
+                KeyCode::Char(c) => {
+                    self.picker_filter.push(c);
+                    self.picker_cursor = 0;
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
         // If waiting for delete confirmation
-        if let Some(idx) = self.picker_confirm_delete {
+        if let Some(cursor_pos) = self.picker_confirm_delete {
+            let real_idx = self.picker_filtered_indices().get(cursor_pos).copied();
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.picker_confirm_delete = None;
-                    if let Some(session) = self.picker_sessions.get(idx) {
+                    if let Some(idx) = real_idx
+                        && let Some(session) = self.picker_sessions.get(idx)
+                    {
                         let session_id = session.id.clone();
-                        // Remove from picker list
                         self.picker_sessions.remove(idx);
-                        if self.picker_cursor >= self.picker_sessions.len()
-                            && self.picker_cursor > 0
-                        {
-                            self.picker_cursor -= 1;
-                        }
+                        self.picker_clamp_cursor();
                         return Some(Action::DeleteSession(session_id));
                     }
                     None
                 }
                 _ => {
-                    // Any other key cancels the confirmation
                     self.picker_confirm_delete = None;
                     None
                 }
             }
-        } else if let Some(idx) = self.picker_confirm_archive {
+        } else if let Some(cursor_pos) = self.picker_confirm_archive {
+            let real_idx = self.picker_filtered_indices().get(cursor_pos).copied();
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.picker_confirm_archive = None;
-                    if let Some(session) = self.picker_sessions.get(idx) {
+                    if let Some(idx) = real_idx
+                        && let Some(session) = self.picker_sessions.get(idx)
+                    {
                         let session_id = session.id.clone();
                         let parent_id = session.parent_id.clone();
-                        // Remove from picker list
                         self.picker_sessions.remove(idx);
-                        if self.picker_cursor >= self.picker_sessions.len()
-                            && self.picker_cursor > 0
-                        {
-                            self.picker_cursor -= 1;
-                        }
+                        self.picker_clamp_cursor();
                         let switch_to = if session_id == self.session_id {
                             parent_id
                         } else {
@@ -593,7 +664,13 @@ impl App {
                 }
             }
         } else {
+            let filtered_len = self.picker_filtered_indices().len();
             match (key.code, key.modifiers) {
+                // / enters filter mode
+                (KeyCode::Char('/'), _) => {
+                    self.picker_filter_mode = true;
+                    None
+                }
                 // Navigate up
                 (KeyCode::Up | KeyCode::Char('k'), _) => {
                     if self.picker_cursor > 0 {
@@ -603,9 +680,7 @@ impl App {
                 }
                 // Navigate down
                 (KeyCode::Down | KeyCode::Char('j'), _) => {
-                    if !self.picker_sessions.is_empty()
-                        && self.picker_cursor < self.picker_sessions.len() - 1
-                    {
+                    if filtered_len > 0 && self.picker_cursor < filtered_len - 1 {
                         self.picker_cursor += 1;
                     }
                     None
@@ -618,10 +693,9 @@ impl App {
                 }
                 // Page down: jump down by a page
                 (KeyCode::PageDown, _) => {
-                    if !self.picker_sessions.is_empty() {
+                    if filtered_len > 0 {
                         const PAGE_SIZE: usize = 10;
-                        self.picker_cursor =
-                            (self.picker_cursor + PAGE_SIZE).min(self.picker_sessions.len() - 1);
+                        self.picker_cursor = (self.picker_cursor + PAGE_SIZE).min(filtered_len - 1);
                     }
                     None
                 }
@@ -632,20 +706,23 @@ impl App {
                 }
                 // End: jump to last item
                 (KeyCode::End, _) => {
-                    if !self.picker_sessions.is_empty() {
-                        self.picker_cursor = self.picker_sessions.len() - 1;
+                    if filtered_len > 0 {
+                        self.picker_cursor = filtered_len - 1;
                     }
                     None
                 }
                 // Enter: switch to selected session
                 (KeyCode::Enter, _) => {
-                    if let Some(session) = self.picker_sessions.get(self.picker_cursor) {
+                    if let Some(idx) = self.picker_selected_session_idx()
+                        && let Some(session) = self.picker_sessions.get(idx)
+                    {
                         let session_id = session.id.clone();
                         self.mode = AppMode::Input;
                         self.picker_confirm_delete = None;
                         self.picker_confirm_archive = None;
+                        self.picker_filter.clear();
+                        self.picker_filter_mode = false;
                         if session_id == self.session_id {
-                            // Already on this session, just close picker
                             return None;
                         }
                         return Some(Action::SwitchSession(session_id));
@@ -657,11 +734,15 @@ impl App {
                     self.mode = self.picker_previous_mode;
                     self.picker_confirm_delete = None;
                     self.picker_confirm_archive = None;
+                    self.picker_filter.clear();
+                    self.picker_filter_mode = false;
                     None
                 }
                 // D (shift+d): delete selected session
                 (KeyCode::Char('D'), _) => {
-                    if let Some(session) = self.picker_sessions.get(self.picker_cursor) {
+                    if let Some(idx) = self.picker_selected_session_idx()
+                        && let Some(session) = self.picker_sessions.get(idx)
+                    {
                         if session.id == self.session_id {
                             self.messages.push(MessageItem::Status {
                                 text: "cannot delete active session".into(),
@@ -669,6 +750,8 @@ impl App {
                             self.mode = self.picker_previous_mode;
                             self.picker_confirm_delete = None;
                             self.picker_confirm_archive = None;
+                            self.picker_filter.clear();
+                            self.picker_filter_mode = false;
                         } else {
                             self.picker_confirm_delete = Some(self.picker_cursor);
                         }
@@ -677,7 +760,9 @@ impl App {
                 }
                 // A (shift+a): archive selected session
                 (KeyCode::Char('A'), _) => {
-                    if let Some(session) = self.picker_sessions.get(self.picker_cursor) {
+                    if let Some(idx) = self.picker_selected_session_idx()
+                        && let Some(session) = self.picker_sessions.get(idx)
+                    {
                         if session.id == self.session_id && session.parent_id.is_none() {
                             self.messages.push(MessageItem::Status {
                                 text: "cannot archive active session".into(),
@@ -685,6 +770,8 @@ impl App {
                             self.mode = self.picker_previous_mode;
                             self.picker_confirm_delete = None;
                             self.picker_confirm_archive = None;
+                            self.picker_filter.clear();
+                            self.picker_filter_mode = false;
                         } else {
                             self.picker_confirm_archive = Some(self.picker_cursor);
                         }
@@ -696,6 +783,8 @@ impl App {
                     self.mode = self.picker_previous_mode;
                     self.picker_confirm_delete = None;
                     self.picker_confirm_archive = None;
+                    self.picker_filter.clear();
+                    self.picker_filter_mode = false;
                     None
                 }
                 _ => None,
@@ -1173,11 +1262,11 @@ impl App {
                 if self.mode == AppMode::SessionPicker {
                     // Sort sessions into tree order (parents before children, siblings by last_activity)
                     self.picker_sessions = tree_sort_sessions(sessions);
-                    // Reset cursor -- find current session
-                    self.picker_cursor = self
-                        .picker_sessions
+                    // Reset cursor -- find current session in filtered view
+                    let filtered = self.picker_filtered_indices();
+                    self.picker_cursor = filtered
                         .iter()
-                        .position(|s| s.id == self.session_id)
+                        .position(|&i| self.picker_sessions[i].id == self.session_id)
                         .unwrap_or(0);
                     self.picker_confirm_delete = None;
                     self.picker_confirm_archive = None;

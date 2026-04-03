@@ -298,6 +298,8 @@ async fn run_inner(
                     app.mode = AppMode::SessionPicker;
                     app.picker_sessions.clear();
                     app.picker_confirm_delete = None;
+                    app.picker_filter.clear();
+                    app.picker_filter_mode = false;
                     send_request_and_recv(
                         Request::ListSessions {
                             include_archived: false,
