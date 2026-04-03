@@ -86,6 +86,7 @@ impl TestServer {
             db_path,
             tool_executor_factory: None,
             mock_tools: vec![],
+            plugins_config: None,
         };
 
         std::thread::spawn(move || {
@@ -132,6 +133,7 @@ impl TestServer {
             db_path,
             tool_executor_factory: None,
             mock_tools: vec![],
+            plugins_config: None,
         };
         let config = configure(base_config);
 

@@ -24,7 +24,7 @@ use crate::types::{Tool, ToolCall, ToolResultContent};
 // Protocol messages: tau → plugin
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginRequest {
     /// Initialize the plugin with session context.
@@ -61,7 +61,7 @@ pub enum PluginRequest {
 // Protocol messages: plugin → tau
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginMessage {
     /// Plugin registration (sent once on startup).
@@ -120,7 +120,7 @@ pub struct PluginCommand {
     pub description: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HookResult {
     /// Optional message to inject before the LLM turn.
     #[serde(default)]
@@ -139,7 +139,7 @@ pub struct HookMessage {
     pub content: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginToolResult {
     pub tool_call_id: String,
     pub content: Vec<ToolResultContent>,
@@ -150,6 +150,11 @@ pub struct PluginToolResult {
 // Plugin handle
 // ---------------------------------------------------------------------------
 
+/// Async stdout reader type (extracted from a plugin for background reading).
+pub type AsyncPluginReader = futures::io::BufReader<smol::Async<std::fs::File>>;
+/// Async stdin writer type (extracted from a plugin for background writing).
+pub type AsyncPluginWriter = futures::io::BufWriter<smol::Async<std::fs::File>>;
+
 /// A running plugin process.
 pub struct PluginHandle {
     pub name: String,
@@ -158,8 +163,8 @@ pub struct PluginHandle {
     stdin: Option<BufWriter<ChildStdin>>,
     stdout: Option<BufReader<ChildStdout>>,
     /// Async pipe fields for non-blocking I/O (used by server-side tool execution).
-    async_stdin: Option<futures::io::BufWriter<smol::Async<std::fs::File>>>,
-    async_stdout: Option<futures::io::BufReader<smol::Async<std::fs::File>>>,
+    async_stdin: Option<AsyncPluginWriter>,
+    async_stdout: Option<AsyncPluginReader>,
     /// Piped stderr for diagnostics.
     stderr_pipe: Option<std::process::ChildStderr>,
     /// Command used to spawn this plugin (for respawning).
@@ -168,6 +173,12 @@ pub struct PluginHandle {
     spawn_cwd: String,
     /// When the plugin last had activity (tool call, hook, etc.).
     pub last_activity: Instant,
+    /// When set, a background task owns the async I/O pipes.
+    /// `read_message_async` reads from this channel instead of stdout directly.
+    bg_msg_rx: Option<smol::channel::Receiver<PluginMessage>>,
+    /// When set, `send_async` writes to this channel, and a background
+    /// writer task drains it to the real stdin.
+    bg_write_tx: Option<smol::channel::Sender<PluginRequest>>,
 }
 
 impl PluginHandle {
@@ -218,6 +229,8 @@ impl PluginHandle {
             spawn_command: command.to_vec(),
             spawn_cwd: cwd.to_string(),
             last_activity: Instant::now(),
+            bg_msg_rx: None,
+            bg_write_tx: None,
         };
 
         // Read the registration message
@@ -361,8 +374,23 @@ impl PluginHandle {
     }
 
     /// Send a request to the plugin asynchronously.
+    ///
+    /// If a background writer channel is installed (via [`set_background_channels`]),
+    /// the request is sent through the channel and a background task writes it
+    /// to the real stdin.  Otherwise, writes directly to the async stdin pipe.
     pub async fn send_async(&mut self, req: &PluginRequest) -> crate::Result<()> {
         self.last_activity = Instant::now();
+
+        // If a background writer channel is installed, route through it.
+        if let Some(ref tx) = self.bg_write_tx {
+            return tx.send(req.clone()).await.map_err(|e| {
+                crate::Error::Io(format!(
+                    "plugin {} background write channel closed: {}",
+                    self.name, e
+                ))
+            });
+        }
+
         let stdin = self.async_stdin.as_mut().ok_or_else(|| {
             crate::Error::Io(format!("plugin {} async stdin not available", self.name))
         })?;
@@ -381,7 +409,20 @@ impl PluginHandle {
     }
 
     /// Read a single message from the plugin asynchronously.
+    ///
+    /// If a background reader channel is installed (via [`set_background_channels`]),
+    /// reads from that channel.  Otherwise, reads directly from the async stdout pipe.
     pub async fn read_message_async(&mut self) -> crate::Result<PluginMessage> {
+        // If a background reader channel is installed, read from it.
+        if let Some(ref rx) = self.bg_msg_rx {
+            return rx.recv().await.map_err(|_| {
+                crate::Error::Io(format!(
+                    "plugin {} background message channel closed",
+                    self.name
+                ))
+            });
+        }
+
         let stdout = self.async_stdout.as_mut().ok_or_else(|| {
             crate::Error::Io(format!("plugin {} async stdout not available", self.name))
         })?;
@@ -401,8 +442,45 @@ impl PluginHandle {
     }
 
     /// Check if this handle has async I/O pipes available.
+    ///
+    /// Returns true if either the direct async pipes or background channels
+    /// are available.
     pub fn has_async_io(&self) -> bool {
+        // Background channels count as async I/O.
+        if self.bg_msg_rx.is_some() && self.bg_write_tx.is_some() {
+            return true;
+        }
         self.async_stdin.is_some() && self.async_stdout.is_some()
+    }
+
+    /// Extract the async I/O pipes from this handle for use by background tasks.
+    ///
+    /// Returns `(reader, writer)`.  After this call, direct async I/O is no
+    /// longer possible on this handle — callers must install background
+    /// channels via [`set_background_channels`].
+    pub fn take_async_io(&mut self) -> crate::Result<(AsyncPluginReader, AsyncPluginWriter)> {
+        let reader = self
+            .async_stdout
+            .take()
+            .ok_or_else(|| crate::Error::Io("no async stdout to take".into()))?;
+        let writer = self
+            .async_stdin
+            .take()
+            .ok_or_else(|| crate::Error::Io("no async stdin to take".into()))?;
+        Ok((reader, writer))
+    }
+
+    /// Install background channels for reading and writing.
+    ///
+    /// After this, [`read_message_async`] receives from `msg_rx` and
+    /// [`send_async`] sends through `write_tx`.
+    pub fn set_background_channels(
+        &mut self,
+        msg_rx: smol::channel::Receiver<PluginMessage>,
+        write_tx: smol::channel::Sender<PluginRequest>,
+    ) {
+        self.bg_msg_rx = Some(msg_rx);
+        self.bg_write_tx = Some(write_tx);
     }
 
     /// Execute a tool call, calling on_output for streaming deltas.
@@ -636,6 +714,9 @@ impl PluginHandle {
         self.stdout = None;
         self.async_stdin = None;
         self.async_stdout = None;
+        // Close background channels (causes bg tasks to exit).
+        self.bg_msg_rx = None;
+        self.bg_write_tx = None;
     }
 
     /// Check if plugin wants a specific hook.
@@ -951,6 +1032,58 @@ impl PluginManager {
                 }
             }
         }
+    }
+
+    /// Set up background I/O for global plugins.
+    ///
+    /// For each global plugin, upgrades its pipes to async (if not already),
+    /// extracts the raw async reader/writer, installs channel-based I/O on
+    /// the handle, and returns the extracted I/O pairs along with plugin names.
+    ///
+    /// The caller should spawn background reader/writer tasks for each
+    /// returned pair.
+    pub fn setup_background_io(
+        &mut self,
+    ) -> Vec<(
+        String,
+        AsyncPluginReader,
+        AsyncPluginWriter,
+        smol::channel::Sender<PluginMessage>,
+        smol::channel::Receiver<PluginRequest>,
+    )> {
+        let mut result = Vec::new();
+        for handle in &mut self.global_plugins {
+            // Upgrade to async if needed.
+            if !handle.has_async_io() {
+                if let Err(e) = handle.upgrade_to_async() {
+                    eprintln!(
+                        "global plugin '{}': failed to upgrade to async: {}",
+                        handle.name, e
+                    );
+                    continue;
+                }
+            }
+
+            // Extract the raw async I/O.
+            let (reader, writer) = match handle.take_async_io() {
+                Ok(io) => io,
+                Err(e) => {
+                    eprintln!(
+                        "global plugin '{}': failed to take async IO: {}",
+                        handle.name, e
+                    );
+                    continue;
+                }
+            };
+
+            // Create channels: bg reader → handle, handle → bg writer.
+            let (msg_tx, msg_rx) = smol::channel::unbounded::<PluginMessage>();
+            let (write_tx, write_rx) = smol::channel::unbounded::<PluginRequest>();
+            handle.set_background_channels(msg_rx, write_tx);
+
+            result.push((handle.name.clone(), reader, writer, msg_tx, write_rx));
+        }
+        result
     }
 
     /// Ensure session plugins are spawned for the given session.
@@ -1326,6 +1459,17 @@ impl PluginManager {
     /// Get the configured idle timeout.
     pub fn idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.config.idle_timeout_secs)
+    }
+
+    /// Get a clone of a global plugin's background write channel sender.
+    ///
+    /// Returns `None` if the plugin has no background channels installed or
+    /// if no global plugin with the given name exists.
+    pub fn get_global_write_tx(&self, name: &str) -> Option<smol::channel::Sender<PluginRequest>> {
+        self.global_plugins
+            .iter()
+            .find(|p| p.name == name)
+            .and_then(|p| p.bg_write_tx.clone())
     }
 }
 

@@ -560,6 +560,7 @@ fn server_session_resume_after_restart() {
         db_path: db_path.clone(),
         tool_executor_factory: None,
         mock_tools: vec![],
+        plugins_config: None,
     };
 
     let handle = std::thread::spawn(move || {
@@ -628,6 +629,7 @@ fn server_session_resume_after_restart() {
         db_path: db_path.clone(),
         tool_executor_factory: None,
         mock_tools: vec![],
+        plugins_config: None,
     };
 
     let _handle2 = std::thread::spawn(move || {
@@ -906,6 +908,7 @@ fn server_chat_with_mock_tool_success() {
         db_path,
         tool_executor_factory: Some(tool_factory),
         mock_tools: vec![mock_tool("read_file", "Read a file")],
+        plugins_config: None,
     };
 
     std::thread::spawn(move || {
@@ -1513,6 +1516,7 @@ fn session_dump_and_replay() {
         db_path: db_path.clone(),
         tool_executor_factory: Some(tool_factory),
         mock_tools: vec![mock_tool("bash", "Run a command")],
+        plugins_config: None,
     };
 
     std::thread::spawn(move || {

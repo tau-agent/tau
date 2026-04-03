@@ -372,6 +372,222 @@ fn spawn_idle_sweep(
 }
 
 // ---------------------------------------------------------------------------
+// Background reader/writer tasks for global plugins
+// ---------------------------------------------------------------------------
+
+/// Read one `PluginMessage` from an async stdout reader.
+async fn read_plugin_message(
+    reader: &mut crate::plugin::AsyncPluginReader,
+) -> crate::Result<crate::plugin::PluginMessage> {
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| crate::Error::Io(format!("read from plugin: {}", e)))?;
+    if n == 0 {
+        return Err(crate::Error::Io("plugin closed stdout".into()));
+    }
+    serde_json::from_str(&line).map_err(|e| crate::Error::Parse(format!("plugin message: {}", e)))
+}
+
+/// Write a `PluginRequest` to an async stdin writer.
+async fn write_plugin_request(
+    writer: &mut crate::plugin::AsyncPluginWriter,
+    req: &crate::plugin::PluginRequest,
+) -> crate::Result<()> {
+    use futures::io::AsyncWriteExt;
+    let mut line = serde_json::to_string(req).map_err(|e| crate::Error::Parse(e.to_string()))?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| crate::Error::Io(format!("write to plugin: {}", e)))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| crate::Error::Io(format!("flush plugin: {}", e)))?;
+    Ok(())
+}
+
+/// Create a chat-spawn channel with a receiver task that fires off
+/// `run_child_chat` for each `(session_id, text)` pair.
+///
+/// Used by `spawn_global_plugin_background_tasks` so that background
+/// `ServerRequest::Chat` calls can spawn agent turns.
+fn spawn_bg_chat_receiver(
+    state: SharedState,
+    plugins: Arc<Mutex<crate::plugin::PluginManager>>,
+    shutdown: ShutdownHandle,
+    session_locks: SessionLocks,
+    throttle: crate::throttle::ProviderThrottle,
+) -> smol::channel::Sender<(String, String)> {
+    let (tx, rx) = smol::channel::unbounded::<(String, String)>();
+    smol::spawn(async move {
+        while let Ok((child_session_id, text)) = rx.recv().await {
+            let s = state.clone();
+            let p = plugins.clone();
+            let sh = shutdown.clone();
+            let sl = session_locks.clone();
+            let th = throttle.clone();
+            let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
+            smol::spawn(async move {
+                let sid = child_session_id;
+                if let Err(e) = run_child_chat(s, p, sh, sl, th, sid.clone(), text, ov).await {
+                    eprintln!("bg child chat {} error: {}", sid, e);
+                }
+            })
+            .detach();
+        }
+    })
+    .detach();
+    tx
+}
+
+/// Spawn background reader/writer tasks for all global plugins.
+///
+/// For each global plugin:
+/// - A **reader task** reads messages from the plugin's stdout.
+///   `ServerRequest` messages are handled inline (via `handle_server_request`);
+///   all other messages (e.g. `ToolResult`, `OutputDelta`) are forwarded to the
+///   plugin handle through a channel so that `PluginExecutor` can consume them
+///   during tool calls.
+/// - A **writer task** drains a channel of `PluginRequest` messages and writes
+///   them to the plugin's stdin.  Both the `PluginExecutor` (via `send_async`)
+///   and the reader task (to send `ServerResponse`) share this channel.
+///
+/// These tasks are detached and run until the plugin dies or the server shuts
+/// down.
+#[allow(clippy::too_many_arguments)]
+fn spawn_global_plugin_background_tasks(
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
+    state: &SharedState,
+    session_locks: &SessionLocks,
+    shutdown: &ShutdownHandle,
+    throttle: &crate::throttle::ProviderThrottle,
+    chat_spawn_tx: &smol::channel::Sender<(String, String)>,
+    test_overrides: &SharedTestOverrides,
+) {
+    let io_pairs = {
+        let mut pm = plugins.lock().unwrap();
+        pm.setup_background_io()
+    };
+
+    for (plugin_name, mut reader, mut writer, msg_tx, write_rx) in io_pairs {
+        // --- Writer task: drain write_rx → stdin ---
+        let writer_plugin_name = plugin_name.clone();
+        smol::spawn(async move {
+            while let Ok(req) = write_rx.recv().await {
+                if let Err(e) = write_plugin_request(&mut writer, &req).await {
+                    eprintln!(
+                        "global plugin '{}' background writer error: {}",
+                        writer_plugin_name, e
+                    );
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // --- Reader task: stdout → route messages ---
+        let reader_state = state.clone();
+        let reader_session_locks = session_locks.clone();
+        let reader_plugins = plugins.clone();
+        let reader_shutdown = shutdown.clone();
+        let reader_throttle = throttle.clone();
+        let reader_chat_tx = chat_spawn_tx.clone();
+        let reader_test_overrides = test_overrides.clone();
+        // Clone msg_tx's corresponding write channel so we can send
+        // ServerResponse back through the writer task.
+        // The write_tx was given to the plugin handle; we need our own
+        // sender for the same channel.  We'll get it from the handle.
+        // Actually, we can just clone the bg_write_tx before it's consumed.
+        // Simpler: the reader task sends ServerResponse via a dedicated clone.
+        // We already have `write_rx` consumed by the writer task above.
+        // To send responses, we need a Sender for the same channel.
+        // Let's refactor: keep a clone of write_tx for the reader.
+        //
+        // The handle already has write_tx.  We need another sender for the
+        // same channel.  Let me restructure: create write_tx outside and
+        // clone it.
+
+        // Actually, looking at the setup: the handle has a write_tx clone.
+        // We need another clone for the reader task.  Let me get it from
+        // the handle via the plugin manager.
+        let resp_tx = {
+            let pm = plugins.lock().unwrap();
+            // Find the global plugin and get its bg_write_tx
+            pm.get_global_write_tx(&plugin_name)
+        };
+        let resp_tx = match resp_tx {
+            Some(tx) => tx,
+            None => {
+                eprintln!(
+                    "global plugin '{}': no write channel for background reader",
+                    plugin_name
+                );
+                continue;
+            }
+        };
+
+        smol::spawn(async move {
+            loop {
+                let msg = match read_plugin_message(&mut reader).await {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        // Don't log during shutdown — plugin may have been killed.
+                        if !reader_shutdown.is_shutting_down() {
+                            eprintln!("global plugin '{}' background reader: {}", plugin_name, e);
+                        }
+                        break;
+                    }
+                };
+
+                match msg {
+                    crate::plugin::PluginMessage::ServerRequest {
+                        request_id,
+                        request,
+                    } => {
+                        let response = handle_server_request(
+                            &reader_state,
+                            &reader_session_locks,
+                            &reader_plugins,
+                            &reader_shutdown,
+                            &reader_throttle,
+                            &reader_chat_tx,
+                            &reader_test_overrides,
+                            &request,
+                            // Background requests have no specific session context;
+                            // use an empty session ID.
+                            "",
+                        )
+                        .await;
+                        let resp_req = crate::plugin::PluginRequest::ServerResponse {
+                            request_id,
+                            response,
+                        };
+                        if resp_tx.send(resp_req).await.is_err() {
+                            eprintln!(
+                                "global plugin '{}' background reader: write channel closed",
+                                plugin_name
+                            );
+                            break;
+                        }
+                    }
+                    other => {
+                        // Forward to plugin handle for tool-call consumption.
+                        if msg_tx.send(other).await.is_err() {
+                            // Handle was dropped (plugin killed / reloaded).
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -426,6 +642,8 @@ pub struct TestServerConfig {
         Option<Arc<dyn Fn() -> Box<dyn crate::worker::ToolExecutor> + Send + Sync>>,
     /// Optional: tool schemas for mock executor.
     pub mock_tools: Vec<Tool>,
+    /// Optional: plugins configuration (for testing global plugins).
+    pub plugins_config: Option<crate::plugin::PluginsConfig>,
 }
 
 /// Run a server with custom config (for testing).
@@ -465,10 +683,12 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
             models: vec![],
         },
     );
-    let plugins_config = crate::plugin::PluginsConfig {
-        no_default_worker: true,
-        ..Default::default()
-    };
+    let plugins_config = config
+        .plugins_config
+        .unwrap_or(crate::plugin::PluginsConfig {
+            no_default_worker: true,
+            ..Default::default()
+        });
     let mut plugins = crate::plugin::PluginManager::new(plugins_config);
     plugins.load_global_plugins("/tmp");
     let plugins: Arc<Mutex<crate::plugin::PluginManager>> = Arc::new(Mutex::new(plugins));
@@ -511,6 +731,24 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     // Spawn idle sweep task for session plugins.
     spawn_idle_sweep(plugins.clone(), state.clone(), shutdown.clone());
 
+    // Spawn background reader/writer tasks for global plugins.
+    let bg_chat_spawn_tx = spawn_bg_chat_receiver(
+        state.clone(),
+        plugins.clone(),
+        shutdown.clone(),
+        session_locks.clone(),
+        throttle.clone(),
+    );
+    spawn_global_plugin_background_tasks(
+        &plugins,
+        &state,
+        &session_locks,
+        &shutdown,
+        &throttle,
+        &bg_chat_spawn_tx,
+        &test_overrides,
+    );
+
     loop {
         let (stream, _) = listener
             .accept()
@@ -527,6 +765,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         let session_locks = session_locks.clone();
         let throttle = throttle.clone();
         let overrides = test_overrides.clone();
+        let bg_chat = bg_chat_spawn_tx.clone();
         smol::spawn(async move {
             if let Err(e) = handle_client(
                 stream,
@@ -536,6 +775,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
                 session_locks,
                 throttle,
                 overrides,
+                bg_chat,
             )
             .await
             {
@@ -621,6 +861,25 @@ pub async fn run() -> crate::Result<()> {
     // Spawn idle sweep task for session plugins.
     spawn_idle_sweep(plugins.clone(), state.clone(), shutdown.clone());
 
+    // Spawn background reader/writer tasks for global plugins so they can
+    // send ServerRequests at any time, not just during tool calls.
+    let bg_chat_spawn_tx = spawn_bg_chat_receiver(
+        state.clone(),
+        plugins.clone(),
+        shutdown.clone(),
+        session_locks.clone(),
+        throttle.clone(),
+    );
+    spawn_global_plugin_background_tasks(
+        &plugins,
+        &state,
+        &session_locks,
+        &shutdown,
+        &throttle,
+        &bg_chat_spawn_tx,
+        &Arc::new(TestOverrides::default()),
+    );
+
     // Auto-resume interrupted child sessions.
     {
         let resume_ids = {
@@ -699,6 +958,7 @@ pub async fn run() -> crate::Result<()> {
         let session_locks = session_locks.clone();
         let throttle = throttle.clone();
         let no_overrides: SharedTestOverrides = Arc::new(TestOverrides::default());
+        let bg_chat = bg_chat_spawn_tx.clone();
         smol::spawn(async move {
             if let Err(e) = handle_client(
                 stream,
@@ -708,6 +968,7 @@ pub async fn run() -> crate::Result<()> {
                 session_locks,
                 throttle,
                 no_overrides,
+                bg_chat,
             )
             .await
             {
@@ -848,6 +1109,7 @@ async fn handle_client(
     session_locks: SessionLocks,
     throttle: crate::throttle::ProviderThrottle,
     test_overrides: SharedTestOverrides,
+    bg_chat_spawn_tx: smol::channel::Sender<(String, String)>,
 ) -> crate::Result<()> {
     // Register for shutdown notifications
     let shutdown_rx = shutdown.register_client();
@@ -1930,6 +2192,16 @@ async fn handle_client(
                 };
                 match result {
                     Ok(()) => {
+                        // Restart background tasks for the new global plugins.
+                        spawn_global_plugin_background_tasks(
+                            &plugins,
+                            &state,
+                            &session_locks,
+                            &shutdown,
+                            &throttle,
+                            &bg_chat_spawn_tx,
+                            &test_overrides,
+                        );
                         queue_message_to_session(
                             &state,
                             &session_id,
