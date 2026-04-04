@@ -367,6 +367,10 @@ fn handle_session_tool(
                     .get("auto_archive")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                notify_parent: args
+                    .get("notify_parent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
             };
             let resp = match server_request(writer, reader, create_req) {
                 Ok(r) => r,

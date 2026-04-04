@@ -204,6 +204,7 @@ pub fn merge_task(
             child_budget: 0,
             tagline: Some(format!("Merge task {}", task_id)),
             auto_archive: false,
+            notify_parent: false,
         },
     )? {
         Response::SessionCreated { session_id } => session_id,

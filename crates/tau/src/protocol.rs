@@ -36,6 +36,9 @@ pub enum Request {
         /// When true, auto-archive this session after completion+join.
         #[serde(default)]
         auto_archive: bool,
+        /// When true, notify parent session on child completion (default true).
+        #[serde(default = "default_true")]
+        notify_parent: bool,
     },
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },
@@ -245,6 +248,10 @@ pub struct SessionResult {
 
 fn default_wait_timeout() -> u64 {
     300
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_state() -> String {
