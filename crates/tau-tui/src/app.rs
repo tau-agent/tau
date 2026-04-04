@@ -1046,7 +1046,7 @@ impl App {
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|approve|ready] /reload /sessions /session <id> /back /fork /new /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|approve|ready] /reload /sessions /session <id> /back /fork /new /help /quit"
                         .into(),
                 });
                 None
@@ -1157,10 +1157,44 @@ impl App {
                     }
                 }
             }
+            "create" => {
+                let title = args.strip_prefix("create").unwrap_or("").trim();
+                if title.is_empty() {
+                    self.messages.push(MessageItem::Error {
+                        text: "usage: /task create <title>".into(),
+                    });
+                    return;
+                }
+                match self.run_task_create(title) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.messages.push(MessageItem::Error {
+                            text: format!("task create: {}", e),
+                        });
+                    }
+                }
+            }
+            "search" => {
+                let query = args.strip_prefix("search").unwrap_or("").trim();
+                if query.is_empty() {
+                    self.messages.push(MessageItem::Error {
+                        text: "usage: /task search <query>".into(),
+                    });
+                    return;
+                }
+                match self.run_task_search(query) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.messages.push(MessageItem::Error {
+                            text: format!("task search: {}", e),
+                        });
+                    }
+                }
+            }
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!(
-                        "unknown task command: {}. Use: list [state], get <id>, approve <id>, ready <id>",
+                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, approve <id>, ready <id>",
                         subcmd
                     ),
                 });
@@ -1250,6 +1284,46 @@ impl App {
             }
         }
 
+        Ok(())
+    }
+
+    fn run_task_create(&mut self, title: &str) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let project = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let task = db.create_task(&project, title, None, None, None, false)?;
+        self.messages.push(MessageItem::Status {
+            text: format!("Created task #{}: {}", task.id, task.title),
+        });
+        Ok(())
+    }
+
+    fn run_task_search(&mut self, query: &str) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let project = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let tasks = db.search_tasks(&project, query, None)?;
+        if tasks.is_empty() {
+            self.messages.push(MessageItem::Status {
+                text: "no matching tasks".into(),
+            });
+            return Ok(());
+        }
+        self.messages.push(MessageItem::Status {
+            text: format!("  {:>4}  {:<12}  {:>8}  TITLE", "ID", "STATE", "PRIORITY"),
+        });
+        for t in &tasks {
+            self.messages.push(MessageItem::Status {
+                text: format!(
+                    "  {:>4}  {:<12}  {:>8}  {}",
+                    t.id, t.state, t.priority, t.title
+                ),
+            });
+        }
         Ok(())
     }
 
