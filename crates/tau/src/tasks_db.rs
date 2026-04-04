@@ -1398,10 +1398,6 @@ mod tests {
 
     #[test]
     fn test_assign_task() {
-    // ----- git integration tests -----
-
-    #[test]
-    fn test_set_branch() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task("/project", "Test", None, None, None, false)
@@ -1463,49 +1459,11 @@ mod tests {
     fn test_assign_task_nonexistent() {
         let db = TasksDb::open_memory().unwrap();
         let err = db.assign_task(99999, "s1").unwrap_err();
-        assert!(task.branch.is_none());
-
-        db.set_branch(task.id, "task-1").unwrap();
-
-        let loaded = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(loaded.branch.as_deref(), Some("task-1"));
-    }
-
-    #[test]
-    fn test_set_branch_nonexistent_task() {
-        let db = TasksDb::open_memory().unwrap();
-        let err = db.set_branch(99999, "task-99999").unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
     #[test]
     fn test_record_session_idempotent() {
-    fn test_set_worktree_path() {
-        let db = TasksDb::open_memory().unwrap();
-        let task = db
-            .create_task("/project", "Test", None, None, None, false)
-            .unwrap();
-        assert!(task.worktree_path.is_none());
-
-        db.set_worktree_path(task.id, "/home/user/project-task-1")
-            .unwrap();
-
-        let loaded = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(
-            loaded.worktree_path.as_deref(),
-            Some("/home/user/project-task-1")
-        );
-    }
-
-    #[test]
-    fn test_set_worktree_path_nonexistent_task() {
-        let db = TasksDb::open_memory().unwrap();
-        let err = db.set_worktree_path(99999, "/tmp/wt").unwrap_err();
-        assert!(err.to_string().contains("not found"));
-    }
-
-    #[test]
-    fn test_clear_worktree() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task("/project", "Test", None, None, None, false)
@@ -1539,36 +1497,6 @@ mod tests {
 
     #[test]
     fn test_subtask_defaults_to_ready() {
-        db.set_worktree_path(task.id, "/home/user/project-task-1")
-            .unwrap();
-        let loaded = db.get_task(task.id).unwrap().unwrap();
-        assert!(loaded.worktree_path.is_some());
-
-        db.clear_worktree(task.id).unwrap();
-        let loaded = db.get_task(task.id).unwrap().unwrap();
-        assert!(loaded.worktree_path.is_none());
-    }
-
-    #[test]
-    fn test_clear_worktree_nonexistent_task() {
-        let db = TasksDb::open_memory().unwrap();
-        let err = db.clear_worktree(99999).unwrap_err();
-        assert!(err.to_string().contains("not found"));
-    }
-
-    #[test]
-    fn test_get_merge_target_root_task() {
-        let db = TasksDb::open_memory().unwrap();
-        let task = db
-            .create_task("/project", "Root task", None, None, None, false)
-            .unwrap();
-
-        let target = db.get_merge_target(task.id).unwrap();
-        assert_eq!(target, "main");
-    }
-
-    #[test]
-    fn test_get_merge_target_subtask() {
         let db = TasksDb::open_memory().unwrap();
         let parent = db
             .create_task("/project", "Parent", None, None, None, false)
@@ -1641,6 +1569,97 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.state, "approved");
+    }
+
+    // ----- git integration tests -----
+
+    #[test]
+    fn test_set_branch() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        assert!(task.branch.is_none());
+
+        db.set_branch(task.id, "task-1").unwrap();
+
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(loaded.branch.as_deref(), Some("task-1"));
+    }
+
+    #[test]
+    fn test_set_branch_nonexistent_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let err = db.set_branch(99999, "task-99999").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_set_worktree_path() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        assert!(task.worktree_path.is_none());
+
+        db.set_worktree_path(task.id, "/home/user/project-task-1")
+            .unwrap();
+
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            loaded.worktree_path.as_deref(),
+            Some("/home/user/project-task-1")
+        );
+    }
+
+    #[test]
+    fn test_set_worktree_path_nonexistent_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let err = db.set_worktree_path(99999, "/tmp/wt").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_clear_worktree() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+
+        db.set_worktree_path(task.id, "/home/user/project-task-1")
+            .unwrap();
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(loaded.worktree_path.is_some());
+
+        db.clear_worktree(task.id).unwrap();
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(loaded.worktree_path.is_none());
+    }
+
+    #[test]
+    fn test_clear_worktree_nonexistent_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let err = db.clear_worktree(99999).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_get_merge_target_root_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Root task", None, None, None, false)
+            .unwrap();
+
+        let target = db.get_merge_target(task.id).unwrap();
+        assert_eq!(target, "main");
+    }
+
+    #[test]
+    fn test_get_merge_target_subtask() {
+        let db = TasksDb::open_memory().unwrap();
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false)
+            .unwrap();
         db.set_branch(parent.id, "task-1").unwrap();
 
         let child = db
