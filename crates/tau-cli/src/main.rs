@@ -42,6 +42,9 @@ enum Commands {
     /// Async tool execution worker - default (internal, used by daemon)
     #[command(hide = true)]
     Worker2,
+    /// Task system plugin (internal, used by daemon)
+    #[command(name = "plugin-tasks", hide = true)]
+    PluginTasks,
     /// Manage the tau server
     #[command(alias = "srv")]
     Server {
@@ -244,6 +247,10 @@ async fn run(cli: Cli) -> tau::Result<()> {
         }
         Commands::Worker2 => {
             tau::worker2::run();
+            return Ok(());
+        }
+        Commands::PluginTasks => {
+            tau::tasks::run_tasks_plugin();
             return Ok(());
         }
         Commands::Login { provider } => {

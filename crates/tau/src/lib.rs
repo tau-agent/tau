@@ -12,6 +12,8 @@ pub mod providers;
 pub mod replay;
 pub mod server;
 pub mod system_prompt;
+pub mod tasks;
+pub mod tasks_db;
 pub mod throttle;
 pub mod tools;
 pub mod types;
