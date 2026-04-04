@@ -550,7 +550,6 @@ async fn cmd_chat(
                 child_budget,
                 tagline: None,
                 auto_archive: false,
-                notify_parent: true,
             })
             .await?;
 
@@ -671,7 +670,6 @@ async fn cli_create_session(
             child_budget: 0,
             tagline: None,
             auto_archive: false,
-            notify_parent: true,
         })
         .await?;
 

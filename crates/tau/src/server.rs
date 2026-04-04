@@ -1152,7 +1152,6 @@ async fn handle_client(
                 child_budget,
                 tagline,
                 auto_archive,
-                notify_parent,
             } => {
                 // Atomic budget check + session creation (single lock hold)
                 let resp = create_session_impl(
@@ -1165,7 +1164,6 @@ async fn handle_client(
                     child_budget,
                     &tagline,
                     auto_archive,
-                    notify_parent,
                 );
 
                 // If created and no explicit system prompt, set up plugins
@@ -3336,7 +3334,6 @@ fn create_session_impl(
     child_budget: u32,
     tagline: &Option<String>,
     auto_archive: bool,
-    notify_parent: bool,
 ) -> crate::protocol::Response {
     use crate::protocol::Response;
     let st = lock_state(state);
@@ -3421,7 +3418,6 @@ fn create_session_impl(
         last_exit_status: None,
         last_phase: None,
         auto_archive,
-        notify_parent,
     };
     match st.db.create_session(&stored) {
         Ok(()) => Response::SessionCreated { session_id: id },
@@ -3664,7 +3660,6 @@ async fn handle_server_request(
             child_budget,
             tagline,
             auto_archive,
-            notify_parent,
         } => create_session_impl(
             state,
             model_id,
@@ -3675,7 +3670,6 @@ async fn handle_server_request(
             *child_budget,
             tagline,
             *auto_archive,
-            *notify_parent,
         ),
         Request::GetSessionInfo { session_id } => get_session_info_impl(state, session_id),
         Request::GetMessages { session_id } => get_messages_impl(state, session_id),
@@ -4103,14 +4097,12 @@ fn notify_parent_of_child_completion(
         if st.waited_sessions.contains(child_session_id) {
             return;
         }
-        let child = st.db.get_session(child_session_id).ok().flatten();
-        // Skip notification if the child session has notify_parent=false.
-        if let Some(ref child_session) = child {
-            if !child_session.notify_parent {
-                return;
-            }
-        }
-        let parent = child.and_then(|s| s.parent_id);
+        let parent = st
+            .db
+            .get_session(child_session_id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parent_id);
         let summary = st
             .db
             .get_messages(child_session_id)

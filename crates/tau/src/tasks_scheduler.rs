@@ -226,7 +226,6 @@ pub fn dispatch(
         child_budget: 4,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
-        notify_parent: false,
     };
 
     let session_id = match server_request(writer, reader, create_req)? {

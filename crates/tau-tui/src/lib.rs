@@ -533,7 +533,6 @@ async fn create_session(
             child_budget: 0,
             tagline: None,
             auto_archive: false,
-            notify_parent: true,
         })
         .await?;
 
