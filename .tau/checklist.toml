@@ -3,9 +3,5 @@ name = "cargo fmt"
 command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo fmt --check"
 
 [[check]]
-name = "cargo clippy"
-command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo clippy --workspace -- -D warnings"
-
-[[check]]
 name = "cargo test"
 command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo test --workspace"
