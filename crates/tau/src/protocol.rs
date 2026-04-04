@@ -54,6 +54,8 @@ pub enum Request {
         #[serde(default)]
         require_ancestor: Option<String>,
     },
+    /// Restore (un-archive) a session and all its descendants.
+    RestoreSession { session_id: String },
     /// Delete a session.
     DeleteSession { session_id: String },
     /// List available models.
@@ -153,6 +155,8 @@ pub enum Response {
     SessionDeleted,
     /// Session archived.
     SessionArchived,
+    /// Session restored (un-archived).
+    SessionRestored,
     /// Available models.
     Models { models: Vec<ModelInfo> },
     /// Model changed.

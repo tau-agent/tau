@@ -89,6 +89,7 @@ impl Client {
                 | Response::SessionInfo { .. }
                 | Response::SessionDeleted
                 | Response::SessionArchived
+                | Response::SessionRestored
                 | Response::Sessions { .. }
                 | Response::Models { .. }
                 | Response::ModelChanged { .. }

@@ -372,6 +372,30 @@ impl Db {
         Ok(())
     }
 
+    /// Restore (un-archive) a session and all its descendants.
+    ///
+    /// Sets the `archived` flag to 0 for the entire subtree inside a single
+    /// transaction.
+    pub fn restore_session_tree(&self, id: &str) -> crate::Result<()> {
+        let ids = self.get_subtree_ids(id)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Io(format!("restore_tree begin: {}", e)))?;
+
+        for sid in &ids {
+            tx.execute(
+                "UPDATE sessions SET archived = 0 WHERE id = ?1",
+                params![sid],
+            )
+            .map_err(|e| crate::Error::Io(format!("restore_tree session: {}", e)))?;
+        }
+
+        tx.commit()
+            .map_err(|e| crate::Error::Io(format!("restore_tree commit: {}", e)))?;
+        Ok(())
+    }
+
     /// Collect all session IDs in the subtree rooted at `id` (inclusive).
     pub fn get_subtree_ids(&self, id: &str) -> crate::Result<Vec<String>> {
         let mut ids = vec![id.to_string()];

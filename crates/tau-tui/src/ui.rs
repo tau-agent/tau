@@ -670,7 +670,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     let hint = if app.picker_filter_mode {
         " type to filter  enter accept  esc clear"
     } else {
-        " /search  j/k nav  enter switch  A archive  D del  tab/esc close"
+        " /search  j/k nav  enter switch  A archive  R restore  D del  tab/esc close"
     };
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()

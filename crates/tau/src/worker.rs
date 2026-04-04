@@ -731,6 +731,24 @@ fn handle_session_tool(
             }
         }
 
+        "session_restore" => {
+            let sid = match args.get("session_id").and_then(|v| v.as_str()) {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => return tool_err("session_id is required"),
+            };
+            let req = crate::protocol::Request::RestoreSession {
+                session_id: sid.clone(),
+            };
+            match server_request(writer, reader, req) {
+                Ok(crate::protocol::Response::SessionRestored) => {
+                    tool_ok(&format!("Restored session {}", sid))
+                }
+                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
+                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(&e.to_string()),
+            }
+        }
+
         "session_message" => {
             let target = args
                 .get("session_id")

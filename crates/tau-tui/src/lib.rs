@@ -361,6 +361,21 @@ async fn run_inner(
                         ),
                     });
                 }
+                Action::RestoreSession { session_id } => {
+                    send_request_and_recv(
+                        Request::RestoreSession {
+                            session_id: session_id.clone(),
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                    app.messages.push(crate::message::MessageItem::Status {
+                        text: format!(
+                            "restored session {}",
+                            &session_id[..session_id.len().min(8)]
+                        ),
+                    });
+                }
                 Action::ListChildren => {
                     send_request_and_recv(
                         Request::ListSessions {

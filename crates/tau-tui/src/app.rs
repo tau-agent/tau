@@ -789,6 +789,23 @@ impl App {
                     }
                     None
                 }
+                // R (shift+r): restore (un-archive) selected session
+                (KeyCode::Char('R'), _) => {
+                    if let Some(idx) = self.picker_selected_session_idx()
+                        && let Some(session) = self.picker_sessions.get(idx)
+                    {
+                        if session.archived {
+                            let session_id = session.id.clone();
+                            self.mode = self.picker_previous_mode;
+                            self.picker_confirm_delete = None;
+                            self.picker_confirm_archive = None;
+                            self.picker_filter.clear();
+                            self.picker_filter_mode = false;
+                            return Some(Action::RestoreSession { session_id });
+                        }
+                    }
+                    None
+                }
                 // Ctrl+C: close picker, return to previous mode
                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                     self.mode = self.picker_previous_mode;
@@ -1786,6 +1803,10 @@ pub enum Action {
     ArchiveSession {
         session_id: String,
         switch_to: Option<String>,
+    },
+    /// Restore an archived session.
+    RestoreSession {
+        session_id: String,
     },
     /// Switch to viewing a different session.
     SwitchSession(String),

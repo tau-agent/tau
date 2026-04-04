@@ -256,6 +256,12 @@ enum SessionAction {
         #[arg(add = ArgValueCandidates::new(completer::session_completer))]
         id: String,
     },
+    /// Restore (un-archive) a session
+    Restore {
+        /// Session ID
+        #[arg(add = ArgValueCandidates::new(completer::archived_session_completer))]
+        id: String,
+    },
     /// Dump a session as a JSON recording (for replay testing)
     Dump {
         /// Session ID
@@ -350,6 +356,9 @@ async fn run(cli: Cli) -> tau::Result<()> {
             }
             SessionAction::Archive { id } => {
                 cmd_sessions_archive(&id).await?;
+            }
+            SessionAction::Restore { id } => {
+                cmd_sessions_restore(&id).await?;
             }
             SessionAction::Delete { id } => {
                 cmd_sessions_delete(&id).await?;
@@ -1442,6 +1451,18 @@ async fn cmd_sessions_archive(id: &str) -> tau::Result<()> {
         .await?;
     client.recv_streaming(|_| {}).await?;
     eprintln!("archived session {}", id);
+    Ok(())
+}
+
+async fn cmd_sessions_restore(id: &str) -> tau::Result<()> {
+    let mut client = tau::client::Client::connect_or_start().await?;
+    client
+        .send(&tau::protocol::Request::RestoreSession {
+            session_id: id.to_string(),
+        })
+        .await?;
+    client.recv_streaming(|_| {}).await?;
+    eprintln!("restored session {}", id);
     Ok(())
 }
 

@@ -263,7 +263,7 @@ fn session_info_includes_tree_fields() {
 #[test]
 fn orchestration_tool_definitions() {
     let tools = tau::orchestration::orchestration_tools();
-    assert_eq!(tools.len(), 12);
+    assert_eq!(tools.len(), 13);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"session_spawn"));

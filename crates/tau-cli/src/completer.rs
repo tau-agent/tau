@@ -52,3 +52,23 @@ pub fn model_completer() -> Vec<CompletionCandidate> {
         })
         .collect()
 }
+
+/// Complete archived session IDs (for the restore command).
+pub fn archived_session_completer() -> Vec<CompletionCandidate> {
+    let Some(Response::Sessions { sessions }) = query(&Request::ListSessions {
+        include_archived: true,
+    }) else {
+        return vec![];
+    };
+    sessions
+        .into_iter()
+        .filter(|s| s.archived)
+        .map(|s| {
+            let help = format!(
+                "[archived] {}/{} {} msgs",
+                s.provider, s.model, s.message_count
+            );
+            CompletionCandidate::new(s.id).help(Some(help.into()))
+        })
+        .collect()
+}

@@ -1704,6 +1704,44 @@ async fn handle_client(
 
                 send(&mut writer, &Response::SessionArchived).await?;
             }
+            Request::RestoreSession { session_id } => {
+                // Validate: session must exist and be archived
+                let exists = {
+                    let st = lock_state(&state);
+                    st.db.get_session(&session_id)?
+                };
+                match exists {
+                    None => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("session not found: {}", session_id),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Some(ref s) if !s.archived => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("session {} is not archived", session_id),
+                            },
+                        )
+                        .await?;
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // Restore in DB
+                {
+                    let st = lock_state(&state);
+                    st.db.restore_session_tree(&session_id)?;
+                }
+
+                send(&mut writer, &Response::SessionRestored).await?;
+            }
             Request::DeleteSession { session_id } => {
                 // Collect all session IDs in the subtree before deleting
                 let subtree_ids = {
@@ -3976,6 +4014,36 @@ async fn handle_server_request(
             }
 
             Response::SessionArchived
+        }
+        Request::RestoreSession { session_id } => {
+            // Validate: session must exist and be archived
+            let st = lock_state(state);
+            match st.db.get_session(session_id) {
+                Ok(Some(s)) if !s.archived => {
+                    return Response::Error {
+                        message: format!("session {} is not archived", session_id),
+                    };
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Response::Error {
+                        message: format!("session not found: {}", session_id),
+                    };
+                }
+                Err(e) => {
+                    return Response::Error {
+                        message: e.to_string(),
+                    };
+                }
+            }
+            // Restore in DB
+            if let Err(e) = st.db.restore_session_tree(session_id) {
+                return Response::Error {
+                    message: e.to_string(),
+                };
+            }
+            drop(st);
+            Response::SessionRestored
         }
         Request::FireHook { name, data } => {
             let mut pm = plugins.lock().unwrap();

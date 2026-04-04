@@ -198,6 +198,22 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             ],
         },
         PluginToolDef {
+            name: "session_restore".into(),
+            description: "Restore (un-archive) a previously archived session. The session and all its descendants are restored and become visible in session listings again.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID to restore"
+                    }
+                },
+                "required": ["session_id"]
+            }),
+            prompt_snippet: None,
+            prompt_guidelines: vec![],
+        },
+        PluginToolDef {
             name: "session_message".into(),
             description: "Send a message to another session. The message is injected as a user message into the target session's conversation. If the target is idle, it will resume processing. Fire-and-forget: does not wait for a response.".into(),
             parameters: serde_json::json!({
