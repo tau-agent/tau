@@ -259,15 +259,21 @@ pub fn merge_task(
         }
     }
 
-    // 6. Fast-forward merge from repo root
+    // 6. Fast-forward merge using update-ref (worktree-safe)
+    //
+    // We can't `git checkout <target> && git merge` because the target
+    // branch may be checked out in another worktree. Instead, verify the
+    // fast-forward condition and update the ref directly.
     log.push_str(&format!("=== Merge {} into {} ===\n", branch, merge_target));
+
+    // Verify fast-forward: merge_target must be an ancestor of branch
     let (output, is_error) = execute_bash(
         writer,
         reader,
         &log_session,
         &format!(
-            "cd $(git rev-parse --show-toplevel) && git checkout {} && git merge --ff-only {}",
-            merge_target, branch
+            "git merge-base --is-ancestor {} {} && git update-ref refs/heads/{} $(git rev-parse {})",
+            merge_target, branch, merge_target, branch
         ),
     )?;
     log.push_str(&output);
