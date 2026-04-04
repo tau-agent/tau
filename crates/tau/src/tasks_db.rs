@@ -1041,8 +1041,8 @@ impl TasksDb {
     /// Get the merge target branch for a task.
     ///
     /// Returns the parent task's branch name if the task has a parent,
-    /// or `"main"` if it is a root task. Errors if the parent exists but
-    /// has no branch set.
+    /// or `"main"` if it is a root task. Falls back to `"main"` if the
+    /// parent has no branch set (e.g. interactive tasks).
     pub fn get_merge_target(&self, task_id: i64) -> crate::Result<String> {
         let task = self
             .get_task(task_id)?
@@ -1054,9 +1054,7 @@ impl TasksDb {
                 let parent = self
                     .get_task(pid)?
                     .ok_or_else(|| crate::Error::Io(format!("parent task {} not found", pid)))?;
-                parent.branch.ok_or_else(|| {
-                    crate::Error::Io(format!("parent task {} has no branch set", pid))
-                })
+                Ok(parent.branch.unwrap_or_else(|| "main".to_string()))
             }
         }
     }
@@ -1896,14 +1894,14 @@ mod tests {
         let parent = db
             .create_task("/project", "Parent", None, None, None, false)
             .unwrap();
-        // Don't set a branch on parent
+        // Don't set a branch on parent — should fall back to "main"
 
         let child = db
             .create_task("/project", "Child", None, Some(parent.id), None, false)
             .unwrap();
 
-        let err = db.get_merge_target(child.id).unwrap_err();
-        assert!(err.to_string().contains("no branch set"));
+        let target = db.get_merge_target(child.id).unwrap();
+        assert_eq!(target, "main");
     }
 
     #[test]
