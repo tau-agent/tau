@@ -570,7 +570,9 @@ impl TasksDb {
 
     // ----- relations -----
 
-    /// Add a relation between two tasks. Validates both exist.
+    /// Add a relation between two tasks. Validates both exist, are in the
+    /// same project, are not self-referential, and (for `depends_on`) do not
+    /// create a cycle.
     pub fn add_relation(&self, from_task: i64, to_task: i64, relation: &str) -> crate::Result<()> {
         // Validate relation type
         if !matches!(relation, "depends_on" | "blocks" | "related") {
@@ -580,19 +582,98 @@ impl TasksDb {
             )));
         }
 
+        // Prevent self-referential relations
+        if from_task == to_task {
+            return Err(crate::Error::Io(
+                "cannot create a relation from a task to itself".into(),
+            ));
+        }
+
+        // Use IMMEDIATE transaction so the cycle check + insert are atomic.
+        // This prevents a concurrent process from inserting a relation that
+        // creates a cycle between our check and our insert.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Io(format!("add_relation begin: {}", e)))?;
+
         // Validate both tasks exist
-        self.get_task(from_task)?
+        let from = tx
+            .query_row(
+                "SELECT project FROM tasks WHERE id = ?1",
+                params![from_task],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| crate::Error::Io(format!("check from_task: {}", e)))?
             .ok_or_else(|| crate::Error::Io(format!("from_task {} not found", from_task)))?;
-        self.get_task(to_task)?
+
+        let to = tx
+            .query_row(
+                "SELECT project FROM tasks WHERE id = ?1",
+                params![to_task],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| crate::Error::Io(format!("check to_task: {}", e)))?
             .ok_or_else(|| crate::Error::Io(format!("to_task {} not found", to_task)))?;
 
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO task_relations (from_task, to_task, relation)
-                 VALUES (?1, ?2, ?3)",
-                params![from_task, to_task, relation],
-            )
-            .map_err(|e| crate::Error::Io(format!("insert relation: {}", e)))?;
+        // Both tasks must be in the same project
+        if from != to {
+            return Err(crate::Error::Io(format!(
+                "cannot relate tasks across projects: '{}' and '{}'",
+                from, to
+            )));
+        }
+
+        // Prevent circular dependencies for depends_on.
+        // BFS from to_task following depends_on edges; if we reach from_task
+        // there would be a cycle.
+        if relation == "depends_on" {
+            use std::collections::{HashSet, VecDeque};
+
+            let mut visited = HashSet::new();
+            let mut queue = VecDeque::new();
+            queue.push_back(to_task);
+            visited.insert(to_task);
+
+            while let Some(current) = queue.pop_front() {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT to_task FROM task_relations
+                         WHERE from_task = ?1 AND relation = 'depends_on'",
+                    )
+                    .map_err(|e| crate::Error::Io(format!("prepare cycle check: {}", e)))?;
+
+                let deps: Vec<i64> = stmt
+                    .query_map(params![current], |row| row.get(0))
+                    .map_err(|e| crate::Error::Io(format!("cycle check: {}", e)))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| crate::Error::Io(format!("read cycle check row: {}", e)))?;
+
+                for dep in deps {
+                    if dep == from_task {
+                        return Err(crate::Error::Io(format!(
+                            "circular dependency: task {} transitively depends on task {}",
+                            to_task, from_task
+                        )));
+                    }
+                    if visited.insert(dep) {
+                        queue.push_back(dep);
+                    }
+                }
+            }
+        }
+
+        tx.execute(
+            "INSERT OR IGNORE INTO task_relations (from_task, to_task, relation)
+             VALUES (?1, ?2, ?3)",
+            params![from_task, to_task, relation],
+        )
+        .map_err(|e| crate::Error::Io(format!("insert relation: {}", e)))?;
+
+        tx.commit()
+            .map_err(|e| crate::Error::Io(format!("add_relation commit: {}", e)))?;
 
         Ok(())
     }
@@ -622,6 +703,111 @@ impl TasksDb {
             relations.push(row.map_err(|e| crate::Error::Io(format!("read relation row: {}", e)))?);
         }
         Ok(relations)
+    }
+
+    /// Get tasks that this task depends on that are NOT yet done.
+    /// Returns tasks where: relation(this_task, dep, 'depends_on') AND dep.state != 'done'
+    pub fn get_blocking_dependencies(&self, task_id: i64) -> crate::Result<Vec<Task>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT t.id, t.project, t.title, t.state, t.priority, t.parent_id,
+                        t.tags, t.affected_files, t.assigned_session, t.branch,
+                        t.worktree_path, t.session_id, t.skip_review, t.created_at,
+                        t.updated_at
+                 FROM task_relations r
+                 JOIN tasks t ON t.id = r.to_task
+                 WHERE r.from_task = ?1 AND r.relation = 'depends_on' AND t.state != 'done'",
+            )
+            .map_err(|e| crate::Error::Io(format!("prepare get_blocking_dependencies: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![task_id], row_to_task)
+            .map_err(|e| crate::Error::Io(format!("get_blocking_dependencies: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(
+                row.map_err(|e| crate::Error::Io(format!("read blocking dependency row: {}", e)))?,
+            );
+        }
+        Ok(tasks)
+    }
+
+    /// Get tasks that are ready AND have no unfinished dependencies.
+    pub fn get_schedulable_tasks(&self, project: &str) -> crate::Result<Vec<Task>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT t.id, t.project, t.title, t.state, t.priority, t.parent_id,
+                        t.tags, t.affected_files, t.assigned_session, t.branch,
+                        t.worktree_path, t.session_id, t.skip_review, t.created_at,
+                        t.updated_at
+                 FROM tasks t
+                 WHERE t.project = ?1 AND t.state = 'ready'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_relations r
+                       JOIN tasks dep ON dep.id = r.to_task
+                       WHERE r.from_task = t.id
+                         AND r.relation = 'depends_on'
+                         AND dep.state != 'done'
+                   )
+                 ORDER BY t.priority DESC, t.created_at ASC",
+            )
+            .map_err(|e| crate::Error::Io(format!("prepare get_schedulable_tasks: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![project], row_to_task)
+            .map_err(|e| crate::Error::Io(format!("get_schedulable_tasks: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(
+                row.map_err(|e| crate::Error::Io(format!("read schedulable task row: {}", e)))?,
+            );
+        }
+        Ok(tasks)
+    }
+
+    /// Check if `from` transitively depends on `to` via `depends_on` relations.
+    /// Uses BFS from `from` following depends_on edges. Returns true if `to` is
+    /// reachable.
+    pub fn has_transitive_dependency(&self, from: i64, to: i64) -> crate::Result<bool> {
+        use std::collections::{HashSet, VecDeque};
+
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(from);
+        visited.insert(from);
+
+        while let Some(current) = queue.pop_front() {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT to_task FROM task_relations
+                     WHERE from_task = ?1 AND relation = 'depends_on'",
+                )
+                .map_err(|e| {
+                    crate::Error::Io(format!("prepare has_transitive_dependency: {}", e))
+                })?;
+
+            let deps: Vec<i64> = stmt
+                .query_map(params![current], |row| row.get(0))
+                .map_err(|e| crate::Error::Io(format!("has_transitive_dependency: {}", e)))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| crate::Error::Io(format!("read transitive dependency row: {}", e)))?;
+
+            for dep in deps {
+                if dep == to {
+                    return Ok(true);
+                }
+                if visited.insert(dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        Ok(false)
     }
 
     // ----- subtasks -----
@@ -1725,5 +1911,451 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let err = db.get_merge_target(99999).unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    // ----- dependency enforcement tests -----
+
+    /// Helper: create a task and move it to a given state using valid transitions.
+    fn create_task_in_state(db: &TasksDb, project: &str, title: &str, state: &str) -> Task {
+        let task = db
+            .create_task(project, title, None, None, None, true)
+            .unwrap();
+        let transitions: &[&str] = match state {
+            "interactive" => &[],
+            "ready" => &["ready"],
+            "active" => &["ready"],
+            "review" => &["ready"],
+            "approved" => &["ready"],
+            "done" => &["ready"],
+            _ => panic!("unsupported target state: {}", state),
+        };
+        for &s in transitions {
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some(s.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+        // For states beyond "ready", use assign_task and further transitions
+        match state {
+            "active" => {
+                db.assign_task(task.id, "test-session").unwrap();
+            }
+            "review" => {
+                db.assign_task(task.id, "test-session").unwrap();
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("review".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            }
+            "approved" => {
+                db.assign_task(task.id, "test-session").unwrap();
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("approved".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            }
+            "done" => {
+                db.assign_task(task.id, "test-session").unwrap();
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("approved".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("merging".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("done".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            }
+            _ => {}
+        }
+        db.get_task(task.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn test_get_blocking_dependencies_with_unmet_dep() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = create_task_in_state(&db, "/project", "Dependency", "ready");
+        let task = create_task_in_state(&db, "/project", "Dependent", "ready");
+
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        let blocking = db.get_blocking_dependencies(task.id).unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].id, dep.id);
+    }
+
+    #[test]
+    fn test_get_blocking_dependencies_with_met_dep() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = create_task_in_state(&db, "/project", "Dependency", "done");
+        let task = create_task_in_state(&db, "/project", "Dependent", "ready");
+
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        let blocking = db.get_blocking_dependencies(task.id).unwrap();
+        assert!(blocking.is_empty());
+    }
+
+    #[test]
+    fn test_get_blocking_dependencies_no_deps() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = create_task_in_state(&db, "/project", "No deps", "ready");
+
+        let blocking = db.get_blocking_dependencies(task.id).unwrap();
+        assert!(blocking.is_empty());
+    }
+
+    #[test]
+    fn test_get_blocking_dependencies_ignores_non_depends_on() {
+        let db = TasksDb::open_memory().unwrap();
+        let other = create_task_in_state(&db, "/project", "Related", "ready");
+        let task = create_task_in_state(&db, "/project", "Task", "ready");
+
+        // "related" relation should NOT count as a blocking dependency
+        db.add_relation(task.id, other.id, "related").unwrap();
+
+        let blocking = db.get_blocking_dependencies(task.id).unwrap();
+        assert!(blocking.is_empty());
+    }
+
+    #[test]
+    fn test_get_schedulable_tasks_with_unmet_dep() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = create_task_in_state(&db, "/project", "Dependency", "active");
+        let task = create_task_in_state(&db, "/project", "Blocked task", "ready");
+
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        // dep is active (not ready), task is blocked — neither should be schedulable
+        let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
+        assert!(!ids.contains(&task.id));
+    }
+
+    #[test]
+    fn test_get_schedulable_tasks_with_met_dep() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = create_task_in_state(&db, "/project", "Dependency", "done");
+        let task = create_task_in_state(&db, "/project", "Unblocked task", "ready");
+
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&task.id));
+    }
+
+    #[test]
+    fn test_get_schedulable_tasks_no_deps() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = create_task_in_state(&db, "/project", "Independent task", "ready");
+
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&task.id));
+    }
+
+    #[test]
+    fn test_get_schedulable_tasks_mixed() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = create_task_in_state(&db, "/project", "Dependency", "active");
+        let blocked = create_task_in_state(&db, "/project", "Blocked", "ready");
+        let free = create_task_in_state(&db, "/project", "Free", "ready");
+
+        db.add_relation(blocked.id, dep.id, "depends_on").unwrap();
+
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
+        assert!(!ids.contains(&blocked.id));
+        assert!(ids.contains(&free.id));
+    }
+
+    #[test]
+    fn test_get_schedulable_tasks_only_ready() {
+        let db = TasksDb::open_memory().unwrap();
+        // Active task should NOT appear in schedulable
+        let _active = create_task_in_state(&db, "/project", "Active", "active");
+        // Interactive task should NOT appear
+        let _interactive = create_task_in_state(&db, "/project", "Interactive", "interactive");
+        // Only this ready one should appear
+        let ready = create_task_in_state(&db, "/project", "Ready", "ready");
+
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        assert_eq!(schedulable.len(), 1);
+        assert_eq!(schedulable[0].id, ready.id);
+    }
+
+    #[test]
+    fn test_get_schedulable_tasks_project_scoped() {
+        let db = TasksDb::open_memory().unwrap();
+        let _task_a = create_task_in_state(&db, "/project-a", "Task A", "ready");
+        let _task_b = create_task_in_state(&db, "/project-b", "Task B", "ready");
+
+        let schedulable = db.get_schedulable_tasks("/project-a").unwrap();
+        assert_eq!(schedulable.len(), 1);
+        assert_eq!(schedulable[0].title, "Task A");
+    }
+
+    #[test]
+    fn test_self_referential_relation_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Self ref", None, None, None, false)
+            .unwrap();
+
+        let err = db.add_relation(task.id, task.id, "depends_on").unwrap_err();
+        assert!(err.to_string().contains("relation from a task to itself"));
+    }
+
+    #[test]
+    fn test_cross_project_relation_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project-a", "Task A", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project-b", "Task B", None, None, None, false)
+            .unwrap();
+
+        let err = db.add_relation(t1.id, t2.id, "depends_on").unwrap_err();
+        assert!(err.to_string().contains("across projects"));
+    }
+
+    #[test]
+    fn test_circular_dependency_direct() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project", "Task 1", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project", "Task 2", None, None, None, false)
+            .unwrap();
+
+        // A depends_on B — OK
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+
+        // B depends_on A — should be rejected (cycle)
+        let err = db.add_relation(t2.id, t1.id, "depends_on").unwrap_err();
+        assert!(err.to_string().contains("circular dependency"));
+    }
+
+    #[test]
+    fn test_circular_dependency_transitive() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project", "Task 1", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project", "Task 2", None, None, None, false)
+            .unwrap();
+        let t3 = db
+            .create_task("/project", "Task 3", None, None, None, false)
+            .unwrap();
+
+        // A -> B -> C
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+        db.add_relation(t2.id, t3.id, "depends_on").unwrap();
+
+        // C -> A would create a cycle
+        let err = db.add_relation(t3.id, t1.id, "depends_on").unwrap_err();
+        assert!(err.to_string().contains("circular dependency"));
+    }
+
+    #[test]
+    fn test_circular_dependency_not_triggered_for_non_depends_on() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project", "Task 1", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project", "Task 2", None, None, None, false)
+            .unwrap();
+
+        // A depends_on B
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+
+        // B "related" A — should succeed (cycle check only for depends_on)
+        db.add_relation(t2.id, t1.id, "related").unwrap();
+    }
+
+    #[test]
+    fn test_has_transitive_dependency_no_path() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project", "Task 1", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project", "Task 2", None, None, None, false)
+            .unwrap();
+
+        assert!(!db.has_transitive_dependency(t1.id, t2.id).unwrap());
+    }
+
+    #[test]
+    fn test_has_transitive_dependency_direct() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project", "Task 1", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project", "Task 2", None, None, None, false)
+            .unwrap();
+
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+
+        assert!(db.has_transitive_dependency(t1.id, t2.id).unwrap());
+        assert!(!db.has_transitive_dependency(t2.id, t1.id).unwrap());
+    }
+
+    #[test]
+    fn test_has_transitive_dependency_chain() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project", "Task 1", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project", "Task 2", None, None, None, false)
+            .unwrap();
+        let t3 = db
+            .create_task("/project", "Task 3", None, None, None, false)
+            .unwrap();
+        let t4 = db
+            .create_task("/project", "Task 4", None, None, None, false)
+            .unwrap();
+
+        // 1 -> 2 -> 3 -> 4
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+        db.add_relation(t2.id, t3.id, "depends_on").unwrap();
+        db.add_relation(t3.id, t4.id, "depends_on").unwrap();
+
+        assert!(db.has_transitive_dependency(t1.id, t4.id).unwrap());
+        assert!(db.has_transitive_dependency(t1.id, t3.id).unwrap());
+        assert!(db.has_transitive_dependency(t2.id, t4.id).unwrap());
+        assert!(!db.has_transitive_dependency(t4.id, t1.id).unwrap());
+    }
+
+    #[test]
+    fn test_get_blocking_dependencies_multiple() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep1 = create_task_in_state(&db, "/project", "Dep 1", "active");
+        let dep2 = create_task_in_state(&db, "/project", "Dep 2", "done");
+        let dep3 = create_task_in_state(&db, "/project", "Dep 3", "ready");
+        let task = create_task_in_state(&db, "/project", "Main task", "ready");
+
+        db.add_relation(task.id, dep1.id, "depends_on").unwrap();
+        db.add_relation(task.id, dep2.id, "depends_on").unwrap();
+        db.add_relation(task.id, dep3.id, "depends_on").unwrap();
+
+        let blocking = db.get_blocking_dependencies(task.id).unwrap();
+        // dep1 (active) and dep3 (ready) are blocking; dep2 (done) is not
+        assert_eq!(blocking.len(), 2);
+        let blocking_ids: Vec<i64> = blocking.iter().map(|t| t.id).collect();
+        assert!(blocking_ids.contains(&dep1.id));
+        assert!(blocking_ids.contains(&dep3.id));
+        assert!(!blocking_ids.contains(&dep2.id));
+    }
+
+    #[test]
+    fn test_circular_dependency_diamond() {
+        // Diamond: A -> B, A -> C, B -> D, C -> D
+        // Then D -> A should be rejected (cycle through either path)
+        let db = TasksDb::open_memory().unwrap();
+        let a = db.create_task("/p", "A", None, None, None, false).unwrap();
+        let b = db.create_task("/p", "B", None, None, None, false).unwrap();
+        let c = db.create_task("/p", "C", None, None, None, false).unwrap();
+        let d = db.create_task("/p", "D", None, None, None, false).unwrap();
+
+        db.add_relation(a.id, b.id, "depends_on").unwrap();
+        db.add_relation(a.id, c.id, "depends_on").unwrap();
+        db.add_relation(b.id, d.id, "depends_on").unwrap();
+        db.add_relation(c.id, d.id, "depends_on").unwrap();
+
+        // D -> A creates a cycle
+        let err = db.add_relation(d.id, a.id, "depends_on").unwrap_err();
+        assert!(err.to_string().contains("circular dependency"));
+
+        // But D -> (new task E) is fine
+        let e = db.create_task("/p", "E", None, None, None, false).unwrap();
+        db.add_relation(d.id, e.id, "depends_on").unwrap();
+    }
+
+    #[test]
+    fn test_circular_dependency_mid_chain() {
+        // Chain: A -> B -> C -> D -> E
+        // Adding E -> C should be rejected (cycle C -> D -> E -> C)
+        let db = TasksDb::open_memory().unwrap();
+        let a = db.create_task("/p", "A", None, None, None, false).unwrap();
+        let b = db.create_task("/p", "B", None, None, None, false).unwrap();
+        let c = db.create_task("/p", "C", None, None, None, false).unwrap();
+        let d = db.create_task("/p", "D", None, None, None, false).unwrap();
+        let e = db.create_task("/p", "E", None, None, None, false).unwrap();
+
+        db.add_relation(a.id, b.id, "depends_on").unwrap();
+        db.add_relation(b.id, c.id, "depends_on").unwrap();
+        db.add_relation(c.id, d.id, "depends_on").unwrap();
+        db.add_relation(d.id, e.id, "depends_on").unwrap();
+
+        let err = db.add_relation(e.id, c.id, "depends_on").unwrap_err();
+        assert!(err.to_string().contains("circular dependency"));
+    }
+
+    #[test]
+    fn test_no_false_positive_cycle_with_blocks() {
+        // A depends_on B, B blocks A — no real cycle since blocks is informational
+        let db = TasksDb::open_memory().unwrap();
+        let a = db.create_task("/p", "A", None, None, None, false).unwrap();
+        let b = db.create_task("/p", "B", None, None, None, false).unwrap();
+
+        db.add_relation(a.id, b.id, "depends_on").unwrap();
+        // blocks is informational, shouldn't trigger cycle detection
+        db.add_relation(b.id, a.id, "blocks").unwrap();
+    }
+
+    #[test]
+    fn test_parallel_non_conflicting_deps_allowed() {
+        // A -> C and B -> C is fine (convergent, no cycle)
+        let db = TasksDb::open_memory().unwrap();
+        let a = db.create_task("/p", "A", None, None, None, false).unwrap();
+        let b = db.create_task("/p", "B", None, None, None, false).unwrap();
+        let c = db.create_task("/p", "C", None, None, None, false).unwrap();
+
+        db.add_relation(a.id, c.id, "depends_on").unwrap();
+        db.add_relation(b.id, c.id, "depends_on").unwrap();
+        // And C -> D is fine (no cycle)
+        let d = db.create_task("/p", "D", None, None, None, false).unwrap();
+        db.add_relation(c.id, d.id, "depends_on").unwrap();
     }
 }

@@ -464,10 +464,37 @@ fn handle_task_get(db: &TasksDb, args: &serde_json::Value, tool_call_id: &str) -
         Err(e) => return tool_err(tool_call_id, &format!("get subtasks: {}", e)),
     };
 
+    // Build enriched relations with dependency status
+    let enriched_relations: Vec<serde_json::Value> = relations
+        .iter()
+        .map(|rel| {
+            let mut obj = serde_json::json!({
+                "from_task": rel.from_task,
+                "to_task": rel.to_task,
+                "relation": rel.relation,
+            });
+            // For depends_on relations where this task is the dependent,
+            // include whether the dependency is satisfied or blocking.
+            if rel.relation == "depends_on"
+                && rel.from_task == id
+                && let Ok(Some(dep_task)) = db.get_task(rel.to_task)
+            {
+                let satisfied = dep_task.state == "done";
+                obj["dependency_status"] = if satisfied {
+                    serde_json::json!("satisfied")
+                } else {
+                    serde_json::json!("blocking")
+                };
+                obj["dependency_state"] = serde_json::json!(dep_task.state);
+            }
+            obj
+        })
+        .collect();
+
     let result = serde_json::json!({
         "task": task,
         "messages": messages,
-        "relations": relations,
+        "relations": enriched_relations,
         "subtasks": subtasks,
     });
 
@@ -1476,5 +1503,176 @@ mod tests {
                 .unwrap()
                 .contains("claim")
         );
+    }
+
+    // ----- dependency enforcement tests (plugin layer) -----
+
+    #[test]
+    fn test_task_relate_self_referential_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Self", None, None, None, false)
+            .unwrap();
+
+        let result = handle_task_relate(
+            &db,
+            &serde_json::json!({"from_task": task.id, "to_task": task.id, "relation": "depends_on"}),
+            "tc1",
+        );
+        assert!(result.is_error);
+        assert!(extract_text(&result).contains("to itself"));
+    }
+
+    #[test]
+    fn test_task_relate_cross_project_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project-a", "A", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project-b", "B", None, None, None, false)
+            .unwrap();
+
+        let result = handle_task_relate(
+            &db,
+            &serde_json::json!({"from_task": t1.id, "to_task": t2.id, "relation": "depends_on"}),
+            "tc1",
+        );
+        assert!(result.is_error);
+        assert!(extract_text(&result).contains("across projects"));
+    }
+
+    #[test]
+    fn test_task_relate_circular_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project", "T1", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project", "T2", None, None, None, false)
+            .unwrap();
+
+        // T1 depends_on T2 — OK
+        let result = handle_task_relate(
+            &db,
+            &serde_json::json!({"from_task": t1.id, "to_task": t2.id, "relation": "depends_on"}),
+            "tc1",
+        );
+        assert!(!result.is_error);
+
+        // T2 depends_on T1 — circular
+        let result = handle_task_relate(
+            &db,
+            &serde_json::json!({"from_task": t2.id, "to_task": t1.id, "relation": "depends_on"}),
+            "tc2",
+        );
+        assert!(result.is_error);
+        assert!(extract_text(&result).contains("circular dependency"));
+    }
+
+    #[test]
+    fn test_task_get_dependency_status_blocking() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = db
+            .create_task("/project", "Dependency", None, None, None, false)
+            .unwrap();
+        let task = db
+            .create_task("/project", "Dependent", None, None, None, false)
+            .unwrap();
+
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        let result = handle_task_get(&db, &serde_json::json!({"id": task.id}), "tc1");
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let relations = parsed["relations"].as_array().unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0]["dependency_status"], "blocking");
+        assert_eq!(relations[0]["dependency_state"], "interactive");
+    }
+
+    #[test]
+    fn test_task_get_dependency_status_satisfied() {
+        let db = TasksDb::open_memory().unwrap();
+        // Create dep and move to done
+        let dep = db
+            .create_task("/project", "Dependency", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            dep.id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(dep.id, "s1").unwrap();
+        db.update_task(
+            dep.id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            dep.id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("merging".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            dep.id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("done".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let task = db
+            .create_task("/project", "Dependent", None, None, None, false)
+            .unwrap();
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        let result = handle_task_get(&db, &serde_json::json!({"id": task.id}), "tc1");
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let relations = parsed["relations"].as_array().unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0]["dependency_status"], "satisfied");
+        assert_eq!(relations[0]["dependency_state"], "done");
+    }
+
+    #[test]
+    fn test_task_get_non_depends_on_has_no_status() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("/project", "T1", None, None, None, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/project", "T2", None, None, None, false)
+            .unwrap();
+
+        db.add_relation(t1.id, t2.id, "related").unwrap();
+
+        let result = handle_task_get(&db, &serde_json::json!({"id": t1.id}), "tc1");
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let relations = parsed["relations"].as_array().unwrap();
+        assert_eq!(relations.len(), 1);
+        assert!(relations[0].get("dependency_status").is_none());
     }
 }

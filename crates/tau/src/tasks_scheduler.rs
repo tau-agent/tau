@@ -97,7 +97,7 @@ pub struct ScheduledTask {
 ///
 /// Returns the list of tasks that were prepared for dispatch.
 pub fn schedule(db: &TasksDb, project: &str) -> crate::Result<Vec<ScheduledTask>> {
-    let ready_tasks = db.list_tasks(project, Some("ready"), None, None, None)?;
+    let ready_tasks = db.get_schedulable_tasks(project)?;
 
     if ready_tasks.is_empty() {
         return Ok(Vec::new());
@@ -584,5 +584,142 @@ mod tests {
         assert_eq!(batch[0].id, 1);
         assert_eq!(batch[1].id, 3);
         assert_eq!(batch[2].id, 5);
+    }
+
+    // ----- dependency + scheduling integration tests -----
+
+    /// Helper: create a task in the DB and set it to ready state.
+    fn create_ready_task(
+        db: &TasksDb,
+        project: &str,
+        title: &str,
+        priority: i64,
+        files: Option<&serde_json::Value>,
+    ) -> crate::tasks_db::Task {
+        let task = db
+            .create_task(project, title, Some(priority), None, None, true)
+            .unwrap();
+        // interactive -> ready
+        db.update_task(
+            task.id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("ready".into()),
+                affected_files: files.cloned(),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.get_task(task.id).unwrap().unwrap()
+    }
+
+    /// Helper: move task through all states to done.
+    fn move_to_done(db: &TasksDb, task_id: i64) {
+        // Must be in ready → assign → active → approved → merging → done
+        let task = db.get_task(task_id).unwrap().unwrap();
+        if task.state == "ready" {
+            db.assign_task(task_id, "test-session").unwrap();
+        }
+        db.update_task(
+            task_id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task_id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("merging".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task_id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("done".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_get_schedulable_filters_blocked_tasks() {
+        let db = TasksDb::open_memory().unwrap();
+        let files_a = serde_json::json!(["src/a.rs"]);
+        let files_b = serde_json::json!(["src/b.rs"]);
+
+        let dep = create_ready_task(&db, "/project", "Dependency", 5, Some(&files_a));
+        let blocked = create_ready_task(&db, "/project", "Blocked", 3, Some(&files_b));
+        let free = create_ready_task(
+            &db,
+            "/project",
+            "Free",
+            1,
+            Some(&serde_json::json!(["src/c.rs"])),
+        );
+
+        db.add_relation(blocked.id, dep.id, "depends_on").unwrap();
+
+        // get_schedulable_tasks should exclude "blocked" but include "dep" and "free"
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&dep.id));
+        assert!(!ids.contains(&blocked.id));
+        assert!(ids.contains(&free.id));
+    }
+
+    #[test]
+    fn test_select_non_conflicting_with_dependency_filtered_input() {
+        let db = TasksDb::open_memory().unwrap();
+        let files_shared = serde_json::json!(["src/shared.rs"]);
+        let files_other = serde_json::json!(["src/other.rs"]);
+
+        let dep = create_ready_task(&db, "/project", "Dependency", 10, Some(&files_shared));
+        let blocked = create_ready_task(&db, "/project", "Blocked", 5, Some(&files_other));
+        let free = create_ready_task(&db, "/project", "Free", 1, Some(&files_other));
+
+        db.add_relation(blocked.id, dep.id, "depends_on").unwrap();
+
+        // get_schedulable_tasks filters out "blocked"
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        assert_eq!(schedulable.len(), 2);
+
+        // select_non_conflicting on the filtered set
+        let batch = select_non_conflicting(&schedulable);
+        let batch_ids: Vec<i64> = batch.iter().map(|t| t.id).collect();
+        // dep (priority 10, shared.rs) and free (priority 1, other.rs) don't conflict
+        assert!(batch_ids.contains(&dep.id));
+        assert!(batch_ids.contains(&free.id));
+        assert!(!batch_ids.contains(&blocked.id));
+    }
+
+    #[test]
+    fn test_dependency_becomes_schedulable_after_dep_done() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = create_ready_task(&db, "/project", "Dep", 5, None);
+        let task = create_ready_task(&db, "/project", "Task", 3, None);
+
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        // Before: only dep is schedulable
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&dep.id));
+        assert!(!ids.contains(&task.id));
+
+        // Move dep to done
+        move_to_done(&db, dep.id);
+
+        // After: task should now be schedulable
+        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&task.id));
     }
 }
