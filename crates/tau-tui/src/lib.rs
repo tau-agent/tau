@@ -466,6 +466,16 @@ async fn run_inner(
                         }
                     }
                 }
+                Action::FireHook { name, data } => {
+                    // Best-effort: fire the hook on the server so plugins
+                    // (e.g. the task scheduler) can react. If it fails we
+                    // just log — the DB state change already succeeded.
+                    if let Err(e) = send_fire_and_forget(Request::FireHook { name, data }).await {
+                        app.messages.push(crate::message::MessageItem::Error {
+                            text: format!("hook: {}", e),
+                        });
+                    }
+                }
             }
         }
 

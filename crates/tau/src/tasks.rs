@@ -1049,7 +1049,7 @@ pub fn run_tasks_plugin() {
     let registration = PluginRegistration {
         name: "tasks".to_string(),
         tools: tasks_tools(),
-        hooks: Vec::new(),
+        hooks: vec!["task_state_changed".to_string()],
         commands: Vec::new(),
     };
     send_message(&mut writer, &PluginMessage::Register(registration));
@@ -1173,7 +1173,25 @@ pub fn run_tasks_plugin() {
                     &PluginMessage::HookResult(HookResult::default()),
                 );
             }
-            PluginRequest::Hook { .. } => {
+            PluginRequest::Hook { name, data } => {
+                if name == "task_state_changed" {
+                    let new_state = data.get("new_state").and_then(|v| v.as_str()).unwrap_or("");
+                    let task_id = data.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    match new_state {
+                        "approved" => {
+                            pending_events.push(SchedulerEvent::MergeNeeded);
+                        }
+                        "ready" => {
+                            // Look up the task's project for the schedule pass.
+                            if let Ok(Some(task)) = db.get_task(task_id) {
+                                pending_events
+                                    .push(SchedulerEvent::ScheduleNeeded(task.project.clone()));
+                            }
+                        }
+                        _ => {}
+                    }
+                    drain_scheduler_events(&mut pending_events, &db, &mut writer, &mut chan_reader);
+                }
                 send_message(
                     &mut writer,
                     &PluginMessage::HookResult(HookResult::default()),

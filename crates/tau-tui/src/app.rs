@@ -1075,10 +1075,7 @@ impl App {
                     Some(Action::SetCwd(args.to_string()))
                 }
             }
-            "/task" | "/tasks" => {
-                self.handle_task_slash_command(args);
-                None
-            }
+            "/task" | "/tasks" => self.handle_task_slash_command(args),
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!("unknown command: {}. Type /help", cmd),
@@ -1088,7 +1085,7 @@ impl App {
         }
     }
 
-    fn handle_task_slash_command(&mut self, args: &str) {
+    fn handle_task_slash_command(&mut self, args: &str) -> Option<Action> {
         let parts: Vec<&str> = args.splitn(3, ' ').collect();
         let subcmd = parts.first().copied().unwrap_or("");
 
@@ -1113,13 +1110,13 @@ impl App {
                     self.messages.push(MessageItem::Error {
                         text: "usage: /task get <id>".into(),
                     });
-                    return;
+                    return None;
                 };
                 let Ok(id) = id_str.parse::<i64>() else {
                     self.messages.push(MessageItem::Error {
                         text: format!("invalid task id: {}", id_str),
                     });
-                    return;
+                    return None;
                 };
                 match self.run_task_get(id) {
                     Ok(()) => {}
@@ -1135,16 +1132,21 @@ impl App {
                     self.messages.push(MessageItem::Error {
                         text: "usage: /task approve <id>".into(),
                     });
-                    return;
+                    return None;
                 };
                 let Ok(id) = id_str.parse::<i64>() else {
                     self.messages.push(MessageItem::Error {
                         text: format!("invalid task id: {}", id_str),
                     });
-                    return;
+                    return None;
                 };
                 match self.run_task_state_change(id, "approved") {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        return Some(Action::FireHook {
+                            name: "task_state_changed".into(),
+                            data: serde_json::json!({"task_id": id, "new_state": "approved"}),
+                        });
+                    }
                     Err(e) => {
                         self.messages.push(MessageItem::Error {
                             text: format!("task approve: {}", e),
@@ -1157,16 +1159,21 @@ impl App {
                     self.messages.push(MessageItem::Error {
                         text: "usage: /task ready <id>".into(),
                     });
-                    return;
+                    return None;
                 };
                 let Ok(id) = id_str.parse::<i64>() else {
                     self.messages.push(MessageItem::Error {
                         text: format!("invalid task id: {}", id_str),
                     });
-                    return;
+                    return None;
                 };
                 match self.run_task_state_change(id, "ready") {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        return Some(Action::FireHook {
+                            name: "task_state_changed".into(),
+                            data: serde_json::json!({"task_id": id, "new_state": "ready"}),
+                        });
+                    }
                     Err(e) => {
                         self.messages.push(MessageItem::Error {
                             text: format!("task ready: {}", e),
@@ -1180,7 +1187,7 @@ impl App {
                     self.messages.push(MessageItem::Error {
                         text: "usage: /task create <title>".into(),
                     });
-                    return;
+                    return None;
                 }
                 match self.run_task_create(title) {
                     Ok(()) => {}
@@ -1197,7 +1204,7 @@ impl App {
                     self.messages.push(MessageItem::Error {
                         text: "usage: /task search <query>".into(),
                     });
-                    return;
+                    return None;
                 }
                 match self.run_task_search(query) {
                     Ok(()) => {}
@@ -1217,6 +1224,7 @@ impl App {
                 });
             }
         }
+        None
     }
 
     fn run_task_list(&mut self, state_filter: Option<&str>) -> tau::Result<()> {
@@ -1829,6 +1837,11 @@ pub enum Action {
     ForkSession,
     /// Create a fresh session with default settings.
     NewSession,
+    /// Fire a hook on the server (best-effort, e.g. after TUI task state changes).
+    FireHook {
+        name: String,
+        data: serde_json::Value,
+    },
 }
 
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.
