@@ -1049,6 +1049,26 @@ impl PluginManager {
                 }
             }
         }
+
+        // Auto-spawn built-in tasks plugin if not already configured
+        if !self.global_plugins.iter().any(|p| p.name == "tasks")
+            && let Ok(exe) = std::env::current_exe()
+        {
+            let exe = exe.to_string_lossy().to_string();
+            let cmd = vec![exe, "plugin-tasks".to_string()];
+            match PluginHandle::spawn(&cmd, cwd) {
+                Ok(handle) => {
+                    eprintln!(
+                        "auto-spawned tasks plugin: {} tools",
+                        handle.registration.tools.len()
+                    );
+                    self.global_plugins.push(handle);
+                }
+                Err(e) => {
+                    eprintln!("failed to auto-spawn tasks plugin: {}", e);
+                }
+            }
+        }
     }
 
     /// Set up background I/O for global plugins.
