@@ -9,6 +9,7 @@ use crate::plugin::{
     HookResult, PluginMessage, PluginRegistration, PluginRequest, PluginToolDef, PluginToolResult,
 };
 use crate::tasks_db::{TaskUpdate, TasksDb};
+use crate::tasks_merge;
 use crate::tasks_scheduler;
 use crate::types::ToolResultContent;
 
@@ -313,6 +314,25 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "Finds all ready tasks, selects a non-conflicting batch based on affected_files, creates branches/worktrees, transitions to active.".into(),
                 "After scheduling, use task_dispatch to create sessions and start work.".into(),
+            ],
+        },
+        PluginToolDef {
+            name: "task_merge".into(),
+            description: "Merge an approved task: rebase, run checklist, fast-forward merge into target branch.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "description": "Task ID to merge"
+                    }
+                },
+                "required": ["id"]
+            }),
+            prompt_snippet: Some("Merge an approved task into its target branch".into()),
+            prompt_guidelines: vec![
+                "Task must be in 'approved' state. Transitions to 'merging', then 'done' on success or back to 'active' on failure.".into(),
+                "Runs: rebase onto target, project checklist, fast-forward merge.".into(),
             ],
         },
         PluginToolDef {
@@ -675,6 +695,135 @@ fn handle_task_dispatch(
     }
 }
 
+fn handle_task_merge(
+    db: &TasksDb,
+    args: &serde_json::Value,
+    session_id: Option<&str>,
+    tool_call_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> PluginToolResult {
+    let id = match args.get("id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return tool_err(tool_call_id, "id is required"),
+    };
+
+    // Get task and validate it's approved
+    let task = match db.get_task(id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return tool_err(tool_call_id, &format!("task {} not found", id)),
+        Err(e) => return tool_err(tool_call_id, &format!("get task: {}", e)),
+    };
+
+    if task.state != "approved" {
+        return tool_err(
+            tool_call_id,
+            &format!(
+                "task {} is in state '{}', must be 'approved' to merge",
+                id, task.state
+            ),
+        );
+    }
+
+    // Transition to merging
+    if let Err(e) = db.update_task(
+        id,
+        &TaskUpdate {
+            state: Some("merging".into()),
+            ..Default::default()
+        },
+        session_id,
+    ) {
+        return tool_err(tool_call_id, &format!("transition to merging: {}", e));
+    }
+
+    // Run the merge
+    let project_dir = &task.project;
+    match tasks_merge::merge_task(db, id, project_dir, writer, reader) {
+        Ok(result) => {
+            if result.success {
+                // Transition to done
+                if let Err(e) = db.update_task(
+                    id,
+                    &TaskUpdate {
+                        state: Some("done".into()),
+                        ..Default::default()
+                    },
+                    session_id,
+                ) {
+                    return tool_err(
+                        tool_call_id,
+                        &format!("merge succeeded but transition to done failed: {}", e),
+                    );
+                }
+
+                // Check parent notification
+                if let Err(e) = tasks_merge::notify_parent_if_all_done(db, id, writer, reader) {
+                    eprintln!("tasks: parent notification failed for task {}: {}", id, e);
+                }
+
+                match serde_json::to_string_pretty(&result) {
+                    Ok(json) => tool_ok(tool_call_id, &json),
+                    Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
+                }
+            } else {
+                // Merge failed — transition back to active
+                if let Err(e) = db.update_task(
+                    id,
+                    &TaskUpdate {
+                        state: Some("active".into()),
+                        ..Default::default()
+                    },
+                    session_id,
+                ) {
+                    eprintln!(
+                        "tasks: failed to transition task {} back to active: {}",
+                        id, e
+                    );
+                }
+
+                // Add error details as a task message
+                let _ = db.add_message(
+                    id,
+                    &format!("Merge failed:\n{}", result.log),
+                    Some("system"),
+                );
+
+                // Notify assigned session if it exists
+                if let Some(ref sid) = task.session_id {
+                    crate::tasks_merge::notify_session_of_merge_failure(
+                        sid,
+                        id,
+                        &result.log,
+                        writer,
+                        reader,
+                    );
+                }
+
+                tool_err(tool_call_id, &format!("merge failed:\n{}", result.log))
+            }
+        }
+        Err(e) => {
+            // Unexpected error — transition back to active
+            if let Err(te) = db.update_task(
+                id,
+                &TaskUpdate {
+                    state: Some("active".into()),
+                    ..Default::default()
+                },
+                session_id,
+            ) {
+                eprintln!(
+                    "tasks: failed to transition task {} back to active: {}",
+                    id, te
+                );
+            }
+            let _ = db.add_message(id, &format!("Merge error: {}", e), Some("system"));
+            tool_err(tool_call_id, &format!("merge error: {}", e))
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plugin main loop
 // ---------------------------------------------------------------------------
@@ -750,6 +899,14 @@ pub fn run_tasks_plugin() {
                     "task_schedule" => {
                         handle_task_schedule(&db, &arguments, project, &tool_call_id)
                     }
+                    "task_merge" => handle_task_merge(
+                        &db,
+                        &arguments,
+                        session,
+                        &tool_call_id,
+                        &mut writer,
+                        &mut reader,
+                    ),
                     "task_dispatch" => handle_task_dispatch(
                         &db,
                         &arguments,
@@ -821,7 +978,7 @@ mod tests {
     #[test]
     fn test_tasks_tools_defined() {
         let tools = tasks_tools();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"task_create"));
         assert!(names.contains(&"task_get"));
@@ -834,6 +991,7 @@ mod tests {
         assert!(names.contains(&"task_search"));
         assert!(names.contains(&"task_schedule"));
         assert!(names.contains(&"task_dispatch"));
+        assert!(names.contains(&"task_merge"));
     }
 
     #[test]
@@ -982,7 +1140,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "register");
         assert_eq!(parsed["name"], "tasks");
-        assert_eq!(parsed["tools"].as_array().unwrap().len(), 11);
+        assert_eq!(parsed["tools"].as_array().unwrap().len(), 12);
     }
 
     fn extract_text(result: &PluginToolResult) -> String {

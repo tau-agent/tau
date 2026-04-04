@@ -15,6 +15,7 @@ pub mod system_prompt;
 pub mod tasks;
 pub mod tasks_db;
 pub mod tasks_git;
+pub mod tasks_merge;
 pub mod tasks_scheduler;
 pub mod throttle;
 pub mod tools;

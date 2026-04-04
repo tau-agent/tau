@@ -1,0 +1,956 @@
+//! Merge queue for the task system.
+//!
+//! Processes `merging` tasks: rebases onto the merge target, runs the project
+//! checklist, and performs a fast-forward merge.
+
+use std::io::{BufRead, Write};
+
+use serde::Deserialize;
+use serde_json::json;
+
+use crate::plugin::{PluginMessage, PluginRequest};
+use crate::protocol::{Request, Response};
+use crate::tasks_db::TasksDb;
+
+// ---------------------------------------------------------------------------
+// Checklist
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct Checklist {
+    #[serde(default)]
+    pub check: Vec<CheckItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckItem {
+    pub name: String,
+    pub command: String,
+}
+
+/// Load the project checklist from `{project_dir}/.tau/checklist.toml`.
+/// Returns an empty vec if the file doesn't exist or can't be parsed.
+pub fn load_checklist(project_dir: &str) -> Vec<CheckItem> {
+    let path = std::path::Path::new(project_dir)
+        .join(".tau")
+        .join("checklist.toml");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    match toml::from_str::<Checklist>(&content) {
+        Ok(cl) => cl.check,
+        Err(e) => {
+            eprintln!("tasks merge: failed to parse checklist: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merge result
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, serde::Serialize)]
+pub struct MergeResult {
+    pub success: bool,
+    pub log: String,
+}
+
+// ---------------------------------------------------------------------------
+// ServerRequest tunnel helpers (same pattern as tasks_scheduler)
+// ---------------------------------------------------------------------------
+
+fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
+    if let Ok(mut line) = serde_json::to_string(msg) {
+        line.push('\n');
+        let _ = writer.write_all(line.as_bytes());
+        let _ = writer.flush();
+    }
+}
+
+fn server_request(
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+    request: Request,
+) -> crate::Result<Response> {
+    let request_id = format!("merge-sr-{}", crate::types::timestamp_ms());
+    send_message(
+        writer,
+        &PluginMessage::ServerRequest {
+            request_id: request_id.clone(),
+            request,
+        },
+    );
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                return Err(crate::Error::Io(
+                    "stdin closed while waiting for server response".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return Err(crate::Error::Io(format!("read error: {}", e)));
+            }
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let req: PluginRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if let PluginRequest::ServerResponse {
+            request_id: rid,
+            response,
+        } = req
+            && rid == request_id
+        {
+            return Ok(response);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Execute a bash command via the log session
+// ---------------------------------------------------------------------------
+
+/// Run a bash command via ExecuteTool on the given session.
+/// Returns (stdout text, is_error).
+fn execute_bash(
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+    session_id: &str,
+    command: &str,
+) -> crate::Result<(String, bool)> {
+    let resp = server_request(
+        writer,
+        reader,
+        Request::ExecuteTool {
+            session_id: session_id.to_string(),
+            tool_name: "bash".into(),
+            arguments: json!({ "command": command }),
+        },
+    )?;
+
+    match resp {
+        Response::ToolExecuted { content, is_error } => Ok((content, is_error)),
+        Response::Error { message } => {
+            Err(crate::Error::Io(format!("ExecuteTool error: {}", message)))
+        }
+        other => Err(crate::Error::Io(format!(
+            "unexpected ExecuteTool response: {:?}",
+            other
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merge execution
+// ---------------------------------------------------------------------------
+
+/// Execute the merge sequence for a task.
+///
+/// The task must already be in `merging` state with a worktree.
+/// Creates a log session via ServerRequest, rebases, runs the checklist,
+/// and fast-forward merges into the merge target.
+pub fn merge_task(
+    db: &TasksDb,
+    task_id: i64,
+    project_dir: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> crate::Result<MergeResult> {
+    // 1. Get task, branch, merge target
+    let task = db
+        .get_task(task_id)?
+        .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
+
+    if task.state != "merging" {
+        return Err(crate::Error::Io(format!(
+            "task {} is in state '{}', must be 'merging'",
+            task_id, task.state
+        )));
+    }
+
+    let branch = task
+        .branch
+        .as_ref()
+        .ok_or_else(|| crate::Error::Io(format!("task {} has no branch set", task_id)))?;
+
+    let worktree_path = task
+        .worktree_path
+        .as_ref()
+        .ok_or_else(|| crate::Error::Io(format!("task {} has no worktree", task_id)))?;
+
+    let merge_target = db.get_merge_target(task_id)?;
+
+    let mut log = String::new();
+
+    // 3. Create a log-provider session
+    let log_session = match server_request(
+        writer,
+        reader,
+        Request::CreateSession {
+            model: Some("log".into()),
+            provider: None,
+            system_prompt: None,
+            cwd: Some(worktree_path.clone()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: Some(format!("Merge task {}", task_id)),
+            auto_archive: false,
+        },
+    )? {
+        Response::SessionCreated { session_id } => session_id,
+        Response::Error { message } => {
+            return Ok(MergeResult {
+                success: false,
+                log: format!("Failed to create log session: {}", message),
+            });
+        }
+        other => {
+            return Ok(MergeResult {
+                success: false,
+                log: format!("Unexpected response creating log session: {:?}", other),
+            });
+        }
+    };
+
+    // 4. Rebase onto merge target
+    log.push_str(&format!("=== Rebase onto {} ===\n", merge_target));
+    let (output, is_error) = execute_bash(
+        writer,
+        reader,
+        &log_session,
+        &format!("git rebase {}", merge_target),
+    )?;
+    log.push_str(&output);
+    log.push('\n');
+
+    if is_error {
+        // Abort the rebase so we leave a clean state
+        let _ = execute_bash(writer, reader, &log_session, "git rebase --abort");
+        archive_session(writer, reader, &log_session);
+        return Ok(MergeResult {
+            success: false,
+            log: format!("Rebase failed:\n{}", log),
+        });
+    }
+
+    // 5. Run checklist
+    let checklist = load_checklist(project_dir);
+    for item in &checklist {
+        log.push_str(&format!("=== Check: {} ===\n", item.name));
+        let (output, is_error) = execute_bash(writer, reader, &log_session, &item.command)?;
+        log.push_str(&output);
+        log.push('\n');
+
+        if is_error {
+            archive_session(writer, reader, &log_session);
+            return Ok(MergeResult {
+                success: false,
+                log: format!("Checklist '{}' failed:\n{}", item.name, log),
+            });
+        }
+    }
+
+    // 6. Fast-forward merge from repo root
+    log.push_str(&format!("=== Merge {} into {} ===\n", branch, merge_target));
+    let (output, is_error) = execute_bash(
+        writer,
+        reader,
+        &log_session,
+        &format!(
+            "cd $(git rev-parse --show-toplevel) && git checkout {} && git merge --ff-only {}",
+            merge_target, branch
+        ),
+    )?;
+    log.push_str(&output);
+    log.push('\n');
+
+    if is_error {
+        archive_session(writer, reader, &log_session);
+        return Ok(MergeResult {
+            success: false,
+            log: format!("Merge failed:\n{}", log),
+        });
+    }
+
+    // 7. Clean up: remove worktree via bash, clear in DB
+    let _ = execute_bash(
+        writer,
+        reader,
+        &log_session,
+        &format!(
+            "cd $(git rev-parse --show-toplevel) && git worktree remove --force {}",
+            worktree_path
+        ),
+    );
+    let _ = db.clear_worktree(task_id);
+
+    // 8. Archive the log session
+    archive_session(writer, reader, &log_session);
+
+    log.push_str("=== Merge complete ===\n");
+
+    Ok(MergeResult { success: true, log })
+}
+
+/// Archive a session (best-effort, errors are ignored).
+fn archive_session(writer: &mut impl Write, reader: &mut impl BufRead, session_id: &str) {
+    let _ = server_request(
+        writer,
+        reader,
+        Request::ArchiveSession {
+            session_id: session_id.to_string(),
+            require_ancestor: None,
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Parent notification
+// ---------------------------------------------------------------------------
+
+/// After a subtask merges successfully, check if all sibling subtasks under
+/// the same parent are `done`. If so, add a message to the parent and
+/// optionally notify its session.
+pub fn notify_parent_if_all_done(
+    db: &TasksDb,
+    task_id: i64,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> crate::Result<()> {
+    let task = db
+        .get_task(task_id)?
+        .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
+
+    let parent_id = match task.parent_id {
+        Some(pid) => pid,
+        None => return Ok(()), // root task, nothing to notify
+    };
+
+    let parent = match db.get_task(parent_id)? {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    // Check if all sibling subtasks are done
+    let subtasks = db.get_subtasks(parent_id)?;
+    let all_done = !subtasks.is_empty() && subtasks.iter().all(|t| t.state == "done");
+
+    if !all_done {
+        return Ok(());
+    }
+
+    // All subtasks done — notify parent
+    let parent_branch = parent.branch.as_deref().unwrap_or("main");
+    let msg = format!(
+        "All subtasks completed and merged into branch {}.",
+        parent_branch
+    );
+    let _ = db.add_message(parent_id, &msg, Some("system"));
+
+    // If parent has a session_id, send QueueMessage to notify the agent
+    if let Some(ref session_id) = parent.session_id {
+        let _ = server_request(
+            writer,
+            reader,
+            Request::QueueMessage {
+                target_session_id: session_id.clone(),
+                content: msg,
+                sender_info: format!("task-system (task {})", task_id),
+                await_reply: false,
+                reply_to: None,
+            },
+        );
+    }
+
+    Ok(())
+}
+
+/// Send a QueueMessage to notify a session about merge failure.
+/// Best-effort — errors are ignored.
+pub fn notify_session_of_merge_failure(
+    session_id: &str,
+    task_id: i64,
+    log: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let content = format!(
+        "Merge for task {} failed. The task has been moved back to active state.\n\n{}",
+        task_id, log
+    );
+    let _ = server_request(
+        writer,
+        reader,
+        Request::QueueMessage {
+            target_session_id: session_id.to_string(),
+            content,
+            sender_info: format!("task-system (merge task {})", task_id),
+            await_reply: false,
+            reply_to: None,
+        },
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks_db::{TaskUpdate, TasksDb};
+
+    // ----- checklist parsing -----
+
+    #[test]
+    fn test_load_checklist_valid_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(
+            tau_dir.join("checklist.toml"),
+            r#"
+[[check]]
+name = "fmt"
+command = "cargo fmt --check"
+
+[[check]]
+name = "clippy"
+command = "cargo clippy -- -D warnings"
+
+[[check]]
+name = "test"
+command = "cargo test"
+"#,
+        )
+        .unwrap();
+
+        let items = load_checklist(dir.path().to_str().unwrap());
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].name, "fmt");
+        assert_eq!(items[0].command, "cargo fmt --check");
+        assert_eq!(items[1].name, "clippy");
+        assert_eq!(items[2].name, "test");
+        assert_eq!(items[2].command, "cargo test");
+    }
+
+    #[test]
+    fn test_load_checklist_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let items = load_checklist(dir.path().to_str().unwrap());
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_load_checklist_empty_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join("checklist.toml"), "").unwrap();
+
+        let items = load_checklist(dir.path().to_str().unwrap());
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_load_checklist_no_checks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join("checklist.toml"), "# empty checklist\n").unwrap();
+
+        let items = load_checklist(dir.path().to_str().unwrap());
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_load_checklist_invalid_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join("checklist.toml"), "not [[ valid toml {{").unwrap();
+
+        let items = load_checklist(dir.path().to_str().unwrap());
+        assert!(items.is_empty());
+    }
+
+    // ----- merge state validation -----
+
+    #[test]
+    fn test_merge_result_serialization() {
+        let result = MergeResult {
+            success: true,
+            log: "all good".into(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("all good"));
+    }
+
+    // ----- helper to create a task in merging state -----
+
+    fn make_merging_task(db: &TasksDb) -> i64 {
+        let task = db
+            .create_task("/project", "Test merge", None, None, None, true)
+            .unwrap();
+        // interactive -> ready
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        // ready -> active (via assign)
+        db.assign_task(task.id, "s1").unwrap();
+        // active -> approved (skip_review=true)
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        // approved -> merging
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("merging".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.set_branch(task.id, "task-1").unwrap();
+        db.set_worktree_path(task.id, "/tmp/wt-1").unwrap();
+        task.id
+    }
+
+    #[test]
+    fn test_merge_task_requires_merging_state() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Not merging", None, None, None, false)
+            .unwrap();
+
+        // We can't call merge_task without real I/O, but we can validate
+        // the state check by creating a mock reader/writer that will cause
+        // an early return due to state validation.
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        let result = merge_task(&db, task.id, "/project", &mut writer, &mut reader);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("must be 'merging'"), "got: {}", err);
+    }
+
+    #[test]
+    fn test_merge_task_requires_branch() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "No branch", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("merging".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        // No branch set, no worktree set
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        let result = merge_task(&db, task.id, "/project", &mut writer, &mut reader);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("no branch"),
+            "expected 'no branch' error"
+        );
+    }
+
+    #[test]
+    fn test_merge_task_requires_worktree() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "No worktree", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("merging".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.set_branch(task.id, "task-1").unwrap();
+        // No worktree set
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        let result = merge_task(&db, task.id, "/project", &mut writer, &mut reader);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("no worktree"),
+            "expected 'no worktree' error"
+        );
+    }
+
+    // ----- parent notification -----
+
+    #[test]
+    fn test_notify_parent_all_subtasks_done() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create parent
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false)
+            .unwrap();
+        db.set_branch(parent.id, "task-parent").unwrap();
+
+        // Create two subtasks and move them to done
+        let child1 = db
+            .create_task("/project", "Child 1", None, Some(parent.id), None, false)
+            .unwrap();
+        let child2 = db
+            .create_task("/project", "Child 2", None, Some(parent.id), None, false)
+            .unwrap();
+
+        // Move both to done via full state machine
+        for child_id in [child1.id, child2.id] {
+            db.assign_task(child_id, "s1").unwrap();
+            db.update_task(
+                child_id,
+                &TaskUpdate {
+                    state: Some("review".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            db.update_task(
+                child_id,
+                &TaskUpdate {
+                    state: Some("approved".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            db.update_task(
+                child_id,
+                &TaskUpdate {
+                    state: Some("merging".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            db.update_task(
+                child_id,
+                &TaskUpdate {
+                    state: Some("done".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        // No real server — writer/reader that won't be used (no session_id on parent)
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        notify_parent_if_all_done(&db, child1.id, &mut writer, &mut reader).unwrap();
+
+        // Parent should have a message about all subtasks completed
+        let messages = db.get_messages(parent.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("All subtasks completed"));
+        assert!(messages[0].content.contains("task-parent"));
+    }
+
+    #[test]
+    fn test_notify_parent_not_all_done() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false)
+            .unwrap();
+        db.set_branch(parent.id, "task-parent").unwrap();
+
+        let child1 = db
+            .create_task("/project", "Child 1", None, Some(parent.id), None, false)
+            .unwrap();
+        let _child2 = db
+            .create_task("/project", "Child 2", None, Some(parent.id), None, false)
+            .unwrap();
+
+        // Only move child1 to done
+        db.assign_task(child1.id, "s1").unwrap();
+        db.update_task(
+            child1.id,
+            &TaskUpdate {
+                state: Some("review".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            child1.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            child1.id,
+            &TaskUpdate {
+                state: Some("merging".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            child1.id,
+            &TaskUpdate {
+                state: Some("done".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        notify_parent_if_all_done(&db, child1.id, &mut writer, &mut reader).unwrap();
+
+        // No message should be added — child2 is still in 'ready' state
+        let messages = db.get_messages(parent.id).unwrap();
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_notify_parent_root_task_noop() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let task = db
+            .create_task("/project", "Root", None, None, None, false)
+            .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        // Should be a no-op for root tasks
+        notify_parent_if_all_done(&db, task.id, &mut writer, &mut reader).unwrap();
+    }
+
+    #[test]
+    fn test_notify_parent_sends_queue_message() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false)
+            .unwrap();
+        db.set_branch(parent.id, "task-parent").unwrap();
+        db.set_session_id(parent.id, "parent-session").unwrap();
+
+        let child = db
+            .create_task("/project", "Child", None, Some(parent.id), None, false)
+            .unwrap();
+
+        // Move child to done
+        db.assign_task(child.id, "s1").unwrap();
+        db.update_task(
+            child.id,
+            &TaskUpdate {
+                state: Some("review".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            child.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            child.id,
+            &TaskUpdate {
+                state: Some("merging".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            child.id,
+            &TaskUpdate {
+                state: Some("done".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Provide a fake server response for the QueueMessage
+        let _fake_response = serde_json::to_string(&PluginRequest::ServerResponse {
+            request_id: "placeholder".into(),
+            response: Response::Ok,
+        })
+        .unwrap();
+
+        // We need the reader to provide a response. However, the request_id
+        // is generated dynamically, so we simulate by writing a response that
+        // matches. For this test, we verify the writer output instead.
+        // Use an empty reader — the QueueMessage send will fail/block but
+        // since it's best-effort (uses `let _ =`), the function should still
+        // return Ok. Actually, it will block on read... Let's use a reader
+        // that provides a response. We need to predict the request_id prefix.
+
+        // Actually, notify_parent_if_all_done catches the QueueMessage error
+        // with `let _ =`. But server_request will block on stdin. For testing,
+        // we can't easily mock this. Instead let's verify the DB side effects
+        // and that the function doesn't panic when stdin is empty (it will error,
+        // but the `let _ =` catches it).
+
+        // Provide a reader that immediately returns EOF, which will cause
+        // server_request to return Err, which is caught by `let _ =`.
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        // The QueueMessage will fail (empty reader), but that's ok — it's
+        // handled gracefully. The function should still succeed.
+        notify_parent_if_all_done(&db, child.id, &mut writer, &mut reader).unwrap();
+
+        // Verify DB side effects
+        let messages = db.get_messages(parent.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("All subtasks completed"));
+
+        // Verify that a QueueMessage was attempted (check writer output)
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("queue_message"), "output: {}", output);
+        assert!(output.contains("parent-session"), "output: {}", output);
+    }
+
+    // ----- merging state transition helpers -----
+
+    #[test]
+    fn test_full_state_machine_to_merging() {
+        let db = TasksDb::open_memory().unwrap();
+        let task_id = make_merging_task(&db);
+
+        let task = db.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, "merging");
+        assert_eq!(task.branch.as_deref(), Some("task-1"));
+        assert_eq!(task.worktree_path.as_deref(), Some("/tmp/wt-1"));
+    }
+
+    #[test]
+    fn test_merging_to_done_transition() {
+        let db = TasksDb::open_memory().unwrap();
+        let task_id = make_merging_task(&db);
+
+        // merging -> done
+        db.update_task(
+            task_id,
+            &TaskUpdate {
+                state: Some("done".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let task = db.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, "done");
+    }
+
+    #[test]
+    fn test_merging_to_active_transition() {
+        let db = TasksDb::open_memory().unwrap();
+        let task_id = make_merging_task(&db);
+
+        // merging -> active (on merge failure)
+        db.update_task(
+            task_id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let task = db.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, "active");
+    }
+}
