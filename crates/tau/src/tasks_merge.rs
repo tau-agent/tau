@@ -69,6 +69,12 @@ fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
     }
 }
 
+/// Send a ServerRequest via plugin protocol and wait for the ServerResponse.
+///
+/// While waiting, any `ToolCall` messages that arrive on stdin are
+/// **immediately answered with an error** so that the calling session does
+/// not hang.  See the identical comment in `tasks_scheduler::server_request`
+/// for the full rationale.
 fn server_request(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
@@ -104,13 +110,34 @@ fn server_request(
             Ok(r) => r,
             Err(_) => continue,
         };
-        if let PluginRequest::ServerResponse {
-            request_id: rid,
-            response,
-        } = req
-            && rid == request_id
-        {
-            return Ok(response);
+        match req {
+            PluginRequest::ServerResponse {
+                request_id: rid,
+                response,
+            } if rid == request_id => {
+                return Ok(response);
+            }
+            // A concurrent ToolCall arrived while we are mid-ServerRequest.
+            // Answer immediately with an error so the session is not left
+            // hanging in "running tools".
+            PluginRequest::ToolCall { tool_call_id, .. } => {
+                send_message(
+                    writer,
+                    &PluginMessage::ToolResult(crate::plugin::PluginToolResult {
+                        tool_call_id,
+                        content: vec![crate::types::ToolResultContent::Text(
+                            crate::types::TextContent {
+                                text: "tasks plugin is busy with a background merge pass \
+                                       — please retry in a moment"
+                                    .into(),
+                                text_signature: None,
+                            },
+                        )],
+                        is_error: true,
+                    }),
+                );
+            }
+            _ => {}
         }
     }
 }
