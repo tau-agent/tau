@@ -1240,12 +1240,15 @@ impl App {
         });
         for t in &tasks {
             let session = t.assigned_session.as_deref().unwrap_or("-");
-            self.messages.push(MessageItem::Status {
-                text: format!(
-                    "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
-                    t.id, t.state, t.priority, session, t.title
-                ),
-            });
+            let text = format!(
+                "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
+                t.id, t.state, t.priority, session, t.title
+            );
+            if t.state == "failed" {
+                self.messages.push(MessageItem::Error { text });
+            } else {
+                self.messages.push(MessageItem::Status { text });
+            }
         }
         Ok(())
     }
@@ -1299,9 +1302,12 @@ impl App {
                 text: "Subtasks:".into(),
             });
             for st in &subtasks {
-                self.messages.push(MessageItem::Status {
-                    text: format!("  #{:<4} {:<8} {}", st.id, st.state, st.title),
-                });
+                let text = format!("  #{:<4} {:<8} {}", st.id, st.state, st.title);
+                if st.state == "failed" {
+                    self.messages.push(MessageItem::Error { text });
+                } else {
+                    self.messages.push(MessageItem::Status { text });
+                }
             }
         }
 
@@ -1342,12 +1348,15 @@ impl App {
         });
         for t in &tasks {
             let session = t.assigned_session.as_deref().unwrap_or("-");
-            self.messages.push(MessageItem::Status {
-                text: format!(
-                    "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
-                    t.id, t.state, t.priority, session, t.title
-                ),
-            });
+            let text = format!(
+                "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
+                t.id, t.state, t.priority, session, t.title
+            );
+            if t.state == "failed" {
+                self.messages.push(MessageItem::Error { text });
+            } else {
+                self.messages.push(MessageItem::Status { text });
+            }
         }
         Ok(())
     }

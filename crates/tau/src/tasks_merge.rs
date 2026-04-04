@@ -410,7 +410,7 @@ pub fn notify_session_of_merge_failure(
     reader: &mut impl BufRead,
 ) {
     let content = format!(
-        "Merge for task {} failed. The task has been moved back to active state.\n\n{}",
+        "Merge for task {} failed. The task has been moved back to active state so you can fix the issue and retry.\n\n{}",
         task_id, log
     );
     let _ = server_request(
@@ -965,7 +965,41 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
         let task_id = make_merging_task(&db);
 
-        // merging -> active (on merge failure)
+        // merging -> active (recoverable merge failure: rebase conflict, checklist)
+        db.update_task(
+            task_id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let task = db.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, "active");
+    }
+
+    #[test]
+    fn test_merging_to_failed_to_active_transition() {
+        let db = TasksDb::open_memory().unwrap();
+        let task_id = make_merging_task(&db);
+
+        // merging -> failed (terminal infrastructure error)
+        db.update_task(
+            task_id,
+            &TaskUpdate {
+                state: Some("failed".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let task = db.get_task(task_id).unwrap().unwrap();
+        assert_eq!(task.state, "failed");
+
+        // failed -> active (manual recovery)
         db.update_task(
             task_id,
             &TaskUpdate {

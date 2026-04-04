@@ -74,6 +74,7 @@ const VALID_STATES: &[&str] = &[
     "review",
     "approved",
     "merging",
+    "failed",
     "done",
 ];
 
@@ -119,6 +120,8 @@ pub fn validate_state_transition(from: &str, to: &str) -> bool {
             | ("approved", "ready")
             | ("approved", "interactive")
             | ("merging", "active")
+            | ("merging", "failed")
+            | ("failed", "active")
     )
 }
 
@@ -1410,6 +1413,8 @@ mod tests {
         assert!(validate_state_transition("approved", "ready"));
         assert!(validate_state_transition("approved", "interactive"));
         assert!(validate_state_transition("merging", "active"));
+        assert!(validate_state_transition("merging", "failed"));
+        assert!(validate_state_transition("failed", "active"));
 
         // Universal overrides: any state -> done
         assert!(validate_state_transition("interactive", "done"));
@@ -1432,6 +1437,14 @@ mod tests {
         // Skip transitions that don't make sense
         assert!(!validate_state_transition("interactive", "active"));
         assert!(!validate_state_transition("interactive", "merging"));
+
+        // failed state transitions
+        assert!(validate_state_transition("merging", "failed"));
+        assert!(validate_state_transition("failed", "active"));
+        assert!(validate_state_transition("failed", "done")); // universal
+        assert!(validate_state_transition("failed", "interactive")); // universal
+        assert!(!validate_state_transition("failed", "merging"));
+        assert!(!validate_state_transition("failed", "approved"));
     }
 
     #[test]
@@ -2234,6 +2247,7 @@ mod tests {
             "active" => &["ready"],
             "review" => &["ready"],
             "approved" => &["ready"],
+            "failed" => &["ready"],
             "done" => &["ready"],
             _ => panic!("unsupported target state: {}", state),
         };
@@ -2271,6 +2285,36 @@ mod tests {
                     task.id,
                     &TaskUpdate {
                         state: Some("approved".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            }
+            "failed" => {
+                db.assign_task(task.id, "test-session").unwrap();
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("approved".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("merging".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("failed".into()),
                         ..Default::default()
                     },
                     None,

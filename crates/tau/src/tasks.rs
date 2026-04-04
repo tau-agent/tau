@@ -91,7 +91,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "Top-level tasks start in 'interactive' state for spec refinement".into(),
                 "Subtasks (with parent_id) start in 'ready' state with skip_review=false".into(),
-                "Valid states: interactive, ready, active, review, approved, merging, done".into(),
+                "Valid states: interactive, ready, active, review, approved, merging, failed, done".into(),
             ],
         },
         PluginToolDef {
@@ -121,7 +121,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "properties": {
                     "state": {
                         "type": "string",
-                        "description": "Filter by state (interactive, ready, active, review, approved, merging, done)"
+                        "description": "Filter by state (interactive, ready, active, review, approved, merging, failed, done)"
                     },
                     "parent_id": {
                         "type": "integer",
@@ -206,7 +206,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "State transitions are validated: interactive->ready->active->review->approved->merging->done".into(),
                 "Shortcuts: interactive->approved, active->approved (skip_review only)".into(),
-                "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active".into(),
+                "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active (recoverable), merging->failed (terminal), failed->active (manual retry)".into(),
                 "Universal overrides: any state->done (manual close), any state->interactive (human takes over)".into(),
                 "active -> approved is only allowed if skip_review=true on the task".into(),
             ],
@@ -333,7 +333,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Merge an approved task into its target branch".into()),
             prompt_guidelines: vec![
-                "Task must be in 'approved' state. Transitions to 'merging', then 'done' on success or back to 'active' on failure.".into(),
+                "Task must be in 'approved' state. Transitions to 'merging', then 'done' on success, back to 'active' on recoverable error (rebase/checklist), or 'failed' on terminal error.".into(),
                 "Runs: rebase onto target, project checklist, fast-forward merge.".into(),
             ],
         },
@@ -950,7 +950,8 @@ fn handle_task_merge(
                     Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
                 }
             } else {
-                // Merge failed — transition back to active
+                // Merge failed (rebase conflict, checklist, ff-merge) — recoverable.
+                // Transition back to active so the assigned session can fix and retry.
                 if let Err(e) = db.update_task(
                     id,
                     &TaskUpdate {
@@ -972,7 +973,7 @@ fn handle_task_merge(
                     Some("system"),
                 );
 
-                // Notify assigned session if it exists
+                // Notify assigned session so it can fix the issue
                 if let Some(ref sid) = task.session_id {
                     crate::tasks_merge::notify_session_of_merge_failure(
                         sid,
@@ -987,19 +988,17 @@ fn handle_task_merge(
             }
         }
         Err(e) => {
-            // Unexpected error — transition back to active
+            // Infrastructure error (DB, missing branch/worktree, server request
+            // failure) — not recoverable by the agent. Transition to failed.
             if let Err(te) = db.update_task(
                 id,
                 &TaskUpdate {
-                    state: Some("active".into()),
+                    state: Some("failed".into()),
                     ..Default::default()
                 },
                 session_id,
             ) {
-                eprintln!(
-                    "tasks: failed to transition task {} back to active: {}",
-                    id, te
-                );
+                eprintln!("tasks: failed to transition task {} to failed: {}", id, te);
             }
             let _ = db.add_message(id, &format!("Merge error: {}", e), Some("system"));
             tool_err(tool_call_id, &format!("merge error: {}", e))
