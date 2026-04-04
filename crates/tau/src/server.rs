@@ -1797,6 +1797,29 @@ async fn handle_client(
                     }
                 }
             }
+            Request::ReparentChildren {
+                old_parent_id,
+                new_parent_id,
+            } => {
+                let result = {
+                    let st = lock_state(&state);
+                    st.db.reparent_children(&old_parent_id, &new_parent_id)
+                };
+                match result {
+                    Ok(()) => {
+                        send(&mut writer, &Response::Ok).await?;
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: e.to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             Request::SetModel {
                 session_id,
                 model_id,

@@ -158,9 +158,9 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 },
                 "required": ["id"]
             }),
-            prompt_snippet: Some("Use task_assign to claim a task and start working on it. This transitions the task from ready to active.".into()),
+            prompt_snippet: Some("Use task_assign to claim a task and start working on it. This transitions the task from ready to active. For interactive tasks, it reassigns the session without changing state.".into()),
             prompt_guidelines: vec![
-                "Task must be in 'ready' state to be assigned".into(),
+                "Task must be in 'ready' or 'interactive' state to be assigned".into(),
                 "If session_id is omitted, the current session is used".into(),
             ],
         },
@@ -521,6 +521,8 @@ fn handle_task_assign(
     args: &serde_json::Value,
     session_id: Option<&str>,
     tool_call_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
 ) -> PluginToolResult {
     let id = match args.get("id").and_then(|v| v.as_i64()) {
         Some(id) => id,
@@ -542,11 +544,39 @@ fn handle_task_assign(
         }
     };
 
+    // Capture old session before assign (for reparenting)
+    let old_session = db
+        .get_task(id)
+        .ok()
+        .flatten()
+        .and_then(|t| t.assigned_session.clone());
+
     match db.assign_task(id, sid) {
-        Ok(task) => match serde_json::to_string_pretty(&task) {
-            Ok(json) => tool_ok(tool_call_id, &json),
-            Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
-        },
+        Ok(task) => {
+            // For interactive tasks, reparent child sessions from the old session
+            if task.state == "interactive" {
+                if let Some(ref old_sid) = old_session {
+                    if old_sid != sid {
+                        let req = crate::protocol::Request::ReparentChildren {
+                            old_parent_id: old_sid.clone(),
+                            new_parent_id: sid.to_string(),
+                        };
+                        if let Err(e) =
+                            crate::tasks_scheduler::server_request(writer, reader, req)
+                        {
+                            eprintln!(
+                                "warning: failed to reparent children from {} to {}: {}",
+                                old_sid, sid, e
+                            );
+                        }
+                    }
+                }
+            }
+            match serde_json::to_string_pretty(&task) {
+                Ok(json) => tool_ok(tool_call_id, &json),
+                Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
+            }
+        }
         Err(e) => tool_err(tool_call_id, &format!("assign task: {}", e)),
     }
 }
@@ -1134,7 +1164,14 @@ pub fn run_tasks_plugin() {
                     ),
                     "task_get" => handle_task_get(&db, &arguments, &tool_call_id),
                     "task_list" => handle_task_list(&db, &arguments, project, &tool_call_id),
-                    "task_assign" => handle_task_assign(&db, &arguments, session, &tool_call_id),
+                    "task_assign" => handle_task_assign(
+                        &db,
+                        &arguments,
+                        session,
+                        &tool_call_id,
+                        &mut writer,
+                        &mut chan_reader,
+                    ),
                     "task_update" => handle_task_update(
                         &db,
                         &arguments,
@@ -1798,6 +1835,8 @@ mod tests {
             &serde_json::json!({"id": task_id, "session_id": "worker-session"}),
             Some("s1"),
             "tc3",
+            &mut writer,
+            &mut reader,
         );
         assert!(!result.is_error);
         let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1841,6 +1880,8 @@ mod tests {
             &serde_json::json!({"id": task_id}),
             Some("context-session"),
             "tc3",
+            &mut writer,
+            &mut reader,
         );
         assert!(!result.is_error);
         let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1848,13 +1889,13 @@ mod tests {
     }
 
     #[test]
-    fn test_task_assign_requires_ready_state() {
+    fn test_task_assign_interactive_reassigns_session() {
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
 
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Not ready task"}),
+            &serde_json::json!({"title": "Interactive task"}),
             &ToolCtx {
                 project: "/project",
                 session_id: Some("s1"),
@@ -1867,11 +1908,19 @@ mod tests {
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let task_id = task["id"].as_i64().unwrap();
 
-        // Try to assign in interactive state — should fail
-        let result =
-            handle_task_assign(&db, &serde_json::json!({"id": task_id}), Some("s1"), "tc2");
-        assert!(result.is_error);
-        assert!(extract_text(&result).contains("must be 'ready'"));
+        // Assign interactive task to a new session — should succeed and stay interactive
+        let result = handle_task_assign(
+            &db,
+            &serde_json::json!({"id": task_id}),
+            Some("s2"),
+            "tc2",
+            &mut writer,
+            &mut reader,
+        );
+        assert!(!result.is_error, "expected success: {}", extract_text(&result));
+        let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(assigned["state"], "interactive");
+        assert_eq!(assigned["assigned_session"], "s2");
     }
 
     #[test]
@@ -1905,7 +1954,14 @@ mod tests {
         );
 
         // Assign without any session — should fail
-        let result = handle_task_assign(&db, &serde_json::json!({"id": task_id}), None, "tc3");
+        let result = handle_task_assign(
+            &db,
+            &serde_json::json!({"id": task_id}),
+            None,
+            "tc3",
+            &mut writer,
+            &mut reader,
+        );
         assert!(result.is_error);
         assert!(extract_text(&result).contains("session_id is required"));
     }

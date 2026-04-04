@@ -921,14 +921,20 @@ impl TasksDb {
             .get_task(task_id)?
             .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
 
-        if task.state != "ready" {
+        if task.state != "ready" && task.state != "interactive" {
             return Err(crate::Error::Io(format!(
-                "cannot assign task {}: state is '{}', must be 'ready'",
+                "cannot assign task {}: state is '{}', must be 'ready' or 'interactive'",
                 task_id, task.state
             )));
         }
 
         let now = crate::types::timestamp_ms() as i64;
+        // Interactive tasks stay interactive; ready tasks transition to active
+        let new_state = if task.state == "interactive" {
+            "interactive"
+        } else {
+            "active"
+        };
 
         let tx = self
             .conn
@@ -936,19 +942,21 @@ impl TasksDb {
             .map_err(|e| crate::Error::Io(format!("assign_task begin: {}", e)))?;
 
         tx.execute(
-            "UPDATE tasks SET state = 'active', assigned_session = ?1, updated_at = ?2 \
-             WHERE id = ?3",
-            params![session_id, now, task_id],
+            "UPDATE tasks SET state = ?1, assigned_session = ?2, updated_at = ?3 \
+             WHERE id = ?4",
+            params![new_state, session_id, now, task_id],
         )
         .map_err(|e| crate::Error::Io(format!("assign task update: {}", e)))?;
 
-        // Record state change in history
-        tx.execute(
-            "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![task_id, "state", task.state, "active", session_id, now],
-        )
-        .map_err(|e| crate::Error::Io(format!("assign task history (state): {}", e)))?;
+        // Record state change in history (only if state actually changed)
+        if new_state != task.state {
+            tx.execute(
+                "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![task_id, "state", task.state, new_state, session_id, now],
+            )
+            .map_err(|e| crate::Error::Io(format!("assign task history (state): {}", e)))?;
+        }
 
         // Record assigned_session change in history
         tx.execute(
@@ -1992,8 +2000,34 @@ mod tests {
             .create_task("/project", "Test", None, None, None, false)
             .unwrap();
 
+        // Move to ready then active — active tasks can't be assigned
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s0").unwrap();
+        // Now task is active — assigning again should fail
         let err = db.assign_task(task.id, "s1").unwrap_err();
-        assert!(err.to_string().contains("must be 'ready'"));
+        assert!(err.to_string().contains("must be 'ready' or 'interactive'"));
+    }
+
+    #[test]
+    fn test_assign_interactive_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        assert_eq!(task.state, "interactive");
+
+        // Assigning an interactive task should succeed and stay interactive
+        let assigned = db.assign_task(task.id, "s1").unwrap();
+        assert_eq!(assigned.state, "interactive");
+        assert_eq!(assigned.assigned_session.as_deref(), Some("s1"));
     }
 
     #[test]

@@ -70,6 +70,11 @@ pub enum Request {
     },
     /// Change working directory for a session.
     SetCwd { session_id: String, cwd: String },
+    /// Re-parent all child sessions from one parent to another.
+    ReparentChildren {
+        old_parent_id: String,
+        new_parent_id: String,
+    },
     /// Start OAuth login for a provider.
     Login { provider: String },
     /// Query authentication status.

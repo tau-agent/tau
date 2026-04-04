@@ -554,6 +554,17 @@ impl Db {
         Ok(())
     }
 
+    /// Re-parent all child sessions from one parent to another.
+    pub fn reparent_children(&self, old_parent_id: &str, new_parent_id: &str) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE sessions SET parent_id = ?1 WHERE parent_id = ?2",
+                params![new_parent_id, old_parent_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("reparent children: {}", e)))?;
+        Ok(())
+    }
+
     /// Update the model for a session.
     pub fn update_model(&self, session_id: &str, model: &crate::types::Model) -> crate::Result<()> {
         let model_json =
