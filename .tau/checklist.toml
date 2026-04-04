@@ -1,11 +1,11 @@
 [[check]]
 name = "cargo fmt"
-command = "cargo fmt --check"
+command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo fmt --check"
 
 [[check]]
 name = "cargo clippy"
-command = "cargo clippy --workspace -- -D warnings"
+command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo clippy --workspace -- -D warnings"
 
 [[check]]
 name = "cargo test"
-command = "cargo test --workspace"
+command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo test --workspace"
