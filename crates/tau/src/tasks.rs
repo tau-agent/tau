@@ -703,6 +703,9 @@ fn handle_task_update(
         return tool_err(tool_call_id, &format!("record session: {}", e));
     }
 
+    // Capture the old state before updating, so we can detect review → active.
+    let old_state = db.get_task(id).ok().flatten().map(|t| t.state);
+
     match db.update_task(id, &update, session_id) {
         Ok(task) => {
             // Trigger scheduler events based on the new state.
@@ -712,6 +715,30 @@ fn handle_task_update(
                     pending_events.push(SchedulerEvent::ScheduleNeeded(task.project.clone()));
                 }
                 _ => {}
+            }
+
+            // When a task transitions from review back to active (changes
+            // requested), notify the worker session so it knows to resume.
+            if task.state == "active" && old_state.as_deref() == Some("review") {
+                if let Some(ref sid) = task.session_id {
+                    let msg = format!(
+                        "Task {} was moved back to active (changes requested). \
+                        Please run task_get to read the latest review feedback \
+                        and address the requested changes.",
+                        task.id
+                    );
+                    let _ = crate::tasks_scheduler::server_request(
+                        writer,
+                        reader,
+                        crate::protocol::Request::QueueMessage {
+                            target_session_id: sid.clone(),
+                            content: msg,
+                            sender_info: format!("task-system (review task {})", task.id),
+                            await_reply: false,
+                            reply_to: None,
+                        },
+                    );
+                }
             }
 
             // When a task transitions to done, auto-archive its session
@@ -2797,5 +2824,166 @@ mod tests {
         assert_eq!(schedule_projects.len(), 2);
         assert!(schedule_projects.contains(&"/project-a".to_string()));
         assert!(schedule_projects.contains(&"/project-b".to_string()));
+    }
+
+    // ----- review → active notification tests -----
+
+    #[test]
+    fn test_review_to_active_notifies_worker_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a task, assign it a session, advance to review state
+        let task = db
+            .create_task("/project", "Review notify test", None, None, None, false)
+            .unwrap();
+        db.set_session_id(task.id, "worker-session").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-session").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("review".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Use a plain Vec<u8> writer so we can inspect the raw output.
+        // The QueueMessage send will fail (empty reader) but is best-effort.
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        // review -> active: should send a QueueMessage to "worker-session"
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "active"}),
+            Some("reviewer-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "unexpected error: {:?}", result);
+
+        let output = String::from_utf8(writer).unwrap();
+        assert!(
+            output.contains("queue_message"),
+            "expected QueueMessage in output: {output}"
+        );
+        assert!(
+            output.contains("worker-session"),
+            "expected worker-session in output: {output}"
+        );
+        assert!(
+            output.contains("changes requested"),
+            "expected 'changes requested' in output: {output}"
+        );
+    }
+
+    #[test]
+    fn test_review_to_active_no_session_no_panic() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Task with no session_id — review -> active should succeed silently
+        let task = db
+            .create_task("/project", "No session review", None, None, None, false)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("review".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "active"}),
+            None,
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "unexpected error: {:?}", result);
+        // No QueueMessage should be attempted when there is no session_id
+        assert!(
+            !String::from_utf8_lossy(&writer).contains("queue_message"),
+            "should not send QueueMessage when no session_id"
+        );
+    }
+
+    #[test]
+    fn test_approved_to_active_no_notification() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Test that approved → active does NOT send a QueueMessage
+        // (only review → active should trigger the notification)
+        let task = db
+            .create_task("/project", "Approved bounce", None, None, None, true)
+            .unwrap();
+        db.set_session_id(task.id, "worker-session").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-session").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        // approved → active should NOT send a QueueMessage
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "active"}),
+            Some("reviewer-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "unexpected error: {:?}", result);
+        assert!(
+            !String::from_utf8_lossy(&writer).contains("queue_message"),
+            "should not send QueueMessage for approved → active transition"
+        );
     }
 }
