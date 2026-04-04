@@ -307,6 +307,66 @@ fn plugin_manager_integration() {
     assert!(results[0].message.is_some());
 }
 
+/// Verify that tool_schemas returns global plugin tools even while a global
+/// plugin handle is temporarily taken for tool execution.
+///
+/// This is a regression test for the race condition where task_dispatch
+/// takes the tasks plugin handle, spawns a child session, and the child
+/// session's tool_schemas call runs before the handle is returned — causing
+/// task tools to be missing from the LLM context.
+#[test]
+fn tool_schemas_stable_during_take() {
+    let cmd = test_plugin_command();
+    let config = PluginsConfig {
+        session_prefix: None,
+        global: [("test".into(), PluginEntry { command: cmd })]
+            .into_iter()
+            .collect(),
+        session: Default::default(),
+        no_default_worker: true,
+        idle_timeout_secs: 30,
+    };
+
+    let mut manager = PluginManager::new(config);
+    manager.load_global_plugins("/tmp");
+
+    let session_id = "test-session";
+
+    // Before take: tools are present
+    let schemas_before = manager.tool_schemas(session_id, 16);
+    assert!(!schemas_before.is_empty(), "should have tools before take");
+
+    // Take the plugin handle (simulating PluginExecutor during a tool call)
+    let taken = manager.take_tool_plugin(session_id, "echo_tool");
+    assert!(taken.is_some(), "should be able to take echo_tool plugin");
+    let (handle, source) = taken.unwrap();
+
+    // While taken: tool_schemas must STILL return the same tools
+    let schemas_during = manager.tool_schemas(session_id, 16);
+    assert_eq!(
+        schemas_before.len(),
+        schemas_during.len(),
+        "tool_schemas should return same tools even while plugin handle is taken; \
+         before={:?}, during={:?}",
+        schemas_before.iter().map(|t| &t.name).collect::<Vec<_>>(),
+        schemas_during.iter().map(|t| &t.name).collect::<Vec<_>>(),
+    );
+
+    // tool_prompts should also be stable
+    let prompts_during = manager.tool_prompts(session_id, 16);
+    assert!(
+        !prompts_during.is_empty(),
+        "tool_prompts should return prompts even while plugin handle is taken"
+    );
+
+    // Return the handle
+    manager.return_tool_plugin(source, handle);
+
+    // After return: tools still present
+    let schemas_after = manager.tool_schemas(session_id, 16);
+    assert_eq!(schemas_before.len(), schemas_after.len());
+}
+
 #[test]
 fn plugin_wants_hook() {
     let cmd = test_plugin_command();

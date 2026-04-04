@@ -993,6 +993,19 @@ pub enum PluginSource {
 pub struct PluginManager {
     /// Global plugins (spawned once at server start).
     global_plugins: Vec<PluginHandle>,
+    /// Cached tool schemas from global plugins.
+    ///
+    /// Populated by `load_global_plugins` and never modified by
+    /// `take_tool_plugin`/`return_tool_plugin`. This ensures that
+    /// `tool_schemas` always returns the full set of global tools even
+    /// when a plugin handle is temporarily taken for tool execution.
+    ///
+    /// Without this cache, a race condition exists: `task_dispatch` takes
+    /// the tasks plugin handle, spawns a child session via ServerRequest,
+    /// and the child session's `tool_schemas` call runs before the handle
+    /// is returned — resulting in task tools being absent from the LLM
+    /// context.
+    global_tool_cache: Vec<(Vec<Tool>, Vec<crate::system_prompt::ToolPrompt>)>,
     /// Per-session plugin sets, keyed by session ID.
     session_plugins: HashMap<String, SessionPlugins>,
     /// Sessions that have already received session_start.
@@ -1005,6 +1018,7 @@ impl PluginManager {
     pub fn new(config: PluginsConfig) -> Self {
         Self {
             global_plugins: Vec::new(),
+            global_tool_cache: Vec::new(),
             session_plugins: HashMap::new(),
             initialized_sessions: std::collections::HashSet::new(),
             config,
@@ -1070,6 +1084,20 @@ impl PluginManager {
                 }
             }
         }
+
+        // Rebuild the global tool cache so that tool_schemas / tool_prompts
+        // always return the complete set even when a handle is temporarily
+        // taken for tool execution.
+        self.rebuild_global_tool_cache();
+    }
+
+    /// Rebuild the cached tool schemas/prompts from the current global plugins.
+    fn rebuild_global_tool_cache(&mut self) {
+        self.global_tool_cache = self
+            .global_plugins
+            .iter()
+            .map(|p| (p.tool_schemas(), p.tool_prompts()))
+            .collect();
     }
 
     /// Set up background I/O for global plugins.
@@ -1149,7 +1177,12 @@ impl PluginManager {
         if let Some(sp) = self.session_plugins.get(session_id) {
             schemas.extend(sp.tool_schemas());
         }
-        schemas.extend(collect_tool_schemas(&self.global_plugins));
+        // Use the cached global tool schemas so that tools are always
+        // present even when a plugin handle is temporarily taken for
+        // tool execution (see take_tool_plugin / return_tool_plugin).
+        for (tool_schemas, _) in &self.global_tool_cache {
+            schemas.extend(tool_schemas.iter().cloned());
+        }
         if child_budget == 0 {
             schemas.retain(|t| !t.name.starts_with("session_"));
         }
@@ -1167,7 +1200,10 @@ impl PluginManager {
         if let Some(sp) = self.session_plugins.get(session_id) {
             prompts.extend(sp.tool_prompts());
         }
-        prompts.extend(collect_tool_prompts(&self.global_plugins));
+        // Use the cached global tool prompts (same reason as tool_schemas).
+        for (_, tool_prompts) in &self.global_tool_cache {
+            prompts.extend(tool_prompts.iter().cloned());
+        }
         if child_budget == 0 {
             prompts.retain(|t| !t.name.starts_with("session_"));
         }
