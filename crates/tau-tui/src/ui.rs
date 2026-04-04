@@ -59,6 +59,21 @@ fn input_area_height(app: &App, width: u16) -> u16 {
 // Messages
 // ---------------------------------------------------------------------------
 
+/// Extract the background color from a line, checking line style first then spans.
+fn line_bg_color(line: &Line<'_>) -> Option<ratatui::style::Color> {
+    // Check the line-level style first
+    if let Some(bg) = line.style.bg {
+        return Some(bg);
+    }
+    // Fall back: check the first span's resolved style
+    if let Some(span) = line.spans.first() {
+        if let Some(bg) = span.style.bg {
+            return Some(bg);
+        }
+    }
+    None
+}
+
 /// Wrap a single Line into multiple lines at `width` character boundaries.
 /// Preserves span styles across the split.
 fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
@@ -99,7 +114,8 @@ fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         if !current_text.is_empty() {
             spans.push(Span::styled(current_text, current_style));
         }
-        result.push(Line::from(spans));
+        // Preserve the original line-level style (carries bg color)
+        result.push(Line::from(spans).style(style));
     }
     result
 }
@@ -124,7 +140,21 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
         // Pre-wrap long lines so Line count == visual row count
         for line in msg_lines {
-            all_lines.extend(wrap_line(line, w));
+            let wrapped = wrap_line(line, w);
+            all_lines.extend(wrapped);
+        }
+    }
+
+    // Unified post-wrap background fill: any line with a bg color gets
+    // padded to full width so the background covers the entire row.
+    for line in all_lines.iter_mut() {
+        if let Some(bg_color) = line_bg_color(line) {
+            let visible = line.width();
+            let pad = w.saturating_sub(visible);
+            if pad > 0 {
+                let pad_style = Style::default().bg(bg_color);
+                line.spans.push(Span::styled(" ".repeat(pad), pad_style));
+            }
         }
     }
 
