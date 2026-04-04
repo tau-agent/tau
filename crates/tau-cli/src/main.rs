@@ -144,6 +144,14 @@ enum TaskAction {
         /// Task ID
         id: i64,
     },
+    /// Claim a task (assign to current session and activate)
+    Claim {
+        /// Task ID
+        id: i64,
+        /// Session ID to assign the task to
+        #[arg(long)]
+        session: String,
+    },
     /// Mark a task as ready (shorthand for update --state=ready)
     Ready {
         /// Task ID
@@ -1868,6 +1876,10 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
             };
             let task = db.update_task(id, &update, None)?;
             println!("approved task #{}: {}", task.id, task.title);
+        }
+        TaskAction::Claim { id, session } => {
+            let task = db.assign_task(id, &session)?;
+            println!("Claimed task #{}: {}", task.id, task.title);
         }
         TaskAction::Ready { id } => {
             let update = tau::tasks_db::TaskUpdate {

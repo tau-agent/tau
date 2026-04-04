@@ -1063,7 +1063,7 @@ impl App {
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|approve|ready|mq] /reload /sessions /session <id> /back /fork /new /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|mq] /reload /sessions /session <id> /back /fork /new /help /quit"
                         .into(),
                 });
                 None
@@ -1215,6 +1215,28 @@ impl App {
                     }
                 }
             }
+            "claim" => {
+                let Some(id_str) = parts.get(1) else {
+                    self.messages.push(MessageItem::Error {
+                        text: "usage: /task claim <id>".into(),
+                    });
+                    return None;
+                };
+                let Ok(id) = id_str.parse::<i64>() else {
+                    self.messages.push(MessageItem::Error {
+                        text: format!("invalid task id: {}", id_str),
+                    });
+                    return None;
+                };
+                match self.run_task_claim(id) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.messages.push(MessageItem::Error {
+                            text: format!("task claim: {}", e),
+                        });
+                    }
+                }
+            }
             "mq" => match self.run_task_merge_queue() {
                 Ok(()) => {}
                 Err(e) => {
@@ -1226,7 +1248,7 @@ impl App {
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!(
-                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, approve <id>, ready <id>, mq",
+                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, claim <id>, approve <id>, ready <id>, mq",
                         subcmd
                     ),
                 });
@@ -1418,6 +1440,15 @@ impl App {
         let task = db.update_task(id, &update, None)?;
         self.messages.push(MessageItem::Status {
             text: format!("task #{} → {} : {}", task.id, task.state, task.title),
+        });
+        Ok(())
+    }
+
+    fn run_task_claim(&mut self, id: i64) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let task = db.assign_task(id, &self.session_id)?;
+        self.messages.push(MessageItem::Status {
+            text: format!("Claimed task #{}: {}", task.id, task.title),
         });
         Ok(())
     }
