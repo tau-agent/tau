@@ -1159,7 +1159,14 @@ mod tests {
 
         // Create a task and move it to active state with a session_id already set.
         let task = db
-            .create_task("/project", "Already dispatched task", Some(5), None, None, true)
+            .create_task(
+                "/project",
+                "Already dispatched task",
+                Some(5),
+                None,
+                None,
+                true,
+            )
             .unwrap();
         // interactive -> ready
         db.update_task(
