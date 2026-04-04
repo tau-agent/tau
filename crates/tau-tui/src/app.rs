@@ -1216,13 +1216,17 @@ impl App {
             return Ok(());
         }
         self.messages.push(MessageItem::Status {
-            text: format!("  {:>4}  {:<12}  {:>8}  TITLE", "ID", "STATE", "PRIORITY"),
+            text: format!(
+                "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
+                "ID", "STATE", "PRIORITY", "SESSION"
+            ),
         });
         for t in &tasks {
+            let session = t.assigned_session.as_deref().unwrap_or("-");
             self.messages.push(MessageItem::Status {
                 text: format!(
-                    "  {:>4}  {:<12}  {:>8}  {}",
-                    t.id, t.state, t.priority, t.title
+                    "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
+                    t.id, t.state, t.priority, session, t.title
                 ),
             });
         }
@@ -1314,13 +1318,17 @@ impl App {
             return Ok(());
         }
         self.messages.push(MessageItem::Status {
-            text: format!("  {:>4}  {:<12}  {:>8}  TITLE", "ID", "STATE", "PRIORITY"),
+            text: format!(
+                "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
+                "ID", "STATE", "PRIORITY", "SESSION"
+            ),
         });
         for t in &tasks {
+            let session = t.assigned_session.as_deref().unwrap_or("-");
             self.messages.push(MessageItem::Status {
                 text: format!(
-                    "  {:>4}  {:<12}  {:>8}  {}",
-                    t.id, t.state, t.priority, t.title
+                    "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
+                    t.id, t.state, t.priority, session, t.title
                 ),
             });
         }
