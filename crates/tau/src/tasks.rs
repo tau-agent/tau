@@ -994,7 +994,13 @@ fn handle_task_merge(
 // Plugin main loop
 // ---------------------------------------------------------------------------
 
+/// How often (in seconds) the scheduler checks for approved tasks to merge.
+const MERGE_POLL_INTERVAL_SECS: u64 = 5;
+
 /// Run the tasks plugin loop. Called from `tau plugin tasks` subcommand.
+///
+/// Uses a reader thread so the main loop can poll for approved tasks
+/// on a timer in addition to handling tool calls.
 pub fn run_tasks_plugin() {
     // Open DB at startup (it's always at the same global path)
     let db = match TasksDb::open_default() {
@@ -1005,8 +1011,6 @@ pub fn run_tasks_plugin() {
         }
     };
 
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
 
@@ -1019,14 +1023,48 @@ pub fn run_tasks_plugin() {
     };
     send_message(&mut writer, &PluginMessage::Register(registration));
 
+    // Spawn a reader thread that sends lines through a channel.
+    // This lets the main loop use recv_timeout for periodic merge checks.
+    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut reader = BufReader::new(stdin.lock());
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    if line_tx.send(line).is_err() {
+                        break; // Main thread dropped the receiver
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Wrap line_rx in a ChannelLineReader so tool handlers (and the merge
+    // pass) can use it as a `BufRead`.  Since tool calls and the merge pass
+    // are never concurrent (both run on the main thread), sharing is safe.
+    let mut chan_reader = ChannelLineReader::new(line_rx);
+
+    let poll_interval = std::time::Duration::from_secs(MERGE_POLL_INTERVAL_SECS);
+
     // Handle requests
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => break,
-        }
+        // Wait for the next line, or timeout for merge polling
+        let line = match chan_reader.recv_timeout(poll_interval) {
+            Some(l) => l,
+            None => {
+                // Timeout (or EOF) — run a merge pass for approved tasks
+                if chan_reader.is_closed() {
+                    break;
+                }
+                run_merge_pass(&db, &mut writer, &mut chan_reader);
+                continue;
+            }
+        };
+
         if line.trim().is_empty() {
             continue;
         }
@@ -1058,7 +1096,7 @@ pub fn run_tasks_plugin() {
                         session,
                         &tool_call_id,
                         &mut writer,
-                        &mut reader,
+                        &mut chan_reader,
                     ),
                     "task_get" => handle_task_get(&db, &arguments, &tool_call_id),
                     "task_list" => handle_task_list(&db, &arguments, project, &tool_call_id),
@@ -1069,7 +1107,7 @@ pub fn run_tasks_plugin() {
                         session,
                         &tool_call_id,
                         &mut writer,
-                        &mut reader,
+                        &mut chan_reader,
                     ),
                     "task_message" => handle_task_message(&db, &arguments, session, &tool_call_id),
                     "task_message_edit" => handle_task_message_edit(&db, &arguments, &tool_call_id),
@@ -1084,7 +1122,7 @@ pub fn run_tasks_plugin() {
                         session,
                         &tool_call_id,
                         &mut writer,
-                        &mut reader,
+                        &mut chan_reader,
                     ),
                     "task_dispatch" => handle_task_dispatch(
                         &db,
@@ -1092,7 +1130,7 @@ pub fn run_tasks_plugin() {
                         session,
                         &tool_call_id,
                         &mut writer,
-                        &mut reader,
+                        &mut chan_reader,
                     ),
                     _ => tool_err(&tool_call_id, &format!("unknown tool: {}", name)),
                 };
@@ -1115,8 +1153,130 @@ pub fn run_tasks_plugin() {
                 break;
             }
             PluginRequest::ServerResponse { .. } => {
-                // Not expected for this plugin — ignore
+                // Not expected outside of tool/merge passes — ignore
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChannelLineReader — BufRead adapter over mpsc::Receiver<String>
+// ---------------------------------------------------------------------------
+
+/// A `BufRead` adapter backed by a `std::sync::mpsc::Receiver<String>`.
+///
+/// Each received string is treated as one line (newline-terminated).
+/// `read_line` blocks until a line is available or the channel closes.
+///
+/// Also provides `recv_timeout` for the main loop to poll with a deadline.
+struct ChannelLineReader {
+    rx: std::sync::mpsc::Receiver<String>,
+    /// Leftover bytes from the current line that haven't been consumed yet.
+    buf: Vec<u8>,
+    closed: bool,
+}
+
+impl ChannelLineReader {
+    fn new(rx: std::sync::mpsc::Receiver<String>) -> Self {
+        Self {
+            rx,
+            buf: Vec::new(),
+            closed: false,
+        }
+    }
+
+    /// Receive the next line with a timeout. Returns `None` on timeout or
+    /// channel close.
+    fn recv_timeout(&mut self, timeout: std::time::Duration) -> Option<String> {
+        match self.rx.recv_timeout(timeout) {
+            Ok(line) => Some(line),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.closed = true;
+                None
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed
+    }
+}
+
+impl std::io::Read for ChannelLineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Drain leftover bytes first
+        if !self.buf.is_empty() {
+            let n = std::cmp::min(buf.len(), self.buf.len());
+            buf[..n].copy_from_slice(&self.buf[..n]);
+            self.buf.drain(..n);
+            return Ok(n);
+        }
+        // Block for the next line
+        match self.rx.recv() {
+            Ok(line) => {
+                let bytes = line.as_bytes();
+                let n = std::cmp::min(buf.len(), bytes.len());
+                buf[..n].copy_from_slice(&bytes[..n]);
+                if n < bytes.len() {
+                    self.buf.extend_from_slice(&bytes[n..]);
+                }
+                Ok(n)
+            }
+            Err(_) => {
+                self.closed = true;
+                Ok(0) // EOF
+            }
+        }
+    }
+}
+
+impl BufRead for ChannelLineReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.buf.is_empty() {
+            match self.rx.recv() {
+                Ok(line) => {
+                    self.buf = line.into_bytes();
+                }
+                Err(_) => {
+                    self.closed = true;
+                }
+            }
+        }
+        Ok(&self.buf)
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.buf.drain(..amt);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Merge pass
+// ---------------------------------------------------------------------------
+
+/// Run a merge pass: find approved tasks and merge them.
+///
+/// Called periodically from the main loop when no tool calls are pending.
+/// Shares the same writer (stdout) and reader (channel from stdin) as
+/// tool handlers — this is safe because the merge pass and tool handling
+/// are never concurrent (both run on the main thread).
+fn run_merge_pass(db: &TasksDb, writer: &mut impl Write, reader: &mut impl BufRead) {
+    match tasks_scheduler::merge_approved(db, writer, reader) {
+        Ok(attempts) => {
+            for a in &attempts {
+                if !a.success {
+                    eprintln!(
+                        "tasks scheduler: auto-merge failed for task {} ({}): {}",
+                        a.task_id,
+                        a.title,
+                        a.log.lines().next().unwrap_or("(no details)")
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("tasks scheduler: merge pass error: {}", e);
         }
     }
 }

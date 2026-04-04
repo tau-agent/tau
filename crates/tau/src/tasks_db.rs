@@ -797,6 +797,51 @@ impl TasksDb {
         Ok(tasks)
     }
 
+    /// Get all tasks in `approved` state, optionally filtered by project.
+    /// Used by the scheduler to find tasks ready for auto-merge.
+    pub fn get_approved_tasks(&self, project: Option<&str>) -> crate::Result<Vec<Task>> {
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project {
+            Some(p) => (
+                "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
+                        assigned_session, branch, worktree_path, session_id, skip_review,
+                        created_at, updated_at
+                 FROM tasks
+                 WHERE state = 'approved' AND project = ?1
+                 ORDER BY priority DESC, created_at ASC"
+                    .to_string(),
+                vec![Box::new(p.to_string())],
+            ),
+            None => (
+                "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
+                        assigned_session, branch, worktree_path, session_id, skip_review,
+                        created_at, updated_at
+                 FROM tasks
+                 WHERE state = 'approved'
+                 ORDER BY priority DESC, created_at ASC"
+                    .to_string(),
+                vec![],
+            ),
+        };
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| crate::Error::Io(format!("prepare get_approved_tasks: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params_refs.as_slice(), row_to_task)
+            .map_err(|e| crate::Error::Io(format!("get_approved_tasks: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks
+                .push(row.map_err(|e| crate::Error::Io(format!("read approved task row: {}", e)))?);
+        }
+        Ok(tasks)
+    }
+
     /// Check if `from` transitively depends on `to` via `depends_on` relations.
     /// Uses BFS from `from` following depends_on edges. Returns true if `to` is
     /// reachable.
@@ -2620,5 +2665,210 @@ mod tests {
         // And C -> D is fine (no cycle)
         let d = db.create_task("/p", "D", None, None, None, false).unwrap();
         db.add_relation(c.id, d.id, "depends_on").unwrap();
+    }
+
+    // ----- get_approved_tasks tests -----
+
+    #[test]
+    fn test_get_approved_tasks_empty() {
+        let db = TasksDb::open_memory().unwrap();
+        let tasks = db.get_approved_tasks(None).unwrap();
+        assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn test_get_approved_tasks_returns_only_approved() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create tasks in various states
+        let t1 = db
+            .create_task("/project", "Ready task", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            t1.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let t2 = db
+            .create_task("/project", "Approved task", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            t2.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(t2.id, "s1").unwrap();
+        db.update_task(
+            t2.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let t3 = db
+            .create_task("/project", "Another approved", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            t3.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(t3.id, "s2").unwrap();
+        db.update_task(
+            t3.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // All projects
+        let approved = db.get_approved_tasks(None).unwrap();
+        assert_eq!(approved.len(), 2);
+
+        // Specific project
+        let approved = db.get_approved_tasks(Some("/project")).unwrap();
+        assert_eq!(approved.len(), 2);
+
+        // Non-existent project
+        let approved = db.get_approved_tasks(Some("/other")).unwrap();
+        assert!(approved.is_empty());
+    }
+
+    #[test]
+    fn test_get_approved_tasks_filters_by_project() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let t1 = db
+            .create_task("/project-a", "Task A", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            t1.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(t1.id, "s1").unwrap();
+        db.update_task(
+            t1.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let t2 = db
+            .create_task("/project-b", "Task B", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            t2.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(t2.id, "s2").unwrap();
+        db.update_task(
+            t2.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let a_tasks = db.get_approved_tasks(Some("/project-a")).unwrap();
+        assert_eq!(a_tasks.len(), 1);
+        assert_eq!(a_tasks[0].id, t1.id);
+
+        let b_tasks = db.get_approved_tasks(Some("/project-b")).unwrap();
+        assert_eq!(b_tasks.len(), 1);
+        assert_eq!(b_tasks[0].id, t2.id);
+
+        let all_tasks = db.get_approved_tasks(None).unwrap();
+        assert_eq!(all_tasks.len(), 2);
+    }
+
+    #[test]
+    fn test_get_approved_tasks_priority_ordering() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let t1 = db
+            .create_task("/project", "Low priority", Some(1), None, None, true)
+            .unwrap();
+        db.update_task(
+            t1.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(t1.id, "s1").unwrap();
+        db.update_task(
+            t1.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let t2 = db
+            .create_task("/project", "High priority", Some(10), None, None, true)
+            .unwrap();
+        db.update_task(
+            t2.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(t2.id, "s2").unwrap();
+        db.update_task(
+            t2.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let approved = db.get_approved_tasks(None).unwrap();
+        assert_eq!(approved.len(), 2);
+        // Higher priority should come first
+        assert_eq!(approved[0].id, t2.id);
+        assert_eq!(approved[1].id, t1.id);
     }
 }

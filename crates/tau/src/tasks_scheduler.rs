@@ -1,13 +1,15 @@
 //! Scheduler logic for the task system.
 //!
-//! Provides two synchronous operations called from tool handlers:
+//! Provides three synchronous operations called from tool handlers:
 //!
 //! - **schedule**: query `ready` tasks, pick a non-conflicting batch, and
 //!   prepare them for dispatch (create branch + worktree, update DB).
 //! - **dispatch**: create a session for a prepared task and send the initial
 //!   chat message via the ServerRequest tunnel.
+//! - **merge_approved**: find `approved` tasks and run the merge queue for
+//!   each, serializing merges per target branch.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 
 use crate::plugin::{PluginMessage, PluginRequest};
@@ -287,6 +289,227 @@ pub fn dispatch(
     }
 
     Ok(session_id)
+}
+
+// ---------------------------------------------------------------------------
+// Auto-merge approved tasks
+// ---------------------------------------------------------------------------
+
+/// Result of a single auto-merge attempt.
+#[derive(Debug, serde::Serialize)]
+pub struct MergeAttempt {
+    pub task_id: i64,
+    pub title: String,
+    pub success: bool,
+    pub log: String,
+}
+
+/// Find all `approved` tasks and merge them, serializing merges per target
+/// branch (no parallel merges into the same branch).
+///
+/// Returns the list of merge attempts (both successes and failures).
+pub fn merge_approved(
+    db: &TasksDb,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> crate::Result<Vec<MergeAttempt>> {
+    let approved = db.get_approved_tasks(None)?;
+    if approved.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Group tasks by their merge target branch. Within each group, process
+    // one at a time (serialized). Across groups we could parallelize, but
+    // since we have a single writer/reader pair, we process sequentially.
+    let mut by_target: HashMap<String, Vec<Task>> = HashMap::new();
+    for task in approved {
+        let target = db
+            .get_merge_target(task.id)
+            .unwrap_or_else(|_| "main".into());
+        by_target.entry(target).or_default().push(task);
+    }
+
+    let mut attempts = Vec::new();
+
+    for tasks in by_target.values() {
+        for task in tasks {
+            let attempt = merge_one_task(db, task, writer, reader);
+            attempts.push(attempt);
+        }
+    }
+
+    attempts.sort_by_key(|a| a.task_id);
+    Ok(attempts)
+}
+
+/// Execute the merge sequence for a single approved task.
+///
+/// Transitions: approved → merging → done (success) or merging → active (failure).
+fn merge_one_task(
+    db: &TasksDb,
+    task: &Task,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> MergeAttempt {
+    let task_id = task.id;
+    let title = task.title.clone();
+
+    // Re-check state — another merge pass may have already processed this task,
+    // or the user may have changed it.
+    let current = match db.get_task(task_id) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return MergeAttempt {
+                task_id,
+                title,
+                success: false,
+                log: "task not found".into(),
+            };
+        }
+        Err(e) => {
+            return MergeAttempt {
+                task_id,
+                title,
+                success: false,
+                log: format!("db error: {}", e),
+            };
+        }
+    };
+
+    if current.state != "approved" {
+        return MergeAttempt {
+            task_id,
+            title,
+            success: false,
+            log: format!("task is now in '{}' state, skipping", current.state),
+        };
+    }
+
+    // Transition to merging
+    if let Err(e) = db.update_task(
+        task_id,
+        &TaskUpdate {
+            state: Some("merging".into()),
+            ..Default::default()
+        },
+        None,
+    ) {
+        return MergeAttempt {
+            task_id,
+            title,
+            success: false,
+            log: format!("failed to transition to merging: {}", e),
+        };
+    }
+
+    eprintln!("tasks scheduler: auto-merging task {} ({})", task_id, title);
+
+    // Run the merge
+    let project_dir = &current.project;
+    match crate::tasks_merge::merge_task(db, task_id, project_dir, writer, reader) {
+        Ok(result) => {
+            if result.success {
+                // Transition to done
+                if let Err(e) = db.update_task(
+                    task_id,
+                    &TaskUpdate {
+                        state: Some("done".into()),
+                        ..Default::default()
+                    },
+                    None,
+                ) {
+                    eprintln!(
+                        "tasks scheduler: merge succeeded but transition to done failed for task {}: {}",
+                        task_id, e
+                    );
+                }
+
+                // Notify parent if all subtasks are done
+                if let Err(e) =
+                    crate::tasks_merge::notify_parent_if_all_done(db, task_id, writer, reader)
+                {
+                    eprintln!(
+                        "tasks scheduler: parent notification failed for task {}: {}",
+                        task_id, e
+                    );
+                }
+
+                eprintln!("tasks scheduler: task {} merged successfully", task_id);
+                MergeAttempt {
+                    task_id,
+                    title,
+                    success: true,
+                    log: result.log,
+                }
+            } else {
+                // Merge failed — transition back to active
+                if let Err(e) = db.update_task(
+                    task_id,
+                    &TaskUpdate {
+                        state: Some("active".into()),
+                        ..Default::default()
+                    },
+                    None,
+                ) {
+                    eprintln!(
+                        "tasks scheduler: failed to transition task {} back to active: {}",
+                        task_id, e
+                    );
+                }
+
+                // Add error details as a task message
+                let _ = db.add_message(
+                    task_id,
+                    &format!("Auto-merge failed:\n{}", result.log),
+                    Some("system"),
+                );
+
+                // Notify assigned session about failure
+                if let Some(ref sid) = current.session_id {
+                    crate::tasks_merge::notify_session_of_merge_failure(
+                        sid,
+                        task_id,
+                        &result.log,
+                        writer,
+                        reader,
+                    );
+                }
+
+                eprintln!("tasks scheduler: task {} merge failed", task_id);
+                MergeAttempt {
+                    task_id,
+                    title,
+                    success: false,
+                    log: result.log,
+                }
+            }
+        }
+        Err(e) => {
+            // Unexpected error — transition back to active
+            if let Err(te) = db.update_task(
+                task_id,
+                &TaskUpdate {
+                    state: Some("active".into()),
+                    ..Default::default()
+                },
+                None,
+            ) {
+                eprintln!(
+                    "tasks scheduler: failed to transition task {} back to active: {}",
+                    task_id, te
+                );
+            }
+            let _ = db.add_message(task_id, &format!("Auto-merge error: {}", e), Some("system"));
+
+            eprintln!("tasks scheduler: task {} merge error: {}", task_id, e);
+            MergeAttempt {
+                task_id,
+                title,
+                success: false,
+                log: format!("merge error: {}", e),
+            }
+        }
+    }
 }
 
 /// Build the initial chat message sent to a dispatched task's session.
@@ -739,5 +962,138 @@ mod tests {
         let schedulable = db.get_schedulable_tasks("/project").unwrap();
         let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
         assert!(ids.contains(&task.id));
+    }
+
+    // ----- merge_approved tests -----
+
+    #[test]
+    fn test_merge_approved_no_approved_tasks() {
+        let db = TasksDb::open_memory().unwrap();
+        // Empty reader/writer — merge_approved should return immediately
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        let attempts = merge_approved(&db, &mut writer, &mut reader).unwrap();
+        assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn test_merge_approved_skips_non_approved() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a task in ready state — should not be picked up by merge_approved
+        create_ready_task(&db, "/project", "Ready task", 5, None);
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        let attempts = merge_approved(&db, &mut writer, &mut reader).unwrap();
+        assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn test_merge_approved_task_state_changed_before_merge() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a task and move it to approved state
+        let task = db
+            .create_task("/project", "Will be moved", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Now move it to active before merge_approved runs
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        // merge_approved should skip this task because it re-checks state
+        let attempts = merge_approved(&db, &mut writer, &mut reader).unwrap();
+        // get_approved_tasks returns nothing since we moved it out of approved
+        assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn test_merge_approved_transitions_to_merging() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create and approve a task
+        let task = db
+            .create_task("/project", "Merge me", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.set_branch(task.id, "task-1").unwrap();
+        db.set_worktree_path(task.id, "/tmp/wt-1").unwrap();
+
+        // merge_approved will transition to merging, then fail because
+        // there's no real server. The task should end up back in active.
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        let attempts = merge_approved(&db, &mut writer, &mut reader).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(!attempts[0].success);
+
+        // Task should be back to active (merge_one_task transitions back on failure)
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(updated.state, "active");
+    }
+
+    #[test]
+    fn test_merge_attempt_serialization() {
+        let attempt = MergeAttempt {
+            task_id: 42,
+            title: "Test task".into(),
+            success: true,
+            log: "all good".into(),
+        };
+        let json = serde_json::to_string(&attempt).unwrap();
+        assert!(json.contains("\"task_id\":42"));
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("all good"));
     }
 }
