@@ -180,11 +180,39 @@ fn prepare_task(db: &TasksDb, task: &Task, repo_root: &str) -> crate::Result<Sch
 // Dispatch
 // ---------------------------------------------------------------------------
 
+/// Look up the session ID of a task's parent task. Returns `None` if the
+/// task has no parent, or the parent has no session.
+fn resolve_parent_session(db: &TasksDb, task: &Task) -> Option<String> {
+    let parent_id = task.parent_id?;
+    let parent_task = db.get_task(parent_id).ok()??;
+    parent_task.session_id
+}
+
+/// Look up a session's model via GetSessionInfo. Returns `None` if the
+/// request fails or the session is not found.
+pub fn get_session_model(
+    session_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<String> {
+    let req = crate::protocol::Request::GetSessionInfo {
+        session_id: session_id.to_string(),
+    };
+    match server_request(writer, reader, req) {
+        Ok(crate::protocol::Response::SessionInfo { info }) => Some(info.model),
+        _ => None,
+    }
+}
+
 /// Dispatch a single task: create a session via ServerRequest, send initial
 /// chat, and update the task with the session ID.
 ///
 /// The `writer` and `reader` are the plugin's stdout/stdin — used to tunnel
 /// ServerRequests through to the tau server.
+///
+/// `parent_session_id` is the calling session when dispatched manually (via
+/// tool call), or `None` when auto-dispatched. When `None`, the parent task's
+/// session is looked up automatically.
 pub fn dispatch(
     db: &TasksDb,
     task_id: i64,
@@ -216,13 +244,25 @@ pub fn dispatch(
 
     let cwd = task.worktree_path.clone();
 
+    // Resolve the effective parent session: use the explicit parent_session_id
+    // (from a manual tool call), or fall back to the parent task's session.
+    let effective_parent_session = match parent_session_id {
+        Some(sid) => Some(sid.to_string()),
+        None => resolve_parent_session(db, &task),
+    };
+
+    // Inherit model from the parent session so child tasks use the same model.
+    let model = effective_parent_session
+        .as_deref()
+        .and_then(|sid| get_session_model(sid, writer, reader));
+
     // Create session via ServerRequest.
     let create_req = crate::protocol::Request::CreateSession {
-        model: None,
+        model,
         provider: None,
         system_prompt: None,
         cwd,
-        parent_id: parent_session_id.map(String::from),
+        parent_id: effective_parent_session,
         child_budget: 4,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,

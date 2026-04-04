@@ -455,8 +455,13 @@ fn create_interactive_session(
 ) -> Option<String> {
     use crate::protocol::{Request, Response};
 
+    // Inherit model from the parent session so the interactive task uses
+    // the same model as its creator.
+    let model =
+        parent_session_id.and_then(|sid| tasks_scheduler::get_session_model(sid, writer, reader));
+
     let create_req = Request::CreateSession {
-        model: None,
+        model,
         provider: None,
         system_prompt: None,
         cwd: Some(project.to_string()),
@@ -561,8 +566,7 @@ fn handle_task_assign(
                             old_parent_id: old_sid.clone(),
                             new_parent_id: sid.to_string(),
                         };
-                        if let Err(e) =
-                            crate::tasks_scheduler::server_request(writer, reader, req)
+                        if let Err(e) = crate::tasks_scheduler::server_request(writer, reader, req)
                         {
                             eprintln!(
                                 "warning: failed to reparent children from {} to {}: {}",
@@ -1433,6 +1437,8 @@ fn run_schedule_pass(
                     st.id, st.title, st.branch
                 );
                 // Dispatch each scheduled task (create session + send initial message).
+                // Pass None for parent_session_id — dispatch() will resolve the parent
+                // task's session automatically for auto-dispatched tasks.
                 if let Err(e) = tasks_scheduler::dispatch(db, st.id, None, writer, reader) {
                     eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
                 }
@@ -1499,6 +1505,27 @@ mod tests {
                             self.session_counter += 1;
                             crate::protocol::Response::SessionCreated {
                                 session_id: format!("mock-s{}", self.session_counter),
+                            }
+                        }
+                        crate::protocol::Request::GetSessionInfo { session_id } => {
+                            crate::protocol::Response::SessionInfo {
+                                info: crate::protocol::SessionInfo {
+                                    id: session_id.clone(),
+                                    model: "mock-model".to_string(),
+                                    provider: "mock".to_string(),
+                                    cwd: None,
+                                    message_count: 0,
+                                    stats: Default::default(),
+                                    last_activity: 0,
+                                    parent_id: None,
+                                    child_count: 0,
+                                    child_budget: 4,
+                                    tagline: None,
+                                    state: "idle".to_string(),
+                                    context_pct: None,
+                                    archived: false,
+                                    last_exit_status: None,
+                                },
                             }
                         }
                         crate::protocol::Request::QueueMessage { .. } => {
@@ -1917,7 +1944,11 @@ mod tests {
             &mut writer,
             &mut reader,
         );
-        assert!(!result.is_error, "expected success: {}", extract_text(&result));
+        assert!(
+            !result.is_error,
+            "expected success: {}",
+            extract_text(&result)
+        );
         let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(assigned["state"], "interactive");
         assert_eq!(assigned["assigned_session"], "s2");
