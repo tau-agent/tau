@@ -335,7 +335,7 @@ fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
 }
 
 /// Send a ServerRequest via plugin protocol and wait for the ServerResponse.
-fn server_request(
+pub fn server_request(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     request: crate::protocol::Request,
