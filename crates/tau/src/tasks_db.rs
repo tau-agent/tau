@@ -78,18 +78,46 @@ const VALID_STATES: &[&str] = &[
 ];
 
 /// Check whether a state transition is allowed.
+///
+/// Forward (happy path):
+///   interactive -> ready -> active -> review -> approved -> merging -> done
+///
+/// Shortcuts:
+///   interactive -> approved   (skip straight to approval)
+///   active -> approved        (only when skip_review=true, enforced in update_task)
+///
+/// Backward (error recovery / human override):
+///   review -> active          (reviewer requests changes)
+///   approved -> active        (merge error, agent needs to fix)
+///   approved -> ready         (unapprove, send back to queue)
+///   approved -> interactive   (needs redesign / human intervention)
+///   merging -> active         (merge failure, rework)
+///
+/// Universal overrides (admin / bootstrap):
+///   any state -> done         (manual close)
+///   any state -> interactive  (human takes over)
 pub fn validate_state_transition(from: &str, to: &str) -> bool {
+    // Universal: any state can go to done or interactive (except self-loops)
+    if from != to && (to == "done" || to == "interactive") {
+        return true;
+    }
+
     matches!(
         (from, to),
+        // Forward transitions
         ("interactive", "ready")
             | ("interactive", "approved")
             | ("ready", "active")
             | ("active", "review")
             | ("active", "approved")
             | ("review", "approved")
-            | ("review", "active")
             | ("approved", "merging")
             | ("merging", "done")
+            // Backward transitions (error recovery)
+            | ("review", "active")
+            | ("approved", "active")
+            | ("approved", "ready")
+            | ("approved", "interactive")
             | ("merging", "active")
     )
 }
@@ -1321,24 +1349,44 @@ mod tests {
 
     #[test]
     fn test_state_transition_validation() {
-        // Valid transitions
+        // Forward transitions
         assert!(validate_state_transition("interactive", "ready"));
         assert!(validate_state_transition("interactive", "approved"));
         assert!(validate_state_transition("ready", "active"));
         assert!(validate_state_transition("active", "review"));
         assert!(validate_state_transition("active", "approved"));
         assert!(validate_state_transition("review", "approved"));
-        assert!(validate_state_transition("review", "active"));
         assert!(validate_state_transition("approved", "merging"));
         assert!(validate_state_transition("merging", "done"));
+
+        // Backward transitions (error recovery)
+        assert!(validate_state_transition("review", "active"));
+        assert!(validate_state_transition("approved", "active"));
+        assert!(validate_state_transition("approved", "ready"));
+        assert!(validate_state_transition("approved", "interactive"));
         assert!(validate_state_transition("merging", "active"));
 
-        // Invalid transitions
+        // Universal overrides: any state -> done
+        assert!(validate_state_transition("interactive", "done"));
+        assert!(validate_state_transition("ready", "done"));
+        assert!(validate_state_transition("active", "done"));
+        assert!(validate_state_transition("review", "done"));
+        assert!(validate_state_transition("approved", "done"));
+
+        // Universal overrides: any state -> interactive
+        assert!(validate_state_transition("ready", "interactive"));
+        assert!(validate_state_transition("active", "interactive"));
+        assert!(validate_state_transition("review", "interactive"));
+        assert!(validate_state_transition("approved", "interactive"));
+        assert!(validate_state_transition("done", "interactive"));
+
+        // Self-loops are not allowed
+        assert!(!validate_state_transition("done", "done"));
+        assert!(!validate_state_transition("interactive", "interactive"));
+
+        // Skip transitions that don't make sense
         assert!(!validate_state_transition("interactive", "active"));
-        assert!(!validate_state_transition("ready", "done"));
-        assert!(!validate_state_transition("done", "interactive"));
-        assert!(!validate_state_transition("active", "ready"));
-        assert!(!validate_state_transition("review", "ready"));
+        assert!(!validate_state_transition("interactive", "merging"));
     }
 
     #[test]
@@ -1371,6 +1419,223 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_backward_transitions_for_error_recovery() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a task and advance it to approved
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        // interactive -> ready -> active -> review -> approved
+        for state in ["ready", "active", "review", "approved"] {
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some(state.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "approved");
+
+        // approved -> active (merge error, agent needs to fix)
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "active");
+
+        // Back to approved via review
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("review".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("approved".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // approved -> ready (unapprove, send back to queue)
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "ready");
+
+        // ready -> active -> review -> approved
+        for state in ["active", "review", "approved"] {
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some(state.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        // approved -> interactive (needs redesign / human intervention)
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("interactive".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "interactive");
+    }
+
+    #[test]
+    fn test_universal_done_override() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Any state -> done should work
+        for start_state in ["interactive", "ready", "active", "review", "approved"] {
+            let task = db
+                .create_task(
+                    "/project",
+                    &format!("Test {}", start_state),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+
+            // Advance to the start state
+            let path_to_state: &[&str] = match start_state {
+                "interactive" => &[],
+                "ready" => &["ready"],
+                "active" => &["ready", "active"],
+                "review" => &["ready", "active", "review"],
+                "approved" => &["ready", "active", "review", "approved"],
+                _ => unreachable!(),
+            };
+            for state in path_to_state {
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some((*state).into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            }
+
+            // -> done
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("done".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "done");
+        }
+    }
+
+    #[test]
+    fn test_universal_interactive_override() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Any state -> interactive should work
+        for start_state in ["ready", "active", "review", "approved", "done"] {
+            let task = db
+                .create_task(
+                    "/project",
+                    &format!("Test {}", start_state),
+                    None,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+
+            // Advance to the start state
+            let path_to_state: &[&str] = match start_state {
+                "ready" => &["ready"],
+                "active" => &["ready", "active"],
+                "review" => &["ready", "active", "review"],
+                "approved" => &["ready", "active", "review", "approved"],
+                "done" => &["done"], // uses universal override
+                _ => unreachable!(),
+            };
+            for state in path_to_state {
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some((*state).into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            }
+
+            // -> interactive
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("interactive".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "interactive");
+        }
+    }
+
+    #[test]
+    fn test_self_loop_transitions_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+
+        // interactive -> interactive is a self-loop, should be rejected
+        let err = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("interactive".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid state transition"));
     }
 
     #[test]
