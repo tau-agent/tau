@@ -14,6 +14,7 @@ pub mod server;
 pub mod system_prompt;
 pub mod tasks;
 pub mod tasks_db;
+pub mod tasks_git;
 pub mod throttle;
 pub mod tools;
 pub mod types;

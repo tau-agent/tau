@@ -815,6 +815,82 @@ impl TasksDb {
 
         Ok(tasks)
     }
+
+    // ----- git integration -----
+
+    /// Set the branch name for a task.
+    pub fn set_branch(&self, task_id: i64, branch: &str) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET branch = ?1, updated_at = ?2 WHERE id = ?3",
+                params![branch, now, task_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("set_branch: {}", e)))?;
+
+        if updated == 0 {
+            return Err(crate::Error::Io(format!("task {} not found", task_id)));
+        }
+        Ok(())
+    }
+
+    /// Set the worktree path for a task.
+    pub fn set_worktree_path(&self, task_id: i64, path: &str) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET worktree_path = ?1, updated_at = ?2 WHERE id = ?3",
+                params![path, now, task_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("set_worktree_path: {}", e)))?;
+
+        if updated == 0 {
+            return Err(crate::Error::Io(format!("task {} not found", task_id)));
+        }
+        Ok(())
+    }
+
+    /// Get the merge target branch for a task.
+    ///
+    /// Returns the parent task's branch name if the task has a parent,
+    /// or `"main"` if it is a root task. Errors if the parent exists but
+    /// has no branch set.
+    pub fn get_merge_target(&self, task_id: i64) -> crate::Result<String> {
+        let task = self
+            .get_task(task_id)?
+            .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
+
+        match task.parent_id {
+            None => Ok("main".to_string()),
+            Some(pid) => {
+                let parent = self
+                    .get_task(pid)?
+                    .ok_or_else(|| crate::Error::Io(format!("parent task {} not found", pid)))?;
+                parent.branch.ok_or_else(|| {
+                    crate::Error::Io(format!("parent task {} has no branch set", pid))
+                })
+            }
+        }
+    }
+
+    /// Clear the worktree path for a task (set to NULL).
+    pub fn clear_worktree(&self, task_id: i64) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET worktree_path = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now, task_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("clear_worktree: {}", e)))?;
+
+        if updated == 0 {
+            return Err(crate::Error::Io(format!("task {} not found", task_id)));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,6 +1398,10 @@ mod tests {
 
     #[test]
     fn test_assign_task() {
+    // ----- git integration tests -----
+
+    #[test]
+    fn test_set_branch() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task("/project", "Test", None, None, None, false)
@@ -1383,11 +1463,49 @@ mod tests {
     fn test_assign_task_nonexistent() {
         let db = TasksDb::open_memory().unwrap();
         let err = db.assign_task(99999, "s1").unwrap_err();
+        assert!(task.branch.is_none());
+
+        db.set_branch(task.id, "task-1").unwrap();
+
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(loaded.branch.as_deref(), Some("task-1"));
+    }
+
+    #[test]
+    fn test_set_branch_nonexistent_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let err = db.set_branch(99999, "task-99999").unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
     #[test]
     fn test_record_session_idempotent() {
+    fn test_set_worktree_path() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        assert!(task.worktree_path.is_none());
+
+        db.set_worktree_path(task.id, "/home/user/project-task-1")
+            .unwrap();
+
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            loaded.worktree_path.as_deref(),
+            Some("/home/user/project-task-1")
+        );
+    }
+
+    #[test]
+    fn test_set_worktree_path_nonexistent_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let err = db.set_worktree_path(99999, "/tmp/wt").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_clear_worktree() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task("/project", "Test", None, None, None, false)
@@ -1421,6 +1539,36 @@ mod tests {
 
     #[test]
     fn test_subtask_defaults_to_ready() {
+        db.set_worktree_path(task.id, "/home/user/project-task-1")
+            .unwrap();
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(loaded.worktree_path.is_some());
+
+        db.clear_worktree(task.id).unwrap();
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(loaded.worktree_path.is_none());
+    }
+
+    #[test]
+    fn test_clear_worktree_nonexistent_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let err = db.clear_worktree(99999).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_get_merge_target_root_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Root task", None, None, None, false)
+            .unwrap();
+
+        let target = db.get_merge_target(task.id).unwrap();
+        assert_eq!(target, "main");
+    }
+
+    #[test]
+    fn test_get_merge_target_subtask() {
         let db = TasksDb::open_memory().unwrap();
         let parent = db
             .create_task("/project", "Parent", None, None, None, false)
@@ -1493,5 +1641,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.state, "approved");
+        db.set_branch(parent.id, "task-1").unwrap();
+
+        let child = db
+            .create_task("/project", "Child", None, Some(parent.id), None, false)
+            .unwrap();
+
+        let target = db.get_merge_target(child.id).unwrap();
+        assert_eq!(target, "task-1");
+    }
+
+    #[test]
+    fn test_get_merge_target_parent_no_branch() {
+        let db = TasksDb::open_memory().unwrap();
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false)
+            .unwrap();
+        // Don't set a branch on parent
+
+        let child = db
+            .create_task("/project", "Child", None, Some(parent.id), None, false)
+            .unwrap();
+
+        let err = db.get_merge_target(child.id).unwrap_err();
+        assert!(err.to_string().contains("no branch set"));
+    }
+
+    #[test]
+    fn test_get_merge_target_nonexistent_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let err = db.get_merge_target(99999).unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 }
