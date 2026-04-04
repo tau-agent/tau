@@ -793,16 +793,15 @@ impl App {
                 (KeyCode::Char('R'), _) => {
                     if let Some(idx) = self.picker_selected_session_idx()
                         && let Some(session) = self.picker_sessions.get(idx)
+                        && session.archived
                     {
-                        if session.archived {
-                            let session_id = session.id.clone();
-                            self.mode = self.picker_previous_mode;
-                            self.picker_confirm_delete = None;
-                            self.picker_confirm_archive = None;
-                            self.picker_filter.clear();
-                            self.picker_filter_mode = false;
-                            return Some(Action::RestoreSession { session_id });
-                        }
+                        let session_id = session.id.clone();
+                        self.mode = self.picker_previous_mode;
+                        self.picker_confirm_delete = None;
+                        self.picker_confirm_archive = None;
+                        self.picker_filter.clear();
+                        self.picker_filter_mode = false;
+                        return Some(Action::RestoreSession { session_id });
                     }
                     None
                 }

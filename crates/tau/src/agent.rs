@@ -1091,10 +1091,10 @@ mod tests {
             // Check that a Status event was emitted mentioning "stuck"
             let mut found_stuck_status = false;
             while let Ok(event) = rx.try_recv() {
-                if let StreamEvent::Status { message } = event {
-                    if message.contains("stuck") {
-                        found_stuck_status = true;
-                    }
+                if let StreamEvent::Status { message } = event
+                    && message.contains("stuck")
+                {
+                    found_stuck_status = true;
                 }
             }
             assert!(

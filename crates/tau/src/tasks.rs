@@ -365,16 +365,25 @@ fn tasks_tools() -> Vec<PluginToolDef> {
 // Tool handlers
 // ---------------------------------------------------------------------------
 
+/// Context shared across tool-handler calls: project path, calling session,
+/// and the tool-call identifier used to route the response.
+struct ToolCtx<'a> {
+    project: &'a str,
+    session_id: Option<&'a str>,
+    tool_call_id: &'a str,
+}
+
 fn handle_task_create(
     db: &TasksDb,
     args: &serde_json::Value,
-    project: &str,
-    session_id: Option<&str>,
-    tool_call_id: &str,
+    ctx: &ToolCtx<'_>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     pending_events: &mut Vec<SchedulerEvent>,
 ) -> PluginToolResult {
+    let project = ctx.project;
+    let session_id = ctx.session_id;
+    let tool_call_id = ctx.tool_call_id;
     let title = match args.get("title").and_then(|v| v.as_str()) {
         Some(t) => t,
         None => return tool_err(tool_call_id, "title is required"),
@@ -1086,12 +1095,7 @@ pub fn run_tasks_plugin() {
     let mut pending_events: Vec<SchedulerEvent> = Vec::new();
 
     // Handle requests — blocks on recv() until a line arrives or EOF.
-    loop {
-        let line = match chan_reader.recv() {
-            Some(l) => l,
-            None => break, // EOF — stdin closed
-        };
-
+    while let Some(line) = chan_reader.recv() {
         if line.trim().is_empty() {
             continue;
         }
@@ -1119,9 +1123,11 @@ pub fn run_tasks_plugin() {
                     "task_create" => handle_task_create(
                         &db,
                         &arguments,
-                        project,
-                        session,
-                        &tool_call_id,
+                        &ToolCtx {
+                            project,
+                            session_id: session,
+                            tool_call_id: &tool_call_id,
+                        },
                         &mut writer,
                         &mut chan_reader,
                         &mut pending_events,
@@ -1568,9 +1574,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Test task", "priority": 3, "message": "Hello"}),
-            "/project",
-            Some("s1"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -1662,9 +1670,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({}),
-            "/p",
-            None,
-            "tc1",
+            &ToolCtx {
+                project: "/p",
+                session_id: None,
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -1757,9 +1767,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Assignable task"}),
-            "/project",
-            Some("s1"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -1801,9 +1813,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Task for context session"}),
-            "/project",
-            Some("s1"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -1841,9 +1855,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Not ready task"}),
-            "/project",
-            Some("s1"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -1866,9 +1882,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "No session task"}),
-            "/project",
-            None,
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: None,
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -1901,9 +1919,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Parent"}),
-            "/project",
-            Some("s1"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -1916,9 +1936,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id, "skip_review": true}),
-            "/project",
-            Some("s1"),
-            "tc2",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc2",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2303,9 +2325,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Interactive task"}),
-            "/project",
-            Some("creating-session"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("creating-session"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2340,9 +2364,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "No parent session task"}),
-            "/project",
-            None,
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: None,
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2373,9 +2399,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Parent"}),
-            "/project",
-            Some("s1"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2387,9 +2415,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
-            "/project",
-            Some("s1"),
-            "tc2",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc2",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2543,9 +2573,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Interactive task"}),
-            "/project",
-            Some("s1"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2580,9 +2612,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Parent"}),
-            "/project",
-            Some("s1"),
-            "tc1",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2594,9 +2628,11 @@ mod tests {
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
-            "/project",
-            Some("s1"),
-            "tc2",
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc2",
+            },
             &mut writer,
             &mut reader,
             &mut events,
