@@ -149,6 +149,8 @@ enum TaskAction {
         /// Task ID
         id: i64,
     },
+    /// Show the merge queue (approved + merging tasks)
+    Mq,
 }
 
 #[derive(Subcommand)]
@@ -1874,6 +1876,24 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
             };
             let task = db.update_task(id, &update, None)?;
             println!("task #{} marked ready: {}", task.id, task.title);
+        }
+        TaskAction::Mq => {
+            let project = project_key();
+            let approved = db.list_tasks(&project, Some("approved"), None, None, None)?;
+            let merging = db.list_tasks(&project, Some("merging"), None, None, None)?;
+            if approved.is_empty() && merging.is_empty() {
+                println!("merge queue is empty");
+                return Ok(());
+            }
+            println!("  MERGE QUEUE");
+            println!("  {:>4}  {:<12}  {:<14}  TITLE", "ID", "STATE", "BRANCH");
+            for t in approved.iter().chain(merging.iter()) {
+                let branch = t.branch.as_deref().unwrap_or("-");
+                println!(
+                    "  {:>4}  {:<12}  {:<14}  {}",
+                    t.id, t.state, branch, t.title
+                );
+            }
         }
     }
     Ok(())

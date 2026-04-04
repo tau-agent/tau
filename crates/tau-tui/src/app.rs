@@ -1063,7 +1063,7 @@ impl App {
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|approve|ready] /reload /sessions /session <id> /back /fork /new /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|approve|ready|mq] /reload /sessions /session <id> /back /fork /new /help /quit"
                         .into(),
                 });
                 None
@@ -1215,16 +1215,56 @@ impl App {
                     }
                 }
             }
+            "mq" => match self.run_task_merge_queue() {
+                Ok(()) => {}
+                Err(e) => {
+                    self.messages.push(MessageItem::Error {
+                        text: format!("task mq: {}", e),
+                    });
+                }
+            },
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!(
-                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, approve <id>, ready <id>",
+                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, approve <id>, ready <id>, mq",
                         subcmd
                     ),
                 });
             }
         }
         None
+    }
+
+    fn run_task_merge_queue(&mut self) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let project = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let approved = db.list_tasks(&project, Some("approved"), None, None, None)?;
+        let merging = db.list_tasks(&project, Some("merging"), None, None, None)?;
+        if approved.is_empty() && merging.is_empty() {
+            self.messages.push(MessageItem::Status {
+                text: "merge queue is empty".into(),
+            });
+            return Ok(());
+        }
+        self.messages.push(MessageItem::Status {
+            text: "  MERGE QUEUE".into(),
+        });
+        self.messages.push(MessageItem::Status {
+            text: format!("  {:>4}  {:<12}  {:<14}  TITLE", "ID", "STATE", "BRANCH"),
+        });
+        for t in approved.iter().chain(merging.iter()) {
+            let branch = t.branch.as_deref().unwrap_or("-");
+            self.messages.push(MessageItem::Status {
+                text: format!(
+                    "  {:>4}  {:<12}  {:<14}  {}",
+                    t.id, t.state, branch, t.title
+                ),
+            });
+        }
+        Ok(())
     }
 
     fn run_task_list(&mut self, state_filter: Option<&str>) -> tau::Result<()> {
