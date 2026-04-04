@@ -205,9 +205,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Update task fields (title, state, priority, tags, etc.)".into()),
             prompt_guidelines: vec![
                 "State transitions are validated: interactive->ready->active->review->approved->merging->done".into(),
-                "Shortcuts: interactive->approved, active->approved (skip_review only)".into(),
-                "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active".into(),
-                "Universal overrides: any state->done (manual close), any state->interactive (human takes over)".into(),
+                "Some shortcuts: interactive->approved, active->approved (skip_review only), review->active (rework)".into(),
                 "active -> approved is only allowed if skip_review=true on the task".into(),
             ],
         },
@@ -370,8 +368,6 @@ fn handle_task_create(
     project: &str,
     session_id: Option<&str>,
     tool_call_id: &str,
-    writer: &mut impl Write,
-    reader: &mut impl BufRead,
 ) -> PluginToolResult {
     let title = match args.get("title").and_then(|v| v.as_str()) {
         Some(t) => t,
@@ -388,19 +384,6 @@ fn handle_task_create(
 
     match db.create_task(project, title, priority, parent_id, tags, skip_review) {
         Ok(task) => {
-            // Interactive tasks get a fresh session for the user to drive
-            if task.state == "interactive"
-                && let Some(new_sid) =
-                    create_interactive_session(db, &task, project, session_id, writer, reader)
-            {
-                let _ = db.set_session_id(task.id, &new_sid);
-                let _ = db.set_assigned_session(task.id, &new_sid);
-                let _ = db.record_session(task.id, &new_sid, "interactive");
-                if let Some(creator_sid) = session_id {
-                    let _ = db.record_session(task.id, creator_sid, "creator");
-                }
-            }
-
             if let Some(msg_content) = message {
                 let author = session_id.unwrap_or("user");
                 if let Err(e) = db.add_message(task.id, msg_content, Some(author)) {
@@ -410,91 +393,13 @@ fn handle_task_create(
                     );
                 }
             }
-
-            // Re-fetch to include the session_id/assigned_session updates
-            match db.get_task(task.id) {
-                Ok(Some(updated_task)) => match serde_json::to_string_pretty(&updated_task) {
-                    Ok(json) => tool_ok(tool_call_id, &json),
-                    Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
-                },
-                Ok(None) => tool_err(tool_call_id, "task not found after create"),
-                Err(e) => tool_err(tool_call_id, &format!("re-fetch task: {}", e)),
+            match serde_json::to_string_pretty(&task) {
+                Ok(json) => tool_ok(tool_call_id, &json),
+                Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
             }
         }
         Err(e) => tool_err(tool_call_id, &format!("create task: {}", e)),
     }
-}
-
-/// Create a fresh session for an interactive task.
-///
-/// Returns the new session ID on success, or None if session creation fails
-/// (the task is still created — session linking is best-effort).
-fn create_interactive_session(
-    _db: &TasksDb,
-    task: &crate::tasks_db::Task,
-    project: &str,
-    parent_session_id: Option<&str>,
-    writer: &mut impl Write,
-    reader: &mut impl BufRead,
-) -> Option<String> {
-    use crate::protocol::{Request, Response};
-
-    let create_req = Request::CreateSession {
-        model: None,
-        provider: None,
-        system_prompt: None,
-        cwd: Some(project.to_string()),
-        parent_id: parent_session_id.map(String::from),
-        child_budget: 4,
-        tagline: Some(format!("Task {}: {}", task.id, task.title)),
-        auto_archive: false,
-    };
-
-    let new_sid = match crate::tasks_scheduler::server_request(writer, reader, create_req) {
-        Ok(Response::SessionCreated { session_id }) => session_id,
-        Ok(Response::Error { message }) => {
-            eprintln!(
-                "tasks: failed to create session for task {}: {}",
-                task.id, message
-            );
-            return None;
-        }
-        Ok(_) => {
-            eprintln!(
-                "tasks: unexpected response creating session for task {}",
-                task.id
-            );
-            return None;
-        }
-        Err(e) => {
-            eprintln!("tasks: error creating session for task {}: {}", task.id, e);
-            return None;
-        }
-    };
-
-    // Queue an initial message so the session has context when the user connects
-    let initial_msg = format!(
-        "You are working on task {id}: {title}. Use task_get {id} to read the full spec.",
-        id = task.id,
-        title = task.title,
-    );
-
-    let queue_req = Request::QueueMessage {
-        target_session_id: new_sid.clone(),
-        content: initial_msg,
-        sender_info: "task-system".to_string(),
-        await_reply: false,
-        reply_to: None,
-    };
-
-    if let Err(e) = crate::tasks_scheduler::server_request(writer, reader, queue_req) {
-        eprintln!(
-            "tasks: session {} created for task {} but failed to queue initial message: {}",
-            new_sid, task.id, e
-        );
-    }
-
-    Some(new_sid)
 }
 
 fn handle_task_assign(
@@ -1007,15 +912,9 @@ pub fn run_tasks_plugin() {
                 let session = session_id.as_deref();
 
                 let result = match name.as_str() {
-                    "task_create" => handle_task_create(
-                        &db,
-                        &arguments,
-                        project,
-                        session,
-                        &tool_call_id,
-                        &mut writer,
-                        &mut reader,
-                    ),
+                    "task_create" => {
+                        handle_task_create(&db, &arguments, project, session, &tool_call_id)
+                    }
                     "task_get" => handle_task_get(&db, &arguments, &tool_call_id),
                     "task_list" => handle_task_list(&db, &arguments, project, &tool_call_id),
                     "task_assign" => handle_task_assign(&db, &arguments, session, &tool_call_id),
@@ -1079,108 +978,6 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Create a mock writer and reader pair for tests that need ServerRequest
-    /// support. The writer captures output and the reader provides canned
-    /// responses.
-    ///
-    /// Returns `(writer, reader)` where writer is `MockServerIO` and reader
-    /// wraps the same mock via a shared reference.
-    ///
-    /// Since `BufRead` needs `Read` and `Write` on the same object is tricky
-    /// with borrowing, we use two separate mock objects connected via a buffer.
-    fn mock_io() -> (MockWriter, BufReader<MockReader>) {
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(MockShared {
-            write_buf: Vec::new(),
-            read_buf: Vec::new(),
-            session_counter: 0,
-        }));
-        let writer = MockWriter {
-            shared: shared.clone(),
-        };
-        let reader = MockReader { shared };
-        (writer, BufReader::new(reader))
-    }
-
-    struct MockShared {
-        write_buf: Vec<u8>,
-        read_buf: Vec<u8>,
-        session_counter: u32,
-    }
-
-    impl MockShared {
-        fn process_pending(&mut self) {
-            let buf = std::mem::take(&mut self.write_buf);
-            let text = String::from_utf8_lossy(&buf);
-            for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(PluginMessage::ServerRequest {
-                    request_id,
-                    ref request,
-                }) = serde_json::from_str::<PluginMessage>(line)
-                {
-                    let response = match request {
-                        crate::protocol::Request::CreateSession { .. } => {
-                            self.session_counter += 1;
-                            crate::protocol::Response::SessionCreated {
-                                session_id: format!("mock-s{}", self.session_counter),
-                            }
-                        }
-                        crate::protocol::Request::QueueMessage { .. } => {
-                            crate::protocol::Response::Ok
-                        }
-                        _ => crate::protocol::Response::Ok,
-                    };
-                    let resp = PluginRequest::ServerResponse {
-                        request_id,
-                        response,
-                    };
-                    if let Ok(mut json) = serde_json::to_string(&resp) {
-                        json.push('\n');
-                        self.read_buf.extend_from_slice(json.as_bytes());
-                    }
-                }
-            }
-        }
-    }
-
-    struct MockWriter {
-        shared: std::sync::Arc<std::sync::Mutex<MockShared>>,
-    }
-
-    impl std::io::Write for MockWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let mut shared = self.shared.lock().unwrap();
-            shared.write_buf.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct MockReader {
-        shared: std::sync::Arc<std::sync::Mutex<MockShared>>,
-    }
-
-    impl std::io::Read for MockReader {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let mut shared = self.shared.lock().unwrap();
-            shared.process_pending();
-            if shared.read_buf.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "no more mock responses",
-                ));
-            }
-            let n = std::cmp::min(buf.len(), shared.read_buf.len());
-            buf[..n].copy_from_slice(&shared.read_buf[..n]);
-            shared.read_buf.drain(..n);
-            Ok(n)
-        }
-    }
-
     /// Helper: simulate a tool call and return the result.
     fn simulate_tool_call(input_lines: &str) -> Vec<PluginMessage> {
         let input = input_lines.as_bytes().to_vec();
@@ -1228,7 +1025,6 @@ mod tests {
     fn test_tool_handlers_via_db() {
         // Test handlers directly with an in-memory DB
         let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
 
         // Create
         let result = handle_task_create(
@@ -1237,8 +1033,6 @@ mod tests {
             "/project",
             Some("s1"),
             "tc1",
-            &mut writer,
-            &mut reader,
         );
         assert!(!result.is_error);
         let text = extract_text(&result);
@@ -1247,9 +1041,6 @@ mod tests {
         assert_eq!(task["title"], "Test task");
         assert_eq!(task["priority"], 3);
         assert_eq!(task["state"], "interactive");
-        // Interactive task gets a fresh session via ServerRequest
-        assert_eq!(task["session_id"], "mock-s1");
-        assert_eq!(task["assigned_session"], "mock-s1");
 
         // Check message was created
         let messages = db.get_messages(task_id).unwrap();
@@ -1283,10 +1074,10 @@ mod tests {
         let updated: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(updated["state"], "ready");
 
-        // Invalid state transition (ready -> merging is not allowed)
+        // Invalid state transition
         let result = handle_task_update(
             &db,
-            &serde_json::json!({"id": task_id, "state": "merging"}),
+            &serde_json::json!({"id": task_id, "state": "done"}),
             None,
             "tc5",
         );
@@ -1317,16 +1108,7 @@ mod tests {
     #[test]
     fn test_tool_create_missing_title() {
         let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
-        let result = handle_task_create(
-            &db,
-            &serde_json::json!({}),
-            "/p",
-            None,
-            "tc1",
-            &mut writer,
-            &mut reader,
-        );
+        let result = handle_task_create(&db, &serde_json::json!({}), "/p", None, "tc1");
         assert!(result.is_error);
         assert!(extract_text(&result).contains("title is required"));
     }
@@ -1409,7 +1191,6 @@ mod tests {
     #[test]
     fn test_task_assign_handler() {
         let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
 
         // Create a task and move to ready
         let result = handle_task_create(
@@ -1418,8 +1199,6 @@ mod tests {
             "/project",
             Some("s1"),
             "tc1",
-            &mut writer,
-            &mut reader,
         );
         assert!(!result.is_error);
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1450,7 +1229,6 @@ mod tests {
     #[test]
     fn test_task_assign_uses_context_session() {
         let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
 
         let result = handle_task_create(
             &db,
@@ -1458,8 +1236,6 @@ mod tests {
             "/project",
             Some("s1"),
             "tc1",
-            &mut writer,
-            &mut reader,
         );
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let task_id = task["id"].as_i64().unwrap();
@@ -1486,7 +1262,6 @@ mod tests {
     #[test]
     fn test_task_assign_requires_ready_state() {
         let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
 
         let result = handle_task_create(
             &db,
@@ -1494,8 +1269,6 @@ mod tests {
             "/project",
             Some("s1"),
             "tc1",
-            &mut writer,
-            &mut reader,
         );
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let task_id = task["id"].as_i64().unwrap();
@@ -1510,7 +1283,6 @@ mod tests {
     #[test]
     fn test_task_assign_no_session() {
         let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
 
         let result = handle_task_create(
             &db,
@@ -1518,8 +1290,6 @@ mod tests {
             "/project",
             None,
             "tc1",
-            &mut writer,
-            &mut reader,
         );
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let task_id = task["id"].as_i64().unwrap();
@@ -1540,7 +1310,6 @@ mod tests {
     #[test]
     fn test_subtask_defaults() {
         let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
 
         // Create parent task
         let result = handle_task_create(
@@ -1549,8 +1318,6 @@ mod tests {
             "/project",
             Some("s1"),
             "tc1",
-            &mut writer,
-            &mut reader,
         );
         let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let parent_id = parent["id"].as_i64().unwrap();
@@ -1563,8 +1330,6 @@ mod tests {
             "/project",
             Some("s1"),
             "tc2",
-            &mut writer,
-            &mut reader,
         );
         assert!(!result.is_error);
         let subtask: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1909,112 +1674,5 @@ mod tests {
         let relations = parsed["relations"].as_array().unwrap();
         assert_eq!(relations.len(), 1);
         assert!(relations[0].get("dependency_status").is_none());
-    }
-
-    // ----- interactive task auto-link tests -----
-
-    #[test]
-    fn test_interactive_task_creates_fresh_session() {
-        let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
-
-        let result = handle_task_create(
-            &db,
-            &serde_json::json!({"title": "Interactive task"}),
-            "/project",
-            Some("creating-session"),
-            "tc1",
-            &mut writer,
-            &mut reader,
-        );
-        assert!(!result.is_error);
-        let text = extract_text(&result);
-        let task: serde_json::Value = serde_json::from_str(&text).unwrap();
-
-        assert_eq!(task["state"], "interactive");
-        // session_id should be the NEW session, not the creating session
-        assert_eq!(task["session_id"], "mock-s1");
-        assert_eq!(task["assigned_session"], "mock-s1");
-
-        // Check task_sessions table has both creator and interactive records
-        let task_id = task["id"].as_i64().unwrap();
-        let sessions = db.get_sessions(task_id).unwrap();
-        assert_eq!(sessions.len(), 2);
-        let roles: Vec<(&str, &str)> = sessions
-            .iter()
-            .map(|s| (s.session_id.as_str(), s.role.as_str()))
-            .collect();
-        assert!(roles.contains(&("mock-s1", "interactive")));
-        assert!(roles.contains(&("creating-session", "creator")));
-    }
-
-    #[test]
-    fn test_interactive_task_no_parent_session_still_creates_session() {
-        let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
-
-        // Create without a session_id context — session still created, just no parent
-        let result = handle_task_create(
-            &db,
-            &serde_json::json!({"title": "No parent session task"}),
-            "/project",
-            None,
-            "tc1",
-            &mut writer,
-            &mut reader,
-        );
-        assert!(!result.is_error);
-        let text = extract_text(&result);
-        let task: serde_json::Value = serde_json::from_str(&text).unwrap();
-
-        assert_eq!(task["state"], "interactive");
-        // Session still created even without a parent session
-        assert_eq!(task["session_id"], "mock-s1");
-        assert_eq!(task["assigned_session"], "mock-s1");
-
-        // Only the interactive session recorded (no creator since no parent session)
-        let task_id = task["id"].as_i64().unwrap();
-        let sessions = db.get_sessions(task_id).unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "mock-s1");
-        assert_eq!(sessions[0].role, "interactive");
-    }
-
-    #[test]
-    fn test_subtask_does_not_create_session() {
-        let db = TasksDb::open_memory().unwrap();
-        let (mut writer, mut reader) = mock_io();
-
-        // Create parent (interactive — gets mock-s1)
-        let result = handle_task_create(
-            &db,
-            &serde_json::json!({"title": "Parent"}),
-            "/project",
-            Some("s1"),
-            "tc1",
-            &mut writer,
-            &mut reader,
-        );
-        let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        let parent_id = parent["id"].as_i64().unwrap();
-
-        // Create subtask (defaults to ready, not interactive)
-        let result = handle_task_create(
-            &db,
-            &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
-            "/project",
-            Some("s1"),
-            "tc2",
-            &mut writer,
-            &mut reader,
-        );
-        assert!(!result.is_error);
-        let text = extract_text(&result);
-        let subtask: serde_json::Value = serde_json::from_str(&text).unwrap();
-
-        assert_eq!(subtask["state"], "ready");
-        // Subtask should NOT have session auto-linked (it's not interactive)
-        assert!(subtask["session_id"].is_null());
-        assert!(subtask["assigned_session"].is_null());
     }
 }
