@@ -497,11 +497,19 @@ fn create_interactive_session(
         }
     };
 
-    // Queue an initial message so the session has context when the user connects
+    // Queue an initial message so the session has context when the user connects.
+    // Interactive tasks get a "gather-first" instruction: the session should
+    // read the spec and understand requirements but NOT start any work until
+    // the user explicitly says to proceed.
     let initial_msg = format!(
-        "You are working on task {id}: {title}. \
+        "You are working on task {id}: {title}.\n\
+         \n\
          Use the task_get tool (not a bash command) to read the full spec: \
-         call `task_get` with arguments {{\"id\": {id}}}.",
+         call `task_get` with arguments {{\"id\": {id}}}.\n\
+         \n\
+         This is an interactive task. Read the spec and gather all necessary information \
+         (understand the requirements, explore relevant code, ask clarifying questions), \
+         but do NOT start making any changes until the user explicitly tells you to proceed.",
         id = task.id,
         title = task.title,
     );
