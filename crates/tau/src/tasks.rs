@@ -87,7 +87,8 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Create a new task in the project task board".into()),
             prompt_guidelines: vec![
-                "Tasks start in 'interactive' state for spec refinement".into(),
+                "Top-level tasks start in 'interactive' state for spec refinement".into(),
+                "Subtasks (with parent_id) start in 'ready' state with skip_review=false".into(),
                 "Valid states: interactive, ready, active, review, approved, merging, done".into(),
             ],
         },
@@ -105,8 +106,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 },
                 "required": ["id"]
             }),
-            prompt_snippet: Some("Get full details of a task including messages and relations".into()),
-            prompt_guidelines: vec![],
+            prompt_snippet: Some("Use task_get to read the full specification of a task including all messages and subtasks.".into()),
+            prompt_guidelines: vec![
+                "When working on a task, first task_get to read the spec, then task_assign to claim it, do the work, then task_update to mark review or approved.".into(),
+            ],
         },
         PluginToolDef {
             name: "task_list".into(),
@@ -134,6 +137,29 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("List tasks filtered by state, parent, or tag".into()),
             prompt_guidelines: vec![],
+        },
+        PluginToolDef {
+            name: "task_assign".into(),
+            description: "Assign a task to a session and start working on it. Transitions the task from ready to active.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "description": "Task ID to assign"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID to assign to (defaults to current session)"
+                    }
+                },
+                "required": ["id"]
+            }),
+            prompt_snippet: Some("Use task_assign to claim a task and start working on it. This transitions the task from ready to active.".into()),
+            prompt_guidelines: vec![
+                "Task must be in 'ready' state to be assigned".into(),
+                "If session_id is omitted, the current session is used".into(),
+            ],
         },
         PluginToolDef {
             name: "task_update".into(),
@@ -177,7 +203,8 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Update task fields (title, state, priority, tags, etc.)".into()),
             prompt_guidelines: vec![
                 "State transitions are validated: interactive->ready->active->review->approved->merging->done".into(),
-                "Some shortcuts: interactive->approved, active->approved (skip_review), review->active (rework)".into(),
+                "Some shortcuts: interactive->approved, active->approved (skip_review only), review->active (rework)".into(),
+                "active -> approved is only allowed if skip_review=true on the task".into(),
             ],
         },
         PluginToolDef {
@@ -316,6 +343,41 @@ fn handle_task_create(
     }
 }
 
+fn handle_task_assign(
+    db: &TasksDb,
+    args: &serde_json::Value,
+    session_id: Option<&str>,
+    tool_call_id: &str,
+) -> PluginToolResult {
+    let id = match args.get("id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return tool_err(tool_call_id, "id is required"),
+    };
+
+    // Use explicit session_id from args, or fall back to context session_id
+    let sid = args
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .or(session_id);
+    let sid = match sid {
+        Some(s) => s,
+        None => {
+            return tool_err(
+                tool_call_id,
+                "session_id is required (not available from context)",
+            );
+        }
+    };
+
+    match db.assign_task(id, sid) {
+        Ok(task) => match serde_json::to_string_pretty(&task) {
+            Ok(json) => tool_ok(tool_call_id, &json),
+            Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
+        },
+        Err(e) => tool_err(tool_call_id, &format!("assign task: {}", e)),
+    }
+}
+
 fn handle_task_get(db: &TasksDb, args: &serde_json::Value, tool_call_id: &str) -> PluginToolResult {
     let id = match args.get("id").and_then(|v| v.as_i64()) {
         Some(id) => id,
@@ -396,6 +458,14 @@ fn handle_task_update(
         skip_review: args.get("skip_review").and_then(|v| v.as_bool()),
     };
 
+    // Track session as reviewer if transitioning to review or approved
+    if let (Some(sid), Some(new_state)) = (session_id, &update.state)
+        && (new_state == "review" || new_state == "approved")
+        && let Err(e) = db.record_session(id, sid, "reviewer")
+    {
+        return tool_err(tool_call_id, &format!("record session: {}", e));
+    }
+
     match db.update_task(id, &update, session_id) {
         Ok(task) => match serde_json::to_string_pretty(&task) {
             Ok(json) => tool_ok(tool_call_id, &json),
@@ -419,6 +489,13 @@ fn handle_task_message(
         Some(c) => c,
         None => return tool_err(tool_call_id, "content is required"),
     };
+
+    // Track session as contributor
+    if let Some(sid) = session_id
+        && let Err(e) = db.record_session(id, sid, "contributor")
+    {
+        return tool_err(tool_call_id, &format!("record session: {}", e));
+    }
 
     let author = session_id.unwrap_or("user");
     match db.add_message(id, content, Some(author)) {
@@ -571,6 +648,7 @@ pub fn run_tasks_plugin() {
                     }
                     "task_get" => handle_task_get(&db, &arguments, &tool_call_id),
                     "task_list" => handle_task_list(&db, &arguments, project, &tool_call_id),
+                    "task_assign" => handle_task_assign(&db, &arguments, session, &tool_call_id),
                     "task_update" => handle_task_update(&db, &arguments, session, &tool_call_id),
                     "task_message" => handle_task_message(&db, &arguments, session, &tool_call_id),
                     "task_message_edit" => handle_task_message_edit(&db, &arguments, &tool_call_id),
@@ -639,11 +717,12 @@ mod tests {
     #[test]
     fn test_tasks_tools_defined() {
         let tools = tasks_tools();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"task_create"));
         assert!(names.contains(&"task_get"));
         assert!(names.contains(&"task_list"));
+        assert!(names.contains(&"task_assign"));
         assert!(names.contains(&"task_update"));
         assert!(names.contains(&"task_message"));
         assert!(names.contains(&"task_message_edit"));
@@ -797,7 +876,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "register");
         assert_eq!(parsed["name"], "tasks");
-        assert_eq!(parsed["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(parsed["tools"].as_array().unwrap().len(), 9);
     }
 
     fn extract_text(result: &PluginToolResult) -> String {
@@ -816,5 +895,322 @@ mod tests {
     #[test]
     fn test_simulate_tool_call_compiles() {
         let _ = simulate_tool_call;
+    }
+
+    #[test]
+    fn test_task_assign_handler() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a task and move to ready
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Assignable task"}),
+            "/project",
+            Some("s1"),
+            "tc1",
+        );
+        assert!(!result.is_error);
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        // Move to ready first
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "ready"}),
+            Some("s1"),
+            "tc2",
+        );
+        assert!(!result.is_error);
+
+        // Assign with explicit session_id
+        let result = handle_task_assign(
+            &db,
+            &serde_json::json!({"id": task_id, "session_id": "worker-session"}),
+            Some("s1"),
+            "tc3",
+        );
+        assert!(!result.is_error);
+        let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(assigned["state"], "active");
+        assert_eq!(assigned["assigned_session"], "worker-session");
+    }
+
+    #[test]
+    fn test_task_assign_uses_context_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Task for context session"}),
+            "/project",
+            Some("s1"),
+            "tc1",
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "ready"}),
+            Some("s1"),
+            "tc2",
+        );
+
+        // Assign without explicit session_id — uses context session
+        let result = handle_task_assign(
+            &db,
+            &serde_json::json!({"id": task_id}),
+            Some("context-session"),
+            "tc3",
+        );
+        assert!(!result.is_error);
+        let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(assigned["assigned_session"], "context-session");
+    }
+
+    #[test]
+    fn test_task_assign_requires_ready_state() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Not ready task"}),
+            "/project",
+            Some("s1"),
+            "tc1",
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        // Try to assign in interactive state — should fail
+        let result =
+            handle_task_assign(&db, &serde_json::json!({"id": task_id}), Some("s1"), "tc2");
+        assert!(result.is_error);
+        assert!(extract_text(&result).contains("must be 'ready'"));
+    }
+
+    #[test]
+    fn test_task_assign_no_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "No session task"}),
+            "/project",
+            None,
+            "tc1",
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "ready"}),
+            None,
+            "tc2",
+        );
+
+        // Assign without any session — should fail
+        let result = handle_task_assign(&db, &serde_json::json!({"id": task_id}), None, "tc3");
+        assert!(result.is_error);
+        assert!(extract_text(&result).contains("session_id is required"));
+    }
+
+    #[test]
+    fn test_subtask_defaults() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create parent task
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Parent"}),
+            "/project",
+            Some("s1"),
+            "tc1",
+        );
+        let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let parent_id = parent["id"].as_i64().unwrap();
+        assert_eq!(parent["state"], "interactive");
+
+        // Create subtask — should default to ready state, skip_review=false
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Subtask", "parent_id": parent_id, "skip_review": true}),
+            "/project",
+            Some("s1"),
+            "tc2",
+        );
+        assert!(!result.is_error);
+        let subtask: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(subtask["state"], "ready");
+        assert_eq!(subtask["skip_review"], false);
+    }
+
+    #[test]
+    fn test_active_to_approved_requires_skip_review() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create task without skip_review
+        let task = db
+            .create_task("/project", "No skip", None, None, None, false)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+
+        // Try active -> approved without skip_review — should fail
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "approved"}),
+            Some("s1"),
+            "tc1",
+        );
+        assert!(result.is_error);
+        assert!(extract_text(&result).contains("skip_review is false"));
+
+        // active -> review should still work
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("s1"),
+            "tc2",
+        );
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn test_active_to_approved_with_skip_review() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create task with skip_review=true
+        let task = db
+            .create_task("/project", "Skip review", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+
+        // active -> approved with skip_review=true — should succeed
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "approved"}),
+            Some("s1"),
+            "tc1",
+        );
+        assert!(!result.is_error);
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "approved");
+    }
+
+    #[test]
+    fn test_session_tracking_on_message() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Tracked", None, None, None, false)
+            .unwrap();
+
+        // Add a message with a session — should record contributor
+        let result = handle_task_message(
+            &db,
+            &serde_json::json!({"id": task.id, "content": "hello"}),
+            Some("contributor-session"),
+            "tc1",
+        );
+        assert!(!result.is_error);
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "contributor-session");
+        assert_eq!(sessions[0].role, "contributor");
+    }
+
+    #[test]
+    fn test_session_tracking_on_update_to_review() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Review track", None, None, None, false)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-s").unwrap();
+
+        // Update to review with a different session
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("reviewer-session"),
+            "tc1",
+        );
+        assert!(!result.is_error);
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(roles.contains(&("worker-s", "worker")));
+        assert!(roles.contains(&("reviewer-session", "reviewer")));
+    }
+
+    #[test]
+    fn test_session_tracking_idempotent() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Idempotent", None, None, None, false)
+            .unwrap();
+
+        // Record same session twice — should be idempotent
+        db.record_session(task.id, "s1", "contributor").unwrap();
+        db.record_session(task.id, "s1", "contributor").unwrap();
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_prompt_snippets_present() {
+        let tools = tasks_tools();
+        for tool in &tools {
+            assert!(
+                tool.prompt_snippet.is_some(),
+                "tool {} missing prompt_snippet",
+                tool.name
+            );
+        }
+        // task_get should have the guideline about workflow
+        let task_get = tools.iter().find(|t| t.name == "task_get").unwrap();
+        assert!(!task_get.prompt_guidelines.is_empty());
+        assert!(task_get.prompt_guidelines[0].contains("task_assign"));
+
+        // task_assign should have snippets
+        let task_assign = tools.iter().find(|t| t.name == "task_assign").unwrap();
+        assert!(
+            task_assign
+                .prompt_snippet
+                .as_ref()
+                .unwrap()
+                .contains("claim")
+        );
     }
 }

@@ -44,6 +44,14 @@ pub struct TaskRelation {
     pub relation: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskSession {
+    pub task_id: i64,
+    pub session_id: String,
+    pub role: String,
+    pub created_at: i64,
+}
+
 /// Fields that can be updated on a task.
 #[derive(Debug, Clone, Default)]
 pub struct TaskUpdate {
@@ -196,6 +204,10 @@ impl TasksDb {
     // ----- tasks -----
 
     /// Create a new task. Returns the created task.
+    ///
+    /// Default state depends on context:
+    /// - Tasks with a `parent_id` (subtasks) default to `ready` with `skip_review=false`
+    /// - Top-level tasks default to `interactive`
     pub fn create_task(
         &self,
         project: &str,
@@ -212,13 +224,26 @@ impl TasksDb {
             .transpose()
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
 
+        // Subtasks default to 'ready' state and skip_review=false
+        let default_state = if parent_id.is_some() {
+            "ready"
+        } else {
+            "interactive"
+        };
+        let skip_review = if parent_id.is_some() {
+            false
+        } else {
+            skip_review
+        };
+
         self.conn
             .execute(
                 "INSERT INTO tasks (project, title, state, priority, parent_id, tags, skip_review, created_at, updated_at)
-                 VALUES (?1, ?2, 'interactive', ?3, ?4, ?5, ?6, ?7, ?8)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     project,
                     title,
+                    default_state,
                     priority,
                     parent_id,
                     tags_str,
@@ -339,6 +364,14 @@ impl TasksDb {
                     "invalid state transition: {} -> {}",
                     task.state, new_state
                 )));
+            }
+            // active -> approved requires skip_review=true
+            if task.state == "active" && new_state == "approved" && !task.skip_review {
+                return Err(crate::Error::Io(
+                    "cannot transition active -> approved: skip_review is false, \
+                     must go through review first"
+                        .into(),
+                ));
             }
         }
 
@@ -614,6 +647,118 @@ impl TasksDb {
             tasks.push(row.map_err(|e| crate::Error::Io(format!("read subtask row: {}", e)))?);
         }
         Ok(tasks)
+    }
+
+    // ----- assign -----
+
+    /// Assign a task to a session. Validates task is in `ready` state,
+    /// transitions to `active`, sets `assigned_session`, records in
+    /// `task_sessions` and `task_history`.
+    pub fn assign_task(&self, task_id: i64, session_id: &str) -> crate::Result<Task> {
+        let task = self
+            .get_task(task_id)?
+            .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
+
+        if task.state != "ready" {
+            return Err(crate::Error::Io(format!(
+                "cannot assign task {}: state is '{}', must be 'ready'",
+                task_id, task.state
+            )));
+        }
+
+        let now = crate::types::timestamp_ms() as i64;
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Io(format!("assign_task begin: {}", e)))?;
+
+        tx.execute(
+            "UPDATE tasks SET state = 'active', assigned_session = ?1, updated_at = ?2 \
+             WHERE id = ?3",
+            params![session_id, now, task_id],
+        )
+        .map_err(|e| crate::Error::Io(format!("assign task update: {}", e)))?;
+
+        // Record state change in history
+        tx.execute(
+            "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![task_id, "state", task.state, "active", session_id, now],
+        )
+        .map_err(|e| crate::Error::Io(format!("assign task history (state): {}", e)))?;
+
+        // Record assigned_session change in history
+        tx.execute(
+            "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                task_id,
+                "assigned_session",
+                task.assigned_session,
+                session_id,
+                session_id,
+                now
+            ],
+        )
+        .map_err(|e| crate::Error::Io(format!("assign task history (assigned): {}", e)))?;
+
+        // Record in task_sessions
+        tx.execute(
+            "INSERT OR IGNORE INTO task_sessions (task_id, session_id, role, created_at) \
+             VALUES (?1, ?2, 'worker', ?3)",
+            params![task_id, session_id, now],
+        )
+        .map_err(|e| crate::Error::Io(format!("assign task session: {}", e)))?;
+
+        tx.commit()
+            .map_err(|e| crate::Error::Io(format!("assign_task commit: {}", e)))?;
+
+        self.get_task(task_id)?
+            .ok_or_else(|| crate::Error::Io("task not found after assign".into()))
+    }
+
+    // ----- session tracking -----
+
+    /// Record a session's association with a task (idempotent — INSERT OR IGNORE).
+    pub fn record_session(&self, task_id: i64, session_id: &str, role: &str) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO task_sessions (task_id, session_id, role, created_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![task_id, session_id, role, now],
+            )
+            .map_err(|e| crate::Error::Io(format!("record session: {}", e)))?;
+        Ok(())
+    }
+
+    /// Get all sessions for a task.
+    pub fn get_sessions(&self, task_id: i64) -> crate::Result<Vec<TaskSession>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT task_id, session_id, role, created_at \
+                 FROM task_sessions WHERE task_id = ?1 ORDER BY created_at",
+            )
+            .map_err(|e| crate::Error::Io(format!("prepare get sessions: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![task_id], |row| {
+                Ok(TaskSession {
+                    task_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| crate::Error::Io(format!("get sessions: {}", e)))?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row.map_err(|e| crate::Error::Io(format!("read session row: {}", e)))?);
+        }
+        Ok(sessions)
     }
 
     // ----- search -----
@@ -1171,5 +1316,182 @@ mod tests {
             )
             .unwrap();
         assert!(!updated.skip_review);
+    }
+
+    // ----- session integration tests -----
+
+    #[test]
+    fn test_assign_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        assert_eq!(task.state, "interactive");
+
+        // Move to ready first
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Assign
+        let assigned = db.assign_task(task.id, "session-1").unwrap();
+        assert_eq!(assigned.state, "active");
+        assert_eq!(assigned.assigned_session.as_deref(), Some("session-1"));
+
+        // Check task_sessions
+        let sessions = db.get_sessions(task.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "session-1");
+        assert_eq!(sessions[0].role, "worker");
+
+        // Check history includes state and assigned_session changes
+        let mut stmt = db
+            .conn
+            .prepare("SELECT field, new_value FROM task_history WHERE task_id = ?1 ORDER BY id")
+            .unwrap();
+        let history: Vec<(String, String)> = stmt
+            .query_map(params![task.id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(history.iter().any(|(f, v)| f == "state" && v == "active"));
+        assert!(
+            history
+                .iter()
+                .any(|(f, v)| f == "assigned_session" && v == "session-1")
+        );
+    }
+
+    #[test]
+    fn test_assign_task_wrong_state() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+
+        let err = db.assign_task(task.id, "s1").unwrap_err();
+        assert!(err.to_string().contains("must be 'ready'"));
+    }
+
+    #[test]
+    fn test_assign_task_nonexistent() {
+        let db = TasksDb::open_memory().unwrap();
+        let err = db.assign_task(99999, "s1").unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_record_session_idempotent() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+
+        db.record_session(task.id, "s1", "contributor").unwrap();
+        db.record_session(task.id, "s1", "contributor").unwrap();
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn test_get_sessions_multiple_roles() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+
+        db.record_session(task.id, "s1", "worker").unwrap();
+        db.record_session(task.id, "s2", "reviewer").unwrap();
+        db.record_session(task.id, "s3", "contributor").unwrap();
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        assert_eq!(sessions.len(), 3);
+        let roles: Vec<&str> = sessions.iter().map(|s| s.role.as_str()).collect();
+        assert!(roles.contains(&"worker"));
+        assert!(roles.contains(&"reviewer"));
+        assert!(roles.contains(&"contributor"));
+    }
+
+    #[test]
+    fn test_subtask_defaults_to_ready() {
+        let db = TasksDb::open_memory().unwrap();
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false)
+            .unwrap();
+        assert_eq!(parent.state, "interactive");
+
+        // Subtask: even with skip_review=true, it gets forced to false
+        let child = db
+            .create_task("/project", "Child", None, Some(parent.id), None, true)
+            .unwrap();
+        assert_eq!(child.state, "ready");
+        assert!(!child.skip_review);
+    }
+
+    #[test]
+    fn test_active_to_approved_blocked_without_skip_review() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+
+        let err = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("approved".into()),
+                    ..Default::default()
+                },
+                Some("s1"),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("skip_review is false"));
+    }
+
+    #[test]
+    fn test_active_to_approved_allowed_with_skip_review() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+
+        let result = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("approved".into()),
+                    ..Default::default()
+                },
+                Some("s1"),
+            )
+            .unwrap();
+        assert_eq!(result.state, "approved");
     }
 }
