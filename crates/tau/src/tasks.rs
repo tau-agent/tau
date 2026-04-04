@@ -386,6 +386,15 @@ fn handle_task_create(
 
     match db.create_task(project, title, priority, parent_id, tags, skip_review) {
         Ok(task) => {
+            // Interactive tasks auto-link to the creating session
+            if task.state == "interactive"
+                && let Some(sid) = session_id
+            {
+                let _ = db.set_session_id(task.id, sid);
+                let _ = db.set_assigned_session(task.id, sid);
+                let _ = db.record_session(task.id, sid, "creator");
+            }
+
             if let Some(msg_content) = message {
                 let author = session_id.unwrap_or("user");
                 if let Err(e) = db.add_message(task.id, msg_content, Some(author)) {
@@ -395,9 +404,15 @@ fn handle_task_create(
                     );
                 }
             }
-            match serde_json::to_string_pretty(&task) {
-                Ok(json) => tool_ok(tool_call_id, &json),
-                Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
+
+            // Re-fetch to include the session_id/assigned_session updates
+            match db.get_task(task.id) {
+                Ok(Some(updated_task)) => match serde_json::to_string_pretty(&updated_task) {
+                    Ok(json) => tool_ok(tool_call_id, &json),
+                    Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
+                },
+                Ok(None) => tool_err(tool_call_id, "task not found after create"),
+                Err(e) => tool_err(tool_call_id, &format!("re-fetch task: {}", e)),
             }
         }
         Err(e) => tool_err(tool_call_id, &format!("create task: {}", e)),
@@ -1043,6 +1058,9 @@ mod tests {
         assert_eq!(task["title"], "Test task");
         assert_eq!(task["priority"], 3);
         assert_eq!(task["state"], "interactive");
+        // Interactive task auto-links to creating session
+        assert_eq!(task["session_id"], "s1");
+        assert_eq!(task["assigned_session"], "s1");
 
         // Check message was created
         let messages = db.get_messages(task_id).unwrap();
@@ -1676,5 +1694,92 @@ mod tests {
         let relations = parsed["relations"].as_array().unwrap();
         assert_eq!(relations.len(), 1);
         assert!(relations[0].get("dependency_status").is_none());
+    }
+
+    // ----- interactive task auto-link tests -----
+
+    #[test]
+    fn test_interactive_task_autolinks_to_creating_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Interactive task"}),
+            "/project",
+            Some("creating-session"),
+            "tc1",
+        );
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let task: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(task["state"], "interactive");
+        assert_eq!(task["session_id"], "creating-session");
+        assert_eq!(task["assigned_session"], "creating-session");
+
+        // Also check task_sessions table has a creator record
+        let task_id = task["id"].as_i64().unwrap();
+        let sessions = db.get_sessions(task_id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "creating-session");
+        assert_eq!(sessions[0].role, "creator");
+    }
+
+    #[test]
+    fn test_interactive_task_no_session_no_autolink() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create without a session_id context
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "No session task"}),
+            "/project",
+            None,
+            "tc1",
+        );
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let task: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(task["state"], "interactive");
+        assert!(task["session_id"].is_null());
+        assert!(task["assigned_session"].is_null());
+
+        let task_id = task["id"].as_i64().unwrap();
+        let sessions = db.get_sessions(task_id).unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_subtask_does_not_autolink() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create parent (interactive)
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Parent"}),
+            "/project",
+            Some("s1"),
+            "tc1",
+        );
+        let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let parent_id = parent["id"].as_i64().unwrap();
+
+        // Create subtask (defaults to ready, not interactive)
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
+            "/project",
+            Some("s1"),
+            "tc2",
+        );
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let subtask: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(subtask["state"], "ready");
+        // Subtask should NOT have session auto-linked (it's not interactive)
+        assert!(subtask["session_id"].is_null());
+        assert!(subtask["assigned_session"].is_null());
     }
 }
