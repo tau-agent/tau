@@ -289,28 +289,53 @@ pub fn dispatch(
     Ok(session_id)
 }
 
+/// Load optional dispatch context from `.tau/dispatch-context.md`.
+///
+/// Projects can create this file to provide standard instructions that are
+/// prepended to every dispatched task's initial message (e.g., build commands,
+/// coding conventions, git workflow).
+fn load_dispatch_context(project_dir: &str) -> Option<String> {
+    let path = std::path::Path::new(project_dir)
+        .join(".tau")
+        .join("dispatch-context.md");
+    match std::fs::read_to_string(&path) {
+        Ok(content) if !content.trim().is_empty() => Some(content.trim().to_string()),
+        _ => None,
+    }
+}
+
 /// Build the initial chat message sent to a dispatched task's session.
 fn build_initial_message(task: &Task) -> String {
     let review_instruction = if task.skip_review {
         format!(
-            "- task_update {} state=approved (skip_review is true for this task)",
-            task.id
+            "- task_update {id} state=approved  (skip_review is true for this task)",
+            id = task.id
         )
     } else {
         format!(
-            "- task_update {} state=review (skip_review is false — needs review)",
-            task.id
+            "- task_update {id} state=review  (skip_review is false — needs review)",
+            id = task.id
         )
     };
+
+    let dispatch_context = load_dispatch_context(&task.project)
+        .map(|ctx| format!("\n{}\n", ctx))
+        .unwrap_or_default();
 
     format!(
         "You are working on task {id}: {title}\n\
          \n\
-         Read the full task specification with task_get {id}.\n\
-         Assign yourself with task_assign {id}.\n\
-         Do the work in this worktree.\n\
+         Use the task_get tool (not a bash command) to read the full specification:\n\
+         - Call the `task_get` tool with arguments: {{\"id\": {id}}}\n\
+         Then assign yourself:\n\
+         - Call the `task_assign` tool with arguments: {{\"id\": {id}}}\n\
+         \n\
+         Do the work in this worktree. Commit your changes on the current branch — do NOT merge into main.\n\
          When done, run the project checklist, then mark the task:\n\
-         {review}",
+         {review}\n\
+         \n\
+         Note: task_get, task_assign, and task_update are agent tools (like bash or edit), not CLI commands.\
+         {dispatch_context}",
         id = task.id,
         title = task.title,
         review = review_instruction,
@@ -543,10 +568,13 @@ mod tests {
         let task = make_task(5, 0, None);
         let msg = build_initial_message(&task);
         assert!(msg.contains("task 5"));
-        assert!(msg.contains("task_get 5"));
-        assert!(msg.contains("task_assign 5"));
+        assert!(msg.contains("task_get"));
+        assert!(msg.contains("task_assign"));
         assert!(msg.contains("state=review"));
         assert!(msg.contains("skip_review is false"));
+        // Must clarify these are tool calls, not CLI commands
+        assert!(msg.contains("not a bash command") || msg.contains("not CLI commands"));
+        assert!(msg.contains("do NOT merge into main") || msg.contains("do not merge"));
     }
 
     #[test]
@@ -556,6 +584,51 @@ mod tests {
         let msg = build_initial_message(&task);
         assert!(msg.contains("state=approved"));
         assert!(msg.contains("skip_review is true"));
+    }
+
+    #[test]
+    fn test_build_initial_message_tool_call_format() {
+        let task = make_task(42, 0, None);
+        let msg = build_initial_message(&task);
+        // Should include JSON argument hint so agent knows the invocation format
+        assert!(msg.contains(r#"{"id": 42}"#));
+        // Should tell agent to commit on branch
+        assert!(msg.contains("current branch"));
+    }
+
+    #[test]
+    fn test_load_dispatch_context_missing() {
+        let ctx = load_dispatch_context("/nonexistent/path");
+        assert!(ctx.is_none());
+    }
+
+    #[test]
+    fn test_load_dispatch_context_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(
+            tau_dir.join("dispatch-context.md"),
+            "# Build\nRun `cargo test` before committing.\n",
+        )
+        .unwrap();
+
+        let ctx = load_dispatch_context(dir.path().to_str().unwrap());
+        assert!(ctx.is_some());
+        assert!(ctx.unwrap().contains("cargo test"));
+    }
+
+    #[test]
+    fn test_build_initial_message_with_dispatch_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join("dispatch-context.md"), "Always run clippy.\n").unwrap();
+
+        let mut task = make_task(1, 0, None);
+        task.project = dir.path().to_str().unwrap().to_string();
+        let msg = build_initial_message(&task);
+        assert!(msg.contains("Always run clippy."));
     }
 
     #[test]
