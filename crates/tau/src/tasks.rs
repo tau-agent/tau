@@ -454,6 +454,7 @@ fn create_interactive_session(
         child_budget: 4,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
+        notify_parent: false,
     };
 
     let new_sid = match crate::tasks_scheduler::server_request(writer, reader, create_req) {

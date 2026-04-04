@@ -44,6 +44,10 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                     "auto_archive": {
                         "type": "boolean",
                         "description": "If true, automatically archive this child session after it completes and is joined (default false)"
+                    },
+                    "notify_parent": {
+                        "type": "boolean",
+                        "description": "If true, notify the parent session when this child completes (default true). Set to false for task-managed sessions."
                     }
                 },
                 "required": ["task"]

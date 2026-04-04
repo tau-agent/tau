@@ -47,6 +47,8 @@ pub struct StoredSession {
     pub last_phase: Option<String>,
     /// When true, auto-archive this session (and its subtree) after completion+join.
     pub auto_archive: bool,
+    /// When true, notify parent session on child completion.
+    pub notify_parent: bool,
 }
 
 pub struct Db {
@@ -117,6 +119,9 @@ impl Db {
         let _ = conn.execute_batch(
             "ALTER TABLE sessions ADD COLUMN auto_archive INTEGER NOT NULL DEFAULT 0;",
         );
+        let _ = conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN notify_parent INTEGER NOT NULL DEFAULT 1;",
+        );
 
         // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
@@ -162,7 +167,8 @@ impl Db {
                 archived       INTEGER NOT NULL DEFAULT 0,
                 last_exit_status TEXT,
                 last_phase     TEXT,
-                auto_archive   INTEGER NOT NULL DEFAULT 0
+                auto_archive   INTEGER NOT NULL DEFAULT 0,
+                notify_parent  INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,
@@ -195,8 +201,8 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     session.id,
                     model_json,
@@ -211,6 +217,7 @@ impl Db {
                     session.last_exit_status,
                     session.last_phase,
                     session.auto_archive as i32,
+                    session.notify_parent as i32,
                 ],
             )
             .map_err(|e| crate::Error::Io(format!("insert session: {}", e)))?;
@@ -221,7 +228,7 @@ impl Db {
     pub fn get_session(&self, id: &str) -> crate::Result<Option<StoredSession>> {
         self.conn
             .query_row(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent
                  FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
@@ -247,6 +254,7 @@ impl Db {
                         last_exit_status: row.get(10)?,
                         last_phase: row.get(11)?,
                         auto_archive: row.get::<_, i32>(12)? != 0,
+                        notify_parent: row.get::<_, i32>(13)? != 0,
                     })
                 },
             )
@@ -259,10 +267,10 @@ impl Db {
     /// If `include_archived` is false, archived sessions are excluded.
     pub fn list_sessions(&self, include_archived: bool) -> crate::Result<Vec<StoredSession>> {
         let sql = if include_archived {
-            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive
+            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent
              FROM sessions ORDER BY created_at"
         } else {
-            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive
+            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent
              FROM sessions WHERE archived = 0 ORDER BY created_at"
         };
         let mut stmt = self
@@ -294,6 +302,7 @@ impl Db {
                     last_exit_status: row.get(10)?,
                     last_phase: row.get(11)?,
                     auto_archive: row.get::<_, i32>(12)? != 0,
+                    notify_parent: row.get::<_, i32>(13)? != 0,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list sessions: {}", e)))?;
@@ -411,7 +420,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive
+                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent
                  FROM sessions WHERE parent_id = ?1 ORDER BY created_at",
             )
             .map_err(|e| crate::Error::Io(format!("prepare children: {}", e)))?;
@@ -440,6 +449,7 @@ impl Db {
                     last_exit_status: row.get(10)?,
                     last_phase: row.get(11)?,
                     auto_archive: row.get::<_, i32>(12)? != 0,
+                    notify_parent: row.get::<_, i32>(13)? != 0,
                 })
             })
             .map_err(|e| crate::Error::Io(format!("list children: {}", e)))?;
@@ -1039,6 +1049,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         };
         db.create_session(&session).unwrap();
 
@@ -1066,6 +1077,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         };
         db.create_session(&session).unwrap();
 
@@ -1103,6 +1115,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         };
         db.create_session(&session).unwrap();
         db.append_message("s1", &Message::User(UserMessage::text("hi")))
@@ -1131,6 +1144,7 @@ mod tests {
                 last_exit_status: None,
                 last_phase: None,
                 auto_archive: false,
+                notify_parent: true,
             })
             .unwrap();
         }
@@ -1158,6 +1172,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
         assert_eq!(db.next_session_id().unwrap(), "s6");
@@ -1182,6 +1197,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1204,6 +1220,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1225,6 +1242,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1256,6 +1274,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1273,6 +1292,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1291,6 +1311,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1319,6 +1340,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1336,6 +1358,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1366,6 +1389,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
         db.append_message("top", &Message::User(UserMessage::text("hello")))
@@ -1386,6 +1410,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
         db.append_message("child1", &Message::User(UserMessage::text("work")))
@@ -1406,6 +1431,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
         db.append_message(
@@ -1429,6 +1455,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
         db.append_message(
@@ -1462,6 +1489,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1487,6 +1515,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1518,6 +1547,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1570,6 +1600,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1595,6 +1626,7 @@ mod tests {
                 last_exit_status: None,
                 last_phase: None,
                 auto_archive: false,
+                notify_parent: true,
             })
             .unwrap();
         }
@@ -1628,6 +1660,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1656,6 +1689,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1680,6 +1714,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1755,6 +1790,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1795,6 +1831,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
         db.append_message("old_archived", &Message::User(UserMessage::text("hello")))
@@ -1816,6 +1853,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 
@@ -1834,6 +1872,7 @@ mod tests {
             last_exit_status: None,
             last_phase: None,
             auto_archive: false,
+            notify_parent: true,
         })
         .unwrap();
 

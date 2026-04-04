@@ -31,6 +31,7 @@ fn server_create_session_and_list() {
             child_budget: 5,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     );
     let session_id = match resp {
@@ -77,6 +78,7 @@ fn server_create_child_session_with_budget() {
             child_budget: 3,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -96,6 +98,7 @@ fn server_create_child_session_with_budget() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -153,6 +156,7 @@ fn server_budget_exceeded() {
             child_budget: 1,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -172,6 +176,7 @@ fn server_budget_exceeded() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { .. } => {}
@@ -191,6 +196,7 @@ fn server_budget_exceeded() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::Error { message } => {
@@ -223,6 +229,7 @@ fn server_delete_session_tree() {
             child_budget: 5,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -241,6 +248,7 @@ fn server_delete_session_tree() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -302,6 +310,7 @@ fn server_wait_sessions_immediate() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -346,6 +355,7 @@ fn server_chat_simple_text() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -420,6 +430,7 @@ fn server_chat_tool_call_loop() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -492,6 +503,7 @@ fn server_chat_error_preserves_partial_messages() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -589,6 +601,7 @@ fn server_session_resume_after_restart() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -709,6 +722,7 @@ fn steer_queues_message_for_idle_session() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -839,6 +853,7 @@ fn queue_message_persists_across_operations() {
         last_exit_status: None,
         last_phase: None,
         auto_archive: false,
+        notify_parent: true,
     })
     .unwrap();
 
@@ -943,6 +958,7 @@ fn server_chat_with_mock_tool_success() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1073,6 +1089,7 @@ fn server_chat_with_mock_tool_error() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1192,6 +1209,7 @@ fn server_chat_multi_tool_calls() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1315,6 +1333,7 @@ fn server_chat_multi_turn_tool_loop() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1434,6 +1453,7 @@ fn server_chat_tool_schemas_in_context() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1549,6 +1569,7 @@ fn session_dump_and_replay() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2000,6 +2021,7 @@ done
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2095,6 +2117,7 @@ fn server_execute_tool_basic() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2154,6 +2177,7 @@ fn server_execute_tool_error() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2213,6 +2237,7 @@ fn server_execute_tool_persistence() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2358,6 +2383,7 @@ fn server_log_provider_chat_returns_immediately() {
             child_budget: 0,
             tagline: None,
             auto_archive: false,
+            notify_parent: true,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
