@@ -875,6 +875,40 @@ impl TasksDb {
         }
     }
 
+    /// Set the assigned_session for a task (which session is assigned to it).
+    pub fn set_assigned_session(&self, task_id: i64, session_id: &str) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET assigned_session = ?1, updated_at = ?2 WHERE id = ?3",
+                params![session_id, now, task_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("set_assigned_session: {}", e)))?;
+
+        if updated == 0 {
+            return Err(crate::Error::Io(format!("task {} not found", task_id)));
+        }
+        Ok(())
+    }
+
+    /// Set the session_id for a task (the session working on it).
+    pub fn set_session_id(&self, task_id: i64, session_id: &str) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![session_id, now, task_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("set_session_id: {}", e)))?;
+
+        if updated == 0 {
+            return Err(crate::Error::Io(format!("task {} not found", task_id)));
+        }
+        Ok(())
+    }
+
     /// Clear the worktree path for a task (set to NULL).
     pub fn clear_worktree(&self, task_id: i64) -> crate::Result<()> {
         let now = crate::types::timestamp_ms() as i64;

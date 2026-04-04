@@ -9,6 +9,7 @@ use crate::plugin::{
     HookResult, PluginMessage, PluginRegistration, PluginRequest, PluginToolDef, PluginToolResult,
 };
 use crate::tasks_db::{TaskUpdate, TasksDb};
+use crate::tasks_scheduler;
 use crate::types::ToolResultContent;
 
 // ---------------------------------------------------------------------------
@@ -296,6 +297,44 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Search tasks by title and message content".into()),
             prompt_guidelines: vec![],
         },
+        PluginToolDef {
+            name: "task_schedule".into(),
+            description: "Run a scheduling pass: find ready tasks, pick a non-conflicting batch, create branches and worktrees, and transition them to active. Returns the list of tasks ready to dispatch.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project path (defaults to session cwd)"
+                    }
+                }
+            }),
+            prompt_snippet: Some("Run a scheduling pass to prepare ready tasks for dispatch".into()),
+            prompt_guidelines: vec![
+                "Finds all ready tasks, selects a non-conflicting batch based on affected_files, creates branches/worktrees, transitions to active.".into(),
+                "After scheduling, use task_dispatch to create sessions and start work.".into(),
+            ],
+        },
+        PluginToolDef {
+            name: "task_dispatch".into(),
+            description: "Dispatch a task: create a session, send the initial chat message, and record the session on the task. The task must be in active state (run task_schedule first) or ready state (will be prepared automatically).".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "integer",
+                        "description": "Task ID to dispatch"
+                    }
+                },
+                "required": ["id"]
+            }),
+            prompt_snippet: Some("Dispatch a task: create a session and start work on it".into()),
+            prompt_guidelines: vec![
+                "Creates a new session with cwd set to the task's worktree.".into(),
+                "Sends an initial chat message with instructions to read the task spec and do the work.".into(),
+                "The task must be active (prepared by task_schedule) or ready (will be prepared inline).".into(),
+            ],
+        },
     ]
 }
 
@@ -582,6 +621,60 @@ fn handle_task_search(
     }
 }
 
+fn handle_task_schedule(
+    db: &TasksDb,
+    args: &serde_json::Value,
+    project: &str,
+    tool_call_id: &str,
+) -> PluginToolResult {
+    let project = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project);
+
+    match tasks_scheduler::schedule(db, project) {
+        Ok(scheduled) => {
+            if scheduled.is_empty() {
+                return tool_ok(tool_call_id, "No ready tasks to schedule.");
+            }
+            match serde_json::to_string_pretty(&scheduled) {
+                Ok(json) => tool_ok(
+                    tool_call_id,
+                    &format!(
+                        "Scheduled {} task(s) for dispatch:\n{}",
+                        scheduled.len(),
+                        json
+                    ),
+                ),
+                Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
+            }
+        }
+        Err(e) => tool_err(tool_call_id, &format!("schedule: {}", e)),
+    }
+}
+
+fn handle_task_dispatch(
+    db: &TasksDb,
+    args: &serde_json::Value,
+    session_id: Option<&str>,
+    tool_call_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> PluginToolResult {
+    let id = match args.get("id").and_then(|v| v.as_i64()) {
+        Some(id) => id,
+        None => return tool_err(tool_call_id, "id is required"),
+    };
+
+    match tasks_scheduler::dispatch(db, id, session_id, writer, reader) {
+        Ok(sid) => tool_ok(
+            tool_call_id,
+            &format!("Task {} dispatched. Session: {}", id, sid),
+        ),
+        Err(e) => tool_err(tool_call_id, &format!("dispatch task {}: {}", id, e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plugin main loop
 // ---------------------------------------------------------------------------
@@ -654,6 +747,17 @@ pub fn run_tasks_plugin() {
                     "task_message_edit" => handle_task_message_edit(&db, &arguments, &tool_call_id),
                     "task_relate" => handle_task_relate(&db, &arguments, &tool_call_id),
                     "task_search" => handle_task_search(&db, &arguments, project, &tool_call_id),
+                    "task_schedule" => {
+                        handle_task_schedule(&db, &arguments, project, &tool_call_id)
+                    }
+                    "task_dispatch" => handle_task_dispatch(
+                        &db,
+                        &arguments,
+                        session,
+                        &tool_call_id,
+                        &mut writer,
+                        &mut reader,
+                    ),
                     _ => tool_err(&tool_call_id, &format!("unknown tool: {}", name)),
                 };
 
@@ -717,7 +821,7 @@ mod tests {
     #[test]
     fn test_tasks_tools_defined() {
         let tools = tasks_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"task_create"));
         assert!(names.contains(&"task_get"));
@@ -728,6 +832,8 @@ mod tests {
         assert!(names.contains(&"task_message_edit"));
         assert!(names.contains(&"task_relate"));
         assert!(names.contains(&"task_search"));
+        assert!(names.contains(&"task_schedule"));
+        assert!(names.contains(&"task_dispatch"));
     }
 
     #[test]
@@ -876,7 +982,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "register");
         assert_eq!(parsed["name"], "tasks");
-        assert_eq!(parsed["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(parsed["tools"].as_array().unwrap().len(), 11);
     }
 
     fn extract_text(result: &PluginToolResult) -> String {
