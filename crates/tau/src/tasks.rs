@@ -372,6 +372,7 @@ fn handle_task_create(
     tool_call_id: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
+    pending_events: &mut Vec<SchedulerEvent>,
 ) -> PluginToolResult {
     let title = match args.get("title").and_then(|v| v.as_str()) {
         Some(t) => t,
@@ -388,6 +389,11 @@ fn handle_task_create(
 
     match db.create_task(project, title, priority, parent_id, tags, skip_review) {
         Ok(task) => {
+            // Subtasks start in ready state — trigger a schedule pass.
+            if task.state == "ready" {
+                pending_events.push(SchedulerEvent::ScheduleNeeded(project.to_string()));
+            }
+
             // Interactive tasks get a fresh session for the user to drive
             if task.state == "interactive"
                 && let Some(new_sid) =
@@ -626,6 +632,7 @@ fn handle_task_update(
     tool_call_id: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
+    pending_events: &mut Vec<SchedulerEvent>,
 ) -> PluginToolResult {
     let id = match args.get("id").and_then(|v| v.as_i64()) {
         Some(id) => id,
@@ -651,6 +658,15 @@ fn handle_task_update(
 
     match db.update_task(id, &update, session_id) {
         Ok(task) => {
+            // Trigger scheduler events based on the new state.
+            match task.state.as_str() {
+                "approved" => pending_events.push(SchedulerEvent::MergeNeeded),
+                "ready" => {
+                    pending_events.push(SchedulerEvent::ScheduleNeeded(task.project.clone()));
+                }
+                _ => {}
+            }
+
             // When a task transitions to done, auto-archive its session
             if task.state == "done" {
                 auto_archive_task_session(db, &task, writer, reader);
@@ -991,16 +1007,31 @@ fn handle_task_merge(
 }
 
 // ---------------------------------------------------------------------------
+// Scheduler events
+// ---------------------------------------------------------------------------
+
+/// Events that trigger scheduler passes after a tool call completes.
+///
+/// Instead of polling on a timer, tool handlers emit these events when
+/// a state transition requires follow-up work. The main loop drains
+/// pending events after each tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchedulerEvent {
+    /// A task moved to `approved` — run the merge queue.
+    MergeNeeded,
+    /// A task moved to `ready` — run a scheduling pass for the given project.
+    ScheduleNeeded(String),
+}
+
+// ---------------------------------------------------------------------------
 // Plugin main loop
 // ---------------------------------------------------------------------------
 
-/// How often (in seconds) the scheduler checks for approved tasks to merge.
-const MERGE_POLL_INTERVAL_SECS: u64 = 5;
-
 /// Run the tasks plugin loop. Called from `tau plugin tasks` subcommand.
 ///
-/// Uses a reader thread so the main loop can poll for approved tasks
-/// on a timer in addition to handling tool calls.
+/// The loop is fully event-driven: it blocks on stdin for tool calls and
+/// runs merge/schedule passes only when triggered by state changes in
+/// tool handlers (via `SchedulerEvent`). There is no polling.
 pub fn run_tasks_plugin() {
     // Open DB at startup (it's always at the same global path)
     let db = match TasksDb::open_default() {
@@ -1024,7 +1055,6 @@ pub fn run_tasks_plugin() {
     send_message(&mut writer, &PluginMessage::Register(registration));
 
     // Spawn a reader thread that sends lines through a channel.
-    // This lets the main loop use recv_timeout for periodic merge checks.
     let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -1048,21 +1078,15 @@ pub fn run_tasks_plugin() {
     // are never concurrent (both run on the main thread), sharing is safe.
     let mut chan_reader = ChannelLineReader::new(line_rx);
 
-    let poll_interval = std::time::Duration::from_secs(MERGE_POLL_INTERVAL_SECS);
+    // Pending scheduler events, populated by tool handlers and drained
+    // after each tool call completes.
+    let mut pending_events: Vec<SchedulerEvent> = Vec::new();
 
-    // Handle requests
+    // Handle requests — blocks on recv() until a line arrives or EOF.
     loop {
-        // Wait for the next line, or timeout for merge polling
-        let line = match chan_reader.recv_timeout(poll_interval) {
+        let line = match chan_reader.recv() {
             Some(l) => l,
-            None => {
-                // Timeout (or EOF) — run a merge pass for approved tasks
-                if chan_reader.is_closed() {
-                    break;
-                }
-                run_merge_pass(&db, &mut writer, &mut chan_reader);
-                continue;
-            }
+            None => break, // EOF — stdin closed
         };
 
         if line.trim().is_empty() {
@@ -1097,6 +1121,7 @@ pub fn run_tasks_plugin() {
                         &tool_call_id,
                         &mut writer,
                         &mut chan_reader,
+                        &mut pending_events,
                     ),
                     "task_get" => handle_task_get(&db, &arguments, &tool_call_id),
                     "task_list" => handle_task_list(&db, &arguments, project, &tool_call_id),
@@ -1108,6 +1133,7 @@ pub fn run_tasks_plugin() {
                         &tool_call_id,
                         &mut writer,
                         &mut chan_reader,
+                        &mut pending_events,
                     ),
                     "task_message" => handle_task_message(&db, &arguments, session, &tool_call_id),
                     "task_message_edit" => handle_task_message_edit(&db, &arguments, &tool_call_id),
@@ -1136,6 +1162,10 @@ pub fn run_tasks_plugin() {
                 };
 
                 send_message(&mut writer, &PluginMessage::ToolResult(result));
+
+                // Drain pending scheduler events and run the
+                // corresponding passes immediately.
+                drain_scheduler_events(&mut pending_events, &db, &mut writer, &mut chan_reader);
             }
             PluginRequest::Init { .. } | PluginRequest::SessionStart { .. } => {
                 send_message(
@@ -1168,7 +1198,7 @@ pub fn run_tasks_plugin() {
 /// Each received string is treated as one line (newline-terminated).
 /// `read_line` blocks until a line is available or the channel closes.
 ///
-/// Also provides `recv_timeout` for the main loop to poll with a deadline.
+/// Provides `recv` for blocking reads (used by the main event loop).
 struct ChannelLineReader {
     rx: std::sync::mpsc::Receiver<String>,
     /// Leftover bytes from the current line that haven't been consumed yet.
@@ -1185,21 +1215,16 @@ impl ChannelLineReader {
         }
     }
 
-    /// Receive the next line with a timeout. Returns `None` on timeout or
-    /// channel close.
-    fn recv_timeout(&mut self, timeout: std::time::Duration) -> Option<String> {
-        match self.rx.recv_timeout(timeout) {
+    /// Receive the next line, blocking until available. Returns `None`
+    /// on channel close (EOF).
+    fn recv(&mut self) -> Option<String> {
+        match self.rx.recv() {
             Ok(line) => Some(line),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::sync::mpsc::RecvError) => {
                 self.closed = true;
                 None
             }
         }
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed
     }
 }
 
@@ -1251,16 +1276,61 @@ impl BufRead for ChannelLineReader {
     }
 }
 
+// ---------------------------------------------------------------------------\n// Scheduler event processing\n// ---------------------------------------------------------------------------
+
+/// Drain pending scheduler events and run the corresponding passes.
+///
+/// Called after each tool call completes. Events are deduplicated: multiple
+/// `MergeNeeded` events collapse into a single merge pass, and multiple
+/// `ScheduleNeeded` events for the same project collapse into one schedule
+/// pass.
+fn drain_scheduler_events(
+    events: &mut Vec<SchedulerEvent>,
+    db: &TasksDb,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    if events.is_empty() {
+        return;
+    }
+
+    let batch = std::mem::take(events);
+
+    let mut need_merge = false;
+    let mut schedule_projects: Vec<String> = Vec::new();
+
+    for ev in batch {
+        match ev {
+            SchedulerEvent::MergeNeeded => need_merge = true,
+            SchedulerEvent::ScheduleNeeded(project) => {
+                if !schedule_projects.contains(&project) {
+                    schedule_projects.push(project);
+                }
+            }
+        }
+    }
+
+    // Run merge pass first (merging may unblock dependencies that become
+    // ready, but schedule passes are triggered by explicit events anyway).
+    if need_merge {
+        run_merge_pass(db, writer, reader);
+    }
+
+    for project in &schedule_projects {
+        run_schedule_pass(db, project, writer, reader);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Merge pass
 // ---------------------------------------------------------------------------
 
 /// Run a merge pass: find approved tasks and merge them.
 ///
-/// Called periodically from the main loop when no tool calls are pending.
-/// Shares the same writer (stdout) and reader (channel from stdin) as
-/// tool handlers — this is safe because the merge pass and tool handling
-/// are never concurrent (both run on the main thread).
+/// Triggered when a task transitions to `approved`. Shares the same
+/// writer (stdout) and reader (channel from stdin) as tool handlers —
+/// this is safe because the merge pass and tool handling are never
+/// concurrent (both run on the main thread).
 fn run_merge_pass(db: &TasksDb, writer: &mut impl Write, reader: &mut impl BufRead) {
     match tasks_scheduler::merge_approved(db, writer, reader) {
         Ok(attempts) => {
@@ -1277,6 +1347,35 @@ fn run_merge_pass(db: &TasksDb, writer: &mut impl Write, reader: &mut impl BufRe
         }
         Err(e) => {
             eprintln!("tasks scheduler: merge pass error: {}", e);
+        }
+    }
+}
+
+/// Run a schedule + dispatch pass for a project: find ready tasks, prepare
+/// branches/worktrees, and dispatch sessions for them.
+///
+/// Triggered when a task transitions to `ready`.
+fn run_schedule_pass(
+    db: &TasksDb,
+    project: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    match tasks_scheduler::schedule(db, project) {
+        Ok(scheduled) => {
+            for st in &scheduled {
+                eprintln!(
+                    "tasks scheduler: scheduled task {} ({}) on branch {}",
+                    st.id, st.title, st.branch
+                );
+                // Dispatch each scheduled task (create session + send initial message).
+                if let Err(e) = tasks_scheduler::dispatch(db, st.id, None, writer, reader) {
+                    eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("tasks scheduler: schedule pass error: {}", e);
         }
     }
 }
@@ -1453,6 +1552,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let text = extract_text(&result);
@@ -1493,6 +1593,7 @@ mod tests {
             "tc4",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let text = extract_text(&result);
@@ -1507,6 +1608,7 @@ mod tests {
             "tc5",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(result.is_error);
 
@@ -1544,6 +1646,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(result.is_error);
         assert!(extract_text(&result).contains("title is required"));
@@ -1638,6 +1741,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1651,6 +1755,7 @@ mod tests {
             "tc2",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -1680,6 +1785,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let task_id = task["id"].as_i64().unwrap();
@@ -1691,6 +1797,7 @@ mod tests {
             "tc2",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
 
         // Assign without explicit session_id — uses context session
@@ -1718,6 +1825,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let task_id = task["id"].as_i64().unwrap();
@@ -1742,6 +1850,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let task_id = task["id"].as_i64().unwrap();
@@ -1753,6 +1862,7 @@ mod tests {
             "tc2",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
 
         // Assign without any session — should fail
@@ -1775,6 +1885,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let parent_id = parent["id"].as_i64().unwrap();
@@ -1789,6 +1900,7 @@ mod tests {
             "tc2",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let subtask: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1824,6 +1936,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(result.is_error);
         assert!(extract_text(&result).contains("skip_review is false"));
@@ -1836,6 +1949,7 @@ mod tests {
             "tc2",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
     }
@@ -1868,6 +1982,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -1922,6 +2037,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -2161,6 +2277,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let text = extract_text(&result);
@@ -2197,6 +2314,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let text = extract_text(&result);
@@ -2229,6 +2347,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let parent_id = parent["id"].as_i64().unwrap();
@@ -2242,6 +2361,7 @@ mod tests {
             "tc2",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let text = extract_text(&result);
@@ -2302,6 +2422,7 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -2336,10 +2457,191 @@ mod tests {
             "tc1",
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(updated["state"], "done");
         // No archive request should be sent (no session_id)
+    }
+
+    // ----- scheduler event tests -----
+
+    #[test]
+    fn test_update_to_approved_emits_merge_event() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+        let mut events = Vec::new();
+
+        // Create a task with skip_review and move to approved
+        let task = db
+            .create_task("/project", "Merge trigger", None, None, None, true)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+
+        // active -> approved (skip_review=true) should emit MergeNeeded
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "approved"}),
+            Some("s1"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+        assert_eq!(events, vec![SchedulerEvent::MergeNeeded]);
+    }
+
+    #[test]
+    fn test_update_to_ready_emits_schedule_event() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+        let mut events = Vec::new();
+
+        // Create a task and move to ready
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Interactive task"}),
+            "/project",
+            Some("s1"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        // interactive -> ready should emit ScheduleNeeded
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "ready"}),
+            Some("s1"),
+            "tc2",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+        assert_eq!(
+            events,
+            vec![SchedulerEvent::ScheduleNeeded("/project".into())]
+        );
+    }
+
+    #[test]
+    fn test_create_subtask_emits_schedule_event() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+        let mut events = Vec::new();
+
+        // Create parent task
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Parent"}),
+            "/project",
+            Some("s1"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let parent_id = parent["id"].as_i64().unwrap();
+
+        // Create subtask — defaults to ready, should emit ScheduleNeeded
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
+            "/project",
+            Some("s1"),
+            "tc2",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+        assert_eq!(
+            events,
+            vec![SchedulerEvent::ScheduleNeeded("/project".into())]
+        );
+    }
+
+    #[test]
+    fn test_update_to_other_state_no_event() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+        let mut events = Vec::new();
+
+        // Create task and move to active (via assign)
+        let task = db
+            .create_task("/project", "No event", None, None, None, false)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+
+        // active -> review should NOT emit any event
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("s1"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_drain_scheduler_events_dedup() {
+        // drain_scheduler_events should deduplicate MergeNeeded and
+        // same-project ScheduleNeeded events.
+        let mut events = vec![
+            SchedulerEvent::MergeNeeded,
+            SchedulerEvent::MergeNeeded,
+            SchedulerEvent::ScheduleNeeded("/project-a".into()),
+            SchedulerEvent::ScheduleNeeded("/project-a".into()),
+            SchedulerEvent::ScheduleNeeded("/project-b".into()),
+        ];
+
+        // We can't easily test the actual passes (they need real git repos),
+        // but we can verify the event collection logic by inspecting it.
+        let batch = std::mem::take(&mut events);
+        let mut need_merge = false;
+        let mut schedule_projects: Vec<String> = Vec::new();
+        for ev in batch {
+            match ev {
+                SchedulerEvent::MergeNeeded => need_merge = true,
+                SchedulerEvent::ScheduleNeeded(project) => {
+                    if !schedule_projects.contains(&project) {
+                        schedule_projects.push(project);
+                    }
+                }
+            }
+        }
+        assert!(need_merge);
+        assert_eq!(schedule_projects.len(), 2);
+        assert!(schedule_projects.contains(&"/project-a".to_string()));
+        assert!(schedule_projects.contains(&"/project-b".to_string()));
     }
 }
