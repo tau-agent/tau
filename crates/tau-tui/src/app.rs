@@ -1046,7 +1046,7 @@ impl App {
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /reload /sessions /session <id> /back /fork /new /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|approve|ready] /reload /sessions /session <id> /back /fork /new /help /quit"
                         .into(),
                 });
                 None
@@ -1058,6 +1058,10 @@ impl App {
                     Some(Action::SetCwd(args.to_string()))
                 }
             }
+            "/task" | "/tasks" => {
+                self.handle_task_slash_command(args);
+                None
+            }
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!("unknown command: {}. Type /help", cmd),
@@ -1065,6 +1069,201 @@ impl App {
                 None
             }
         }
+    }
+
+    fn handle_task_slash_command(&mut self, args: &str) {
+        let parts: Vec<&str> = args.splitn(3, ' ').collect();
+        let subcmd = parts.first().copied().unwrap_or("");
+
+        match subcmd {
+            "" | "list" => {
+                let state_filter = if parts.len() > 1 {
+                    Some(parts[1])
+                } else {
+                    None
+                };
+                match self.run_task_list(state_filter) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.messages.push(MessageItem::Error {
+                            text: format!("task list: {}", e),
+                        });
+                    }
+                }
+            }
+            "get" => {
+                let Some(id_str) = parts.get(1) else {
+                    self.messages.push(MessageItem::Error {
+                        text: "usage: /task get <id>".into(),
+                    });
+                    return;
+                };
+                let Ok(id) = id_str.parse::<i64>() else {
+                    self.messages.push(MessageItem::Error {
+                        text: format!("invalid task id: {}", id_str),
+                    });
+                    return;
+                };
+                match self.run_task_get(id) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.messages.push(MessageItem::Error {
+                            text: format!("task get: {}", e),
+                        });
+                    }
+                }
+            }
+            "approve" => {
+                let Some(id_str) = parts.get(1) else {
+                    self.messages.push(MessageItem::Error {
+                        text: "usage: /task approve <id>".into(),
+                    });
+                    return;
+                };
+                let Ok(id) = id_str.parse::<i64>() else {
+                    self.messages.push(MessageItem::Error {
+                        text: format!("invalid task id: {}", id_str),
+                    });
+                    return;
+                };
+                match self.run_task_state_change(id, "approved") {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.messages.push(MessageItem::Error {
+                            text: format!("task approve: {}", e),
+                        });
+                    }
+                }
+            }
+            "ready" => {
+                let Some(id_str) = parts.get(1) else {
+                    self.messages.push(MessageItem::Error {
+                        text: "usage: /task ready <id>".into(),
+                    });
+                    return;
+                };
+                let Ok(id) = id_str.parse::<i64>() else {
+                    self.messages.push(MessageItem::Error {
+                        text: format!("invalid task id: {}", id_str),
+                    });
+                    return;
+                };
+                match self.run_task_state_change(id, "ready") {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.messages.push(MessageItem::Error {
+                            text: format!("task ready: {}", e),
+                        });
+                    }
+                }
+            }
+            _ => {
+                self.messages.push(MessageItem::Error {
+                    text: format!(
+                        "unknown task command: {}. Use: list [state], get <id>, approve <id>, ready <id>",
+                        subcmd
+                    ),
+                });
+            }
+        }
+    }
+
+    fn run_task_list(&mut self, state_filter: Option<&str>) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let project = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let tasks = db.list_tasks(&project, state_filter, None, None, None)?;
+        if tasks.is_empty() {
+            self.messages.push(MessageItem::Status {
+                text: "no tasks".into(),
+            });
+            return Ok(());
+        }
+        self.messages.push(MessageItem::Status {
+            text: format!("  {:>4}  {:<12}  {:>8}  TITLE", "ID", "STATE", "PRIORITY"),
+        });
+        for t in &tasks {
+            self.messages.push(MessageItem::Status {
+                text: format!(
+                    "  {:>4}  {:<12}  {:>8}  {}",
+                    t.id, t.state, t.priority, t.title
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn run_task_get(&mut self, id: i64) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let task = db
+            .get_task(id)?
+            .ok_or_else(|| tau::Error::Io(format!("task {} not found", id)))?;
+
+        let skip = if task.skip_review { "yes" } else { "no" };
+        let branch = task.branch.as_deref().unwrap_or("none");
+        let parent = task
+            .parent_id
+            .map(|p| format!("#{}", p))
+            .unwrap_or_else(|| "none".to_string());
+
+        self.messages.push(MessageItem::Status {
+            text: format!("Task #{}: {}", task.id, task.title),
+        });
+        self.messages.push(MessageItem::Status {
+            text: format!(
+                "State: {} | Priority: {} | Skip review: {}",
+                task.state, task.priority, skip
+            ),
+        });
+        self.messages.push(MessageItem::Status {
+            text: format!("Branch: {} | Parent: {}", branch, parent),
+        });
+
+        // Messages
+        let messages = db.get_messages(id)?;
+        if !messages.is_empty() {
+            self.messages.push(MessageItem::Status {
+                text: format!("Messages: {}", messages.len()),
+            });
+            for msg in &messages {
+                let author = msg.author.as_deref().unwrap_or("unknown");
+                let preview: String = msg.content.chars().take(80).collect();
+                let ellipsis = if msg.content.len() > 80 { "..." } else { "" };
+                self.messages.push(MessageItem::Status {
+                    text: format!("  #{} [{}] {}{}", msg.id, author, preview, ellipsis),
+                });
+            }
+        }
+
+        // Subtasks
+        let subtasks = db.get_subtasks(id)?;
+        if !subtasks.is_empty() {
+            self.messages.push(MessageItem::Status {
+                text: "Subtasks:".into(),
+            });
+            for st in &subtasks {
+                self.messages.push(MessageItem::Status {
+                    text: format!("  #{:<4} {:<8} {}", st.id, st.state, st.title),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn run_task_state_change(&mut self, id: i64, new_state: &str) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let update = tau::tasks_db::TaskUpdate {
+            state: Some(new_state.to_string()),
+            ..Default::default()
+        };
+        let task = db.update_task(id, &update, None)?;
+        self.messages.push(MessageItem::Status {
+            text: format!("task #{} → {} : {}", task.id, task.state, task.title),
+        });
+        Ok(())
     }
 
     /// Remove empty AssistantStreaming placeholder if present.

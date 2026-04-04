@@ -75,6 +75,80 @@ enum Commands {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Manage tasks
+    #[command(alias = "t")]
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// List tasks for the current project
+    #[command(alias = "l")]
+    List {
+        /// Filter by state
+        #[arg(long)]
+        state: Option<String>,
+        /// Filter by parent task ID
+        #[arg(long)]
+        parent: Option<i64>,
+    },
+    /// Show task details and messages
+    #[command(alias = "g")]
+    Get {
+        /// Task ID
+        id: i64,
+    },
+    /// Create a new task
+    #[command(alias = "c")]
+    Create {
+        /// Task title
+        title: String,
+        /// Parent task ID
+        #[arg(long)]
+        parent: Option<i64>,
+        /// Skip review step
+        #[arg(long)]
+        skip_review: bool,
+        /// Priority (higher = more important)
+        #[arg(long, default_value = "0")]
+        priority: i64,
+    },
+    /// Update a task
+    #[command(alias = "u")]
+    Update {
+        /// Task ID
+        id: i64,
+        /// New state
+        #[arg(long)]
+        state: Option<String>,
+        /// New title
+        #[arg(long)]
+        title: Option<String>,
+        /// New priority
+        #[arg(long)]
+        priority: Option<i64>,
+    },
+    /// Append a message to a task
+    #[command(alias = "msg")]
+    Message {
+        /// Task ID
+        id: i64,
+        /// Message content
+        content: String,
+    },
+    /// Approve a task (shorthand for update --state=approved)
+    Approve {
+        /// Task ID
+        id: i64,
+    },
+    /// Mark a task as ready (shorthand for update --state=ready)
+    Ready {
+        /// Task ID
+        id: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -326,6 +400,9 @@ async fn run(cli: Cli) -> tau::Result<()> {
                 eprintln!("logged out from {}", provider);
             }
         },
+        Commands::Task { action } => {
+            cmd_task(action)?;
+        }
     }
     Ok(())
 }
@@ -1595,4 +1672,186 @@ fn format_time_ago(unix_secs: i64) -> String {
             format!("{}mo ago", mo)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task commands (direct DB access, no server round-trip)
+// ---------------------------------------------------------------------------
+
+fn project_key() -> String {
+    std::env::current_dir()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
+}
+
+fn format_task_timestamp(ms: i64) -> String {
+    use chrono::{DateTime, Local, TimeZone, Utc};
+    let dt: DateTime<Utc> = Utc.timestamp_millis_opt(ms).single().unwrap_or_default();
+    let local: DateTime<Local> = dt.into();
+    local.format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn cmd_task(action: TaskAction) -> tau::Result<()> {
+    let db = tau::tasks_db::TasksDb::open_default()?;
+
+    match action {
+        TaskAction::List { state, parent } => {
+            let project = project_key();
+            let tasks = db.list_tasks(&project, state.as_deref(), parent, None, None)?;
+            if tasks.is_empty() {
+                println!("no tasks");
+                return Ok(());
+            }
+            println!("  {:>4}  {:<12}  {:>8}  TITLE", "ID", "STATE", "PRIORITY");
+            for t in &tasks {
+                println!(
+                    "  {:>4}  {:<12}  {:>8}  {}",
+                    t.id, t.state, t.priority, t.title
+                );
+            }
+        }
+        TaskAction::Get { id } => {
+            let task = db
+                .get_task(id)?
+                .ok_or_else(|| tau::Error::Io(format!("task {} not found", id)))?;
+
+            let skip = if task.skip_review { "yes" } else { "no" };
+            let branch = task.branch.as_deref().unwrap_or("none");
+            let parent = task
+                .parent_id
+                .map(|p| format!("#{}", p))
+                .unwrap_or_else(|| "none".to_string());
+            let tags = match &task.tags {
+                Some(v) => {
+                    if let Some(arr) = v.as_array() {
+                        let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                        if strs.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            format!("[{}]", strs.join(", "))
+                        }
+                    } else {
+                        v.to_string()
+                    }
+                }
+                None => "(none)".to_string(),
+            };
+            let affected = match &task.affected_files {
+                Some(v) => {
+                    if let Some(arr) = v.as_array() {
+                        let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                        if strs.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            strs.join(", ")
+                        }
+                    } else {
+                        v.to_string()
+                    }
+                }
+                None => "(none)".to_string(),
+            };
+
+            println!("Task #{}: {}", task.id, task.title);
+            println!(
+                "State: {} | Priority: {} | Skip review: {}",
+                task.state, task.priority, skip
+            );
+            println!("Branch: {} | Parent: {}", branch, parent);
+            println!("Tags: {}", tags);
+            println!("Affected files: {}", affected);
+
+            // Messages
+            let messages = db.get_messages(id)?;
+            if !messages.is_empty() {
+                println!();
+                println!("Messages:");
+                for msg in &messages {
+                    let author = msg.author.as_deref().unwrap_or("unknown");
+                    let ts = format_task_timestamp(msg.created_at);
+                    println!("  #{} [{}] {}", msg.id, author, ts);
+                    for line in msg.content.lines() {
+                        println!("  {}", line);
+                    }
+                    println!();
+                }
+            }
+
+            // Subtasks
+            let subtasks = db.get_subtasks(id)?;
+            if !subtasks.is_empty() {
+                println!("Subtasks:");
+                for st in &subtasks {
+                    println!("  #{:<4} {:<8} {}", st.id, st.state, st.title);
+                }
+            }
+
+            // Relations
+            let relations = db.get_relations(id)?;
+            if !relations.is_empty() {
+                println!();
+                println!("Relations:");
+                for rel in &relations {
+                    if rel.from_task == id {
+                        println!("  {}: #{}", rel.relation, rel.to_task);
+                    } else {
+                        let inverse = match rel.relation.as_str() {
+                            "depends_on" => "blocks",
+                            "blocks" => "depends_on",
+                            other => other,
+                        };
+                        println!("  {}: #{}", inverse, rel.from_task);
+                    }
+                }
+            }
+        }
+        TaskAction::Create {
+            title,
+            parent,
+            skip_review,
+            priority,
+        } => {
+            let project = project_key();
+            let task =
+                db.create_task(&project, &title, Some(priority), parent, None, skip_review)?;
+            println!("created task #{}: {}", task.id, task.title);
+        }
+        TaskAction::Update {
+            id,
+            state,
+            title,
+            priority,
+        } => {
+            let update = tau::tasks_db::TaskUpdate {
+                state,
+                title,
+                priority,
+                ..Default::default()
+            };
+            let task = db.update_task(id, &update, None)?;
+            println!("updated task #{}: {} [{}]", task.id, task.title, task.state);
+        }
+        TaskAction::Message { id, content } => {
+            let msg = db.add_message(id, &content, Some("user"))?;
+            println!("added message #{} to task #{}", msg.id, id);
+        }
+        TaskAction::Approve { id } => {
+            let update = tau::tasks_db::TaskUpdate {
+                state: Some("approved".to_string()),
+                ..Default::default()
+            };
+            let task = db.update_task(id, &update, None)?;
+            println!("approved task #{}: {}", task.id, task.title);
+        }
+        TaskAction::Ready { id } => {
+            let update = tau::tasks_db::TaskUpdate {
+                state: Some("ready".to_string()),
+                ..Default::default()
+            };
+            let task = db.update_task(id, &update, None)?;
+            println!("task #{} marked ready: {}", task.id, task.title);
+        }
+    }
+    Ok(())
 }
