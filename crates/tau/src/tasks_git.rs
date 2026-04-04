@@ -69,6 +69,25 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> crate::Result<()
     Ok(())
 }
 
+/// Delete a local git branch. Uses `-D` to force-delete even if not merged.
+pub fn delete_branch(repo_path: &str, branch_name: &str) -> crate::Result<()> {
+    let output = Command::new("git")
+        .args(["branch", "-D", branch_name])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| crate::Error::Io(format!("git branch -D: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::Error::Io(format!(
+            "git branch -D {}: {}",
+            branch_name,
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Get the repository root directory from a path inside the repo.
 pub fn get_repo_root(cwd: &str) -> crate::Result<String> {
     let output = Command::new("git")
@@ -333,5 +352,26 @@ mod tests {
         remove_worktree(repo_path, &wt_path).unwrap();
         assert!(!Path::new(&sub_wt_path).exists());
         assert!(!Path::new(&wt_path).exists());
+    }
+
+    #[test]
+    fn test_delete_branch() {
+        let dir = init_test_repo();
+        let path = dir.path().to_str().unwrap();
+
+        create_branch(path, "to-delete", "main").unwrap();
+        assert!(branch_exists(path, "to-delete").unwrap());
+
+        delete_branch(path, "to-delete").unwrap();
+        assert!(!branch_exists(path, "to-delete").unwrap());
+    }
+
+    #[test]
+    fn test_delete_branch_nonexistent() {
+        let dir = init_test_repo();
+        let path = dir.path().to_str().unwrap();
+
+        let result = delete_branch(path, "nonexistent");
+        assert!(result.is_err());
     }
 }

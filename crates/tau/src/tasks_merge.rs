@@ -287,8 +287,11 @@ pub fn merge_task(
         });
     }
 
-    // 7. Clean up: remove worktree via bash, clear in DB
-    let _ = execute_bash(
+    // 7. Clean up: remove worktree, delete branch, archive session, clear DB
+    log.push_str("=== Cleanup ===\n");
+
+    // 7a. Remove the git worktree
+    let (output, _) = execute_bash(
         writer,
         reader,
         &log_session,
@@ -296,8 +299,24 @@ pub fn merge_task(
             "cd $(git rev-parse --show-toplevel) && git worktree remove --force {}",
             worktree_path
         ),
-    );
+    )?;
+    log.push_str(&output);
     let _ = db.clear_worktree(task_id);
+
+    // 7b. Delete the task branch (no longer needed after merge)
+    let (output, _) = execute_bash(
+        writer,
+        reader,
+        &log_session,
+        &format!("git branch -D {}", branch),
+    )?;
+    log.push_str(&output);
+
+    // 7c. Archive the task's working session (best-effort)
+    if let Some(ref sid) = task.session_id {
+        archive_session(writer, reader, sid);
+        log.push_str(&format!("Archived task session {}\n", sid));
+    }
 
     // 8. Archive the log session
     archive_session(writer, reader, &log_session);
