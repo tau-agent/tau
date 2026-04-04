@@ -100,6 +100,7 @@ impl Client {
                 | Response::SessionsCompleted { .. }
                 | Response::MessageReply { .. }
                 | Response::GcComplete { .. }
+                | Response::ToolExecuted { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);
@@ -146,6 +147,29 @@ impl Client {
             };
             async { result }
         })
+    }
+    /// Execute a tool directly on a session (no LLM involved).
+    /// Returns `(content, is_error)`.
+    pub async fn execute_tool(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> crate::Result<(String, bool)> {
+        self.send(&Request::ExecuteTool {
+            session_id: session_id.to_string(),
+            tool_name: tool_name.to_string(),
+            arguments,
+        })
+        .await?;
+        let mut result = None;
+        self.recv_streaming(|resp| {
+            if let Response::ToolExecuted { content, is_error } = resp {
+                result = Some((content.clone(), *is_error));
+            }
+        })
+        .await?;
+        result.ok_or_else(|| crate::Error::Io("no ToolExecuted response received".into()))
     }
 }
 

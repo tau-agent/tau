@@ -122,6 +122,12 @@ pub enum Request {
         name: String,
         data: serde_json::Value,
     },
+    /// Execute a tool directly on a session (no LLM involved).
+    ExecuteTool {
+        session_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -181,6 +187,8 @@ pub enum Response {
     Ok,
     /// Garbage-collection result.
     GcComplete { deleted: usize },
+    /// Tool execution result (response to ExecuteTool).
+    ToolExecuted { content: String, is_error: bool },
     /// Error.
     Error { message: String },
 }

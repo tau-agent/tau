@@ -146,6 +146,7 @@ pub fn resolve_models(config: &Config) -> Vec<Model> {
     // Built-in models
     models.extend(crate::providers::anthropic::models());
     models.extend(builtin_openai_models());
+    models.push(crate::providers::log::log_model());
 
     // Custom models from config
     for (provider_name, provider_config) in &config.providers {

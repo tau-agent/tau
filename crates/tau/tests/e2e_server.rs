@@ -2057,3 +2057,354 @@ done
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// ExecuteTool tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn server_execute_tool_basic() {
+    use std::sync::Arc;
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    tool_handle.on_tool(
+        "echo_tool",
+        MockToolResponse::Success("hello from tool".into()),
+    );
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || Box::new(tool_handle.clone().executor()));
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.tool_executor_factory = Some(tool_factory);
+        config.mock_tools = vec![mock_tool("echo_tool", "Echo tool")];
+        config
+    });
+
+    let conn = server.connect();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let resp = send_recv(
+        &conn2,
+        &Request::ExecuteTool {
+            session_id: sid.clone(),
+            tool_name: "echo_tool".into(),
+            arguments: serde_json::json!({}),
+        },
+    );
+    match resp {
+        Response::ToolExecuted { content, is_error } => {
+            assert_eq!(content, "hello from tool");
+            assert!(!is_error);
+        }
+        other => panic!("expected ToolExecuted, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+#[test]
+fn server_execute_tool_error() {
+    use std::sync::Arc;
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    tool_handle.on_tool(
+        "fail_tool",
+        MockToolResponse::ToolError("something broke".into()),
+    );
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || Box::new(tool_handle.clone().executor()));
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.tool_executor_factory = Some(tool_factory);
+        config.mock_tools = vec![mock_tool("fail_tool", "Failing tool")];
+        config
+    });
+
+    let conn = server.connect();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    let conn2 = server.connect();
+    let resp = send_recv(
+        &conn2,
+        &Request::ExecuteTool {
+            session_id: sid.clone(),
+            tool_name: "fail_tool".into(),
+            arguments: serde_json::json!({}),
+        },
+    );
+    match resp {
+        Response::ToolExecuted { content, is_error } => {
+            assert_eq!(content, "something broke");
+            assert!(is_error);
+        }
+        other => panic!("expected ToolExecuted, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+#[test]
+fn server_execute_tool_persistence() {
+    use std::sync::Arc;
+    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+
+    let mock_executor = MockToolExecutor::new();
+    let tool_handle = mock_executor.handle();
+    tool_handle.on_tool(
+        "my_tool",
+        MockToolResponse::Success("persisted result".into()),
+    );
+
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+        Arc::new(move || Box::new(tool_handle.clone().executor()));
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.tool_executor_factory = Some(tool_factory);
+        config.mock_tools = vec![mock_tool("my_tool", "My tool")];
+        config
+    });
+
+    let conn = server.connect();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Execute tool
+    let conn2 = server.connect();
+    let _ = send_recv(
+        &conn2,
+        &Request::ExecuteTool {
+            session_id: sid.clone(),
+            tool_name: "my_tool".into(),
+            arguments: serde_json::json!({"key": "value"}),
+        },
+    );
+
+    // Verify messages persisted
+    let conn3 = server.connect();
+    let resp = send_recv(&conn3, &Request::GetMessages { session_id: sid });
+    match resp {
+        Response::Messages { messages } => {
+            // Should have 2 messages: Assistant(ToolCall) + ToolResult
+            assert_eq!(
+                messages.len(),
+                2,
+                "expected 2 messages, got {}: {:?}",
+                messages.len(),
+                messages
+            );
+            // First: Assistant with ToolCall
+            match &messages[0] {
+                tau::types::Message::Assistant(a) => {
+                    assert_eq!(a.stop_reason, tau::types::StopReason::ToolUse);
+                    assert!(a.content.iter().any(|c| matches!(
+                        c,
+                        tau::types::AssistantContent::ToolCall(tc)
+                            if tc.name == "my_tool"
+                    )));
+                }
+                other => panic!("expected Assistant message, got {:?}", other),
+            }
+            // Second: ToolResult
+            match &messages[1] {
+                tau::types::Message::ToolResult(tr) => {
+                    assert!(!tr.is_error);
+                    assert_eq!(tr.tool_name, "my_tool");
+                    let text: String = tr
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(text, "persisted result");
+                }
+                other => panic!("expected ToolResult message, got {:?}", other),
+            }
+        }
+        other => panic!("expected Messages, got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+#[test]
+fn server_execute_tool_nonexistent_session() {
+    let server = TestServer::start(vec![]);
+    let conn = server.connect();
+    let resp = send_recv(
+        &conn,
+        &Request::ExecuteTool {
+            session_id: "nonexistent".into(),
+            tool_name: "bash".into(),
+            arguments: serde_json::json!({}),
+        },
+    );
+    match resp {
+        Response::Error { message } => {
+            assert!(message.contains("not found"), "got: {}", message);
+        }
+        other => panic!("expected Error, got {:?}", other),
+    }
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Log provider tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn server_log_provider_chat_returns_immediately() {
+    use tau::providers::log::{LogProvider, log_model};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-test.sock");
+    let db_path = dir.path().join("test.db");
+    let sock_clone = sock_path.clone();
+
+    let model = log_model();
+    let mut registry = tau::provider::ProviderRegistry::new();
+    registry.register(LogProvider);
+
+    let config = tau::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_clone,
+        db_path,
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+    };
+
+    std::thread::spawn(move || {
+        smol::block_on(async {
+            if let Err(e) = tau::server::run_with_config(config).await {
+                eprintln!("test server error: {}", e);
+            }
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sock_path.exists(), "server socket did not appear");
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: Some("log".into()),
+            provider: Some("log".into()),
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Chat — should return immediately with AgentDone (no LLM call)
+    let conn2 = UnixStream::connect(&sock_path).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let responses = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello".into(),
+        },
+    );
+
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::AgentDone)),
+        "expected AgentDone in responses: {:?}",
+        responses
+    );
+
+    // Should NOT have any meaningful text deltas
+    let has_text = responses.iter().any(|r| {
+        if let Response::Stream { event } = r {
+            if let tau::types::StreamEvent::TextDelta { delta, .. } = event.as_ref() {
+                !delta.is_empty()
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    });
+    assert!(
+        !has_text,
+        "log provider should not produce text content: {:?}",
+        responses
+    );
+
+    // Shutdown
+    let conn3 = UnixStream::connect(&sock_path).unwrap();
+    conn3
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_recv(&conn3, &Request::Shutdown { restart: false });
+}

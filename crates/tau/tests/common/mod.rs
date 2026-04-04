@@ -53,6 +53,7 @@ pub fn send_recv_all(stream: &UnixStream, req: &Request) -> Vec<Response> {
                 | Response::Ok
                 | Response::Models { .. }
                 | Response::Messages { .. }
+                | Response::ToolExecuted { .. }
         );
         responses.push(resp);
         if is_terminal {

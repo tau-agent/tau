@@ -600,6 +600,7 @@ fn build_registry() -> ProviderRegistry {
     let mut registry = ProviderRegistry::new();
     registry.register(crate::providers::anthropic::Anthropic);
     registry.register(crate::providers::openai::OpenAi);
+    registry.register(crate::providers::log::LogProvider);
     registry
 }
 
@@ -2229,6 +2230,26 @@ async fn handle_client(
                     }
                 }
             }
+            Request::ExecuteTool {
+                session_id,
+                tool_name,
+                arguments,
+            } => {
+                let resp = execute_tool_impl(
+                    &state,
+                    &plugins,
+                    &session_locks,
+                    &shutdown,
+                    &throttle,
+                    &test_overrides,
+                    &session_id,
+                    &tool_name,
+                    arguments,
+                    &bg_chat_spawn_tx,
+                )
+                .await;
+                send(&mut writer, &resp).await?;
+            }
             Request::FireHook { .. } => {
                 // FireHook is only valid from the plugin ServerRequest tunnel,
                 // not from direct client connections.
@@ -3436,6 +3457,140 @@ fn cancel_chat_impl(state: &SharedState, session_id: &str) -> crate::protocol::R
     crate::protocol::Response::Ok
 }
 
+/// Execute a tool directly on a session without triggering the agent loop.
+/// Persists the tool call and result as messages for audit trail.
+#[allow(clippy::too_many_arguments)]
+async fn execute_tool_impl(
+    state: &SharedState,
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
+    session_locks: &SessionLocks,
+    shutdown: &ShutdownHandle,
+    throttle: &crate::throttle::ProviderThrottle,
+    test_overrides: &SharedTestOverrides,
+    session_id: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    chat_spawn_tx: &smol::channel::Sender<(String, String)>,
+) -> crate::protocol::Response {
+    use crate::protocol::Response;
+    use crate::types::*;
+
+    // 1. Ensure session exists, get its cwd
+    let cwd = {
+        let st = lock_state(state);
+        match st.db.get_session(session_id) {
+            Ok(Some(stored)) => stored.cwd.unwrap_or_else(|| "/tmp".to_string()),
+            Ok(None) => {
+                return Response::Error {
+                    message: format!("session not found: {}", session_id),
+                };
+            }
+            Err(e) => {
+                return Response::Error {
+                    message: e.to_string(),
+                };
+            }
+        }
+    };
+
+    // 2. Ensure session plugins are spawned
+    {
+        let mut pm = plugins.lock().unwrap();
+        if let Err(e) = pm.ensure_session_plugins(session_id, &cwd) {
+            eprintln!("execute_tool: failed to spawn session plugins: {}", e);
+        }
+    }
+
+    // 3. Construct a ToolCall with a generated ID
+    let tool_call = ToolCall {
+        id: format!("et_{}", crate::types::timestamp_ms()),
+        name: tool_name.to_string(),
+        arguments: arguments.clone(),
+    };
+
+    // 4. Persist the assistant message containing the tool call
+    let assistant_msg = Message::Assistant(AssistantMessage {
+        content: vec![AssistantContent::ToolCall(tool_call.clone())],
+        api: "execute_tool".to_string(),
+        provider: "execute_tool".to_string(),
+        model: "execute_tool".to_string(),
+        response_id: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::ToolUse,
+        error_message: None,
+        timestamp: timestamp_ms(),
+    });
+    {
+        let st = lock_state(state);
+        if let Err(e) = st.db.append_message(session_id, &assistant_msg) {
+            eprintln!("execute_tool: db error persisting assistant message: {}", e);
+        }
+    }
+
+    // 5. Execute via the PluginExecutor (or mock)
+    let (output_tx, _output_rx) = smol::channel::unbounded::<String>();
+    let result = if let Some(ref factory) = test_overrides.tool_executor_factory {
+        let mut executor = factory();
+        executor.execute(&tool_call, &output_tx).await
+    } else {
+        let mut executor: Box<dyn crate::worker::ToolExecutor> = Box::new(PluginExecutor {
+            plugins: plugins.clone(),
+            state: state.clone(),
+            session_locks: session_locks.clone(),
+            chat_spawn_tx: chat_spawn_tx.clone(),
+            shutdown: shutdown.clone(),
+            throttle: throttle.clone(),
+            session_id: session_id.to_string(),
+            cwd: cwd.clone(),
+            test_overrides: test_overrides.clone(),
+        });
+        executor.execute(&tool_call, &output_tx).await
+    };
+
+    // 6. Build result message and persist
+    let tool_result_msg = match result {
+        Ok(tr) => tr,
+        Err(e) => ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_name.to_string(),
+            content: vec![ToolResultContent::Text(TextContent {
+                text: format!("executor error: {}", e),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: true,
+            timestamp: timestamp_ms(),
+        },
+    };
+
+    let is_error = tool_result_msg.is_error;
+    let content_text: String = tool_result_msg
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            ToolResultContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Persist tool result
+    {
+        let st = lock_state(state);
+        if let Err(e) = st
+            .db
+            .append_message(session_id, &Message::ToolResult(tool_result_msg))
+        {
+            eprintln!("execute_tool: db error persisting tool result: {}", e);
+        }
+    }
+
+    Response::ToolExecuted {
+        content: content_text,
+        is_error,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Async server request handler (for plugin ServerRequest tunnel)
 // ---------------------------------------------------------------------------
@@ -3826,6 +3981,25 @@ async fn handle_server_request(
             let mut pm = plugins.lock().unwrap();
             pm.call_hook_excluding(session_id, name, data, None);
             Response::Ok
+        }
+        Request::ExecuteTool {
+            session_id: target_session_id,
+            tool_name,
+            arguments,
+        } => {
+            execute_tool_impl(
+                state,
+                plugins,
+                session_locks,
+                shutdown,
+                throttle,
+                test_overrides,
+                target_session_id,
+                tool_name,
+                arguments.clone(),
+                chat_spawn_tx,
+            )
+            .await
         }
         _ => Response::Error {
             message: "request not supported in plugin context".into(),
