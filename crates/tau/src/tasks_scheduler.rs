@@ -517,12 +517,12 @@ fn merge_one_task(
 fn build_initial_message(task: &Task) -> String {
     let review_instruction = if task.skip_review {
         format!(
-            "- task_update {id} state=approved  (skip_review is true for this task)",
+            "- Call the `task_update` tool with arguments: {{\"id\": {id}, \"state\": \"approved\"}}  (skip_review is true for this task)",
             id = task.id
         )
     } else {
         format!(
-            "- task_update {id} state=review  (skip_review is false — needs review)",
+            "- Call the `task_update` tool with arguments: {{\"id\": {id}, \"state\": \"review\"}}  (skip_review is false — needs review)",
             id = task.id
         )
     };
@@ -774,7 +774,8 @@ mod tests {
         assert!(msg.contains("task 5"));
         assert!(msg.contains("task_get"));
         assert!(msg.contains("task_assign"));
-        assert!(msg.contains("state=review"));
+        assert!(msg.contains("task_update"));
+        assert!(msg.contains("\"state\": \"review\""));
         assert!(msg.contains("skip_review is false"));
         // Must clarify these are tool calls, not CLI commands
         assert!(msg.contains("not a bash command") || msg.contains("not CLI commands"));
@@ -786,7 +787,7 @@ mod tests {
         let mut task = make_task(7, 0, None);
         task.skip_review = true;
         let msg = build_initial_message(&task);
-        assert!(msg.contains("state=approved"));
+        assert!(msg.contains("\"state\": \"approved\""));
         assert!(msg.contains("skip_review is true"));
     }
 
@@ -796,8 +797,13 @@ mod tests {
         let msg = build_initial_message(&task);
         // Should include JSON argument hint so agent knows the invocation format
         assert!(msg.contains(r#"{"id": 42}"#));
+        // task_update should also use JSON format, not CLI-style positional args
+        assert!(msg.contains(r#""id": 42"#));
+        assert!(msg.contains(r#""state":"#) || msg.contains(r#""state": "#));
         // Should tell agent to commit on branch
         assert!(msg.contains("current branch"));
+        // Should NOT use CLI-style format like "task_update 42 state=review"
+        assert!(!msg.contains(&format!("task_update {} state=", 42)));
     }
 
     #[test]

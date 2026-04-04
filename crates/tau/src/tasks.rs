@@ -111,6 +111,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Use task_get to read the full specification of a task including all messages and subtasks.".into()),
             prompt_guidelines: vec![
                 "When working on a task, first task_get to read the spec, then task_assign to claim it, do the work, then task_update to mark review or approved.".into(),
+                "task_get, task_assign, task_update and other task_* names are agent tool calls (like bash or edit), NOT shell commands — call them via the tool API, not via bash.".into(),
             ],
         },
         PluginToolDef {
@@ -481,7 +482,9 @@ fn create_interactive_session(
 
     // Queue an initial message so the session has context when the user connects
     let initial_msg = format!(
-        "You are working on task {id}: {title}. Use task_get {id} to read the full spec.",
+        "You are working on task {id}: {title}. \
+         Use the task_get tool (not a bash command) to read the full spec: \
+         call `task_get` with arguments {{\"id\": {id}}}.",
         id = task.id,
         title = task.title,
     );
@@ -2097,6 +2100,16 @@ mod tests {
         let task_get = tools.iter().find(|t| t.name == "task_get").unwrap();
         assert!(!task_get.prompt_guidelines.is_empty());
         assert!(task_get.prompt_guidelines[0].contains("task_assign"));
+        // task_get should also have a guideline that task_* are tool calls, not shell commands
+        assert!(
+            task_get
+                .prompt_guidelines
+                .iter()
+                .any(|g| g.contains("tool call")
+                    || g.contains("tool API")
+                    || g.contains("NOT shell")),
+            "task_get should have a guideline clarifying these are tool calls not shell commands"
+        );
 
         // task_assign should have snippets
         let task_assign = tools.iter().find(|t| t.name == "task_assign").unwrap();

@@ -1906,6 +1906,145 @@ done
     server.shutdown();
 }
 
+/// Test that global plugin tools are included in the LLM context for sessions
+/// created via a background ServerRequest (simulating task_dispatch behavior).
+///
+/// This is the regression test for the bug where dispatched task sessions
+/// didn't have task tools in their LLM tool definitions, causing agents to
+/// try to call task_get/task_assign as bash commands.
+///
+/// Scenario:
+/// 1. Global plugin registers with a custom tool ("dispatch_test_tool")
+/// 2. Plugin creates a new session via background ServerRequest
+/// 3. Plugin sends a Chat request for that session
+/// 4. We verify that "dispatch_test_tool" appears in the LLM context
+#[test]
+fn global_plugin_tools_in_dispatched_session_context() {
+    use std::time::Duration;
+    use tau::providers::mock::{MockProvider, MockResponse};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let results_file = tmp.path().join("dispatch_test_results.txt");
+    let plugin_script = tmp.path().join("dispatch_test_plugin.sh");
+
+    // This plugin:
+    // 1. Registers with one tool ("dispatch_test_tool")
+    // 2. Creates a new session via background ServerRequest
+    // 3. Sends a Chat request to that session
+    // 4. Loops waiting for tool calls (the child session may call dispatch_test_tool)
+    let script = format!(
+        r#"#!/bin/bash
+set -eu
+RESULTS="{results}"
+SESSION_ID=""
+
+# Registration with one tool
+echo '{{"type":"register","name":"dispatch-test","tools":[{{"name":"dispatch_test_tool","description":"Test tool for dispatch verification","parameters":{{"type":"object","properties":{{}}}},"prompt_snippet":"Use dispatch_test_tool for dispatch verification","prompt_guidelines":[]}}],"hooks":[],"commands":[]}}'
+
+# Create a session via background ServerRequest
+echo '{{"type":"server_request","request_id":"create-dispatch-1","request":{{"type":"create_session","model":null,"provider":null,"system_prompt":null,"cwd":"/tmp","parent_id":null,"child_budget":4,"tagline":"dispatch-test-session","auto_archive":false,"notify_parent":false}}}}'
+
+# Main loop: handle messages
+while IFS= read -r line; do
+    case "$line" in
+        *'"request_id":"create-dispatch-1"'*)
+            # Extract session_id from create session response
+            SESSION_ID=$(echo "$line" | grep -o '"session_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+            echo "$SESSION_ID" >> "$RESULTS"
+            # Send a Chat request for the new session
+            echo '{{"type":"server_request","request_id":"chat-dispatch-1","request":{{"type":"chat","session_id":"'"$SESSION_ID"'","text":"test dispatch tools"}}}}'
+            ;;
+        *'"request_id":"chat-dispatch-1"'*)
+            echo "chat_sent" >> "$RESULTS"
+            ;;
+        *'"type":"tool_call"'*)
+            TCID=$(echo "$line" | grep -o '"tool_call_id":"[^"]*"' | head -1 | cut -d'"' -f4)
+            echo '{{"type":"tool_result","tool_call_id":"'"$TCID"'","content":[{{"type":"text","text":"DISPATCH_TOOL_RESULT"}}],"is_error":false}}'
+            ;;
+        *idle*)
+            exit 0
+            ;;
+    esac
+done
+"#,
+        results = results_file.display()
+    );
+    std::fs::write(&plugin_script, &script).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let plugins_config = tau::plugin::PluginsConfig {
+        no_default_worker: true,
+        global: [(
+            "dispatch-test".to_string(),
+            tau::plugin::PluginEntry {
+                command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    // Set up a mock provider that captures the LLM context
+    let provider = MockProvider::new(vec![MockResponse::Text("done".into())]);
+    let provider_handle = provider.handle();
+
+    let server = TestServer::start_with_config(vec![], |mut config| {
+        config.registry = {
+            let mut r = tau::provider::ProviderRegistry::new();
+            r.register(provider);
+            r
+        };
+        config.plugins_config = Some(plugins_config);
+        config
+    });
+
+    // Wait for the plugin to create a session and send a chat
+    for _ in 0..60 {
+        if results_file.exists() {
+            let contents = std::fs::read_to_string(&results_file).unwrap_or_default();
+            if contents.lines().filter(|l| l == &"chat_sent").count() >= 1 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Give the child chat time to complete
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Verify the plugin created a session
+    let contents = std::fs::read_to_string(&results_file)
+        .unwrap_or_else(|e| panic!("results file not found: {}", e));
+    assert!(
+        contents.lines().any(|l| !l.is_empty() && l != "chat_sent"),
+        "plugin should have created a session (got: {})",
+        contents
+    );
+
+    // The key assertion: the global plugin's tool ("dispatch_test_tool")
+    // should appear in the LLM context for the dispatched session.
+    let captures = provider_handle.captures();
+    assert!(
+        !captures.is_empty(),
+        "provider should have been called (dispatched session should have sent a chat to LLM)"
+    );
+    let tools = &captures[0].context.tools;
+    assert!(
+        tools.iter().any(|t| t.name == "dispatch_test_tool"),
+        "dispatch_test_tool (from global plugin) should be in LLM tool list for dispatched session; \
+         got tools: {:?}",
+        tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    server.shutdown();
+}
+
 /// Test that a global plugin with background I/O can still handle tool calls.
 ///
 /// This verifies the channel-mediated path: once background reader/writer
