@@ -205,7 +205,9 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Update task fields (title, state, priority, tags, etc.)".into()),
             prompt_guidelines: vec![
                 "State transitions are validated: interactive->ready->active->review->approved->merging->done".into(),
-                "Some shortcuts: interactive->approved, active->approved (skip_review only), review->active (rework)".into(),
+                "Shortcuts: interactive->approved, active->approved (skip_review only)".into(),
+                "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active".into(),
+                "Universal overrides: any state->done (manual close), any state->interactive (human takes over)".into(),
                 "active -> approved is only allowed if skip_review=true on the task".into(),
             ],
         },
@@ -1074,10 +1076,10 @@ mod tests {
         let updated: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(updated["state"], "ready");
 
-        // Invalid state transition
+        // Invalid state transition (ready -> merging is not allowed)
         let result = handle_task_update(
             &db,
-            &serde_json::json!({"id": task_id, "state": "done"}),
+            &serde_json::json!({"id": task_id, "state": "merging"}),
             None,
             "tc5",
         );
