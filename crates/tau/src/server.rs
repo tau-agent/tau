@@ -1086,6 +1086,7 @@ fn queue_and_maybe_resume(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     stream: Async<UnixStream>,
     state: SharedState,
@@ -2760,6 +2761,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
 
 /// Run an agent turn for a child session (spawned by orchestration tools).
 /// This is a fire-and-forget async task -- output goes to subscribers only.
+#[allow(clippy::too_many_arguments)]
 async fn run_child_chat(
     state: SharedState,
     plugins: Arc<Mutex<crate::plugin::PluginManager>>,

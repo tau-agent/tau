@@ -393,7 +393,7 @@ pub async fn run(
 
         // Loop-review checkpoint: every review_interval turns, ask a reviewer
         // LLM whether the session is making progress or stuck in a loop.
-        if config.review_interval > 0 && turn % config.review_interval == 0 {
+        if config.review_interval > 0 && turn.is_multiple_of(config.review_interval) {
             let review_model = config.review_model.as_ref().unwrap_or(model);
             let is_stuck = run_loop_review(
                 registry,

@@ -26,6 +26,7 @@ use crate::types::{Tool, ToolCall, ToolResultContent};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum PluginRequest {
     /// Initialize the plugin with session context.
     Init { cwd: String, session_id: String },
@@ -1079,6 +1080,7 @@ impl PluginManager {
     ///
     /// The caller should spawn background reader/writer tasks for each
     /// returned pair.
+    #[allow(clippy::type_complexity)]
     pub fn setup_background_io(
         &mut self,
     ) -> Vec<(
@@ -1091,14 +1093,14 @@ impl PluginManager {
         let mut result = Vec::new();
         for handle in &mut self.global_plugins {
             // Upgrade to async if needed.
-            if !handle.has_async_io() {
-                if let Err(e) = handle.upgrade_to_async() {
-                    eprintln!(
-                        "global plugin '{}': failed to upgrade to async: {}",
-                        handle.name, e
-                    );
-                    continue;
-                }
+            if !handle.has_async_io()
+                && let Err(e) = handle.upgrade_to_async()
+            {
+                eprintln!(
+                    "global plugin '{}': failed to upgrade to async: {}",
+                    handle.name, e
+                );
+                continue;
             }
 
             // Extract the raw async I/O.
