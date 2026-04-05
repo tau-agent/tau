@@ -5229,7 +5229,11 @@ mod tests {
             &mut writer,
             &mut reader,
         );
-        assert!(result2.is_ok(), "expected Ok on second call, got: {:?}", result2);
+        assert!(
+            result2.is_ok(),
+            "expected Ok on second call, got: {:?}",
+            result2
+        );
         let sid2 = result2.unwrap();
         assert_eq!(
             sid2, "pre-existing-session",
@@ -5239,10 +5243,7 @@ mod tests {
 
         // Verify only one worker session was recorded (no duplicates).
         let sessions = db.get_sessions(task.id).unwrap();
-        let worker_sessions: Vec<_> = sessions
-            .iter()
-            .filter(|s| s.role == "worker")
-            .collect();
+        let worker_sessions: Vec<_> = sessions.iter().filter(|s| s.role == "worker").collect();
         assert_eq!(
             worker_sessions.len(),
             1,
@@ -5300,21 +5301,12 @@ mod tests {
 
         // Call dispatch directly (as run_schedule_pass would).
         // The mock_io will answer GetSessionInfo with archived=false → reuse.
-        let result = tasks_scheduler::dispatch(
-            &db,
-            task.id,
-            None,
-            &mut writer,
-            &mut reader,
-        );
+        let result = tasks_scheduler::dispatch(&db, task.id, None, &mut writer, &mut reader);
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         // No new worker session should have been created.
         let sessions_after = db.get_sessions(task.id).unwrap();
-        let worker_count_after = sessions_after
-            .iter()
-            .filter(|s| s.role == "worker")
-            .count();
+        let worker_count_after = sessions_after.iter().filter(|s| s.role == "worker").count();
         assert_eq!(
             worker_count_after, worker_count_before,
             "dispatch created an extra worker session!"

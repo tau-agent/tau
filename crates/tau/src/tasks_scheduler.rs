@@ -2199,9 +2199,11 @@ mod tests {
         .unwrap();
         // ready -> active + record worker session
         db.assign_task(task.id, "existing-worker-session").unwrap();
-        db.set_session_id(task.id, "existing-worker-session").unwrap();
+        db.set_session_id(task.id, "existing-worker-session")
+            .unwrap();
         // record_session so find_reusable_session can find it
-        db.record_session(task.id, "existing-worker-session", "worker").unwrap();
+        db.record_session(task.id, "existing-worker-session", "worker")
+            .unwrap();
 
         // With an empty reader, find_reusable_session can't reach the server
         // → returns None → dispatch falls through to CreateSession → fails EOF.
