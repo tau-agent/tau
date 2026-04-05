@@ -236,6 +236,41 @@ fn resolve_parent_session(db: &TasksDb, task: &Task) -> Option<String> {
     parent_task.session_id
 }
 
+/// Resolve the session that should be the **parent** for a newly created
+/// worker/reviewer/refiner session.  The hierarchy should be:
+///   planner → worker, planner → reviewer, planner → refiner
+///
+/// Priority:
+///   1. The task's planner session (from `task_sessions` table).
+///   2. The task's current `session_id` (e.g. if no planner was recorded).
+///   3. The parent task's session (via `resolve_parent_session`).
+fn resolve_hierarchy_parent(db: &TasksDb, task: &Task) -> Option<String> {
+    // 1. Look for the planner session.
+    if let Ok(Some(planner_sid)) = db.find_latest_session_by_role(task.id, "planner") {
+        return Some(planner_sid);
+    }
+    // 2. Fall back to the task's current session_id.
+    if let Some(ref sid) = task.session_id {
+        return Some(sid.clone());
+    }
+    // 3. Fall back to the parent task's session.
+    resolve_parent_session(db, task)
+}
+
+/// Resolve the session to inherit the model from.  Uses the explicit
+/// `parent_session_id` (the session that triggered the dispatch, e.g. the
+/// refiner), falling back to the hierarchy parent, then the parent task's
+/// session.
+fn resolve_model_source(
+    db: &TasksDb,
+    task: &Task,
+    parent_session_id: Option<&str>,
+) -> Option<String> {
+    parent_session_id
+        .map(str::to_string)
+        .or_else(|| resolve_hierarchy_parent(db, task))
+}
+
 /// Look up a session's model via GetSessionInfo. Returns `None` if the
 /// request fails or the session is not found.
 pub fn get_session_model(
@@ -327,16 +362,16 @@ pub fn dispatch(
 
     let cwd = task.worktree_path.clone();
 
-    // Resolve the effective parent session: use the explicit parent_session_id
-    // (from a manual tool call), or fall back to the parent task's session.
-    let effective_parent_session = parent_session_id
-        .map(str::to_string)
-        .or_else(|| resolve_parent_session(db, &task));
-
-    // Inherit model from the parent session so child tasks use the same model.
-    let model = effective_parent_session
+    // Model inheritance: use the triggering session (e.g. the refiner that
+    // moved the task to ready), falling back through the hierarchy.
+    let model_source = resolve_model_source(db, &task, parent_session_id);
+    let model = model_source
         .as_deref()
         .and_then(|sid| get_session_model(sid, writer, reader));
+
+    // Session parenting: use the task's planner session (the orchestrator),
+    // not the refiner/reviewer that triggered the state change.
+    let hierarchy_parent = resolve_hierarchy_parent(db, &task);
 
     // Create session via ServerRequest.
     let create_req = crate::protocol::Request::CreateSession {
@@ -344,7 +379,7 @@ pub fn dispatch(
         provider: None,
         system_prompt: None,
         cwd,
-        parent_id: effective_parent_session,
+        parent_id: hierarchy_parent,
         child_budget: 16,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
@@ -441,14 +476,17 @@ fn dispatch_planning(
         );
     }
 
-    // Resolve the effective parent session
-    let effective_parent_session = parent_session_id
-        .map(str::to_string)
-        .or_else(|| resolve_parent_session(db, task));
-
-    let model = effective_parent_session
+    // Model inheritance: use the triggering session for model.
+    let model_source = resolve_model_source(db, task, parent_session_id);
+    let model = model_source
         .as_deref()
         .and_then(|sid| get_session_model(sid, writer, reader));
+
+    // Session parenting: the planner is the root session for this task,
+    // so its parent is the parent *task*'s session.
+    let hierarchy_parent = parent_session_id
+        .map(str::to_string)
+        .or_else(|| resolve_parent_session(db, task));
 
     // Planning sessions use the project directory as cwd (no worktree).
     let create_req = crate::protocol::Request::CreateSession {
@@ -456,7 +494,7 @@ fn dispatch_planning(
         provider: None,
         system_prompt: None,
         cwd: Some(task.project.clone()),
-        parent_id: effective_parent_session,
+        parent_id: hierarchy_parent,
         child_budget: 16,
         tagline: Some(format!("Planning task {}: {}", task.id, task.title)),
         auto_archive: false,
@@ -655,14 +693,16 @@ pub fn dispatch_review(
 
     // No reusable session found — create a new one.
 
-    // Resolve the effective parent session
-    let effective_parent_session = parent_session_id
-        .map(str::to_string)
-        .or_else(|| resolve_parent_session(db, task));
-
-    let model = effective_parent_session
+    // Model inheritance: use the triggering session for model, falling back
+    // through the hierarchy.
+    let model_source = resolve_model_source(db, task, parent_session_id);
+    let model = model_source
         .as_deref()
         .and_then(|sid| get_session_model(sid, writer, reader));
+
+    // Session parenting: use the planner (orchestrator), not the worker that
+    // triggered the review.
+    let hierarchy_parent = resolve_hierarchy_parent(db, task);
 
     // Review sessions use the task's worktree as cwd.
     let cwd = task.worktree_path.clone().or(Some(task.project.clone()));
@@ -672,7 +712,7 @@ pub fn dispatch_review(
         provider: None,
         system_prompt: None,
         cwd,
-        parent_id: effective_parent_session,
+        parent_id: hierarchy_parent,
         child_budget: 16,
         tagline: Some(format!("Review task {}: {}", task.id, task.title)),
         auto_archive: false,
@@ -813,20 +853,23 @@ pub fn dispatch_refining(
 
     // No reusable session found — create a new one.
 
-    let effective_parent_session = parent_session_id
-        .map(str::to_string)
-        .or_else(|| resolve_parent_session(db, task));
-
-    let model = effective_parent_session
+    // Model inheritance: use the triggering session for model, falling back
+    // through the hierarchy.
+    let model_source = resolve_model_source(db, task, parent_session_id);
+    let model = model_source
         .as_deref()
         .and_then(|sid| get_session_model(sid, writer, reader));
+
+    // Session parenting: use the planner (orchestrator), not whatever
+    // session triggered the refining state change.
+    let hierarchy_parent = resolve_hierarchy_parent(db, task);
 
     let create_req = crate::protocol::Request::CreateSession {
         model,
         provider: None,
         system_prompt: None,
         cwd: Some(task.project.clone()),
-        parent_id: effective_parent_session,
+        parent_id: hierarchy_parent,
         child_budget: 16,
         tagline: Some(format!("Refining task {}: {}", task.id, task.title)),
         auto_archive: false,
@@ -2217,6 +2260,91 @@ mod tests {
             !err_msg.contains("already has session"),
             "dispatch should not return 'already has session', got: {}",
             err_msg
+        );
+    }
+
+    /// `resolve_hierarchy_parent` should prefer the planner session over
+    /// the task's current session_id or the parent task's session.
+    #[test]
+    fn test_resolve_hierarchy_parent_prefers_planner() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a parent task with a session.
+        let parent = db
+            .create_task("/project", "Parent task", Some(5), None, None, true, false)
+            .unwrap();
+        db.set_session_id(parent.id, "parent-session").unwrap();
+
+        // Create a child task under the parent.
+        let child = db
+            .create_task(
+                "/project",
+                "Child task",
+                Some(5),
+                Some(parent.id),
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+
+        // Before any sessions are recorded, hierarchy parent falls back to
+        // the parent task's session.
+        let child_task = db.get_task(child.id).unwrap().unwrap();
+        assert_eq!(
+            resolve_hierarchy_parent(&db, &child_task),
+            Some("parent-session".to_string()),
+            "should fall back to parent task's session when no planner exists"
+        );
+
+        // Set a session_id on the child (e.g. from a previous lifecycle).
+        db.set_session_id(child.id, "old-session").unwrap();
+        let child_task = db.get_task(child.id).unwrap().unwrap();
+        assert_eq!(
+            resolve_hierarchy_parent(&db, &child_task),
+            Some("old-session".to_string()),
+            "should use task's session_id when no planner exists"
+        );
+
+        // Record a planner session.
+        db.record_session(child.id, "planner-session", "planner")
+            .unwrap();
+        // Also set the current session_id to the refiner (simulating the bug scenario).
+        db.set_session_id(child.id, "refiner-session").unwrap();
+        let child_task = db.get_task(child.id).unwrap().unwrap();
+        assert_eq!(
+            resolve_hierarchy_parent(&db, &child_task),
+            Some("planner-session".to_string()),
+            "should prefer planner session over current session_id (refiner)"
+        );
+    }
+
+    /// `resolve_model_source` should prefer the explicit parent_session_id
+    /// over the hierarchy parent.
+    #[test]
+    fn test_resolve_model_source_prefers_triggering_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let task = db
+            .create_task("/project", "Test task", Some(5), None, None, true, false)
+            .unwrap();
+        db.record_session(task.id, "planner-session", "planner")
+            .unwrap();
+
+        let task = db.get_task(task.id).unwrap().unwrap();
+
+        // With an explicit parent_session_id, that takes priority.
+        assert_eq!(
+            resolve_model_source(&db, &task, Some("refiner-session")),
+            Some("refiner-session".to_string()),
+            "should use triggering session for model inheritance"
+        );
+
+        // Without an explicit parent_session_id, falls back to hierarchy.
+        assert_eq!(
+            resolve_model_source(&db, &task, None),
+            Some("planner-session".to_string()),
+            "should fall back to planner session for model inheritance"
         );
     }
 
