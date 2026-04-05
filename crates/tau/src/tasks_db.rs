@@ -1500,6 +1500,31 @@ impl TasksDb {
         Ok(())
     }
 
+    /// Find tasks in terminal states (done/failed) that still have a worktree_path set.
+    /// Used for startup cleanup of stale worktrees.
+    pub fn get_stale_worktree_tasks(&self) -> crate::Result<Vec<Task>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
+                        branch, worktree_path, session_id, skip_review, skip_planning,
+                        created_at, updated_at
+                 FROM tasks
+                 WHERE state IN ('done', 'failed') AND worktree_path IS NOT NULL",
+            )
+            .map_err(|e| crate::Error::Io(format!("prepare stale worktree query: {}", e)))?;
+
+        let rows = stmt
+            .query_map([], row_to_task)
+            .map_err(|e| crate::Error::Io(format!("query stale worktrees: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.map_err(|e| crate::Error::Io(format!("read stale task: {}", e)))?);
+        }
+        Ok(tasks)
+    }
+
     /// Clear the worktree path for a task (set to NULL).
     pub fn clear_worktree(&self, task_id: i64) -> crate::Result<()> {
         let now = crate::types::timestamp_ms() as i64;
@@ -2708,6 +2733,123 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let err = db.clear_worktree(99999).unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_get_stale_worktree_tasks() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Task 1: done with worktree (stale)
+        let t1 = db
+            .create_task(
+                "/project",
+                "Done with worktree",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.set_worktree_path(t1.id, "/tmp/wt-1").unwrap();
+        db.update_task(
+            t1.id,
+            &TaskUpdate {
+                state: Some("done".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Task 2: failed with worktree (stale)
+        let t2 = db
+            .create_task(
+                "/project",
+                "Failed with worktree",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.set_worktree_path(t2.id, "/tmp/wt-2").unwrap();
+        db.update_task(
+            t2.id,
+            &TaskUpdate {
+                state: Some("failed".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Task 3: done without worktree (not stale)
+        let t3 = db
+            .create_task(
+                "/project",
+                "Done no worktree",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            t3.id,
+            &TaskUpdate {
+                state: Some("done".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Task 4: active with worktree (not stale — still in progress)
+        let t4 = db
+            .create_task(
+                "/project",
+                "Active with worktree",
+                None,
+                None,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        db.set_worktree_path(t4.id, "/tmp/wt-4").unwrap();
+        db.update_task(
+            t4.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(t4.id, "s1").unwrap();
+
+        let stale = db.get_stale_worktree_tasks().unwrap();
+        let ids: Vec<i64> = stale.iter().map(|t| t.id).collect();
+        assert!(
+            ids.contains(&t1.id),
+            "done task with worktree should be stale"
+        );
+        assert!(
+            ids.contains(&t2.id),
+            "failed task with worktree should be stale"
+        );
+        assert!(
+            !ids.contains(&t3.id),
+            "done task without worktree should not be stale"
+        );
+        assert!(
+            !ids.contains(&t4.id),
+            "active task with worktree should not be stale"
+        );
+        assert_eq!(stale.len(), 2);
     }
 
     #[test]

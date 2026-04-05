@@ -51,7 +51,20 @@ pub fn create_worktree(
 }
 
 /// Remove a git worktree. Uses `--force` to handle dirty worktrees.
+///
+/// Safety: refuses to remove the main worktree (repo root) to prevent
+/// accidental deletion of the primary working tree.
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> crate::Result<()> {
+    // Guard: never remove the main worktree.
+    let repo_canon = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.into());
+    let wt_canon = std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.into());
+    if repo_canon == wt_canon {
+        return Err(crate::Error::Io(format!(
+            "refusing to remove main worktree: {} is the repo root",
+            worktree_path
+        )));
+    }
+
     let output = Command::new("git")
         .args(["worktree", "remove", "--force", worktree_path])
         .current_dir(repo_path)
@@ -344,6 +357,22 @@ mod tests {
 
         let result = remove_worktree(repo_path, "/tmp/does-not-exist-worktree");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_remove_worktree_refuses_main_worktree() {
+        let dir = init_test_repo();
+        let repo_path = dir.path().to_str().unwrap();
+
+        // Trying to remove the repo root itself should be refused
+        let result = remove_worktree(repo_path, repo_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("refusing to remove main worktree"),
+            "expected 'refusing to remove main worktree' error, got: {}",
+            err_msg
+        );
     }
 
     #[test]

@@ -1496,6 +1496,48 @@ pub fn run_tasks_plugin() {
     // after each tool call completes.
     let mut pending_events: Vec<SchedulerEvent> = Vec::new();
 
+    // Startup sweep: clean up stale worktrees for done/failed tasks.
+    // This catches historical leftovers from before cleanup was implemented
+    // or from tasks that were manually closed without going through merge.
+    if let Ok(stale_tasks) = db.get_stale_worktree_tasks() {
+        for task in &stale_tasks {
+            eprintln!(
+                "tasks: startup cleanup: task {} ({}) in state '{}' has stale worktree at {:?}",
+                task.id, task.title, task.state, task.worktree_path
+            );
+            if let Some(ref wt_path) = task.worktree_path {
+                if let Some(ref branch) = task.branch {
+                    if let Ok(repo_root) = crate::tasks_git::get_repo_root(&task.project) {
+                        if let Err(e) = crate::tasks_git::remove_worktree(&repo_root, wt_path) {
+                            eprintln!(
+                                "tasks: startup cleanup: failed to remove worktree for task {}: {}",
+                                task.id, e
+                            );
+                        }
+                        if let Err(e) = crate::tasks_git::delete_branch(&repo_root, branch) {
+                            eprintln!(
+                                "tasks: startup cleanup: failed to delete branch for task {}: {}",
+                                task.id, e
+                            );
+                        }
+                    }
+                }
+                if let Err(e) = db.clear_worktree(task.id) {
+                    eprintln!(
+                        "tasks: startup cleanup: failed to clear worktree in DB for task {}: {}",
+                        task.id, e
+                    );
+                }
+            }
+        }
+        if !stale_tasks.is_empty() {
+            eprintln!(
+                "tasks: startup cleanup: cleaned up {} stale worktree(s)",
+                stale_tasks.len()
+            );
+        }
+    }
+
     // Handle requests — blocks on recv() until a line arrives or EOF.
     while let Some(line) = chan_reader.recv() {
         if line.trim().is_empty() {

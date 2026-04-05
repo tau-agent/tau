@@ -368,27 +368,53 @@ pub fn merge_task(
     // 7. Clean up: remove worktree, delete branch, archive session, clear DB
     log.push_str("=== Cleanup ===\n");
 
-    // 7a. Remove the git worktree
-    let (output, _) = execute_bash(
-        writer,
-        reader,
-        &log_session,
-        &format!(
-            "cd $(git rev-parse --show-toplevel) && git worktree remove --force {}",
-            worktree_path
-        ),
-    )?;
-    log.push_str(&output);
+    // 7a. Remove the git worktree (but never the main worktree)
+    let wt_is_main = std::fs::canonicalize(worktree_path)
+        .and_then(|wt| std::fs::canonicalize(project_dir).map(|pd| wt == pd))
+        .unwrap_or(false);
+    if wt_is_main {
+        let msg = format!(
+            "refusing to remove main worktree for task {}: {} is the repo root\n",
+            task_id, worktree_path
+        );
+        eprintln!("tasks: warning: {}", msg.trim());
+        log.push_str(&msg);
+    } else {
+        let (output, wt_err) = execute_bash(
+            writer,
+            reader,
+            &log_session,
+            &format!(
+                "cd $(git rev-parse --show-toplevel) && git worktree remove --force {}",
+                worktree_path
+            ),
+        )?;
+        log.push_str(&output);
+        if wt_err {
+            eprintln!(
+                "tasks: warning: failed to remove worktree for task {}: {}",
+                task_id,
+                output.trim()
+            );
+        }
+    }
     let _ = db.clear_worktree(task_id);
 
     // 7b. Delete the task branch (no longer needed after merge)
-    let (output, _) = execute_bash(
+    let (output, br_err) = execute_bash(
         writer,
         reader,
         &log_session,
         &format!("git branch -D {}", branch),
     )?;
     log.push_str(&output);
+    if br_err {
+        eprintln!(
+            "tasks: warning: failed to delete branch for task {}: {}",
+            task_id,
+            output.trim()
+        );
+    }
 
     // 7c. Archive all task sessions: worker, reviewer, refiner, etc. (best-effort)
     let mut archived = std::collections::HashSet::new();
