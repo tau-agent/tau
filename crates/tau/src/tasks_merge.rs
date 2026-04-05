@@ -249,6 +249,30 @@ pub fn merge_task(
         }
     };
 
+    // 3b. Check that the main worktree is clean before merging.
+    //
+    // If there are uncommitted changes, the post-merge `git reset --hard HEAD`
+    // would clobber them — fail early with a clear error instead.
+    let (wt_status, is_error) = execute_bash(
+        writer,
+        reader,
+        &log_session,
+        &format!(
+            "git -C '{}' diff --quiet HEAD && git -C '{}' diff --cached --quiet HEAD",
+            project_dir, project_dir
+        ),
+    )?;
+    if is_error {
+        archive_session(writer, reader, &log_session);
+        return Ok(MergeResult {
+            success: false,
+            log: format!(
+                "Main worktree has uncommitted changes — refusing to merge:\n{}",
+                wt_status
+            ),
+        });
+    }
+
     // 4. Rebase onto merge target
     log.push_str(&format!("=== Rebase onto {} ===\n", merge_target));
     let (output, is_error) = execute_bash(
@@ -313,6 +337,32 @@ pub fn merge_task(
             success: false,
             log: format!("Merge failed:\n{}", log),
         });
+    }
+
+    // 6b. Sync the main worktree's index + working tree after update-ref.
+    //
+    // `git update-ref` only moves the ref — it does NOT touch the index or
+    // working tree of any worktree that has that branch checked out. When
+    // the merge target (typically `main`) is checked out in the main worktree,
+    // the index becomes stale and `git status` shows a phantom staged diff
+    // that reverts the merge. Fix this by running `git reset --hard HEAD` in
+    // the main worktree, but only when its HEAD branch matches the merge target.
+    let (main_head, _) = execute_bash(
+        writer,
+        reader,
+        &log_session,
+        &format!("git -C '{}' rev-parse --abbrev-ref HEAD", project_dir),
+    )?;
+    if main_head.trim() == merge_target {
+        log.push_str("=== Sync main worktree index ===\n");
+        let (output, _) = execute_bash(
+            writer,
+            reader,
+            &log_session,
+            &format!("git -C '{}' reset --hard HEAD", project_dir),
+        )?;
+        log.push_str(&output);
+        log.push('\n');
     }
 
     // 7. Clean up: remove worktree, delete branch, archive session, clear DB
