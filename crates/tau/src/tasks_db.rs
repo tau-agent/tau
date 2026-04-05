@@ -465,9 +465,12 @@ impl TasksDb {
             vec![Box::new(project.to_string())];
 
         if let Some(state) = state_filter {
-            sql.push_str(&format!(" AND state = ?{}", param_idx));
-            params_vec.push(Box::new(state.to_string()));
-            param_idx += 1;
+            if state != "all" {
+                sql.push_str(&format!(" AND state = ?{}", param_idx));
+                params_vec.push(Box::new(state.to_string()));
+                param_idx += 1;
+            }
+            // "all" — no state filter, include done tasks
         } else {
             sql.push_str(" AND state != 'done'");
         }

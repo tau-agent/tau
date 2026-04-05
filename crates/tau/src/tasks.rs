@@ -126,7 +126,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "properties": {
                     "state": {
                         "type": "string",
-                        "description": "Filter by state (interactive, planning, refining, ready, active, review, approved, merging, failed, done)"
+                        "description": "Filter by state (interactive, planning, refining, ready, active, review, approved, merging, failed, done). Use 'all' to include done tasks."
                     },
                     "parent_id": {
                         "type": "integer",
