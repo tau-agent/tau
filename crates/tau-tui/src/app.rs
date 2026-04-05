@@ -1115,7 +1115,7 @@ impl App {
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|mq] /reload /sessions /session <id> /back /fork /new /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|status|mq] /reload /sessions /session <id> /back /fork /new /help /quit"
                         .into(),
                 });
                 None
@@ -1289,6 +1289,14 @@ impl App {
                     }
                 }
             }
+            "status" | "queue" => match self.run_task_status() {
+                Ok(()) => {}
+                Err(e) => {
+                    self.messages.push(MessageItem::Error {
+                        text: format!("task status: {}", e),
+                    });
+                }
+            },
             "mq" => match self.run_task_merge_queue() {
                 Ok(()) => {}
                 Err(e) => {
@@ -1300,13 +1308,25 @@ impl App {
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!(
-                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, claim <id>, approve <id>, ready <id>, mq",
+                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, claim <id>, approve <id>, ready <id>, status, mq",
                         subcmd
                     ),
                 });
             }
         }
         None
+    }
+
+    fn run_task_status(&mut self) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let project = std::env::current_dir()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let status = tau::tasks_scheduler::get_status(&db, &project)?;
+        let output = tau::tasks_scheduler::format_status(&status);
+        self.messages.push(MessageItem::Status { text: output });
+        Ok(())
     }
 
     fn run_task_merge_queue(&mut self) -> tau::Result<()> {

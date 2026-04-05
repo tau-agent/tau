@@ -72,7 +72,7 @@ pub fn select_non_conflicting(tasks: &[Task]) -> Vec<&Task> {
 }
 
 /// Extract file paths from the `affected_files` JSON value.
-fn extract_files(val: &Option<serde_json::Value>) -> Vec<String> {
+pub(crate) fn extract_files(val: &Option<serde_json::Value>) -> Vec<String> {
     match val {
         Some(serde_json::Value::Array(arr)) => arr
             .iter()
@@ -97,7 +97,7 @@ pub struct ScheduledTask {
 
 /// Maximum number of tasks that can be in-flight (planning, refining, active,
 /// review, merging) simultaneously per project.
-const MAX_CONCURRENT_TASKS: usize = 8;
+pub(crate) const MAX_CONCURRENT_TASKS: usize = 8;
 
 /// Run a scheduling pass: find ready/planning tasks, pick a non-conflicting
 /// batch, create branches and worktrees (for ready tasks), update task state.
@@ -1284,6 +1284,290 @@ pub fn server_request(
 }
 
 // ---------------------------------------------------------------------------
+// Scheduler status
+// ---------------------------------------------------------------------------
+
+/// Reason a task is waiting/blocked.
+#[derive(Debug, Clone, serde::Serialize)]
+pub enum WaitReason {
+    /// Blocked by a dependency that hasn't completed yet.
+    Dependency {
+        task_id: i64,
+        title: String,
+        state: String,
+    },
+    /// Affected files overlap with an active/in-flight task.
+    FileConflict {
+        files: Vec<String>,
+        with_task_id: i64,
+    },
+    /// Concurrent task budget exhausted.
+    BudgetExhausted { used: usize, max: usize },
+    /// In ready/planning state but not yet scheduled.
+    NotScheduled,
+}
+
+/// Status of a single task in the scheduler view.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskStatus {
+    pub task: Task,
+    pub session_id: Option<String>,
+    pub wait_reasons: Vec<WaitReason>,
+}
+
+/// Overall scheduler status.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SchedulerStatus {
+    pub active: Vec<TaskStatus>,
+    pub queued_planning: Vec<TaskStatus>,
+    pub queued_ready: Vec<TaskStatus>,
+    pub blocked: Vec<TaskStatus>,
+    pub inflight_count: usize,
+    pub max_concurrent: usize,
+}
+
+/// Compute the current scheduler status: active, queued, and blocked tasks.
+pub fn get_status(db: &TasksDb, project: &str) -> crate::Result<SchedulerStatus> {
+    let inflight_count = db.count_inflight_tasks(project)?;
+    let max_concurrent = MAX_CONCURRENT_TASKS;
+
+    // Get all non-done tasks for this project.
+    let all_tasks = db.list_tasks(project, None, None, None, None)?;
+
+    // Collect active tasks (in-flight working states).
+    let inflight_states: HashSet<&str> = ["active", "review", "merging", "refining"]
+        .iter()
+        .copied()
+        .collect();
+
+    let mut active = Vec::new();
+    let mut queued_planning = Vec::new();
+    let mut queued_ready = Vec::new();
+    let mut blocked = Vec::new();
+
+    // Build a map of active task IDs to their affected files for conflict detection.
+    let active_tasks_files: Vec<(i64, Vec<String>)> = all_tasks
+        .iter()
+        .filter(|t| inflight_states.contains(t.state.as_str()))
+        .map(|t| (t.id, extract_files(&t.affected_files)))
+        .collect();
+
+    for task in all_tasks {
+        if inflight_states.contains(task.state.as_str()) {
+            // Active/in-flight task.
+            // Check if it's waiting on dependencies even though it's active.
+            let deps = db.get_blocking_dependencies(task.id)?;
+            let wait_reasons: Vec<WaitReason> = deps
+                .iter()
+                .map(|d| WaitReason::Dependency {
+                    task_id: d.id,
+                    title: d.title.clone(),
+                    state: d.state.clone(),
+                })
+                .collect();
+            active.push(TaskStatus {
+                session_id: task.session_id.clone(),
+                task,
+                wait_reasons,
+            });
+        } else if task.state == "ready" || task.state == "planning" {
+            // Check blocking dependencies first.
+            let deps = db.get_blocking_dependencies(task.id)?;
+            if !deps.is_empty() {
+                // Blocked by dependencies.
+                let wait_reasons = deps
+                    .iter()
+                    .map(|d| WaitReason::Dependency {
+                        task_id: d.id,
+                        title: d.title.clone(),
+                        state: d.state.clone(),
+                    })
+                    .collect();
+                blocked.push(TaskStatus {
+                    session_id: task.session_id.clone(),
+                    task,
+                    wait_reasons,
+                });
+            } else {
+                // Not blocked by deps — it's queued. Compute why it's waiting.
+                let mut wait_reasons = Vec::new();
+
+                // Check file conflicts (only for ready tasks with affected_files).
+                if task.state == "ready" {
+                    let task_files = extract_files(&task.affected_files);
+                    if !task_files.is_empty() {
+                        for (active_id, active_files) in &active_tasks_files {
+                            let overlapping: Vec<String> = task_files
+                                .iter()
+                                .filter(|f| active_files.contains(f))
+                                .cloned()
+                                .collect();
+                            if !overlapping.is_empty() {
+                                wait_reasons.push(WaitReason::FileConflict {
+                                    files: overlapping,
+                                    with_task_id: *active_id,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Check budget.
+                if inflight_count >= max_concurrent {
+                    wait_reasons.push(WaitReason::BudgetExhausted {
+                        used: inflight_count,
+                        max: max_concurrent,
+                    });
+                }
+
+                // If no specific reason found, it's just not scheduled yet.
+                if wait_reasons.is_empty() {
+                    wait_reasons.push(WaitReason::NotScheduled);
+                }
+
+                let status = TaskStatus {
+                    session_id: task.session_id.clone(),
+                    task: task.clone(),
+                    wait_reasons,
+                };
+                if task.state == "planning" {
+                    queued_planning.push(status);
+                } else {
+                    queued_ready.push(status);
+                }
+            }
+        }
+        // Skip interactive, approved, failed, done — they aren't relevant to scheduler status.
+    }
+
+    Ok(SchedulerStatus {
+        active,
+        queued_planning,
+        queued_ready,
+        blocked,
+        inflight_count,
+        max_concurrent,
+    })
+}
+
+/// Format the scheduler status as a human-readable string.
+pub fn format_status(status: &SchedulerStatus) -> String {
+    let mut out = String::new();
+    out.push_str("=== Task Scheduler Status ===\n");
+    out.push_str(&format!(
+        "    in-flight: {}/{}\n",
+        status.inflight_count, status.max_concurrent
+    ));
+
+    // Active tasks.
+    if !status.active.is_empty() {
+        out.push_str(&format!("\nACTIVE ({}):\n", status.active.len()));
+        for ts in &status.active {
+            format_task_line(&mut out, ts);
+        }
+    }
+
+    // Queued - Planning.
+    if !status.queued_planning.is_empty() {
+        out.push_str(&format!(
+            "\nQUEUED - PLANNING ({}):\n",
+            status.queued_planning.len()
+        ));
+        for ts in &status.queued_planning {
+            format_task_line(&mut out, ts);
+        }
+    }
+
+    // Queued - Ready.
+    if !status.queued_ready.is_empty() {
+        out.push_str(&format!(
+            "\nQUEUED - READY ({}):\n",
+            status.queued_ready.len()
+        ));
+        for ts in &status.queued_ready {
+            format_task_line(&mut out, ts);
+        }
+    }
+
+    // Blocked.
+    if !status.blocked.is_empty() {
+        out.push_str(&format!("\nBLOCKED ({}):\n", status.blocked.len()));
+        for ts in &status.blocked {
+            format_task_line(&mut out, ts);
+        }
+    }
+
+    if status.active.is_empty()
+        && status.queued_planning.is_empty()
+        && status.queued_ready.is_empty()
+        && status.blocked.is_empty()
+    {
+        out.push_str("\nNo active or queued tasks.\n");
+    }
+
+    out
+}
+
+fn format_task_line(out: &mut String, ts: &TaskStatus) {
+    use std::fmt::Write;
+
+    let sid = ts.session_id.as_deref().unwrap_or("-");
+    let files = extract_files(&ts.task.affected_files);
+    let files_str = if files.is_empty() {
+        String::new()
+    } else {
+        // Show abbreviated file names (just filename, not full path).
+        let abbrev: Vec<&str> = files
+            .iter()
+            .map(|f| f.rsplit('/').next().unwrap_or(f.as_str()))
+            .collect();
+        format!("  [{}]", abbrev.join(", "))
+    };
+
+    let _ = write!(
+        out,
+        "  #{:<5} {:<40} {:<6}{}",
+        ts.task.id, ts.task.title, sid, files_str
+    );
+
+    // Append wait reasons.
+    for reason in &ts.wait_reasons {
+        match reason {
+            WaitReason::Dependency {
+                task_id,
+                title: _,
+                state,
+            } => {
+                let _ = write!(out, "  ⏳ depends on #{} ({})", task_id, state);
+            }
+            WaitReason::FileConflict {
+                files,
+                with_task_id,
+            } => {
+                let abbrev: Vec<&str> = files
+                    .iter()
+                    .map(|f| f.rsplit('/').next().unwrap_or(f.as_str()))
+                    .collect();
+                let _ = write!(
+                    out,
+                    "  ⏳ file conflict [{}] with #{}",
+                    abbrev.join(", "),
+                    with_task_id
+                );
+            }
+            WaitReason::BudgetExhausted { used, max } => {
+                let _ = write!(out, "  ⏳ budget ({}/{} sessions used)", used, max);
+            }
+            WaitReason::NotScheduled => {
+                let _ = write!(out, "  ⏳ not yet scheduled");
+            }
+        }
+    }
+
+    out.push('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2065,5 +2349,128 @@ mod tests {
         assert_eq!(schedulable.len(), 1);
         assert_eq!(schedulable[0].id, task.id);
         assert_eq!(schedulable[0].state, "planning");
+    }
+
+    #[test]
+    fn test_get_status_empty() {
+        let db = TasksDb::open_memory().unwrap();
+        let status = get_status(&db, "/project").unwrap();
+        assert!(status.active.is_empty());
+        assert!(status.queued_planning.is_empty());
+        assert!(status.queued_ready.is_empty());
+        assert!(status.blocked.is_empty());
+        assert_eq!(status.inflight_count, 0);
+        assert_eq!(status.max_concurrent, MAX_CONCURRENT_TASKS);
+    }
+
+    #[test]
+    fn test_get_status_active_tasks() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = create_ready_task(&db, "/project", "Active task", 5, None);
+        db.assign_task(task.id, "s1").unwrap();
+        // task is now active
+
+        let status = get_status(&db, "/project").unwrap();
+        assert_eq!(status.active.len(), 1);
+        assert_eq!(status.active[0].task.id, task.id);
+        assert_eq!(status.inflight_count, 1);
+    }
+
+    #[test]
+    fn test_get_status_blocked_by_dependency() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = create_ready_task(&db, "/project", "Dependency", 5, None);
+        let task = create_ready_task(&db, "/project", "Blocked task", 3, None);
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        let status = get_status(&db, "/project").unwrap();
+        assert_eq!(status.blocked.len(), 1);
+        assert_eq!(status.blocked[0].task.id, task.id);
+        assert!(matches!(
+            &status.blocked[0].wait_reasons[0],
+            WaitReason::Dependency { task_id, .. } if *task_id == dep.id
+        ));
+        // dep should be in queued_ready (not blocked)
+        assert_eq!(status.queued_ready.len(), 1);
+        assert_eq!(status.queued_ready[0].task.id, dep.id);
+    }
+
+    #[test]
+    fn test_get_status_file_conflict() {
+        let db = TasksDb::open_memory().unwrap();
+        let files = serde_json::json!(["src/shared.rs"]);
+        let active_task = create_ready_task(&db, "/project", "Active", 5, Some(&files));
+        db.assign_task(active_task.id, "s1").unwrap();
+
+        let queued_task = create_ready_task(&db, "/project", "Queued", 3, Some(&files));
+
+        let status = get_status(&db, "/project").unwrap();
+        assert_eq!(status.active.len(), 1);
+        assert_eq!(status.queued_ready.len(), 1);
+        assert_eq!(status.queued_ready[0].task.id, queued_task.id);
+        assert!(matches!(
+            &status.queued_ready[0].wait_reasons[0],
+            WaitReason::FileConflict { with_task_id, .. } if *with_task_id == active_task.id
+        ));
+    }
+
+    #[test]
+    fn test_get_status_planning_tasks() {
+        let db = TasksDb::open_memory().unwrap();
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let child = db
+            .create_task(
+                "/project",
+                "Child",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(child.state, "planning");
+
+        let status = get_status(&db, "/project").unwrap();
+        // child should be in queued_planning
+        assert!(
+            status
+                .queued_planning
+                .iter()
+                .any(|ts| ts.task.id == child.id)
+        );
+    }
+
+    #[test]
+    fn test_format_status_output() {
+        let status = SchedulerStatus {
+            active: vec![TaskStatus {
+                task: make_task(1, 5, Some(vec!["src/a.rs"])),
+                session_id: Some("s100".into()),
+                wait_reasons: vec![],
+            }],
+            queued_planning: vec![],
+            queued_ready: vec![TaskStatus {
+                task: make_task(2, 3, Some(vec!["src/a.rs"])),
+                session_id: None,
+                wait_reasons: vec![WaitReason::FileConflict {
+                    files: vec!["src/a.rs".into()],
+                    with_task_id: 1,
+                }],
+            }],
+            blocked: vec![],
+            inflight_count: 1,
+            max_concurrent: 8,
+        };
+        let output = format_status(&status);
+        assert!(output.contains("Task Scheduler Status"));
+        assert!(output.contains("ACTIVE"));
+        assert!(output.contains("#1"));
+        assert!(output.contains("s100"));
+        assert!(output.contains("QUEUED - READY"));
+        assert!(output.contains("#2"));
+        assert!(output.contains("file conflict"));
     }
 }

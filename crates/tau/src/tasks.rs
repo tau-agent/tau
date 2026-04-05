@@ -368,6 +368,24 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "The task must be active (prepared by task_schedule) or ready (will be prepared inline).".into(),
             ],
         },
+        PluginToolDef {
+            name: "task_status".into(),
+            description: "Show the current task scheduler status: active, queued, and blocked tasks with wait reasons.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project path (defaults to session cwd)"
+                    }
+                }
+            }),
+            prompt_snippet: Some("Show active/queued/blocked tasks with wait reasons".into()),
+            prompt_guidelines: vec![
+                "Shows what's running, what's queued, and why queued tasks are waiting.".into(),
+                "Wait reasons include: dependency not done, file conflict with active task, budget exhausted, not yet scheduled.".into(),
+            ],
+        },
     ]
 }
 
@@ -1115,6 +1133,23 @@ fn handle_task_search(
     }
 }
 
+fn handle_task_status(
+    db: &TasksDb,
+    args: &serde_json::Value,
+    project: &str,
+    tool_call_id: &str,
+) -> PluginToolResult {
+    let project = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project);
+
+    match tasks_scheduler::get_status(db, project) {
+        Ok(status) => tool_ok(tool_call_id, &tasks_scheduler::format_status(&status)),
+        Err(e) => tool_err(tool_call_id, &format!("scheduler status: {}", e)),
+    }
+}
+
 fn handle_task_schedule(
     db: &TasksDb,
     args: &serde_json::Value,
@@ -1436,6 +1471,7 @@ pub fn run_tasks_plugin() {
                     "task_message_edit" => handle_task_message_edit(&db, &arguments, &tool_call_id),
                     "task_relate" => handle_task_relate(&db, &arguments, &tool_call_id),
                     "task_search" => handle_task_search(&db, &arguments, project, &tool_call_id),
+                    "task_status" => handle_task_status(&db, &arguments, project, &tool_call_id),
                     "task_schedule" => {
                         handle_task_schedule(&db, &arguments, project, &tool_call_id)
                     }
@@ -1902,7 +1938,7 @@ mod tests {
     #[test]
     fn test_tasks_tools_defined() {
         let tools = tasks_tools();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"task_create"));
         assert!(names.contains(&"task_get"));
@@ -1915,6 +1951,7 @@ mod tests {
         assert!(names.contains(&"task_search"));
         assert!(names.contains(&"task_schedule"));
         assert!(names.contains(&"task_dispatch"));
+        assert!(names.contains(&"task_status"));
         assert!(names.contains(&"task_merge"));
     }
 
@@ -2096,7 +2133,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "register");
         assert_eq!(parsed["name"], "tasks");
-        assert_eq!(parsed["tools"].as_array().unwrap().len(), 12);
+        assert_eq!(parsed["tools"].as_array().unwrap().len(), 13);
     }
 
     fn extract_text(result: &PluginToolResult) -> String {

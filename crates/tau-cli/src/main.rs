@@ -162,6 +162,9 @@ enum TaskAction {
     },
     /// Show the merge queue (approved + merging tasks)
     Mq,
+    /// Show scheduler status: active, queued, and blocked tasks
+    #[command(alias = "s")]
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1920,6 +1923,11 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
                     t.id, t.state, branch, t.title
                 );
             }
+        }
+        TaskAction::Status => {
+            let project = project_key();
+            let status = tau::tasks_scheduler::get_status(&db, &project)?;
+            print!("{}", tau::tasks_scheduler::format_status(&status));
         }
     }
     Ok(())
