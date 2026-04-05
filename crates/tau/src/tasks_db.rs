@@ -1329,6 +1329,29 @@ impl TasksDb {
         Ok(sessions)
     }
 
+    /// Find the most recent session for a task with the given role.
+    ///
+    /// Returns the session_id of the most recently recorded session matching
+    /// the specified role, or `None` if no such session exists.
+    pub fn find_latest_session_by_role(
+        &self,
+        task_id: i64,
+        role: &str,
+    ) -> crate::Result<Option<String>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM task_sessions \
+                 WHERE task_id = ?1 AND role = ?2 \
+                 ORDER BY created_at DESC LIMIT 1",
+                params![task_id, role],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| crate::Error::Io(format!("find latest session by role: {}", e)))?;
+        Ok(result)
+    }
+
     // ----- search -----
 
     /// Search tasks by title and message content.
@@ -2431,6 +2454,45 @@ mod tests {
         assert!(roles.contains(&"worker"));
         assert!(roles.contains(&"reviewer"));
         assert!(roles.contains(&"contributor"));
+    }
+
+    #[test]
+    fn test_find_latest_session_by_role() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false, false)
+            .unwrap();
+
+        // No sessions yet
+        assert_eq!(
+            db.find_latest_session_by_role(task.id, "reviewer").unwrap(),
+            None
+        );
+
+        // Record two reviewer sessions
+        db.record_session(task.id, "s1", "reviewer").unwrap();
+        // Small sleep to ensure different timestamps
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        db.record_session(task.id, "s2", "reviewer").unwrap();
+        db.record_session(task.id, "s3", "worker").unwrap();
+
+        // Should return the most recent reviewer
+        assert_eq!(
+            db.find_latest_session_by_role(task.id, "reviewer").unwrap(),
+            Some("s2".into())
+        );
+
+        // Should return worker
+        assert_eq!(
+            db.find_latest_session_by_role(task.id, "worker").unwrap(),
+            Some("s3".into())
+        );
+
+        // No refiner sessions
+        assert_eq!(
+            db.find_latest_session_by_role(task.id, "refiner").unwrap(),
+            None
+        );
     }
 
     #[test]

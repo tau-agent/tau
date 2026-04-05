@@ -530,12 +530,77 @@ fn build_planning_message(task: &Task, project_instructions: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Session reuse helpers
+// ---------------------------------------------------------------------------
+
+/// Check whether a session is alive (not archived and not terminated) by
+/// querying GetSessionInfo. Returns `Some(session_id)` if the session is
+/// reusable, `None` otherwise.
+fn find_reusable_session(
+    db: &TasksDb,
+    task_id: i64,
+    role: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<String> {
+    let session_id = db.find_latest_session_by_role(task_id, role).ok()??;
+
+    // Ask the server whether the session is still alive.
+    let req = crate::protocol::Request::GetSessionInfo {
+        session_id: session_id.clone(),
+    };
+    match server_request(writer, reader, req) {
+        Ok(crate::protocol::Response::SessionInfo { info }) => {
+            if info.archived {
+                return None;
+            }
+            Some(session_id)
+        }
+        _ => None,
+    }
+}
+
+/// Resume an existing session by sending it a QueueMessage.
+fn resume_session(
+    session_id: &str,
+    task_id: i64,
+    message: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> crate::Result<()> {
+    let req = crate::protocol::Request::QueueMessage {
+        target_session_id: session_id.to_string(),
+        content: message.to_string(),
+        sender_info: format!("task-system (task {})", task_id),
+        await_reply: false,
+        reply_to: None,
+    };
+    match server_request(writer, reader, req) {
+        Ok(crate::protocol::Response::Ok) => Ok(()),
+        Ok(crate::protocol::Response::Error { message }) => Err(crate::Error::Io(format!(
+            "failed to resume session {}: {}",
+            session_id, message
+        ))),
+        Ok(other) => Err(crate::Error::Io(format!(
+            "unexpected response resuming session {}: {:?}",
+            session_id, other
+        ))),
+        Err(e) => Err(crate::Error::Io(format!(
+            "failed to resume session {}: {}",
+            session_id, e
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Review dispatch
 // ---------------------------------------------------------------------------
 
 /// Dispatch a review session for a task that just transitioned to `review`.
 ///
-/// Creates a new read-only session that reviews the work done on the task
+/// If an existing reviewer session is found and is still alive (not archived),
+/// it is resumed with a QueueMessage instead of creating a new session.
+/// Otherwise, creates a new session that reviews the work done on the task
 /// and either approves it or requests changes.
 pub fn dispatch_review(
     db: &TasksDb,
@@ -545,6 +610,25 @@ pub fn dispatch_review(
     reader: &mut impl BufRead,
 ) -> crate::Result<String> {
     let task_id = task.id;
+
+    // Try to reuse an existing reviewer session.
+    if let Some(existing_sid) = find_reusable_session(db, task_id, "reviewer", writer, reader) {
+        let msg = format!(
+            "Task {} has been re-submitted for review. \
+             Please run task_get to read the latest changes and review feedback, \
+             then re-review the work.\n\
+             - Call `task_get` with arguments: {{\"id\": {}}}",
+            task_id, task_id
+        );
+        resume_session(&existing_sid, task_id, &msg, writer, reader)?;
+        eprintln!(
+            "tasks: reusing existing reviewer session {} for task {}",
+            existing_sid, task_id
+        );
+        return Ok(existing_sid);
+    }
+
+    // No reusable session found — create a new one.
 
     // Resolve the effective parent session
     let effective_parent_session = match parent_session_id {
@@ -672,8 +756,11 @@ fn build_review_message(task: &Task, project_instructions: &str, merge_target: &
 
 /// Dispatch a refining session for a task that just transitioned to `refining`.
 ///
-/// Creates a new read-only session that reviews the plan produced during
-/// planning and either approves it to `ready` or sends it back to `planning`.
+/// If an existing refiner session is found and is still alive (not archived),
+/// it is resumed with a QueueMessage instead of creating a new session.
+/// Otherwise, creates a new read-only session that reviews the plan produced
+/// during planning and either approves it to `ready` or sends it back to
+/// `planning`.
 pub fn dispatch_refining(
     db: &TasksDb,
     task: &Task,
@@ -682,6 +769,25 @@ pub fn dispatch_refining(
     reader: &mut impl BufRead,
 ) -> crate::Result<String> {
     let task_id = task.id;
+
+    // Try to reuse an existing refiner session.
+    if let Some(existing_sid) = find_reusable_session(db, task_id, "refiner", writer, reader) {
+        let msg = format!(
+            "Task {} has been re-submitted for refining. \
+             The plan has been revised. Please run task_get to read the updated \
+             plan and re-evaluate it.\n\
+             - Call `task_get` with arguments: {{\"id\": {}}}",
+            task_id, task_id
+        );
+        resume_session(&existing_sid, task_id, &msg, writer, reader)?;
+        eprintln!(
+            "tasks: reusing existing refiner session {} for task {}",
+            existing_sid, task_id
+        );
+        return Ok(existing_sid);
+    }
+
+    // No reusable session found — create a new one.
 
     let effective_parent_session = match parent_session_id {
         Some(sid) => Some(sid.to_string()),

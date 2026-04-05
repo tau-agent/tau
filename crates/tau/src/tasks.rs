@@ -1722,6 +1722,27 @@ mod tests {
             write_buf: Vec::new(),
             read_buf: Vec::new(),
             session_counter: 0,
+            archived_sessions: std::collections::HashSet::new(),
+        }));
+        let writer = MockWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockReader { shared };
+        (writer, BufReader::new(reader))
+    }
+
+    /// Create mock IO where the given session IDs are reported as archived.
+    /// Starts from a high counter to avoid ID collisions with earlier mocks.
+    fn mock_io_with_archived(
+        archived: std::collections::HashSet<String>,
+    ) -> (MockWriter, BufReader<MockReader>) {
+        // Start counter high to avoid collisions with sessions created by
+        // earlier mock_io instances in the same test.
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(MockShared {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            session_counter: 100,
+            archived_sessions: archived,
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -1734,6 +1755,8 @@ mod tests {
         write_buf: Vec<u8>,
         read_buf: Vec<u8>,
         session_counter: u32,
+        /// Sessions that should be reported as archived by GetSessionInfo.
+        archived_sessions: std::collections::HashSet<String>,
     }
 
     impl MockShared {
@@ -1757,6 +1780,7 @@ mod tests {
                             }
                         }
                         crate::protocol::Request::GetSessionInfo { session_id } => {
+                            let is_archived = self.archived_sessions.contains(session_id.as_str());
                             crate::protocol::Response::SessionInfo {
                                 info: crate::protocol::SessionInfo {
                                     id: session_id.clone(),
@@ -1772,7 +1796,7 @@ mod tests {
                                     tagline: None,
                                     state: "idle".to_string(),
                                     context_pct: None,
-                                    archived: false,
+                                    archived: is_archived,
                                     last_exit_status: None,
                                 },
                             }
@@ -3382,6 +3406,430 @@ mod tests {
                 .iter()
                 .map(|s| (&s.session_id, &s.role))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ----- session reuse tests -----
+
+    #[test]
+    fn test_second_active_to_review_reuses_existing_reviewer_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a task and advance to active
+        let task = db
+            .create_task(
+                "/project",
+                "Reuse reviewer test",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-session").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-worktree").unwrap();
+
+        // First active -> review: should create a new reviewer session
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("worker-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let sessions_after_first = db.get_sessions(task.id).unwrap();
+        let reviewer_sessions_first: Vec<_> = sessions_after_first
+            .iter()
+            .filter(|s| s.role == "reviewer")
+            .collect();
+        assert!(
+            !reviewer_sessions_first.is_empty(),
+            "expected a reviewer session after first review"
+        );
+        let first_reviewer_id = reviewer_sessions_first.last().unwrap().session_id.clone();
+
+        // Move back to active (simulating changes requested)
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Second active -> review: should reuse the existing reviewer session
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("worker-session"),
+            "tc2",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        // Verify no new reviewer sessions were created — same count as before
+        let sessions_after_second = db.get_sessions(task.id).unwrap();
+        let reviewer_sessions_second: Vec<_> = sessions_after_second
+            .iter()
+            .filter(|s| s.role == "reviewer")
+            .collect();
+
+        // The number of reviewer sessions should not increase on the second review
+        assert_eq!(
+            reviewer_sessions_first.len(),
+            reviewer_sessions_second.len(),
+            "expected reviewer session to be reused, not a new one created. \
+             Sessions: {:?}",
+            reviewer_sessions_second
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>()
+        );
+
+        // The reviewer session ID should still be the same one
+        assert_eq!(
+            first_reviewer_id,
+            reviewer_sessions_second.last().unwrap().session_id,
+            "expected same reviewer session to be reused"
+        );
+    }
+
+    #[test]
+    fn test_archived_reviewer_creates_new_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // First, create a reviewer session using normal mock
+        let (mut writer, mut reader) = mock_io();
+        let task = db
+            .create_task(
+                "/project",
+                "Archived reviewer test",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-session").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-worktree").unwrap();
+
+        // First active -> review: creates "mock-s1" as reviewer
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("worker-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        let first_reviewer = sessions
+            .iter()
+            .find(|s| s.role == "reviewer")
+            .expect("expected a reviewer session")
+            .session_id
+            .clone();
+
+        // Move back to active
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Now create a new mock IO where the first reviewer is archived
+        let mut archived = std::collections::HashSet::new();
+        archived.insert(first_reviewer.clone());
+        let (mut writer2, mut reader2) = mock_io_with_archived(archived);
+
+        // Second active -> review: archived reviewer should trigger new session creation
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("worker-session"),
+            "tc2",
+            &mut writer2,
+            &mut reader2,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        // Verify a new reviewer session was created (different from the first)
+        let sessions_after = db.get_sessions(task.id).unwrap();
+        let reviewer_sessions: Vec<_> = sessions_after
+            .iter()
+            .filter(|s| s.role == "reviewer")
+            .collect();
+        assert!(
+            reviewer_sessions.len() > 1,
+            "expected a new reviewer session to be created when old one is archived, got: {:?}",
+            reviewer_sessions
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>()
+        );
+        let last_reviewer = reviewer_sessions.last().unwrap();
+        assert_ne!(
+            last_reviewer.session_id, first_reviewer,
+            "expected a different session when old reviewer is archived"
+        );
+    }
+
+    #[test]
+    fn test_second_planning_to_refining_reuses_existing_refiner_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask in planning state
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Refiner reuse test",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+
+        db.set_session_id(task.id, "planning-session").unwrap();
+
+        // First planning -> refining: should create a new refiner session
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "refining"}),
+            Some("planning-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let sessions_after_first = db.get_sessions(task.id).unwrap();
+        let refiner_sessions_first: Vec<_> = sessions_after_first
+            .iter()
+            .filter(|s| s.role == "refiner")
+            .collect();
+        assert!(
+            !refiner_sessions_first.is_empty(),
+            "expected a refiner session after first refining"
+        );
+        let first_refiner_id = refiner_sessions_first.last().unwrap().session_id.clone();
+
+        // Move back to planning (simulating plan revision needed)
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Second planning -> refining: should reuse the existing refiner session
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "refining"}),
+            Some("planning-session"),
+            "tc2",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        // Verify no new refiner sessions were created
+        let sessions_after_second = db.get_sessions(task.id).unwrap();
+        let refiner_sessions_second: Vec<_> = sessions_after_second
+            .iter()
+            .filter(|s| s.role == "refiner")
+            .collect();
+
+        assert_eq!(
+            refiner_sessions_first.len(),
+            refiner_sessions_second.len(),
+            "expected refiner session to be reused, not a new one created. \
+             Sessions: {:?}",
+            refiner_sessions_second
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            first_refiner_id,
+            refiner_sessions_second.last().unwrap().session_id,
+            "expected same refiner session to be reused"
+        );
+    }
+
+    #[test]
+    fn test_archived_refiner_creates_new_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a subtask in planning state
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Archived refiner test",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.set_session_id(task.id, "planning-session").unwrap();
+
+        // First planning -> refining with normal mock
+        let (mut writer, mut reader) = mock_io();
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "refining"}),
+            Some("planning-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        let first_refiner = sessions
+            .iter()
+            .find(|s| s.role == "refiner")
+            .expect("expected a refiner session")
+            .session_id
+            .clone();
+
+        // Move back to planning
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Now create mock IO where the first refiner is archived
+        let mut archived = std::collections::HashSet::new();
+        archived.insert(first_refiner.clone());
+        let (mut writer2, mut reader2) = mock_io_with_archived(archived);
+
+        // Second planning -> refining: archived refiner triggers new session creation
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "refining"}),
+            Some("planning-session"),
+            "tc2",
+            &mut writer2,
+            &mut reader2,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        // Verify a new refiner session was created
+        let sessions_after = db.get_sessions(task.id).unwrap();
+        let refiner_sessions: Vec<_> = sessions_after
+            .iter()
+            .filter(|s| s.role == "refiner")
+            .collect();
+        assert!(
+            refiner_sessions.len() > 1,
+            "expected a new refiner session when old one is archived, got: {:?}",
+            refiner_sessions
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>()
+        );
+        let last_refiner = refiner_sessions.last().unwrap();
+        assert_ne!(
+            last_refiner.session_id, first_refiner,
+            "expected a different session when old refiner is archived"
         );
     }
 
