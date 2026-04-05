@@ -3239,6 +3239,125 @@ mod tests {
         );
     }
 
+    // ----- review dispatch tests -----
+
+    #[test]
+    fn test_active_to_review_dispatches_review_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a task with skip_review=false and advance to active
+        let task = db
+            .create_task(
+                "/project",
+                "Review dispatch test",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-session").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-worktree").unwrap();
+
+        // active -> review should trigger auto-dispatch of a review session
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("worker-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "review");
+
+        // Verify that a reviewer session was recorded
+        let sessions = db.get_sessions(task.id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.iter().any(|(_, role)| *role == "reviewer"),
+            "expected a reviewer session to be recorded, got: {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_review_dispatch_records_reviewer_role() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "/project",
+                "Reviewer role test",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-session").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-worktree").unwrap();
+
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("worker-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+
+        // The worker session should be recorded as reviewer (it triggered the transition)
+        // and the auto-dispatched session should also be recorded as reviewer
+        let sessions = db.get_sessions(task.id).unwrap();
+        let reviewer_sessions: Vec<_> = sessions.iter().filter(|s| s.role == "reviewer").collect();
+        // At least one reviewer session (the auto-dispatched one)
+        assert!(
+            !reviewer_sessions.is_empty(),
+            "expected at least one reviewer session, got: {:?}",
+            sessions
+                .iter()
+                .map(|s| (&s.session_id, &s.role))
+                .collect::<Vec<_>>()
+        );
+    }
+
     // ----- refining dispatch tests -----
 
     #[test]
