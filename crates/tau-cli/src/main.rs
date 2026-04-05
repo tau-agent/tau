@@ -20,7 +20,7 @@ enum Commands {
         /// Session ID (creates new if omitted)
         #[arg(short, long, add = ArgValueCandidates::new(completer::session_completer))]
         session: Option<String>,
-        /// Model name (default: saved setting or claude-sonnet-4-6)
+        /// Model name (default: saved setting or claude-opus-4-6)
         #[arg(long, add = ArgValueCandidates::new(completer::model_completer))]
         model: Option<String>,
         /// Disable TUI (use plain text streaming)
@@ -333,7 +333,7 @@ async fn run(cli: Cli) -> tau::Result<()> {
                 tau_tui::settings::load()
                     .tui
                     .model
-                    .unwrap_or_else(|| "claude-sonnet-4-6".into())
+                    .unwrap_or_else(|| "claude-opus-4-6".into())
             });
             cmd_chat(message, session, &model, no_tui, child_budget).await?;
         }
