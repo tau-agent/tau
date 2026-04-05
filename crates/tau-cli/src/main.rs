@@ -623,7 +623,7 @@ async fn cmd_chat(
             totals.cost = info.stats.cost;
             totals.context_tokens = info.stats.context_tokens;
         }
-        interactive_loop(&mut client, session_id, &mut totals).await?;
+        interactive_loop(&mut client, session_id, &mut totals, child_budget).await?;
     } else {
         // TUI mode
         tau_tui::run(
@@ -676,6 +676,7 @@ async fn cli_create_session(
     model: Option<String>,
     cwd: Option<String>,
     parent_id: Option<String>,
+    child_budget: u32,
 ) -> tau::Result<String> {
     client
         .send(&tau::protocol::Request::CreateSession {
@@ -684,7 +685,7 @@ async fn cli_create_session(
             system_prompt: None,
             cwd,
             parent_id,
-            child_budget: 0,
+            child_budget,
             tagline: None,
             auto_archive: false,
             notify_parent: true,
@@ -931,6 +932,7 @@ async fn interactive_loop(
     client: &mut tau::client::Client,
     mut session_id: String,
     totals: &mut UsageTotals,
+    child_budget: u32,
 ) -> tau::Result<()> {
     let hist = history_path();
     if let Some(parent) = hist.parent() {
@@ -959,7 +961,7 @@ async fn interactive_loop(
 
         // Handle slash commands
         if line.starts_with('/') {
-            match handle_slash_command(client, &mut session_id, line, totals).await {
+            match handle_slash_command(client, &mut session_id, line, totals, child_budget).await {
                 Ok(true) => break, // /quit
                 Ok(false) => continue,
                 Err(e) => {
@@ -1089,6 +1091,7 @@ async fn handle_slash_command(
     session_id: &mut String,
     line: &str,
     totals: &mut UsageTotals,
+    child_budget: u32,
 ) -> tau::Result<bool> {
     let (cmd, args) = line.split_once(' ').unwrap_or((line, ""));
     let args = args.trim();
@@ -1228,9 +1231,14 @@ async fn handle_slash_command(
         "/fork" => {
             // Create a new session inheriting model/cwd from the current session
             let info = get_session_info(client, session_id).await?;
-            let new_id =
-                cli_create_session(client, Some(info.model), info.cwd, Some(session_id.clone()))
-                    .await?;
+            let new_id = cli_create_session(
+                client,
+                Some(info.model),
+                info.cwd,
+                Some(session_id.clone()),
+                child_budget,
+            )
+            .await?;
             eprintln!("Forked to session {}", &new_id[..new_id.len().min(8)]);
             *totals = UsageTotals::default();
             *session_id = new_id;
@@ -1241,7 +1249,7 @@ async fn handle_slash_command(
             let cwd = std::env::current_dir()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from));
-            let new_id = cli_create_session(client, None, cwd, None).await?;
+            let new_id = cli_create_session(client, None, cwd, None, child_budget).await?;
             eprintln!("New session {}", &new_id[..new_id.len().min(8)]);
             *totals = UsageTotals::default();
             *session_id = new_id;
