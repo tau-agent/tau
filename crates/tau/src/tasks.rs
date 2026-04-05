@@ -979,20 +979,20 @@ fn handle_task_update(
                         }
                     }
                 };
-                if needs_session {
-                    if let Some(new_sid) = create_interactive_session(
+                if needs_session
+                    && let Some(new_sid) = create_interactive_session(
                         db,
                         &task,
-                        &task.project.clone(),
+                        &task.project,
                         session_id,
                         writer,
                         reader,
-                    ) {
-                        let _ = db.set_session_id(task.id, &new_sid);
-                        let _ = db.record_session(task.id, &new_sid, "interactive");
-                        if let Some(creator_sid) = session_id {
-                            let _ = db.record_session(task.id, creator_sid, "creator");
-                        }
+                    )
+                {
+                    let _ = db.set_session_id(task.id, &new_sid);
+                    let _ = db.record_session(task.id, &new_sid, "interactive");
+                    if let Some(creator_sid) = session_id {
+                        let _ = db.record_session(task.id, creator_sid, "creator");
                     }
                 }
             }
