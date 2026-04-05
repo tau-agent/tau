@@ -880,6 +880,9 @@ async fn handle_session_tool(
                             crate::types::Message::ToolResult(tr) => {
                                 text.push_str(&format!("[tool:{}] ...\n", tr.tool_name));
                             }
+                            crate::types::Message::Info(i) => {
+                                text.push_str(&format!("[info] {}\n", i.text));
+                            }
                             _ => {}
                         }
                     }

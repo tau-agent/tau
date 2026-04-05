@@ -532,6 +532,9 @@ async fn run_loop_review(
                 review_text.push_str(&s.summary);
                 review_text.push('\n');
             }
+            Message::Info(_) => {
+                // Info messages are display-only; skip in loop review.
+            }
         }
         review_text.push('\n');
     }
@@ -1438,6 +1441,7 @@ mod tests {
                         Message::ToolResult(_) => "tool_result",
                         Message::User(_) => "user",
                         Message::CompactionSummary(_) => "summary",
+                        Message::Info(_) => "info",
                     })
                     .collect::<Vec<_>>()
             );
@@ -1520,6 +1524,7 @@ mod tests {
                         Message::ToolResult(_) => "tool_result",
                         Message::User(_) => "user",
                         Message::CompactionSummary(_) => "summary",
+                        Message::Info(_) => "info",
                     })
                     .collect::<Vec<_>>()
             );
@@ -1979,5 +1984,32 @@ mod tests {
                 "should emit status about idle timeout retry"
             );
         });
+    }
+
+    #[test]
+    fn no_continuation_needed_after_info() {
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(AssistantMessage::empty("mock", "mock", "mock-model")),
+            Message::Info(crate::types::InfoMessage {
+                text: "task state changed".into(),
+                timestamp: 0,
+            }),
+        ];
+        assert!(!needs_continuation(&messages));
+    }
+
+    #[test]
+    fn repair_ignores_trailing_info() {
+        // Trailing Info message should not trigger repair
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(AssistantMessage::empty("mock", "mock", "mock-model")),
+            Message::Info(crate::types::InfoMessage {
+                text: "some notification".into(),
+                timestamp: 0,
+            }),
+        ];
+        assert!(repair_messages(&messages).is_empty());
     }
 }

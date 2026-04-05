@@ -95,6 +95,9 @@ fn extract_turns(messages: &[Message]) -> Vec<RecordedTurn> {
             Message::CompactionSummary(_) => {
                 // Skip compaction summaries — they're an implementation detail
             }
+            Message::Info(_) => {
+                // Skip info messages — they're display-only notifications
+            }
         }
     }
 

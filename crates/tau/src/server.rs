@@ -54,6 +54,7 @@ fn compute_stats(messages: &[Message], model: &Model, is_subscription: bool) -> 
             }
             Message::ToolResult(_) => tool_results += 1,
             Message::CompactionSummary(_) => {}
+            Message::Info(_) => {}
         }
     }
 
@@ -1047,6 +1048,18 @@ fn queue_message_to_session(state: &SharedState, target: &str, content: &str, se
         .entry(target.to_string())
         .or_insert_with(|| Arc::new(AtomicBool::new(false)))
         .store(true, Ordering::Release);
+}
+
+/// Persist an info message directly to a session's message history.
+/// Unlike `queue_message_to_session`, this does NOT wake the agent loop —
+/// the message is display-only and excluded from LLM context.
+#[allow(dead_code)] // Infrastructure for follow-up: convert notifications to Info messages
+fn queue_info_to_session(state: &SharedState, target: &str, text: &str) {
+    let info_msg = Message::Info(crate::types::InfoMessage::new(text));
+    let st = lock_state(state);
+    if let Err(e) = st.db.append_message(target, &info_msg) {
+        eprintln!("failed to persist info message: {}", e);
+    }
 }
 
 /// Queue a message and, if the target session is idle, spawn a resume task so

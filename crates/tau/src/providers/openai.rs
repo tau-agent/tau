@@ -468,6 +468,9 @@ fn build_request_body(
                     name: None,
                 });
             }
+            Message::Info(_) => {
+                // Info messages are display-only; not sent to the LLM.
+            }
         }
     }
 

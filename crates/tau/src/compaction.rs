@@ -69,6 +69,7 @@ pub fn estimate_tokens(message: &Message) -> u64 {
             })
             .sum(),
         Message::CompactionSummary(cs) => cs.summary.len(),
+        Message::Info(i) => i.text.len(),
     };
     (chars as u64).div_ceil(4) // ceil(chars / 4)
 }
@@ -139,7 +140,9 @@ pub fn find_cut_point(messages: &[Message], keep_recent_tokens: u64) -> usize {
             // Valid = user message or compaction summary (turn boundary)
             for (j, msg) in messages.iter().enumerate().skip(i) {
                 match msg {
-                    Message::User(_) | Message::CompactionSummary(_) => return j,
+                    Message::User(_) | Message::CompactionSummary(_) | Message::Info(_) => {
+                        return j;
+                    }
                     _ => continue,
                 }
             }
@@ -236,6 +239,9 @@ fn serialize_messages(messages: &[Message]) -> String {
                 out.push_str("## Previous Summary\n");
                 out.push_str(&cs.summary);
                 out.push('\n');
+            }
+            Message::Info(_) => {
+                // Info messages are display-only; skip in summarization.
             }
         }
         out.push('\n');
@@ -484,5 +490,37 @@ mod tests {
         assert!(should_compact(ctx_tokens, 200_000, &settings));
         // With 1M window → should not compact
         assert!(!should_compact(ctx_tokens, 1_000_000, &settings));
+    }
+
+    #[test]
+    fn estimate_tokens_info() {
+        // "hello" = 5 chars → ceil(5/4) = 2 tokens
+        let msg = Message::Info(crate::types::InfoMessage {
+            text: "hello".into(),
+            timestamp: 0,
+        });
+        assert_eq!(estimate_tokens(&msg), 2);
+    }
+
+    #[test]
+    fn find_cut_point_info_is_valid_boundary() {
+        let big = "x".repeat(400);
+        let messages = vec![
+            user(&big),
+            assistant(&big, 500),
+            Message::Info(crate::types::InfoMessage {
+                text: "notification".into(),
+                timestamp: 0,
+            }),
+            user(&big),
+            assistant(&big, 1000),
+        ];
+        let cut = find_cut_point(&messages, 250);
+        // Cut should be at index 2 (Info) or 3 (user) — both are valid boundaries
+        assert!(cut >= 2 && cut <= 3, "cut={cut} should be 2 or 3");
+        assert!(
+            matches!(&messages[cut], Message::User(_) | Message::Info(_)),
+            "cut point must be at a valid boundary"
+        );
     }
 }

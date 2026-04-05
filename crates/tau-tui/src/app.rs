@@ -272,6 +272,13 @@ impl App {
                 Message::CompactionSummary(_) => {
                     // Skip compaction summaries in the UI
                 }
+                Message::Info(info_msg) => {
+                    if !info_msg.text.is_empty() {
+                        self.messages.push(MessageItem::Status {
+                            text: format!("ℹ {}", info_msg.text),
+                        });
+                    }
+                }
             }
         }
     }

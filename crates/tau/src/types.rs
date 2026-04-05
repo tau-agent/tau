@@ -188,12 +188,28 @@ pub struct CompactionSummaryMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfoMessage {
+    pub text: String,
+    pub timestamp: u64,
+}
+
+impl InfoMessage {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            timestamp: timestamp_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
     CompactionSummary(CompactionSummaryMessage),
+    Info(InfoMessage),
 }
 
 // ---------------------------------------------------------------------------
@@ -446,4 +462,24 @@ pub fn timestamp_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn info_message_serde_roundtrip() {
+        let msg = Message::Info(InfoMessage {
+            text: "task state changed".into(),
+            timestamp: 12345,
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""role":"info""#));
+        assert!(json.contains(r#""text":"task state changed""#));
+        let deserialized: Message = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(deserialized, Message::Info(i) if i.text == "task state changed" && i.timestamp == 12345)
+        );
+    }
 }

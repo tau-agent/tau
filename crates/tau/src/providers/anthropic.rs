@@ -463,6 +463,9 @@ fn build_request_body(
                     content: serde_json::Value::String(text),
                 });
             }
+            Message::Info(_) => {
+                // Info messages are display-only; not sent to the LLM.
+            }
         }
     }
 
