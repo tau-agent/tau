@@ -327,17 +327,6 @@ pub fn dispatch(
     db.set_session_id(task_id, &session_id)?;
     db.record_session(task_id, &session_id, "worker")?;
 
-    // Also set assigned_session if not already set.
-    if task.assigned_session.is_none() {
-        // Use update_task but only to trigger the assigned_session history;
-        // we already transitioned state in prepare_task.
-        let now = crate::types::timestamp_ms() as i64;
-        // Direct SQL to set assigned_session without state validation.
-        // (assign_task requires "ready" state, but we're already "active".)
-        db.set_assigned_session(task_id, &session_id)?;
-        let _ = now; // suppress warning
-    }
-
     Ok(session_id)
 }
 
@@ -712,7 +701,6 @@ mod tests {
                         .collect(),
                 )
             }),
-            assigned_session: None,
             branch: None,
             worktree_path: None,
             session_id: None,
@@ -1247,7 +1235,7 @@ mod tests {
     #[test]
     fn test_server_request_handles_concurrent_tool_call() {
         use crate::plugin::{PluginMessage, PluginRequest};
-        use crate::protocol::{Request, Response};
+        use crate::protocol::Response;
 
         // Build a reader that contains:
         //   1. A ToolCall (concurrent, arrives while we wait for the response)

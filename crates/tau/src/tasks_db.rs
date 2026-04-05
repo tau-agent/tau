@@ -18,7 +18,6 @@ pub struct Task {
     pub parent_id: Option<i64>,
     pub tags: Option<serde_json::Value>,
     pub affected_files: Option<serde_json::Value>,
-    pub assigned_session: Option<String>,
     pub branch: Option<String>,
     pub worktree_path: Option<String>,
     pub session_id: Option<String>,
@@ -199,7 +198,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     parent_id INTEGER REFERENCES tasks(id),
     tags TEXT,
     affected_files TEXT,
-    assigned_session TEXT,
     branch TEXT,
     worktree_path TEXT,
     session_id TEXT,
@@ -274,6 +272,8 @@ impl TasksDb {
         conn.execute_batch(SCHEMA)
             .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
 
+        Self::migrate(&conn)?;
+
         Ok(Self { conn })
     }
 
@@ -289,7 +289,35 @@ impl TasksDb {
         conn.execute_batch(SCHEMA)
             .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
 
+        Self::migrate(&conn)?;
+
         Ok(Self { conn })
+    }
+
+    /// Run schema migrations. Currently handles:
+    /// - Dropping the `assigned_session` column (consolidated into `session_id`).
+    fn migrate(conn: &Connection) -> crate::Result<()> {
+        // Check if assigned_session column still exists.
+        let has_assigned_session: bool = conn
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'assigned_session'",
+            )
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if has_assigned_session {
+            // Copy assigned_session values into session_id where they differ,
+            // then drop the column.
+            conn.execute_batch(
+                "UPDATE tasks SET session_id = assigned_session \
+                 WHERE assigned_session IS NOT NULL AND (session_id IS NULL OR session_id != assigned_session); \
+                 ALTER TABLE tasks DROP COLUMN assigned_session;"
+            )
+            .map_err(|e| crate::Error::Io(format!("migrate assigned_session: {}", e)))?;
+        }
+
+        Ok(())
     }
 
     // ----- tasks -----
@@ -355,7 +383,7 @@ impl TasksDb {
         self.conn
             .query_row(
                 "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
-                        assigned_session, branch, worktree_path, session_id, skip_review,
+                        branch, worktree_path, session_id, skip_review,
                         created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
@@ -376,7 +404,7 @@ impl TasksDb {
     ) -> crate::Result<Vec<Task>> {
         let mut sql = String::from(
             "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
-                    assigned_session, branch, worktree_path, session_id, skip_review,
+                    branch, worktree_path, session_id, skip_review,
                     created_at, updated_at
              FROM tasks WHERE project = ?1",
         );
@@ -803,7 +831,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT t.id, t.project, t.title, t.state, t.priority, t.parent_id,
-                        t.tags, t.affected_files, t.assigned_session, t.branch,
+                        t.tags, t.affected_files, t.branch,
                         t.worktree_path, t.session_id, t.skip_review, t.created_at,
                         t.updated_at
                  FROM task_relations r
@@ -831,7 +859,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT t.id, t.project, t.title, t.state, t.priority, t.parent_id,
-                        t.tags, t.affected_files, t.assigned_session, t.branch,
+                        t.tags, t.affected_files, t.branch,
                         t.worktree_path, t.session_id, t.skip_review, t.created_at,
                         t.updated_at
                  FROM tasks t
@@ -866,7 +894,7 @@ impl TasksDb {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project {
             Some(p) => (
                 "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
-                        assigned_session, branch, worktree_path, session_id, skip_review,
+                        branch, worktree_path, session_id, skip_review,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved' AND project = ?1
@@ -876,7 +904,7 @@ impl TasksDb {
             ),
             None => (
                 "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
-                        assigned_session, branch, worktree_path, session_id, skip_review,
+                        branch, worktree_path, session_id, skip_review,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved'
@@ -954,7 +982,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
-                        assigned_session, branch, worktree_path, session_id, skip_review,
+                        branch, worktree_path, session_id, skip_review,
                         created_at, updated_at
                  FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
             )
@@ -971,10 +999,53 @@ impl TasksDb {
         Ok(tasks)
     }
 
+    /// Get all descendant tasks (recursive subtree) of a task.
+    ///
+    /// Uses iterative BFS to collect all tasks whose parent chain leads back
+    /// to `root_id`. Does NOT include the root task itself.
+    pub fn get_descendant_tasks(&self, root_id: i64) -> crate::Result<Vec<Task>> {
+        let mut descendants = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(root_id);
+
+        while let Some(parent_id) = queue.pop_front() {
+            let children = self.get_subtasks(parent_id)?;
+            for child in children {
+                queue.push_back(child.id);
+                descendants.push(child);
+            }
+        }
+
+        Ok(descendants)
+    }
+
+    /// Update `session_id` on a task (and optionally record in task_sessions).
+    /// Used by the subtree-claim logic to update descendants.
+    pub fn update_descendant_session(&self, task_id: i64, session_id: &str) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        self.conn
+            .execute(
+                "UPDATE tasks SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![session_id, now, task_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("update_descendant_session: {}", e)))?;
+
+        // Record in task_sessions
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO task_sessions (task_id, session_id, role, created_at) \
+                 VALUES (?1, ?2, 'assigned', ?3)",
+                params![task_id, session_id, now],
+            )
+            .map_err(|e| crate::Error::Io(format!("record descendant session: {}", e)))?;
+
+        Ok(())
+    }
+
     // ----- assign -----
 
     /// Assign a task to a session. Validates task is in `ready` state,
-    /// transitions to `active`, sets `assigned_session`, records in
+    /// transitions to `active`, sets `session_id`, records in
     /// `task_sessions` and `task_history`.
     pub fn assign_task(&self, task_id: i64, session_id: &str) -> crate::Result<Task> {
         let task = self
@@ -1002,7 +1073,7 @@ impl TasksDb {
             .map_err(|e| crate::Error::Io(format!("assign_task begin: {}", e)))?;
 
         tx.execute(
-            "UPDATE tasks SET state = ?1, assigned_session = ?2, updated_at = ?3 \
+            "UPDATE tasks SET state = ?1, session_id = ?2, updated_at = ?3 \
              WHERE id = ?4",
             params![new_state, session_id, now, task_id],
         )
@@ -1018,14 +1089,14 @@ impl TasksDb {
             .map_err(|e| crate::Error::Io(format!("assign task history (state): {}", e)))?;
         }
 
-        // Record assigned_session change in history
+        // Record session_id change in history
         tx.execute(
             "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 task_id,
-                "assigned_session",
-                task.assigned_session,
+                "session_id",
+                task.session_id,
                 session_id,
                 session_id,
                 now
@@ -1105,7 +1176,7 @@ impl TasksDb {
 
         if let Some(state) = state_filter {
             let sql = "SELECT DISTINCT t.id, t.project, t.title, t.state, t.priority, t.parent_id,
-                    t.tags, t.affected_files, t.assigned_session, t.branch,
+                    t.tags, t.affected_files, t.branch,
                     t.worktree_path, t.session_id, t.skip_review, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
@@ -1124,7 +1195,7 @@ impl TasksDb {
             }
         } else {
             let sql = "SELECT DISTINCT t.id, t.project, t.title, t.state, t.priority, t.parent_id,
-                    t.tags, t.affected_files, t.assigned_session, t.branch,
+                    t.tags, t.affected_files, t.branch,
                     t.worktree_path, t.session_id, t.skip_review, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
@@ -1203,23 +1274,6 @@ impl TasksDb {
         }
     }
 
-    /// Set the assigned_session for a task (which session is assigned to it).
-    pub fn set_assigned_session(&self, task_id: i64, session_id: &str) -> crate::Result<()> {
-        let now = crate::types::timestamp_ms() as i64;
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE tasks SET assigned_session = ?1, updated_at = ?2 WHERE id = ?3",
-                params![session_id, now, task_id],
-            )
-            .map_err(|e| crate::Error::Io(format!("set_assigned_session: {}", e)))?;
-
-        if updated == 0 {
-            return Err(crate::Error::Io(format!("task {} not found", task_id)));
-        }
-        Ok(())
-    }
-
     /// Set the session_id for a task (the session working on it).
     pub fn set_session_id(&self, task_id: i64, session_id: &str) -> crate::Result<()> {
         let now = crate::types::timestamp_ms() as i64;
@@ -1230,6 +1284,23 @@ impl TasksDb {
                 params![session_id, now, task_id],
             )
             .map_err(|e| crate::Error::Io(format!("set_session_id: {}", e)))?;
+
+        if updated == 0 {
+            return Err(crate::Error::Io(format!("task {} not found", task_id)));
+        }
+        Ok(())
+    }
+
+    /// Clear the session_id for a task (set to NULL).
+    pub fn clear_session_id(&self, task_id: i64) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET session_id = NULL, updated_at = ?1 WHERE id = ?2",
+                params![now, task_id],
+            )
+            .map_err(|e| crate::Error::Io(format!("clear_session_id: {}", e)))?;
 
         if updated == 0 {
             return Err(crate::Error::Io(format!("task {} not found", task_id)));
@@ -1275,13 +1346,12 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         parent_id: row.get(5)?,
         tags,
         affected_files,
-        assigned_session: row.get(8)?,
-        branch: row.get(9)?,
-        worktree_path: row.get(10)?,
-        session_id: row.get(11)?,
-        skip_review: row.get::<_, i32>(12)? != 0,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        branch: row.get(8)?,
+        worktree_path: row.get(9)?,
+        session_id: row.get(10)?,
+        skip_review: row.get::<_, i32>(11)? != 0,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -2027,7 +2097,7 @@ mod tests {
         // Assign
         let assigned = db.assign_task(task.id, "session-1").unwrap();
         assert_eq!(assigned.state, "active");
-        assert_eq!(assigned.assigned_session.as_deref(), Some("session-1"));
+        assert_eq!(assigned.session_id.as_deref(), Some("session-1"));
 
         // Check task_sessions
         let sessions = db.get_sessions(task.id).unwrap();
@@ -2035,7 +2105,7 @@ mod tests {
         assert_eq!(sessions[0].session_id, "session-1");
         assert_eq!(sessions[0].role, "worker");
 
-        // Check history includes state and assigned_session changes
+        // Check history includes state and session_id changes
         let mut stmt = db
             .conn
             .prepare("SELECT field, new_value FROM task_history WHERE task_id = ?1 ORDER BY id")
@@ -2049,7 +2119,7 @@ mod tests {
         assert!(
             history
                 .iter()
-                .any(|(f, v)| f == "assigned_session" && v == "session-1")
+                .any(|(f, v)| f == "session_id" && v == "session-1")
         );
     }
 
@@ -2087,7 +2157,7 @@ mod tests {
         // Assigning an interactive task should succeed and stay interactive
         let assigned = db.assign_task(task.id, "s1").unwrap();
         assert_eq!(assigned.state, "interactive");
-        assert_eq!(assigned.assigned_session.as_deref(), Some("s1"));
+        assert_eq!(assigned.session_id.as_deref(), Some("s1"));
     }
 
     #[test]
@@ -3020,7 +3090,6 @@ mod tests {
             parent_id,
             tags: None,
             affected_files: None,
-            assigned_session: None,
             branch: None,
             worktree_path: None,
             session_id: None,
@@ -3091,5 +3160,112 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, 0);
         assert_eq!(result[1].0, 0);
+    }
+
+    // ----- get_descendant_tasks tests -----
+
+    #[test]
+    fn test_get_descendant_tasks_single_level() {
+        let db = TasksDb::open_memory().unwrap();
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false)
+            .unwrap();
+        let child1 = db
+            .create_task("/project", "Child 1", None, Some(parent.id), None, false)
+            .unwrap();
+        let child2 = db
+            .create_task("/project", "Child 2", None, Some(parent.id), None, false)
+            .unwrap();
+
+        let descendants = db.get_descendant_tasks(parent.id).unwrap();
+        assert_eq!(descendants.len(), 2);
+        let ids: Vec<i64> = descendants.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&child1.id));
+        assert!(ids.contains(&child2.id));
+    }
+
+    #[test]
+    fn test_get_descendant_tasks_nested() {
+        let db = TasksDb::open_memory().unwrap();
+        let root = db
+            .create_task("/project", "Root", None, None, None, false)
+            .unwrap();
+        let child = db
+            .create_task("/project", "Child", None, Some(root.id), None, false)
+            .unwrap();
+        let grandchild = db
+            .create_task("/project", "Grandchild", None, Some(child.id), None, false)
+            .unwrap();
+
+        let descendants = db.get_descendant_tasks(root.id).unwrap();
+        assert_eq!(descendants.len(), 2);
+        let ids: Vec<i64> = descendants.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&child.id));
+        assert!(ids.contains(&grandchild.id));
+    }
+
+    #[test]
+    fn test_get_descendant_tasks_no_children() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Leaf", None, None, None, false)
+            .unwrap();
+
+        let descendants = db.get_descendant_tasks(task.id).unwrap();
+        assert!(descendants.is_empty());
+    }
+
+    // ----- assign_task sets session_id tests -----
+
+    #[test]
+    fn test_assign_task_sets_session_id() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let assigned = db.assign_task(task.id, "session-1").unwrap().task;
+        assert_eq!(assigned.session_id.as_deref(), Some("session-1"));
+
+        // Verify history records session_id change
+        let mut stmt = db
+            .conn
+            .prepare("SELECT field, new_value FROM task_history WHERE task_id = ?1 ORDER BY id")
+            .unwrap();
+        let history: Vec<(String, String)> = stmt
+            .query_map(params![task.id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|(f, v)| f == "session_id" && v == "session-1")
+        );
+    }
+
+    #[test]
+    fn test_clear_session_id() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false)
+            .unwrap();
+        db.set_session_id(task.id, "s1").unwrap();
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().session_id.as_deref(),
+            Some("s1")
+        );
+
+        db.clear_session_id(task.id).unwrap();
+        assert!(db.get_task(task.id).unwrap().unwrap().session_id.is_none());
     }
 }

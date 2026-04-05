@@ -413,7 +413,6 @@ fn handle_task_create(
                     create_interactive_session(db, &task, project, session_id, writer, reader)
             {
                 let _ = db.set_session_id(task.id, &new_sid);
-                let _ = db.set_assigned_session(task.id, &new_sid);
                 let _ = db.record_session(task.id, &new_sid, "interactive");
                 if let Some(creator_sid) = session_id {
                     let _ = db.record_session(task.id, creator_sid, "creator");
@@ -430,7 +429,7 @@ fn handle_task_create(
                 }
             }
 
-            // Re-fetch to include the session_id/assigned_session updates
+            // Re-fetch to include the session_id updates
             match db.get_task(task.id) {
                 Ok(Some(updated_task)) => match serde_json::to_string_pretty(&updated_task) {
                     Ok(json) => tool_ok(tool_call_id, &json),
@@ -565,14 +564,15 @@ fn handle_task_assign(
         .get_task(id)
         .ok()
         .flatten()
-        .and_then(|t| t.assigned_session.clone());
+        .and_then(|t| t.session_id.clone());
 
     match db.assign_task(id, sid) {
         Ok(task) => {
-            // For interactive tasks, reparent child sessions from the old session
+            // For interactive tasks, claim the whole subtree and reparent sessions
             if task.state == "interactive" {
                 if let Some(ref old_sid) = old_session {
                     if old_sid != sid {
+                        // Reparent child sessions from the old session to the new one
                         let req = crate::protocol::Request::ReparentChildren {
                             old_parent_id: old_sid.clone(),
                             new_parent_id: sid.to_string(),
@@ -583,6 +583,39 @@ fn handle_task_assign(
                                 "warning: failed to reparent children from {} to {}: {}",
                                 old_sid, sid, e
                             );
+                        }
+
+                        // Update session_id on all descendant tasks and
+                        // reparent their sessions if they were parented
+                        // under the old session.
+                        if let Ok(descendants) = db.get_descendant_tasks(id) {
+                            for desc in &descendants {
+                                if let Err(e) = db.update_descendant_session(desc.id, sid) {
+                                    eprintln!(
+                                        "warning: failed to update session on descendant task {}: {}",
+                                        desc.id, e
+                                    );
+                                }
+
+                                // Reparent descendant task sessions that were
+                                // parented under the old owner.
+                                if let Some(ref desc_sid) = desc.session_id {
+                                    if desc_sid == old_sid {
+                                        let req = crate::protocol::Request::ReparentChildren {
+                                            old_parent_id: desc_sid.clone(),
+                                            new_parent_id: sid.to_string(),
+                                        };
+                                        if let Err(e) = crate::tasks_scheduler::server_request(
+                                            writer, reader, req,
+                                        ) {
+                                            eprintln!(
+                                                "warning: failed to reparent children of {} to {}: {}",
+                                                desc_sid, sid, e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1701,7 +1734,6 @@ mod tests {
         assert_eq!(task["state"], "interactive");
         // Interactive task gets a fresh session via ServerRequest
         assert_eq!(task["session_id"], "mock-s1");
-        assert_eq!(task["assigned_session"], "mock-s1");
 
         // Check message was created
         let messages = db.get_messages(task_id).unwrap();
@@ -1913,7 +1945,7 @@ mod tests {
         assert!(!result.is_error);
         let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(assigned["state"], "active");
-        assert_eq!(assigned["assigned_session"], "worker-session");
+        assert_eq!(assigned["session_id"], "worker-session");
     }
 
     #[test]
@@ -1957,7 +1989,7 @@ mod tests {
         );
         assert!(!result.is_error);
         let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(assigned["assigned_session"], "context-session");
+        assert_eq!(assigned["session_id"], "context-session");
     }
 
     #[test]
@@ -1996,7 +2028,7 @@ mod tests {
         );
         let assigned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(assigned["state"], "interactive");
-        assert_eq!(assigned["assigned_session"], "s2");
+        assert_eq!(assigned["session_id"], "s2");
     }
 
     #[test]
@@ -2473,7 +2505,6 @@ mod tests {
         assert_eq!(task["state"], "interactive");
         // session_id should be the NEW session, not the creating session
         assert_eq!(task["session_id"], "mock-s1");
-        assert_eq!(task["assigned_session"], "mock-s1");
 
         // Check task_sessions table has both creator and interactive records
         let task_id = task["id"].as_i64().unwrap();
@@ -2512,7 +2543,6 @@ mod tests {
         assert_eq!(task["state"], "interactive");
         // Session still created even without a parent session
         assert_eq!(task["session_id"], "mock-s1");
-        assert_eq!(task["assigned_session"], "mock-s1");
 
         // Only the interactive session recorded (no creator since no parent session)
         let task_id = task["id"].as_i64().unwrap();
@@ -2563,7 +2593,6 @@ mod tests {
         assert_eq!(subtask["state"], "ready");
         // Subtask should NOT have session auto-linked (it's not interactive)
         assert!(subtask["session_id"].is_null());
-        assert!(subtask["assigned_session"].is_null());
     }
 
     // ----- auto-archive on done tests -----
@@ -2929,7 +2958,9 @@ mod tests {
     fn test_review_to_active_no_session_no_panic() {
         let db = TasksDb::open_memory().unwrap();
 
-        // Task with no session_id — review -> active should succeed silently
+        // Task with no session_id — review -> active should succeed silently.
+        // assign_task now sets session_id, so we clear it afterwards to
+        // simulate a task whose session was removed.
         let task = db
             .create_task("/project", "No session review", None, None, None, false)
             .unwrap();
@@ -2943,6 +2974,8 @@ mod tests {
         )
         .unwrap();
         db.assign_task(task.id, "s1").unwrap();
+        // Clear session_id to simulate a task with no session
+        db.clear_session_id(task.id).unwrap();
         db.update_task(
             task.id,
             &TaskUpdate {
@@ -3020,6 +3053,151 @@ mod tests {
         assert!(
             !String::from_utf8_lossy(&writer).contains("queue_message"),
             "should not send QueueMessage for approved → active transition"
+        );
+    }
+
+    // ----- subtree claiming tests -----
+
+    #[test]
+    fn test_claiming_parent_updates_session_on_all_descendants() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create parent (interactive — gets mock-s1)
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Parent"}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let parent_id = parent["id"].as_i64().unwrap();
+
+        // Create subtasks
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Subtask 1", "parent_id": parent_id}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc2",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let sub1: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let sub1_id = sub1["id"].as_i64().unwrap();
+        // Give subtask a session_id (simulating dispatch)
+        db.set_session_id(sub1_id, "mock-s1").unwrap();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Subtask 2", "parent_id": parent_id}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc3",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let sub2: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let sub2_id = sub2["id"].as_i64().unwrap();
+
+        // Now reassign the parent to a new session
+        let result = handle_task_assign(
+            &db,
+            &serde_json::json!({"id": parent_id}),
+            Some("new-session"),
+            "tc4",
+            &mut writer,
+            &mut reader,
+        );
+        assert!(
+            !result.is_error,
+            "expected success: {}",
+            extract_text(&result)
+        );
+
+        // Verify subtasks got their session_id updated
+        let sub1_task = db.get_task(sub1_id).unwrap().unwrap();
+        assert_eq!(
+            sub1_task.session_id.as_deref(),
+            Some("new-session"),
+            "subtask 1 should have been claimed"
+        );
+        let sub2_task = db.get_task(sub2_id).unwrap().unwrap();
+        assert_eq!(
+            sub2_task.session_id.as_deref(),
+            Some("new-session"),
+            "subtask 2 should have been claimed"
+        );
+    }
+
+    #[test]
+    fn test_claiming_does_not_affect_non_descendant_sessions() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create two independent tasks
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Task A"}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let task_a: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_a_id = task_a["id"].as_i64().unwrap();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Task B"}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc2",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let task_b: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_b_id = task_b["id"].as_i64().unwrap();
+
+        // Record task B's original session
+        let task_b_before = db.get_task(task_b_id).unwrap().unwrap();
+        let task_b_old_session = task_b_before.session_id.clone();
+
+        // Reassign task A to a new session
+        let result = handle_task_assign(
+            &db,
+            &serde_json::json!({"id": task_a_id}),
+            Some("new-session"),
+            "tc3",
+            &mut writer,
+            &mut reader,
+        );
+        assert!(!result.is_error);
+
+        // Task B's session should be unchanged
+        let task_b_after = db.get_task(task_b_id).unwrap().unwrap();
+        assert_eq!(
+            task_b_after.session_id, task_b_old_session,
+            "unrelated task should not be affected by claiming task A"
         );
     }
 }

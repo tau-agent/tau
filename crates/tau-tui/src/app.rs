@@ -1362,7 +1362,7 @@ impl App {
             ),
         });
         for (depth, t) in &tree {
-            let session = t.assigned_session.as_deref().unwrap_or("-");
+            let session = t.session_id.as_deref().unwrap_or("-");
             let indent = "  ".repeat(*depth);
             let text = format!(
                 "  {:>4}  {:<12}  {:>8}  {:<8}  {}{}",
@@ -1471,7 +1471,7 @@ impl App {
             ),
         });
         for t in &tasks {
-            let session = t.assigned_session.as_deref().unwrap_or("-");
+            let session = t.session_id.as_deref().unwrap_or("-");
             let text = format!(
                 "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
                 t.id, t.state, t.priority, session, t.title
