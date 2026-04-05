@@ -488,7 +488,7 @@ fn handle_task_create(
 /// Returns the new session ID on success, or None if session creation fails
 /// (the task is still created — session linking is best-effort).
 fn create_interactive_session(
-    _db: &TasksDb,
+    db: &TasksDb,
     task: &crate::tasks_db::Task,
     project: &str,
     parent_session_id: Option<&str>,
@@ -518,8 +518,17 @@ fn create_interactive_session(
         Ok(Response::SessionCreated { session_id }) => session_id,
         Ok(Response::Error { message }) => {
             eprintln!(
-                "tasks: failed to create session for task {}: {}",
+                "tasks: failed to create interactive session for task {}: {}",
                 task.id, message
+            );
+            let _ = db.add_message(
+                task.id,
+                &format!(
+                    "⚠️ Failed to create interactive session: {}. \
+                     Task is in interactive state but has no session.",
+                    message
+                ),
+                Some("system"),
             );
             return None;
         }
@@ -528,10 +537,25 @@ fn create_interactive_session(
                 "tasks: unexpected response creating session for task {}",
                 task.id
             );
+            let _ = db.add_message(
+                task.id,
+                "⚠️ Failed to create interactive session: unexpected server response. \
+                 Task is in interactive state but has no session.",
+                Some("system"),
+            );
             return None;
         }
         Err(e) => {
             eprintln!("tasks: error creating session for task {}: {}", task.id, e);
+            let _ = db.add_message(
+                task.id,
+                &format!(
+                    "⚠️ Failed to create interactive session: {}. \
+                     Task is in interactive state but has no session.",
+                    e
+                ),
+                Some("system"),
+            );
             return None;
         }
     };
@@ -1780,15 +1804,48 @@ fn run_schedule_pass(
                 // Pass the triggering session_id so dispatch() can inherit its model.
                 if let Err(e) = tasks_scheduler::dispatch(db, st.id, session_id, writer, reader) {
                     eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
-                    let _ = db.add_message(
-                        st.id,
-                        &format!(
-                            "⚠️ Auto-dispatch of session failed: {}. \
-                             Task was scheduled but no session was created.",
-                            e
-                        ),
-                        Some("system"),
+
+                    // For non-planning tasks, schedule() already transitioned
+                    // to active via prepare_task().  Revert to ready so the
+                    // scheduler can retry on the next pass.
+                    let is_planning = st.branch.is_empty();
+                    if !is_planning {
+                        let _ = db.update_task(
+                            st.id,
+                            &TaskUpdate {
+                                state: Some("ready".to_string()),
+                                ..Default::default()
+                            },
+                            None,
+                        );
+                    }
+
+                    let revert_note = if is_planning {
+                        "Task remains in planning state and will be retried."
+                    } else {
+                        "Task has been reverted to ready state and will be retried."
+                    };
+                    let warn_msg = format!(
+                        "⚠️ Auto-dispatch of session failed for task {} ({}): {}. {}",
+                        st.id, st.title, e, revert_note
                     );
+                    let _ = db.add_message(st.id, &warn_msg, Some("system"));
+
+                    // Notify the triggering session so the user/agent that
+                    // created the task sees the failure inline.
+                    if let Some(sid) = session_id {
+                        let _ = tasks_scheduler::server_request(
+                            writer,
+                            reader,
+                            crate::protocol::Request::QueueMessage {
+                                target_session_id: sid.to_string(),
+                                content: warn_msg,
+                                sender_info: "task-scheduler".to_string(),
+                                await_reply: false,
+                                reply_to: None,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -1822,6 +1879,8 @@ mod tests {
             read_buf: Vec::new(),
             session_counter: 0,
             archived_sessions: std::collections::HashSet::new(),
+            create_session_error: None,
+            written_lines: Vec::new(),
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -1842,6 +1901,25 @@ mod tests {
             read_buf: Vec::new(),
             session_counter: 100,
             archived_sessions: archived,
+            create_session_error: None,
+            written_lines: Vec::new(),
+        }));
+        let writer = MockWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockReader { shared };
+        (writer, BufReader::new(reader))
+    }
+
+    /// Create mock IO where CreateSession requests fail with the given error.
+    fn mock_io_failing_session(error: &str) -> (MockWriter, BufReader<MockReader>) {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(MockShared {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            session_counter: 0,
+            archived_sessions: std::collections::HashSet::new(),
+            create_session_error: Some(error.to_string()),
+            written_lines: Vec::new(),
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -1856,6 +1934,10 @@ mod tests {
         session_counter: u32,
         /// Sessions that should be reported as archived by GetSessionInfo.
         archived_sessions: std::collections::HashSet<String>,
+        /// If set, CreateSession returns this error instead of succeeding.
+        create_session_error: Option<String>,
+        /// All raw lines written by the plugin (captured before processing).
+        written_lines: Vec<String>,
     }
 
     impl MockShared {
@@ -1866,6 +1948,7 @@ mod tests {
                 if line.trim().is_empty() {
                     continue;
                 }
+                self.written_lines.push(line.to_string());
                 if let Ok(PluginMessage::ServerRequest {
                     request_id,
                     ref request,
@@ -1873,9 +1956,15 @@ mod tests {
                 {
                     let response = match request {
                         crate::protocol::Request::CreateSession { .. } => {
-                            self.session_counter += 1;
-                            crate::protocol::Response::SessionCreated {
-                                session_id: format!("mock-s{}", self.session_counter),
+                            if let Some(ref err) = self.create_session_error {
+                                crate::protocol::Response::Error {
+                                    message: err.clone(),
+                                }
+                            } else {
+                                self.session_counter += 1;
+                                crate::protocol::Response::SessionCreated {
+                                    session_id: format!("mock-s{}", self.session_counter),
+                                }
                             }
                         }
                         crate::protocol::Request::GetSessionInfo { session_id } => {
@@ -5310,6 +5399,139 @@ mod tests {
         assert_eq!(
             worker_count_after, worker_count_before,
             "dispatch created an extra worker session!"
+        );
+    }
+
+    // ----- dispatch failure tests -----
+
+    #[test]
+    fn test_schedule_pass_dispatch_failure_notifies_and_reverts() {
+        // When run_schedule_pass fails to create a session (e.g. child_budget
+        // exceeded), it should:
+        //   1. Add a warning message to the task
+        //   2. Send a QueueMessage to the triggering session
+        //   3. Revert planning tasks back to planning state (no state change needed)
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 16 active children, budget is 16");
+
+        // Create a subtask in planning state (no git/worktree needed).
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Budget fail task",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+
+        run_schedule_pass(
+            &db,
+            "/project",
+            Some("trigger-session"),
+            &mut writer,
+            &mut reader,
+        );
+
+        // Task should still be in planning state (planning tasks don't get
+        // transitioned to active by schedule()).
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(updated.state, "planning");
+
+        // A warning message should be recorded on the task.
+        let messages = db.get_messages(task.id).unwrap();
+        let warn = messages
+            .iter()
+            .find(|m| m.content.contains("Auto-dispatch of session failed"));
+        assert!(
+            warn.is_some(),
+            "expected a warning message on the task, got: {:?}",
+            messages
+        );
+        assert!(
+            warn.unwrap().content.contains("budget exceeded"),
+            "warning should mention budget exceeded"
+        );
+
+        // A QueueMessage should have been sent to trigger-session.
+        // Flush unprocessed writes and inspect written_lines.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let remaining = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&remaining);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let all_written = writer.shared.lock().unwrap().written_lines.join("\n");
+        assert!(
+            all_written.contains("queue_message") && all_written.contains("trigger-session"),
+            "expected QueueMessage to trigger-session in:\n{}",
+            all_written
+        );
+    }
+
+    #[test]
+    fn test_dispatch_failure_reverts_active_to_ready() {
+        // When dispatch fails for a non-planning task (already transitioned
+        // to active by prepare_task), run_schedule_pass should revert it
+        // to ready.  This test verifies the active → ready transition works.
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a subtask and manually advance to active (simulating
+        // what prepare_task does during schedule()).
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Revert test",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                true, // skip_planning → starts in ready
+            )
+            .unwrap();
+        assert_eq!(task.state, "ready");
+
+        // Simulate prepare_task: transition to active.
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("active".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let active_task = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(active_task.state, "active");
+
+        // Now revert active → ready (the transition this fix enables).
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let reverted = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            reverted.state, "ready",
+            "active → ready transition should succeed for dispatch-failure recovery"
         );
     }
 }

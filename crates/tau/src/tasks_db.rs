@@ -149,6 +149,7 @@ pub fn validate_state_transition(from: &str, to: &str) -> bool {
             | ("approved", "merging")
             | ("merging", "done")
             // Backward transitions (error recovery)
+            | ("active", "ready")
             | ("review", "active")
             | ("approved", "active")
             | ("approved", "ready")
@@ -1754,6 +1755,7 @@ mod tests {
         assert!(validate_state_transition("refining", "ready"));
 
         // Backward transitions (error recovery)
+        assert!(validate_state_transition("active", "ready"));
         assert!(validate_state_transition("review", "active"));
         assert!(validate_state_transition("approved", "active"));
         assert!(validate_state_transition("approved", "ready"));
