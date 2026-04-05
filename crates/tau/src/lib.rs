@@ -13,6 +13,7 @@ pub mod replay;
 pub mod server;
 pub mod system_prompt;
 pub mod tasks;
+pub mod tasks_config;
 pub mod tasks_db;
 pub mod tasks_git;
 pub mod tasks_merge;
