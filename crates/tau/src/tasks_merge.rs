@@ -390,8 +390,19 @@ pub fn merge_task(
     )?;
     log.push_str(&output);
 
-    // 7c. Archive the task's working session (best-effort)
-    if let Some(ref sid) = task.session_id {
+    // 7c. Archive all task sessions: worker, reviewer, refiner, etc. (best-effort)
+    let mut archived = std::collections::HashSet::new();
+    if let Ok(sessions) = db.get_sessions(task_id) {
+        for ts in &sessions {
+            archive_session(writer, reader, &ts.session_id);
+            log.push_str(&format!("Archived {} session {}\n", ts.role, ts.session_id));
+            archived.insert(ts.session_id.clone());
+        }
+    }
+    // Also archive session_id if it wasn't tracked in task_sessions
+    if let Some(ref sid) = task.session_id
+        && !archived.contains(sid)
+    {
         archive_session(writer, reader, sid);
         log.push_str(&format!("Archived task session {}\n", sid));
     }
