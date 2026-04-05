@@ -2713,7 +2713,7 @@ mod tests {
         let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let parent_id = parent["id"].as_i64().unwrap();
 
-        // Create subtask (defaults to ready, not interactive)
+        // Create subtask (defaults to planning, not interactive)
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
@@ -2928,7 +2928,7 @@ mod tests {
         let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let parent_id = parent["id"].as_i64().unwrap();
 
-        // Create subtask — defaults to ready, should emit ScheduleNeeded
+        // Create subtask — defaults to planning (skip_planning=false), should emit ScheduleNeeded
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),

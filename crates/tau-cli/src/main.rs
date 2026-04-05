@@ -112,6 +112,9 @@ enum TaskAction {
         /// Skip review step
         #[arg(long)]
         skip_review: bool,
+        /// Skip planning step (subtask starts in ready instead of planning)
+        #[arg(long)]
+        skip_planning: bool,
         /// Priority (higher = more important)
         #[arg(long, default_value = "0")]
         priority: i64,
@@ -1752,6 +1755,7 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
                 .ok_or_else(|| tau::Error::Io(format!("task {} not found", id)))?;
 
             let skip = if task.skip_review { "yes" } else { "no" };
+            let skip_plan = if task.skip_planning { "yes" } else { "no" };
             let branch = task.branch.as_deref().unwrap_or("none");
             let parent = task
                 .parent_id
@@ -1790,8 +1794,8 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
 
             println!("Task #{}: {}", task.id, task.title);
             println!(
-                "State: {} | Priority: {} | Skip review: {}",
-                task.state, task.priority, skip
+                "State: {} | Priority: {} | Skip review: {} | Skip planning: {}",
+                task.state, task.priority, skip, skip_plan
             );
             println!("Branch: {} | Parent: {}", branch, parent);
             println!("Tags: {}", tags);
@@ -1845,6 +1849,7 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
             title,
             parent,
             skip_review,
+            skip_planning,
             priority,
         } => {
             let project = project_key();
@@ -1855,7 +1860,7 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
                 parent,
                 None,
                 skip_review,
-                false,
+                skip_planning,
             )?;
             println!("created task #{}: {}", task.id, task.title);
         }

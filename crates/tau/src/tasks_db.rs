@@ -379,6 +379,7 @@ impl TasksDb {
     /// - Tasks with a `parent_id` (subtasks) default to `planning` state
     ///   (or `ready` if `skip_planning` is true)
     /// - Top-level tasks default to `interactive`
+    #[allow(clippy::too_many_arguments)]
     pub fn create_task(
         &self,
         project: &str,
@@ -2445,6 +2446,39 @@ mod tests {
     }
 
     #[test]
+    fn test_top_level_task_ignores_skip_planning() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Top-level task with skip_planning=true should still start in 'interactive'
+        let task = db
+            .create_task("/project", "Top level", None, None, None, false, true)
+            .unwrap();
+        assert_eq!(task.state, "interactive");
+        assert!(task.skip_planning);
+    }
+
+    #[test]
+    fn test_skip_planning_roundtrip() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Test", None, None, None, false, true)
+            .unwrap();
+        assert!(task.skip_planning);
+
+        let updated = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    skip_planning: Some(false),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(!updated.skip_planning);
+    }
+
+    #[test]
     fn test_active_to_approved_blocked_without_skip_review() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
@@ -3809,26 +3843,5 @@ mod tests {
             .unwrap();
             assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "failed");
         }
-    }
-
-    #[test]
-    fn test_skip_planning_roundtrip() {
-        let db = TasksDb::open_memory().unwrap();
-        let task = db
-            .create_task("/project", "Test", None, None, None, false, true)
-            .unwrap();
-        assert!(task.skip_planning);
-
-        let updated = db
-            .update_task(
-                task.id,
-                &TaskUpdate {
-                    skip_planning: Some(false),
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap();
-        assert!(!updated.skip_planning);
     }
 }
