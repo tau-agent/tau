@@ -94,14 +94,28 @@ pub struct ScheduledTask {
     pub worktree_path: String,
 }
 
+/// Maximum number of tasks that can be in-flight (planning, refining, active,
+/// review, merging) simultaneously per project.
+const MAX_CONCURRENT_TASKS: usize = 8;
+
 /// Run a scheduling pass: find ready/planning tasks, pick a non-conflicting
 /// batch, create branches and worktrees (for ready tasks), update task state.
 ///
 /// Ready tasks get branches/worktrees and transition to `active`.
 /// Planning tasks are dispatched without worktrees (read-only sessions).
 ///
+/// Respects `MAX_CONCURRENT_TASKS` — will not schedule more tasks than the
+/// remaining capacity allows.
+///
 /// Returns the list of tasks that were prepared for dispatch.
 pub fn schedule(db: &TasksDb, project: &str) -> crate::Result<Vec<ScheduledTask>> {
+    // Check how many tasks are already in-flight.
+    let inflight = db.count_inflight_tasks(project)?;
+    if inflight >= MAX_CONCURRENT_TASKS {
+        return Ok(Vec::new());
+    }
+    let remaining_capacity = MAX_CONCURRENT_TASKS - inflight;
+
     let schedulable_tasks = db.get_schedulable_tasks(project)?;
 
     if schedulable_tasks.is_empty() {
@@ -154,6 +168,9 @@ pub fn schedule(db: &TasksDb, project: &str) -> crate::Result<Vec<ScheduledTask>
             }
         }
     }
+
+    // Enforce the concurrent tasks limit.
+    scheduled.truncate(remaining_capacity);
 
     Ok(scheduled)
 }
@@ -313,7 +330,7 @@ pub fn dispatch(
         system_prompt: None,
         cwd,
         parent_id: effective_parent_session,
-        child_budget: 4,
+        child_budget: 16,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
@@ -414,7 +431,7 @@ fn dispatch_planning(
         system_prompt: None,
         cwd: Some(task.project.clone()),
         parent_id: effective_parent_session,
-        child_budget: 4,
+        child_budget: 16,
         tagline: Some(format!("Planning task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
@@ -546,7 +563,7 @@ pub fn dispatch_review(
         system_prompt: None,
         cwd,
         parent_id: effective_parent_session,
-        child_budget: 4,
+        child_budget: 16,
         tagline: Some(format!("Review task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
@@ -678,7 +695,7 @@ pub fn dispatch_refining(
         system_prompt: None,
         cwd: Some(task.project.clone()),
         parent_id: effective_parent_session,
-        child_budget: 4,
+        child_budget: 16,
         tagline: Some(format!("Refining task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,

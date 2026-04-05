@@ -490,7 +490,7 @@ fn create_interactive_session(
         system_prompt: None,
         cwd: Some(project.to_string()),
         parent_id: parent_session_id.map(String::from),
-        child_budget: 4,
+        child_budget: 16,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
@@ -874,6 +874,15 @@ fn handle_task_update(
                             "tasks: failed to auto-dispatch review for task {}: {}",
                             task.id, e
                         );
+                        let _ = db.add_message(
+                            task.id,
+                            &format!(
+                                "⚠️ Auto-dispatch of review session failed: {}. \
+                                 Task is in review state but has no reviewer session.",
+                                e
+                            ),
+                            Some("system"),
+                        );
                     }
                 }
             }
@@ -895,6 +904,15 @@ fn handle_task_update(
                         eprintln!(
                             "tasks: failed to auto-dispatch refining for task {}: {}",
                             task.id, e
+                        );
+                        let _ = db.add_message(
+                            task.id,
+                            &format!(
+                                "⚠️ Auto-dispatch of refining session failed: {}. \
+                                 Task is in refining state but has no refiner session.",
+                                e
+                            ),
+                            Some("system"),
                         );
                     }
                 }
@@ -1663,6 +1681,15 @@ fn run_schedule_pass(
                 // Pass the triggering session_id so dispatch() can inherit its model.
                 if let Err(e) = tasks_scheduler::dispatch(db, st.id, session_id, writer, reader) {
                     eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
+                    let _ = db.add_message(
+                        st.id,
+                        &format!(
+                            "⚠️ Auto-dispatch of session failed: {}. \
+                             Task was scheduled but no session was created.",
+                            e
+                        ),
+                        Some("system"),
+                    );
                 }
             }
         }
@@ -1741,7 +1768,7 @@ mod tests {
                                     last_activity: 0,
                                     parent_id: None,
                                     child_count: 0,
-                                    child_budget: 4,
+                                    child_budget: 16,
                                     tagline: None,
                                     state: "idle".to_string(),
                                     context_pct: None,

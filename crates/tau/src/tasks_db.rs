@@ -1021,6 +1021,22 @@ impl TasksDb {
         Ok(tasks)
     }
 
+    /// Count tasks in in-flight states (planning, refining, active, review, merging).
+    /// Used by the scheduler to enforce the max concurrent tasks limit.
+    pub fn count_inflight_tasks(&self, project: &str) -> crate::Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks
+                 WHERE project = ?1
+                   AND state IN ('planning', 'refining', 'active', 'review', 'merging')",
+                params![project],
+                |row| row.get(0),
+            )
+            .map_err(|e| crate::Error::Io(format!("count_inflight_tasks: {}", e)))?;
+        Ok(count as usize)
+    }
+
     /// Check if `from` transitively depends on `to` via `depends_on` relations.
     /// Uses BFS from `from` following depends_on edges. Returns true if `to` is
     /// reachable.

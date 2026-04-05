@@ -560,7 +560,7 @@ async fn handle_session_tool(
             let child_budget = args
                 .get("child_budget")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(4) as u32;
+                .unwrap_or(16) as u32;
             let tagline = args
                 .get("tagline")
                 .and_then(|v| v.as_str())

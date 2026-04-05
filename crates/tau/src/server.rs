@@ -3364,18 +3364,16 @@ fn create_session_impl(
     use crate::protocol::Response;
     let st = lock_state(state);
 
-    // Budget check
+    // Budget check — flat cost of 1 per direct child (non-recursive).
     if let Some(pid) = parent_id {
         match st.db.get_session(pid) {
             Ok(Some(parent)) => {
-                let used = st.db.budget_used(&parent.id).unwrap_or(0);
-                let cost = 1 + child_budget;
-                if used + cost > parent.child_budget {
+                let used = st.db.child_count(&parent.id).unwrap_or(0) as u32;
+                if used >= parent.child_budget {
                     return Response::Error {
                         message: format!(
-                            "child budget exceeded: need {} but only {} available",
-                            cost,
-                            parent.child_budget.saturating_sub(used)
+                            "child budget exceeded: {} active children, budget is {}",
+                            used, parent.child_budget
                         ),
                     };
                 }
