@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 
 use crate::plugin::{PluginMessage, PluginRequest};
+use crate::tasks_config;
 use crate::tasks_db::{Task, TaskUpdate, TasksDb};
 use crate::tasks_git;
 
@@ -454,7 +455,8 @@ fn dispatch_planning(
     };
 
     // Load project-specific planning instructions
-    let project_instructions = load_project_instructions(&task.project, "planning");
+    let project_instructions =
+        tasks_config::load_project_instructions(&task.project, "planning").unwrap_or_default();
 
     // Send planning-specific initial message.
     let chat_msg = build_planning_message(task, &project_instructions);
@@ -586,7 +588,8 @@ pub fn dispatch_review(
     };
 
     // Load project-specific review instructions
-    let project_instructions = load_project_instructions(&task.project, "review");
+    let project_instructions =
+        tasks_config::load_project_instructions(&task.project, "review").unwrap_or_default();
 
     let merge_target = db
         .get_merge_target(task.id)
@@ -718,7 +721,8 @@ pub fn dispatch_refining(
     };
 
     // Load project-specific refining instructions
-    let project_instructions = load_project_instructions(&task.project, "refining");
+    let project_instructions =
+        tasks_config::load_project_instructions(&task.project, "refining").unwrap_or_default();
 
     let chat_msg = build_refining_message(task, &project_instructions);
     let chat_req = crate::protocol::Request::Chat {
@@ -790,43 +794,6 @@ fn build_refining_message(task: &Task, project_instructions: &str) -> String {
     }
 
     msg
-}
-
-// ---------------------------------------------------------------------------
-// Project-specific instructions
-// ---------------------------------------------------------------------------
-
-/// Load project-specific instructions for a given phase from
-/// `.tau/instructions.toml`.
-///
-/// The file format is:
-/// ```toml
-/// [planning]
-/// instructions = "..."
-///
-/// [refining]
-/// instructions = "..."
-///
-/// [review]
-/// instructions = "..."
-/// ```
-pub fn load_project_instructions(project_dir: &str, phase: &str) -> String {
-    let path = std::path::Path::new(project_dir)
-        .join(".tau")
-        .join("instructions.toml");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
-    match toml::from_str::<toml::Value>(&content) {
-        Ok(val) => val
-            .get(phase)
-            .and_then(|v| v.get("instructions"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        Err(_) => String::new(),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,58 +1909,6 @@ mod tests {
         let msg = build_refining_message(&task, "Ensure backward compat.");
         assert!(msg.contains("Ensure backward compat."));
         assert!(msg.contains("Project-specific refining instructions"));
-    }
-
-    #[test]
-    fn test_load_project_instructions_missing_file() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let result = load_project_instructions(dir.path().to_str().unwrap(), "review");
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_load_project_instructions_valid() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let tau_dir = dir.path().join(".tau");
-        std::fs::create_dir_all(&tau_dir).unwrap();
-        std::fs::write(
-            tau_dir.join("instructions.toml"),
-            r#"
-[planning]
-instructions = "Plan carefully."
-
-[refining]
-instructions = "Check for edge cases."
-
-[review]
-instructions = "Run the full test suite."
-"#,
-        )
-        .unwrap();
-
-        let planning = load_project_instructions(dir.path().to_str().unwrap(), "planning");
-        assert_eq!(planning, "Plan carefully.");
-
-        let refining = load_project_instructions(dir.path().to_str().unwrap(), "refining");
-        assert_eq!(refining, "Check for edge cases.");
-
-        let review = load_project_instructions(dir.path().to_str().unwrap(), "review");
-        assert_eq!(review, "Run the full test suite.");
-    }
-
-    #[test]
-    fn test_load_project_instructions_missing_section() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let tau_dir = dir.path().join(".tau");
-        std::fs::create_dir_all(&tau_dir).unwrap();
-        std::fs::write(
-            tau_dir.join("instructions.toml"),
-            "[planning]\ninstructions = \"Only planning\"\n",
-        )
-        .unwrap();
-
-        let review = load_project_instructions(dir.path().to_str().unwrap(), "review");
-        assert_eq!(review, "");
     }
 
     #[test]

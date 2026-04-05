@@ -1,7 +1,7 @@
 //! Project-specific instruction injection for task lifecycle phases.
 //!
 //! Loads custom instructions from `{project_root}/.tau/instructions.toml`
-//! and injects them into refining and review session prompts.
+//! and injects them into planning, refining, and review session prompts.
 //!
 //! ## Config format
 //!
@@ -34,6 +34,8 @@ struct InstructionsConfig {
     #[serde(default)]
     common: Section,
     #[serde(default)]
+    planning: Section,
+    #[serde(default)]
     refining: Section,
     #[serde(default)]
     review: Section,
@@ -57,8 +59,8 @@ struct Section {
 /// `[{phase}].instructions`, separated by a blank line.  Returns `None` if
 /// the file doesn't exist or has no instructions for the requested phase.
 ///
-/// `phase` should be `"refining"` or `"review"`.  Any other value is
-/// accepted but will only match the `[common]` section.
+/// `phase` should be `"planning"`, `"refining"`, or `"review"`.  Any other
+/// value is accepted but will only match the `[common]` section.
 pub fn load_project_instructions(project: &str, phase: &str) -> Option<String> {
     let path = std::path::Path::new(project)
         .join(".tau")
@@ -76,6 +78,7 @@ pub fn load_project_instructions(project: &str, phase: &str) -> Option<String> {
 
     let common = config.common.instructions.as_deref().map(str::trim);
     let phase_section = match phase {
+        "planning" => &config.planning,
         "refining" => &config.refining,
         "review" => &config.review,
         _ => &Section::default(),

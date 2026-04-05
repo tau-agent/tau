@@ -150,17 +150,6 @@ pub fn task_worktree_path(repo_root: &str, task_id: i64) -> crate::Result<String
     Ok(parent.join(worktree_dir).to_string_lossy().into_owned())
 }
 
-/// Check whether a branch is rebased on main (i.e., main is an ancestor of the branch).
-pub fn is_rebased_on_main(worktree_path: &str, branch: &str) -> crate::Result<bool> {
-    let output = Command::new("git")
-        .args(["merge-base", "--is-ancestor", "main", branch])
-        .current_dir(worktree_path)
-        .output()
-        .map_err(|e| crate::Error::Io(format!("git merge-base --is-ancestor: {}", e)))?;
-
-    Ok(output.status.success())
-}
-
 /// Abort a partial rebase if one is in progress in the given worktree.
 ///
 /// Uses `git rev-parse --git-dir` to find the actual git directory (which differs
@@ -435,42 +424,6 @@ mod tests {
 
         let result = delete_branch(path, "nonexistent");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_is_rebased_on_main_true() {
-        let dir = init_test_repo();
-        let path = dir.path().to_str().unwrap();
-
-        create_branch(path, "feature", "main").unwrap();
-        assert!(is_rebased_on_main(path, "feature").unwrap());
-    }
-
-    #[test]
-    fn test_is_rebased_on_main_false() {
-        let dir = init_test_repo();
-        let path = dir.path().to_str().unwrap();
-
-        // Create branch from current main
-        create_branch(path, "feature", "main").unwrap();
-
-        // Make a new commit on main so feature is behind
-        let file = dir.path().join("new_file.txt");
-        std::fs::write(&file, "new content\n").unwrap();
-
-        Command::new("git")
-            .args(["add", "."])
-            .current_dir(path)
-            .output()
-            .expect("git add");
-
-        Command::new("git")
-            .args(["commit", "-m", "new commit on main"])
-            .current_dir(path)
-            .output()
-            .expect("git commit");
-
-        assert!(!is_rebased_on_main(path, "feature").unwrap());
     }
 
     #[test]
