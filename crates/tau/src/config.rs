@@ -71,16 +71,7 @@ impl Default for ModelCost {
 // ---------------------------------------------------------------------------
 
 pub fn config_path() -> PathBuf {
-    if let Ok(config) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(config).join("tau").join("providers.toml")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".config")
-            .join("tau")
-            .join("providers.toml")
-    } else {
-        PathBuf::from("/tmp").join("tau-providers.toml")
-    }
+    crate::paths::config_dir().join("providers.toml")
 }
 
 pub fn load_config() -> crate::Result<Config> {

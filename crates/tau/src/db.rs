@@ -10,6 +10,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::types::{Message, Model, UserMessage};
 
+/// Convert a rusqlite error into `crate::Error::Io` with a contextual prefix.
+fn db_err(ctx: &str) -> impl FnOnce(rusqlite::Error) -> crate::Error + '_ {
+    move |e| crate::Error::Io(format!("{}: {}", ctx, e))
+}
+
 /// Lightweight stats computed via SQL aggregates (no full JSON deserialisation).
 #[derive(Debug, Clone, Default)]
 pub struct DbSessionStats {
@@ -51,6 +56,33 @@ pub struct StoredSession {
     pub notify_parent: bool,
 }
 
+/// SELECT column list shared across all queries that return `StoredSession` rows.
+const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent";
+
+/// Map a `rusqlite::Row` (selected with [`SESSION_COLUMNS`]) into a [`StoredSession`].
+fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<StoredSession> {
+    let model_json: String = row.get(1)?;
+    let model: Model = serde_json::from_str(&model_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(StoredSession {
+        id: row.get(0)?,
+        model,
+        system_prompt: row.get(2)?,
+        cwd: row.get(3)?,
+        is_subscription: row.get::<_, i32>(4)? != 0,
+        created_at: row.get(5)?,
+        parent_id: row.get(6)?,
+        child_budget: row.get::<_, i32>(7)? as u32,
+        tagline: row.get(8)?,
+        archived: row.get::<_, i32>(9)? != 0,
+        last_exit_status: row.get(10)?,
+        last_phase: row.get(11)?,
+        auto_archive: row.get::<_, i32>(12)? != 0,
+        notify_parent: row.get::<_, i32>(13)? != 0,
+    })
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -68,11 +100,11 @@ impl Db {
             std::fs::create_dir_all(parent)
                 .map_err(|e| crate::Error::Io(format!("mkdir {}: {}", parent.display(), e)))?;
         }
-        let conn = Connection::open(path)
-            .map_err(|e| crate::Error::Io(format!("open db {}: {}", path.display(), e)))?;
+        let conn =
+            Connection::open(path).map_err(db_err(&format!("open db {}", path.display())))?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| crate::Error::Io(format!("pragma: {}", e)))?;
+            .map_err(db_err("pragma"))?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS sessions (
@@ -103,7 +135,7 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_queued_target ON queued_messages(target_session_id);",
         )
-        .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
+        .map_err(db_err("create tables"))?;
 
         // Migrations for existing DBs (ALTERs are no-ops if column already exists)
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN cwd TEXT;");
@@ -147,11 +179,10 @@ impl Db {
     #[cfg(test)]
     pub fn open_memory() -> crate::Result<Self> {
         let path = PathBuf::from(":memory:");
-        let conn = Connection::open_in_memory()
-            .map_err(|e| crate::Error::Io(format!("open in-memory db: {}", e)))?;
+        let conn = Connection::open_in_memory().map_err(db_err("open in-memory db"))?;
 
         conn.execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(|e| crate::Error::Io(format!("pragma: {}", e)))?;
+            .map_err(db_err("pragma"))?;
 
         conn.execute_batch(
             "CREATE TABLE sessions (
@@ -187,7 +218,7 @@ impl Db {
             );
             CREATE INDEX idx_queued_target ON queued_messages(target_session_id);",
         )
-        .map_err(|e| crate::Error::Io(format!("create tables: {}", e)))?;
+        .map_err(db_err("create tables"))?;
 
         let _ = path; // suppress unused
         Ok(Self { conn })
@@ -220,46 +251,17 @@ impl Db {
                     session.notify_parent as i32,
                 ],
             )
-            .map_err(|e| crate::Error::Io(format!("insert session: {}", e)))?;
+            .map_err(db_err("insert session"))?;
         Ok(())
     }
 
     /// Load a session's metadata (without messages).
     pub fn get_session(&self, id: &str) -> crate::Result<Option<StoredSession>> {
+        let sql = format!("SELECT {} FROM sessions WHERE id = ?1", SESSION_COLUMNS);
         self.conn
-            .query_row(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent
-                 FROM sessions WHERE id = ?1",
-                params![id],
-                |row| {
-                    let model_json: String = row.get(1)?;
-                    let model: Model = serde_json::from_str(&model_json).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            1,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                    Ok(StoredSession {
-                        id: row.get(0)?,
-                        model,
-                        system_prompt: row.get(2)?,
-                        cwd: row.get(3)?,
-                        is_subscription: row.get::<_, i32>(4)? != 0,
-                        created_at: row.get(5)?,
-                        parent_id: row.get(6)?,
-                        child_budget: row.get::<_, i32>(7)? as u32,
-                        tagline: row.get(8)?,
-                        archived: row.get::<_, i32>(9)? != 0,
-                        last_exit_status: row.get(10)?,
-                        last_phase: row.get(11)?,
-                        auto_archive: row.get::<_, i32>(12)? != 0,
-                        notify_parent: row.get::<_, i32>(13)? != 0,
-                    })
-                },
-            )
+            .query_row(&sql, params![id], row_to_session)
             .optional()
-            .map_err(|e| crate::Error::Io(format!("get session: {}", e)))
+            .map_err(db_err("get session"))
     }
 
     /// List all sessions (metadata only, no messages).
@@ -267,49 +269,25 @@ impl Db {
     /// If `include_archived` is false, archived sessions are excluded.
     pub fn list_sessions(&self, include_archived: bool) -> crate::Result<Vec<StoredSession>> {
         let sql = if include_archived {
-            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent
-             FROM sessions ORDER BY created_at"
+            format!(
+                "SELECT {} FROM sessions ORDER BY created_at",
+                SESSION_COLUMNS
+            )
         } else {
-            "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent
-             FROM sessions WHERE archived = 0 ORDER BY created_at"
+            format!(
+                "SELECT {} FROM sessions WHERE archived = 0 ORDER BY created_at",
+                SESSION_COLUMNS
+            )
         };
-        let mut stmt = self
-            .conn
-            .prepare(sql)
-            .map_err(|e| crate::Error::Io(format!("prepare list: {}", e)))?;
+        let mut stmt = self.conn.prepare(&sql).map_err(db_err("prepare list"))?;
 
         let rows = stmt
-            .query_map([], |row| {
-                let model_json: String = row.get(1)?;
-                let model: Model = serde_json::from_str(&model_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-                Ok(StoredSession {
-                    id: row.get(0)?,
-                    model,
-                    system_prompt: row.get(2)?,
-                    cwd: row.get(3)?,
-                    is_subscription: row.get::<_, i32>(4)? != 0,
-                    created_at: row.get(5)?,
-                    parent_id: row.get(6)?,
-                    child_budget: row.get::<_, i32>(7)? as u32,
-                    tagline: row.get(8)?,
-                    archived: row.get::<_, i32>(9)? != 0,
-                    last_exit_status: row.get(10)?,
-                    last_phase: row.get(11)?,
-                    auto_archive: row.get::<_, i32>(12)? != 0,
-                    notify_parent: row.get::<_, i32>(13)? != 0,
-                })
-            })
-            .map_err(|e| crate::Error::Io(format!("list sessions: {}", e)))?;
+            .query_map([], row_to_session)
+            .map_err(db_err("list sessions"))?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            sessions.push(row.map_err(|e| crate::Error::Io(format!("read session row: {}", e)))?);
+            sessions.push(row.map_err(db_err("read session row"))?);
         }
         Ok(sessions)
     }
@@ -323,7 +301,7 @@ impl Db {
                 [session_id],
                 |row| row.get::<_, Option<i64>>(0),
             )
-            .map_err(|e| crate::Error::Io(format!("last_message_time: {}", e)))?;
+            .map_err(db_err("last_message_time"))?;
         Ok(result)
     }
 
@@ -331,7 +309,28 @@ impl Db {
     pub fn delete_session(&self, id: &str) -> crate::Result<()> {
         self.conn
             .execute("DELETE FROM sessions WHERE id = ?1", params![id])
-            .map_err(|e| crate::Error::Io(format!("delete session: {}", e)))?;
+            .map_err(db_err("delete session"))?;
+        Ok(())
+    }
+
+    /// Apply a SQL statement to every session in the subtree rooted at `id`
+    /// (inclusive), wrapped in a single transaction.
+    ///
+    /// `sql` must contain exactly one `?1` parameter placeholder bound to the
+    /// session id.  `label` is used for error-context messages.
+    fn apply_to_subtree(&self, id: &str, sql: &str, label: &str) -> crate::Result<()> {
+        let ids = self.get_subtree_ids(id)?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db_err(&format!("{} begin", label)))?;
+
+        for sid in &ids {
+            tx.execute(sql, params![sid])
+                .map_err(db_err(&format!("{} session", label)))?;
+        }
+
+        tx.commit().map_err(db_err(&format!("{} commit", label)))?;
         Ok(())
     }
 
@@ -339,22 +338,7 @@ impl Db {
     ///
     /// Wrapped in a single transaction so a crash cannot leave orphaned subtrees.
     pub fn delete_session_tree(&self, id: &str) -> crate::Result<()> {
-        let ids = self.get_subtree_ids(id)?;
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| crate::Error::Io(format!("delete_tree begin: {}", e)))?;
-
-        // Delete deepest nodes first (reverse order preserves FK expectations),
-        // but CASCADE handles it anyway — iterate in collected order.
-        for sid in &ids {
-            tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])
-                .map_err(|e| crate::Error::Io(format!("delete_tree session: {}", e)))?;
-        }
-
-        tx.commit()
-            .map_err(|e| crate::Error::Io(format!("delete_tree commit: {}", e)))?;
-        Ok(())
+        self.apply_to_subtree(id, "DELETE FROM sessions WHERE id = ?1", "delete_tree")
     }
 
     /// Archive a session and all its descendants (recursive).
@@ -362,23 +346,11 @@ impl Db {
     /// Sets the `archived` flag to 1 for the entire subtree inside a single
     /// transaction so a crash cannot leave a partially-archived tree.
     pub fn archive_session_tree(&self, id: &str) -> crate::Result<()> {
-        let ids = self.get_subtree_ids(id)?;
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| crate::Error::Io(format!("archive_tree begin: {}", e)))?;
-
-        for sid in &ids {
-            tx.execute(
-                "UPDATE sessions SET archived = 1 WHERE id = ?1",
-                params![sid],
-            )
-            .map_err(|e| crate::Error::Io(format!("archive_tree session: {}", e)))?;
-        }
-
-        tx.commit()
-            .map_err(|e| crate::Error::Io(format!("archive_tree commit: {}", e)))?;
-        Ok(())
+        self.apply_to_subtree(
+            id,
+            "UPDATE sessions SET archived = 1 WHERE id = ?1",
+            "archive_tree",
+        )
     }
 
     /// Restore (un-archive) a session and all its descendants.
@@ -386,23 +358,11 @@ impl Db {
     /// Sets the `archived` flag to 0 for the entire subtree inside a single
     /// transaction.
     pub fn restore_session_tree(&self, id: &str) -> crate::Result<()> {
-        let ids = self.get_subtree_ids(id)?;
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| crate::Error::Io(format!("restore_tree begin: {}", e)))?;
-
-        for sid in &ids {
-            tx.execute(
-                "UPDATE sessions SET archived = 0 WHERE id = ?1",
-                params![sid],
-            )
-            .map_err(|e| crate::Error::Io(format!("restore_tree session: {}", e)))?;
-        }
-
-        tx.commit()
-            .map_err(|e| crate::Error::Io(format!("restore_tree commit: {}", e)))?;
-        Ok(())
+        self.apply_to_subtree(
+            id,
+            "UPDATE sessions SET archived = 0 WHERE id = ?1",
+            "restore_tree",
+        )
     }
 
     /// Collect all session IDs in the subtree rooted at `id` (inclusive).
@@ -417,46 +377,22 @@ impl Db {
 
     /// Get direct children of a session.
     pub fn get_children(&self, parent_id: &str) -> crate::Result<Vec<StoredSession>> {
+        let sql = format!(
+            "SELECT {} FROM sessions WHERE parent_id = ?1 ORDER BY created_at",
+            SESSION_COLUMNS
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent
-                 FROM sessions WHERE parent_id = ?1 ORDER BY created_at",
-            )
-            .map_err(|e| crate::Error::Io(format!("prepare children: {}", e)))?;
+            .prepare(&sql)
+            .map_err(db_err("prepare children"))?;
 
         let rows = stmt
-            .query_map(params![parent_id], |row| {
-                let model_json: String = row.get(1)?;
-                let model: Model = serde_json::from_str(&model_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?;
-                Ok(StoredSession {
-                    id: row.get(0)?,
-                    model,
-                    system_prompt: row.get(2)?,
-                    cwd: row.get(3)?,
-                    is_subscription: row.get::<_, i32>(4)? != 0,
-                    created_at: row.get(5)?,
-                    parent_id: row.get(6)?,
-                    child_budget: row.get::<_, i32>(7)? as u32,
-                    tagline: row.get(8)?,
-                    archived: row.get::<_, i32>(9)? != 0,
-                    last_exit_status: row.get(10)?,
-                    last_phase: row.get(11)?,
-                    auto_archive: row.get::<_, i32>(12)? != 0,
-                    notify_parent: row.get::<_, i32>(13)? != 0,
-                })
-            })
-            .map_err(|e| crate::Error::Io(format!("list children: {}", e)))?;
+            .query_map(params![parent_id], row_to_session)
+            .map_err(db_err("list children"))?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            sessions.push(row.map_err(|e| crate::Error::Io(format!("read child row: {}", e)))?);
+            sessions.push(row.map_err(db_err("read child row"))?);
         }
         Ok(sessions)
     }
@@ -494,7 +430,7 @@ impl Db {
                    AND s.archived = 0
                    AND m.id = (SELECT MAX(m2.id) FROM messages m2 WHERE m2.session_id = s.id)",
             )
-            .map_err(|e| crate::Error::Io(format!("prepare sessions_needing_resume: {}", e)))?;
+            .map_err(db_err("prepare sessions_needing_resume"))?;
 
         let rows = stmt
             .query_map([], |row| {
@@ -502,12 +438,11 @@ impl Db {
                 let json: String = row.get(1)?;
                 Ok((id, json))
             })
-            .map_err(|e| crate::Error::Io(format!("query sessions_needing_resume: {}", e)))?;
+            .map_err(db_err("query sessions_needing_resume"))?;
 
         let mut result = Vec::new();
         for row in rows {
-            let (id, json) =
-                row.map_err(|e| crate::Error::Io(format!("read resume row: {}", e)))?;
+            let (id, json) = row.map_err(db_err("read resume row"))?;
             if let Ok(msg) = serde_json::from_str::<Message>(&json)
                 && matches!(msg, Message::User(_) | Message::ToolResult(_))
             {
@@ -526,7 +461,7 @@ impl Db {
                 params![session_id],
                 |row| row.get(0),
             )
-            .map_err(|e| crate::Error::Io(format!("child_count: {}", e)))?;
+            .map_err(db_err("child_count"))?;
         Ok(count as usize)
     }
 
@@ -539,19 +474,27 @@ impl Db {
                 params![session_id],
                 |row| row.get(0),
             )
-            .map_err(|e| crate::Error::Io(format!("budget_used: {}", e)))?;
+            .map_err(db_err("budget_used"))?;
         Ok(used as u32)
+    }
+
+    /// Update a single column on the `sessions` table by id.
+    fn update_session_field(
+        &self,
+        id: &str,
+        column: &str,
+        value: &dyn rusqlite::types::ToSql,
+    ) -> crate::Result<()> {
+        let sql = format!("UPDATE sessions SET {} = ?1 WHERE id = ?2", column);
+        self.conn
+            .execute(&sql, params![value, id])
+            .map_err(db_err(&format!("update session {}", column)))?;
+        Ok(())
     }
 
     /// Update the working directory for a session.
     pub fn update_cwd(&self, session_id: &str, cwd: &str) -> crate::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE sessions SET cwd = ?1 WHERE id = ?2",
-                params![cwd, session_id],
-            )
-            .map_err(|e| crate::Error::Io(format!("update cwd: {}", e)))?;
-        Ok(())
+        self.update_session_field(session_id, "cwd", &cwd)
     }
 
     /// Re-parent all child sessions from one parent to another.
@@ -561,7 +504,7 @@ impl Db {
                 "UPDATE sessions SET parent_id = ?1 WHERE parent_id = ?2",
                 params![new_parent_id, old_parent_id],
             )
-            .map_err(|e| crate::Error::Io(format!("reparent children: {}", e)))?;
+            .map_err(db_err("reparent children"))?;
         Ok(())
     }
 
@@ -569,57 +512,27 @@ impl Db {
     pub fn update_model(&self, session_id: &str, model: &crate::types::Model) -> crate::Result<()> {
         let model_json =
             serde_json::to_string(model).map_err(|e| crate::Error::Parse(e.to_string()))?;
-        self.conn
-            .execute(
-                "UPDATE sessions SET model_json = ?1 WHERE id = ?2",
-                params![model_json, session_id],
-            )
-            .map_err(|e| crate::Error::Io(format!("update model: {}", e)))?;
-        Ok(())
+        self.update_session_field(session_id, "model_json", &model_json)
     }
 
     /// Update the tagline for a session.
     pub fn update_tagline(&self, session_id: &str, tagline: &str) -> crate::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE sessions SET tagline = ?1 WHERE id = ?2",
-                params![tagline, session_id],
-            )
-            .map_err(|e| crate::Error::Io(format!("update tagline: {}", e)))?;
-        Ok(())
+        self.update_session_field(session_id, "tagline", &tagline)
     }
 
     /// Update the system prompt for a session.
     pub fn update_system_prompt(&self, session_id: &str, system_prompt: &str) -> crate::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE sessions SET system_prompt = ?1 WHERE id = ?2",
-                params![system_prompt, session_id],
-            )
-            .map_err(|e| crate::Error::Io(format!("update system_prompt: {}", e)))?;
-        Ok(())
+        self.update_session_field(session_id, "system_prompt", &system_prompt)
     }
 
     /// Update the last exit status for a session.
     pub fn update_exit_status(&self, session_id: &str, status: &str) -> crate::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE sessions SET last_exit_status = ?1 WHERE id = ?2",
-                params![status, session_id],
-            )
-            .map_err(|e| crate::Error::Io(format!("update exit_status: {}", e)))?;
-        Ok(())
+        self.update_session_field(session_id, "last_exit_status", &status)
     }
 
     /// Update the persisted agent phase for a session.
     pub fn update_phase(&self, session_id: &str, phase: &str) -> crate::Result<()> {
-        self.conn
-            .execute(
-                "UPDATE sessions SET last_phase = ?1 WHERE id = ?2",
-                params![phase, session_id],
-            )
-            .map_err(|e| crate::Error::Io(format!("update phase: {}", e)))?;
-        Ok(())
+        self.update_session_field(session_id, "last_phase", &phase)
     }
 
     /// Replace messages before `keep_from_id` with a compaction summary.
@@ -642,7 +555,7 @@ impl Db {
 
         self.conn
             .execute_batch("BEGIN")
-            .map_err(|e| crate::Error::Io(e.to_string()))?;
+            .map_err(db_err("compact begin"))?;
 
         // Delete old messages (id < keep_from_id)
         self.conn
@@ -652,7 +565,7 @@ impl Db {
             )
             .map_err(|e| {
                 self.conn.execute_batch("ROLLBACK").ok();
-                crate::Error::Io(format!("delete old messages: {}", e))
+                db_err("delete old messages")(e)
             })?;
 
         // Insert compaction summary before the kept messages
@@ -668,12 +581,12 @@ impl Db {
             )
             .map_err(|e| {
                 self.conn.execute_batch("ROLLBACK").ok();
-                crate::Error::Io(format!("insert summary: {}", e))
+                db_err("insert summary")(e)
             })?;
 
         self.conn
             .execute_batch("COMMIT")
-            .map_err(|e| crate::Error::Io(e.to_string()))?;
+            .map_err(db_err("compact commit"))?;
 
         Ok(())
     }
@@ -683,10 +596,10 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare("SELECT id FROM messages WHERE session_id = ?1 ORDER BY id LIMIT 1 OFFSET ?2")
-            .map_err(|e| crate::Error::Io(e.to_string()))?;
+            .map_err(db_err("prepare message_row_id"))?;
         stmt.query_row(params![session_id, index as i64], |row| row.get(0))
             .optional()
-            .map_err(|e| crate::Error::Io(e.to_string()))
+            .map_err(db_err("get message_row_id"))
     }
 
     /// Get the next session id (max numeric suffix + 1).
@@ -699,7 +612,7 @@ impl Db {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| crate::Error::Io(format!("next id: {}", e)))?;
+            .map_err(db_err("next id"))?;
 
         let next = match max {
             Some(id) => {
@@ -723,7 +636,7 @@ impl Db {
                 "INSERT INTO messages (session_id, message_json, created_at) VALUES (?1, ?2, ?3)",
                 params![session_id, json, now],
             )
-            .map_err(|e| crate::Error::Io(format!("insert message: {}", e)))?;
+            .map_err(db_err("insert message"))?;
         Ok(())
     }
 
@@ -732,7 +645,7 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare("SELECT message_json FROM messages WHERE session_id = ?1 ORDER BY id")
-            .map_err(|e| crate::Error::Io(format!("prepare messages: {}", e)))?;
+            .map_err(db_err("prepare messages"))?;
 
         let rows = stmt
             .query_map(params![session_id], |row| {
@@ -746,11 +659,11 @@ impl Db {
                 })?;
                 Ok(msg)
             })
-            .map_err(|e| crate::Error::Io(format!("query messages: {}", e)))?;
+            .map_err(db_err("query messages"))?;
 
         let mut messages = Vec::new();
         for row in rows {
-            messages.push(row.map_err(|e| crate::Error::Io(format!("read message row: {}", e)))?);
+            messages.push(row.map_err(db_err("read message row"))?);
         }
         Ok(messages)
     }
@@ -764,7 +677,7 @@ impl Db {
                 params![session_id],
                 |row| row.get(0),
             )
-            .map_err(|e| crate::Error::Io(format!("count messages: {}", e)))?;
+            .map_err(db_err("count messages"))?;
         Ok(count as usize)
     }
 
@@ -817,7 +730,7 @@ impl Db {
                     }))
                 },
             )
-            .map_err(|e| crate::Error::Io(format!("session_stats: {}", e)))?;
+            .map_err(db_err("session_stats"))?;
 
         let Some(mut stats) = row else {
             return Ok(None);
@@ -840,8 +753,7 @@ impl Db {
                 params![session_id],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|e| crate::Error::Io(format!("session_stats tool_calls: {}", e)))?
-            as usize;
+            .map_err(db_err("session_stats tool_calls"))? as usize;
 
         // Last input tokens: from the last assistant message that didn't error/abort.
         stats.last_input_tokens = self
@@ -865,7 +777,7 @@ impl Db {
                 },
             )
             .optional()
-            .map_err(|e| crate::Error::Io(format!("session_stats last_input: {}", e)))?
+            .map_err(db_err("session_stats last_input"))?
             .flatten();
 
         Ok(Some(stats))
@@ -888,7 +800,7 @@ impl Db {
                  VALUES (?1, ?2, ?3, ?4)",
                 params![target_session_id, content, sender_info, now],
             )
-            .map_err(|e| crate::Error::Io(format!("queue_message: {}", e)))?;
+            .map_err(db_err("queue_message"))?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -899,7 +811,7 @@ impl Db {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| crate::Error::Io(format!("drain begin: {}", e)))?;
+            .map_err(db_err("drain begin"))?;
 
         let rows: Vec<(i64, String, Option<String>)> = {
             let mut stmt = tx
@@ -907,15 +819,15 @@ impl Db {
                     "SELECT id, content, sender_info FROM queued_messages
                      WHERE target_session_id = ?1 ORDER BY id",
                 )
-                .map_err(|e| crate::Error::Io(format!("drain select: {}", e)))?;
+                .map_err(db_err("drain select"))?;
             let mapped = stmt
                 .query_map(params![session_id], |row| {
                     Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })
-                .map_err(|e| crate::Error::Io(format!("drain query: {}", e)))?;
+                .map_err(db_err("drain query"))?;
             mapped
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| crate::Error::Io(format!("drain row: {}", e)))?
+                .map_err(db_err("drain row"))?
         };
 
         if rows.is_empty() {
@@ -941,18 +853,17 @@ impl Db {
                      VALUES (?1, ?2, ?3)",
                 params![session_id, json, now],
             )
-            .map_err(|e| crate::Error::Io(format!("drain insert message: {}", e)))?;
+            .map_err(db_err("drain insert message"))?;
             messages.push(msg);
         }
 
         // Delete drained rows by collected IDs
         for id in &ids {
             tx.execute("DELETE FROM queued_messages WHERE id = ?1", params![id])
-                .map_err(|e| crate::Error::Io(format!("drain delete: {}", e)))?;
+                .map_err(db_err("drain delete"))?;
         }
 
-        tx.commit()
-            .map_err(|e| crate::Error::Io(format!("drain commit: {}", e)))?;
+        tx.commit().map_err(db_err("drain commit"))?;
 
         Ok(messages)
     }
@@ -966,7 +877,7 @@ impl Db {
                 params![session_id],
                 |row| row.get(0),
             )
-            .map_err(|e| crate::Error::Io(format!("has_queued_messages: {}", e)))?;
+            .map_err(db_err("has_queued_messages"))?;
         Ok(exists)
     }
 
@@ -981,7 +892,7 @@ impl Db {
                 "DELETE FROM sessions WHERE archived = 1 AND created_at < ?1",
                 params![older_than_ms as i64],
             )
-            .map_err(|e| crate::Error::Io(format!("gc_archived_sessions: {}", e)))?;
+            .map_err(db_err("gc_archived_sessions"))?;
         Ok(count)
     }
 
@@ -990,32 +901,20 @@ impl Db {
         let mut stmt = self
             .conn
             .prepare("SELECT DISTINCT target_session_id FROM queued_messages")
-            .map_err(|e| crate::Error::Io(format!("sessions_with_queued: {}", e)))?;
+            .map_err(db_err("sessions_with_queued"))?;
         let rows = stmt
             .query_map([], |row| row.get(0))
-            .map_err(|e| crate::Error::Io(format!("sessions_with_queued query: {}", e)))?;
+            .map_err(db_err("sessions_with_queued query"))?;
         let mut result = Vec::new();
         for row in rows {
-            result.push(
-                row.map_err(|e| crate::Error::Io(format!("sessions_with_queued row: {}", e)))?,
-            );
+            result.push(row.map_err(db_err("sessions_with_queued row"))?);
         }
         Ok(result)
     }
 }
 
 fn default_db_path() -> PathBuf {
-    if let Ok(data) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(data).join("tau").join("tau.db")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("tau")
-            .join("tau.db")
-    } else {
-        PathBuf::from("/tmp").join("tau.db")
-    }
+    crate::paths::data_dir().join("tau.db")
 }
 
 #[cfg(test)]

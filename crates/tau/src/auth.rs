@@ -275,16 +275,7 @@ type AuthData = std::collections::HashMap<String, AuthCredential>;
 impl AuthStorage {
     /// Create storage at `~/.config/tau/auth.json`.
     pub fn default_path() -> PathBuf {
-        if let Ok(config) = std::env::var("XDG_CONFIG_HOME") {
-            PathBuf::from(config).join("tau").join("auth.json")
-        } else if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home)
-                .join(".config")
-                .join("tau")
-                .join("auth.json")
-        } else {
-            PathBuf::from("/tmp").join("tau-auth.json")
-        }
+        crate::paths::config_dir().join("auth.json")
     }
 
     pub fn new(path: PathBuf) -> Self {

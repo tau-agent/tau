@@ -1585,17 +1585,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskMessage> {
 }
 
 fn default_db_path() -> PathBuf {
-    if let Ok(data) = std::env::var("XDG_DATA_HOME") {
-        PathBuf::from(data).join("tau").join("tasks.db")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".local")
-            .join("share")
-            .join("tau")
-            .join("tasks.db")
-    } else {
-        PathBuf::from("/tmp").join("tau-tasks.db")
-    }
+    crate::paths::data_dir().join("tasks.db")
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use futures::io::{AsyncBufReadExt, BufReader};
 use smol::Async;
 
 use crate::auth::{AuthCredential, AuthStorage};
@@ -386,15 +386,10 @@ fn spawn_idle_sweep(
 async fn read_plugin_message(
     reader: &mut crate::plugin::AsyncPluginReader,
 ) -> crate::Result<crate::plugin::PluginMessage> {
-    let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
+    crate::read_json_line_async(reader)
         .await
-        .map_err(|e| crate::Error::Io(format!("read from plugin: {}", e)))?;
-    if n == 0 {
-        return Err(crate::Error::Io("plugin closed stdout".into()));
-    }
-    serde_json::from_str(&line).map_err(|e| crate::Error::Parse(format!("plugin message: {}", e)))
+        .map_err(|e| crate::Error::Io(format!("read from plugin: {}", e)))?
+        .ok_or_else(|| crate::Error::Io("plugin closed stdout".into()))
 }
 
 /// Write a `PluginRequest` to an async stdin writer.
@@ -402,18 +397,9 @@ async fn write_plugin_request(
     writer: &mut crate::plugin::AsyncPluginWriter,
     req: &crate::plugin::PluginRequest,
 ) -> crate::Result<()> {
-    use futures::io::AsyncWriteExt;
-    let mut line = serde_json::to_string(req).map_err(|e| crate::Error::Parse(e.to_string()))?;
-    line.push('\n');
-    writer
-        .write_all(line.as_bytes())
+    crate::write_json_line_async(writer, req)
         .await
-        .map_err(|e| crate::Error::Io(format!("write to plugin: {}", e)))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| crate::Error::Io(format!("flush plugin: {}", e)))?;
-    Ok(())
+        .map_err(|e| crate::Error::Io(format!("write to plugin: {}", e)))
 }
 
 /// Create a chat-spawn channel with a receiver task that fires off
@@ -584,15 +570,7 @@ fn spawn_global_plugin_background_tasks(
 
 /// Returns the default socket path.
 pub fn socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(dir).join("tau").join("tau.sock")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".tau").join("tau.sock")
-    } else {
-        PathBuf::from("/tmp")
-            .join(format!("tau-{}", std::process::id()))
-            .join("tau.sock")
-    }
+    crate::paths::runtime_dir().join("tau.sock")
 }
 
 /// Returns the PID file path next to the socket.
@@ -4277,17 +4255,7 @@ async fn send<W: futures::io::AsyncWrite + Unpin>(
     writer: &mut W,
     resp: &Response,
 ) -> crate::Result<()> {
-    let mut line = serde_json::to_string(resp).map_err(|e| crate::Error::Parse(e.to_string()))?;
-    line.push('\n');
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| crate::Error::Io(e.to_string()))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| crate::Error::Io(e.to_string()))?;
-    Ok(())
+    crate::write_json_line_async(writer, resp).await
 }
 
 /// Auto-archive completed sessions that have `auto_archive=true`.

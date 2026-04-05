@@ -4,7 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::pin::Pin;
 
 use futures::StreamExt;
-use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use futures::io::{AsyncBufReadExt, BufReader};
 use smol::Async;
 
 use crate::protocol::{Request, Response};
@@ -47,18 +47,7 @@ impl Client {
 
     /// Send a request.
     pub async fn send(&mut self, req: &Request) -> crate::Result<()> {
-        let mut line =
-            serde_json::to_string(req).map_err(|e| crate::Error::Parse(e.to_string()))?;
-        line.push('\n');
-        self.stream
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|e| crate::Error::Io(e.to_string()))?;
-        self.stream
-            .flush()
-            .await
-            .map_err(|e| crate::Error::Io(e.to_string()))?;
-        Ok(())
+        crate::write_json_line_async(&mut self.stream, req).await
     }
 
     /// Read all responses until a terminal one arrives.

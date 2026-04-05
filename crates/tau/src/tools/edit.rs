@@ -53,15 +53,6 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-fn resolve_path(cwd: &str, path: &str) -> std::path::PathBuf {
-    let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        std::path::Path::new(cwd).join(p)
-    }
-}
-
 struct Edit {
     old_text: String,
     new_text: String,
@@ -111,7 +102,7 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
         }]
     };
 
-    let path = resolve_path(cwd, path_str);
+    let path = super::resolve_path(cwd, path_str);
     let mut content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => return ToolOutput::error(format!("failed to read {}: {}", path.display(), e)),

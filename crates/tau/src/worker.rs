@@ -319,50 +319,9 @@ async fn write_message(
     writer: &mut (impl AsyncWriteExt + Unpin),
     msg: &PluginMessage,
 ) -> crate::Result<()> {
-    let mut line =
-        serde_json::to_string(msg).map_err(|e| crate::Error::Io(format!("serialize: {}", e)))?;
-    line.push('\n');
-    writer
-        .write_all(line.as_bytes())
+    crate::write_json_line_async(writer, msg)
         .await
-        .map_err(|e| crate::Error::Io(format!("write: {}", e)))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| crate::Error::Io(format!("flush: {}", e)))?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Tool result helpers
-// ---------------------------------------------------------------------------
-
-fn tool_ok(tool_call_id: &str, text: &str) -> ToolResultMessage {
-    ToolResultMessage {
-        tool_call_id: tool_call_id.to_string(),
-        tool_name: String::new(),
-        content: vec![ToolResultContent::Text(TextContent {
-            text: text.to_string(),
-            text_signature: None,
-        })],
-        details: None,
-        is_error: false,
-        timestamp: crate::types::timestamp_ms(),
-    }
-}
-
-fn tool_err(tool_call_id: &str, text: &str) -> ToolResultMessage {
-    ToolResultMessage {
-        tool_call_id: tool_call_id.to_string(),
-        tool_name: String::new(),
-        content: vec![ToolResultContent::Text(TextContent {
-            text: text.to_string(),
-            text_signature: None,
-        })],
-        details: None,
-        is_error: true,
-        timestamp: crate::types::timestamp_ms(),
-    }
+        .map_err(|e| crate::Error::Io(format!("write: {}", e)))
 }
 
 // ---------------------------------------------------------------------------
@@ -410,7 +369,7 @@ async fn execute_bash_async(
     msg_tx: &Sender<PluginMessage>,
 ) -> ToolResultMessage {
     let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
-        return tool_err(tool_call_id, "missing 'command' argument");
+        return ToolResultMessage::error(tool_call_id, "", "missing 'command' argument");
     };
     let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
 
@@ -437,7 +396,13 @@ async fn execute_bash_async(
 
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => return tool_err(tool_call_id, &format!("failed to execute command: {}", e)),
+        Err(e) => {
+            return ToolResultMessage::error(
+                tool_call_id,
+                "",
+                &format!("failed to execute command: {}", e),
+            );
+        }
     };
 
     let child_id = child.id();
@@ -459,7 +424,7 @@ async fn execute_bash_async(
 
     let (async_stdout, async_stderr) = match (async_stdout, async_stderr) {
         (Ok(o), Ok(e)) => (o, e),
-        _ => return tool_err(tool_call_id, "failed to create async pipes"),
+        _ => return ToolResultMessage::error(tool_call_id, "", "failed to create async pipes"),
     };
 
     let mut stdout_reader = BufReader::new(async_stdout);
@@ -570,7 +535,7 @@ fn format_bash_output(
             text.push('\n');
         }
         text.push_str("(timed out)");
-        return tool_err(tool_call_id, text.trim_end());
+        return ToolResultMessage::error(tool_call_id, "", text.trim_end());
     }
 
     let success = exit_code == 0;
@@ -582,9 +547,9 @@ fn format_bash_output(
 
     let text = text.trim_end().to_string();
     if success {
-        tool_ok(tool_call_id, &text)
+        ToolResultMessage::success(tool_call_id, "", &text)
     } else {
-        tool_err(tool_call_id, &text)
+        ToolResultMessage::error(tool_call_id, "", &text)
     }
 }
 
@@ -642,15 +607,29 @@ async fn handle_session_tool(
             };
             let resp = match server_request(msg_tx, pending, create_req).await {
                 Ok(r) => r,
-                Err(e) => return tool_err(tcid, &format!("server request failed: {}", e)),
+                Err(e) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("server request failed: {}", e),
+                    );
+                }
             };
             let child_id = match resp {
                 crate::protocol::Response::SessionCreated { session_id } => session_id,
                 crate::protocol::Response::Error { message } => {
-                    return tool_err(tcid, &format!("spawn failed: {}", message));
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("spawn failed: {}", message),
+                    );
                 }
                 other => {
-                    return tool_err(tcid, &format!("unexpected response: {:?}", other));
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("unexpected response: {:?}", other),
+                    );
                 }
             };
 
@@ -663,24 +642,27 @@ async fn handle_session_tool(
                 match server_request(msg_tx, pending, chat_req).await {
                     Ok(crate::protocol::Response::Ok) => {}
                     Ok(crate::protocol::Response::Error { message }) => {
-                        return tool_err(
+                        return ToolResultMessage::error(
                             tcid,
-                            &format!("session {} created but chat failed: {}", child_id, message),
+                            "",
+                            format!("session {} created but chat failed: {}", child_id, message),
                         );
                     }
                     Ok(other) => {
-                        return tool_err(
+                        return ToolResultMessage::error(
                             tcid,
-                            &format!(
+                            "",
+                            format!(
                                 "session {} created but unexpected chat response: {:?}",
                                 child_id, other
                             ),
                         );
                     }
                     Err(e) => {
-                        return tool_err(
+                        return ToolResultMessage::error(
                             tcid,
-                            &format!("session {} created but chat failed: {}", child_id, e),
+                            "",
+                            format!("session {} created but chat failed: {}", child_id, e),
                         );
                     }
                 }
@@ -689,7 +671,7 @@ async fn handle_session_tool(
             // Track as unjoined.
             unjoined.lock().await.insert(child_id.clone());
 
-            tool_ok(tcid, &format!("Spawned session {}", child_id))
+            ToolResultMessage::success(tcid, "", &format!("Spawned session {}", child_id))
         }
 
         "session_join" => {
@@ -705,7 +687,7 @@ async fn handle_session_tool(
             let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(300);
 
             if session_ids.is_empty() {
-                return tool_err(tcid, "session_ids is required");
+                return ToolResultMessage::error(tcid, "", "session_ids is required");
             }
 
             // Remove joined IDs from unjoined set.
@@ -735,11 +717,15 @@ async fn handle_session_tool(
                             }
                         ));
                     }
-                    tool_ok(tcid, text.trim_end())
+                    ToolResultMessage::success(tcid, "", text.trim_end())
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e),
             }
         }
 
@@ -749,7 +735,7 @@ async fn handle_session_tool(
             let session_ids: Vec<String> = {
                 let mut uj = unjoined.lock().await;
                 if uj.is_empty() {
-                    return tool_ok(tcid, "No unjoined child sessions.");
+                    return ToolResultMessage::success(tcid, "", "No unjoined child sessions.");
                 }
                 uj.drain().collect()
             };
@@ -773,11 +759,15 @@ async fn handle_session_tool(
                             }
                         ));
                     }
-                    tool_ok(tcid, text.trim_end())
+                    ToolResultMessage::success(tcid, "", text.trim_end())
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e),
             }
         }
 
@@ -787,7 +777,7 @@ async fn handle_session_tool(
             let session_ids: Vec<String> = {
                 let uj = unjoined.lock().await;
                 if uj.is_empty() {
-                    return tool_ok(tcid, "No unjoined child sessions.");
+                    return ToolResultMessage::success(tcid, "", "No unjoined child sessions.");
                 }
                 uj.iter().cloned().collect()
             };
@@ -818,11 +808,15 @@ async fn handle_session_tool(
                             }
                         ));
                     }
-                    tool_ok(tcid, text.trim_end())
+                    ToolResultMessage::success(tcid, "", text.trim_end())
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e),
             }
         }
 
@@ -832,29 +826,34 @@ async fn handle_session_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if sid.is_empty() {
-                return tool_err(tcid, "session_id is required");
+                return ToolResultMessage::error(tcid, "", "session_id is required");
             }
             let req = crate::protocol::Request::GetSessionInfo {
                 session_id: sid.to_string(),
             };
             match server_request(msg_tx, pending, req).await {
-                Ok(crate::protocol::Response::SessionInfo { info }) => tool_ok(
+                Ok(crate::protocol::Response::SessionInfo { info }) => ToolResultMessage::success(
                     tcid,
-                    &format!(
+                    "",
+                    format!(
                         "Session {}: {}/{}, {} messages, {} children",
                         info.id, info.provider, info.model, info.message_count, info.child_count
                     ),
                 ),
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e),
             }
         }
 
         "session_list_children" => {
             let parent = session_id.unwrap_or("");
             if parent.is_empty() {
-                return tool_err(tcid, "no session context available");
+                return ToolResultMessage::error(tcid, "", "no session context available");
             }
             let req = crate::protocol::Request::ListSessions {
                 include_archived: false,
@@ -866,7 +865,7 @@ async fn handle_session_tool(
                         .filter(|s| s.parent_id.as_deref() == Some(parent))
                         .collect();
                     if children.is_empty() {
-                        tool_ok(tcid, "No child sessions")
+                        ToolResultMessage::success(tcid, "", "No child sessions")
                     } else {
                         let mut text = String::new();
                         for c in &children {
@@ -875,12 +874,16 @@ async fn handle_session_tool(
                                 c.id, c.provider, c.model, c.message_count
                             ));
                         }
-                        tool_ok(tcid, text.trim_end())
+                        ToolResultMessage::success(tcid, "", text.trim_end())
                     }
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e),
             }
         }
 
@@ -891,7 +894,7 @@ async fn handle_session_tool(
                 .unwrap_or("");
             let last_n = args.get("last_n").and_then(|v| v.as_u64());
             if sid.is_empty() {
-                return tool_err(tcid, "session_id is required");
+                return ToolResultMessage::error(tcid, "", "session_id is required");
             }
             let req = crate::protocol::Request::GetMessages {
                 session_id: sid.to_string(),
@@ -943,14 +946,18 @@ async fn handle_session_tool(
                         }
                     }
                     if text.is_empty() {
-                        tool_ok(tcid, "(no messages)")
+                        ToolResultMessage::success(tcid, "", "(no messages)")
                     } else {
-                        tool_ok(tcid, text.trim_end())
+                        ToolResultMessage::success(tcid, "", text.trim_end())
                     }
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e),
             }
         }
 
@@ -960,18 +967,22 @@ async fn handle_session_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if sid.is_empty() {
-                return tool_err(tcid, "session_id is required");
+                return ToolResultMessage::error(tcid, "", "session_id is required");
             }
             let req = crate::protocol::Request::CancelChat {
                 session_id: sid.to_string(),
             };
             match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::Ok) => {
-                    tool_ok(tcid, &format!("Cancelled session {}", sid))
+                    ToolResultMessage::success(tcid, "", &format!("Cancelled session {}", sid))
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e),
             }
         }
 
@@ -982,10 +993,20 @@ async fn handle_session_tool(
                     .iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
                     .collect(),
-                _ => return tool_err(tcid, "session_id is required (string or array of strings)"),
+                _ => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        "session_id is required (string or array of strings)",
+                    );
+                }
             };
             if sids.is_empty() {
-                return tool_err(tcid, "session_id is required (string or array of strings)");
+                return ToolResultMessage::error(
+                    tcid,
+                    "",
+                    "session_id is required (string or array of strings)",
+                );
             }
             let mut archived = Vec::new();
             let mut errors = Vec::new();
@@ -1009,16 +1030,25 @@ async fn handle_session_tool(
             }
             if errors.is_empty() {
                 if archived.len() == 1 {
-                    tool_ok(tcid, &format!("Archived session {}", archived[0]))
+                    ToolResultMessage::success(
+                        tcid,
+                        "",
+                        &format!("Archived session {}", archived[0]),
+                    )
                 } else {
-                    tool_ok(tcid, &format!("Archived {} sessions", archived.len()))
+                    ToolResultMessage::success(
+                        tcid,
+                        "",
+                        &format!("Archived {} sessions", archived.len()),
+                    )
                 }
             } else if archived.is_empty() {
-                tool_err(tcid, &errors.join("; "))
+                ToolResultMessage::error(tcid, "", &errors.join("; "))
             } else {
-                tool_ok(
+                ToolResultMessage::success(
                     tcid,
-                    &format!(
+                    "",
+                    format!(
                         "Archived {} session(s); {} failed: {}",
                         archived.len(),
                         errors.len(),
@@ -1031,18 +1061,22 @@ async fn handle_session_tool(
         "session_restore" => {
             let sid = match args.get("session_id").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
-                _ => return tool_err(tcid, "session_id is required"),
+                _ => return ToolResultMessage::error(tcid, "", "session_id is required"),
             };
             let req = crate::protocol::Request::RestoreSession {
                 session_id: sid.clone(),
             };
             match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::SessionRestored) => {
-                    tool_ok(tcid, &format!("Restored session {}", sid))
+                    ToolResultMessage::success(tcid, "", &format!("Restored session {}", sid))
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e.to_string()),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
+                }
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e.to_string()),
             }
         }
 
@@ -1053,10 +1087,10 @@ async fn handle_session_tool(
                 .unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
             if target.is_empty() {
-                return tool_err(tcid, "session_id is required");
+                return ToolResultMessage::error(tcid, "", "session_id is required");
             }
             if content.is_empty() {
-                return tool_err(tcid, "content is required");
+                return ToolResultMessage::error(tcid, "", "content is required");
             }
             let sender_info = match session_id {
                 Some(sid) => format!("session:{}", sid),
@@ -1070,20 +1104,30 @@ async fn handle_session_tool(
                 reply_to: None,
             };
             match server_request(msg_tx, pending, req).await {
-                Ok(crate::protocol::Response::Ok) => {
-                    tool_ok(tcid, &format!("Message sent to session {}", target))
+                Ok(crate::protocol::Response::Ok) => ToolResultMessage::success(
+                    tcid,
+                    "",
+                    &format!("Message sent to session {}", target),
+                ),
+                Ok(crate::protocol::Response::Error { message }) => {
+                    ToolResultMessage::error(tcid, "", &message)
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
-                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(tcid, &e),
+                Ok(other) => {
+                    ToolResultMessage::error(tcid, "", &format!("unexpected response: {:?}", other))
+                }
+                Err(e) => ToolResultMessage::error(tcid, "", &e),
             }
         }
 
         "session_id" => match session_id {
-            Some(sid) => tool_ok(tcid, &serde_json::json!({"session_id": sid}).to_string()),
-            None => tool_err(tcid, "session_id not available"),
+            Some(sid) => ToolResultMessage::success(
+                tcid,
+                "",
+                &serde_json::json!({"session_id": sid}).to_string(),
+            ),
+            None => ToolResultMessage::error(tcid, "", "session_id not available"),
         },
 
-        _ => tool_err(tcid, &format!("unknown session tool: {}", name)),
+        _ => ToolResultMessage::error(tcid, "", &format!("unknown session tool: {}", name)),
     }
 }

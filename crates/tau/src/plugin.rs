@@ -10,12 +10,10 @@
 //!   (e.g. `["sandbox", "run", "--"]`).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
-use futures::io::AsyncBufReadExt;
-use futures::io::AsyncWriteExt;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Tool, ToolCall, ToolResultContent};
@@ -295,16 +293,8 @@ impl PluginHandle {
             .stdin
             .as_mut()
             .ok_or_else(|| crate::Error::Io(format!("plugin {} is not running", self.name)))?;
-        let mut line =
-            serde_json::to_string(req).map_err(|e| crate::Error::Parse(e.to_string()))?;
-        line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
-            .map_err(|e| crate::Error::Io(format!("write to plugin {}: {}", self.name, e)))?;
-        stdin
-            .flush()
-            .map_err(|e| crate::Error::Io(format!("flush plugin {}: {}", self.name, e)))?;
-        Ok(())
+        crate::write_json_line(stdin, req)
+            .map_err(|e| crate::Error::Io(format!("write to plugin {}: {}", self.name, e)))
     }
 
     /// Read a single message from the plugin.
@@ -313,35 +303,37 @@ impl PluginHandle {
             .stdout
             .as_mut()
             .ok_or_else(|| crate::Error::Io(format!("plugin {} is not running", self.name)))?;
-        let mut line = String::new();
-        stdout
-            .read_line(&mut line)
-            .map_err(|e| crate::Error::Io(format!("read from plugin {}: {}", self.name, e)))?;
-        if line.is_empty() {
-            let mut msg = format!("plugin {} closed unexpectedly", self.name);
-            // Wait briefly for child to fully exit so we can collect stderr
-            if let Some(ref mut child) = self.child {
-                let _ = child.try_wait();
+        match crate::read_json_line(stdout).map_err(|e| match e {
+            crate::Error::Parse(msg) => {
+                crate::Error::Parse(format!("plugin {} message: {}", self.name, msg))
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            if let Some(exit) = self.child_exit_status() {
-                msg.push_str(&format!(" (exit status: {})", exit));
-                // Only drain stderr if child has exited (otherwise read blocks)
-                let stderr = self.drain_stderr();
-                if !stderr.is_empty() {
-                    msg.push_str(&format!("\n  stderr:\n{}", indent_lines(&stderr, "    ")));
+            other => crate::Error::Io(format!("read from plugin {}: {}", self.name, other)),
+        })? {
+            Some(val) => Ok(val),
+            None => {
+                let mut msg = format!("plugin {} closed unexpectedly", self.name);
+                // Wait briefly for child to fully exit so we can collect stderr
+                if let Some(ref mut child) = self.child {
+                    let _ = child.try_wait();
                 }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if let Some(exit) = self.child_exit_status() {
+                    msg.push_str(&format!(" (exit status: {})", exit));
+                    // Only drain stderr if child has exited (otherwise read blocks)
+                    let stderr = self.drain_stderr();
+                    if !stderr.is_empty() {
+                        msg.push_str(&format!("\n  stderr:\n{}", indent_lines(&stderr, "    ")));
+                    }
+                }
+                // Mark as dead
+                self.child = None;
+                self.stdin = None;
+                self.stdout = None;
+                self.async_stdin = None;
+                self.async_stdout = None;
+                Err(crate::Error::Io(msg))
             }
-            // Mark as dead
-            self.child = None;
-            self.stdin = None;
-            self.stdout = None;
-            self.async_stdin = None;
-            self.async_stdout = None;
-            return Err(crate::Error::Io(msg));
         }
-        serde_json::from_str(&line)
-            .map_err(|e| crate::Error::Parse(format!("plugin {} message: {}", self.name, e)))
     }
 
     // -------------------------------------------------------------------
@@ -423,18 +415,9 @@ impl PluginHandle {
         let stdin = self.async_stdin.as_mut().ok_or_else(|| {
             crate::Error::Io(format!("plugin {} async stdin not available", self.name))
         })?;
-        let mut line =
-            serde_json::to_string(req).map_err(|e| crate::Error::Parse(e.to_string()))?;
-        line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
+        crate::write_json_line_async(stdin, req)
             .await
-            .map_err(|e| crate::Error::Io(format!("write to plugin {}: {}", self.name, e)))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| crate::Error::Io(format!("flush plugin {}: {}", self.name, e)))?;
-        Ok(())
+            .map_err(|e| crate::Error::Io(format!("write to plugin {}: {}", self.name, e)))
     }
 
     /// Read a single message from the plugin asynchronously.
@@ -455,19 +438,22 @@ impl PluginHandle {
         let stdout = self.async_stdout.as_mut().ok_or_else(|| {
             crate::Error::Io(format!("plugin {} async stdout not available", self.name))
         })?;
-        let mut line = String::new();
-        let n = stdout
-            .read_line(&mut line)
+        match crate::read_json_line_async(stdout)
             .await
-            .map_err(|e| crate::Error::Io(format!("read from plugin {}: {}", self.name, e)))?;
-        if n == 0 {
-            let msg = format!("plugin {} closed unexpectedly", self.name);
-            self.async_stdin = None;
-            self.async_stdout = None;
-            return Err(crate::Error::Io(msg));
+            .map_err(|e| match e {
+                crate::Error::Parse(msg) => {
+                    crate::Error::Parse(format!("plugin {} message: {}", self.name, msg))
+                }
+                other => crate::Error::Io(format!("read from plugin {}: {}", self.name, other)),
+            })? {
+            Some(val) => Ok(val),
+            None => {
+                let msg = format!("plugin {} closed unexpectedly", self.name);
+                self.async_stdin = None;
+                self.async_stdout = None;
+                Err(crate::Error::Io(msg))
+            }
         }
-        serde_json::from_str(&line)
-            .map_err(|e| crate::Error::Parse(format!("plugin {} message: {}", self.name, e)))
     }
 
     /// Check if this handle has async I/O pipes available.
@@ -1626,18 +1612,7 @@ pub struct PluginEntry {
 
 /// Load plugins config from `~/.config/tau/plugins.toml`.
 pub fn load_plugins_config() -> PluginsConfig {
-    let path = if let Ok(config) = std::env::var("XDG_CONFIG_HOME") {
-        std::path::PathBuf::from(config)
-            .join("tau")
-            .join("plugins.toml")
-    } else if let Ok(home) = std::env::var("HOME") {
-        std::path::PathBuf::from(home)
-            .join(".config")
-            .join("tau")
-            .join("plugins.toml")
-    } else {
-        return PluginsConfig::default();
-    };
+    let path = crate::paths::config_dir().join("plugins.toml");
 
     if !path.exists() {
         return PluginsConfig::default();

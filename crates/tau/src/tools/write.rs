@@ -29,15 +29,6 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-fn resolve_path(cwd: &str, path: &str) -> std::path::PathBuf {
-    let p = std::path::Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        std::path::Path::new(cwd).join(p)
-    }
-}
-
 fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
     let Some(path_str) = args.get("path").and_then(|p| p.as_str()) else {
         return ToolOutput::error("missing 'path' argument");
@@ -46,7 +37,7 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
         return ToolOutput::error("missing 'content' argument");
     };
 
-    let path = resolve_path(cwd, path_str);
+    let path = super::resolve_path(cwd, path_str);
 
     // Create parent directories
     if let Some(parent) = path.parent()

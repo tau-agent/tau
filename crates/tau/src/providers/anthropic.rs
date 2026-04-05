@@ -1,20 +1,11 @@
 use std::io::{BufRead, BufReader};
-use std::time::Duration;
 
 use async_trait::async_trait;
 
 use super::anthropic_types::*;
+use super::common::{self, StreamCtx, send_event};
 use crate::provider::{EventReceiver, EventSender, Provider};
 use crate::types::*;
-
-/// Timeout for TCP + TLS connection establishment.
-const TIMEOUT_CONNECT: Duration = Duration::from_secs(30);
-/// Timeout for sending the request headers.
-const TIMEOUT_SEND_REQUEST: Duration = Duration::from_secs(30);
-/// Timeout for sending the request body (JSON payload).
-const TIMEOUT_SEND_BODY: Duration = Duration::from_secs(30);
-/// Timeout for receiving response headers (time-to-first-byte).
-const TIMEOUT_RECV_RESPONSE: Duration = Duration::from_secs(120);
 
 const API_ID: &str = "anthropic-messages";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -88,15 +79,6 @@ impl Provider for Anthropic {
     }
 }
 
-struct StreamCtx<'a> {
-    base_url: &'a str,
-    api_key: &'a str,
-    api_id: &'a str,
-    provider_name: &'a str,
-    model_id: &'a str,
-    model: &'a Model,
-}
-
 // ---------------------------------------------------------------------------
 // SSE stream processing
 // ---------------------------------------------------------------------------
@@ -129,10 +111,10 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
 
     let mut resp = req
         .config()
-        .timeout_connect(Some(TIMEOUT_CONNECT))
-        .timeout_send_request(Some(TIMEOUT_SEND_REQUEST))
-        .timeout_send_body(Some(TIMEOUT_SEND_BODY))
-        .timeout_recv_response(Some(TIMEOUT_RECV_RESPONSE))
+        .timeout_connect(Some(common::TIMEOUT_CONNECT))
+        .timeout_send_request(Some(common::TIMEOUT_SEND_REQUEST))
+        .timeout_send_body(Some(common::TIMEOUT_SEND_BODY))
+        .timeout_recv_response(Some(common::TIMEOUT_RECV_RESPONSE))
         .http_status_as_error(false)
         .build()
         .send_json(body)
@@ -157,10 +139,12 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
 
     let reader = BufReader::new(resp.body_mut().as_reader());
     let mut output = AssistantMessage::empty(ctx.api_id, ctx.provider_name, ctx.model_id);
-    tx.send_blocking(StreamEvent::Start {
-        partial: output.clone(),
-    })
-    .map_err(|_| crate::Error::ChannelClosed)?;
+    send_event(
+        tx,
+        StreamEvent::Start {
+            partial: output.clone(),
+        },
+    )?;
 
     let mut block_index_map: Vec<(u64, usize)> = Vec::new();
     let mut current_event_type = String::new();
@@ -204,11 +188,13 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                         }));
                         let ci = output.content.len() - 1;
                         block_index_map.push((ev.index, ci));
-                        tx.send_blocking(StreamEvent::TextStart {
-                            content_index: ci,
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::TextStart {
+                                content_index: ci,
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     ContentBlock::Thinking { .. } => {
                         output
@@ -220,11 +206,13 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                             }));
                         let ci = output.content.len() - 1;
                         block_index_map.push((ev.index, ci));
-                        tx.send_blocking(StreamEvent::ThinkingStart {
-                            content_index: ci,
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::ThinkingStart {
+                                content_index: ci,
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     ContentBlock::RedactedThinking { data: sig } => {
                         output
@@ -236,11 +224,13 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                             }));
                         let ci = output.content.len() - 1;
                         block_index_map.push((ev.index, ci));
-                        tx.send_blocking(StreamEvent::ThinkingStart {
-                            content_index: ci,
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::ThinkingStart {
+                                content_index: ci,
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     ContentBlock::ToolUse { id, name, .. } => {
                         output.content.push(AssistantContent::ToolCall(ToolCall {
@@ -250,11 +240,13 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                         }));
                         let ci = output.content.len() - 1;
                         block_index_map.push((ev.index, ci));
-                        tx.send_blocking(StreamEvent::ToolcallStart {
-                            content_index: ci,
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::ToolcallStart {
+                                content_index: ci,
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                 }
             }
@@ -272,35 +264,41 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                         if let Some(AssistantContent::Text(t)) = output.content.get_mut(ci) {
                             t.text.push_str(&text);
                         }
-                        tx.send_blocking(StreamEvent::TextDelta {
-                            content_index: ci,
-                            delta: text,
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::TextDelta {
+                                content_index: ci,
+                                delta: text,
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     Delta::ThinkingDelta { thinking } => {
                         if let Some(AssistantContent::Thinking(t)) = output.content.get_mut(ci) {
                             t.thinking.push_str(&thinking);
                         }
-                        tx.send_blocking(StreamEvent::ThinkingDelta {
-                            content_index: ci,
-                            delta: thinking,
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::ThinkingDelta {
+                                content_index: ci,
+                                delta: thinking,
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     Delta::InputJsonDelta { partial_json } => {
                         tool_json_accum
                             .entry(ev.index)
                             .or_default()
                             .push_str(&partial_json);
-                        tx.send_blocking(StreamEvent::ToolcallDelta {
-                            content_index: ci,
-                            delta: partial_json,
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::ToolcallDelta {
+                                content_index: ci,
+                                delta: partial_json,
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     Delta::SignatureDelta { signature } => {
                         if let Some(AssistantContent::Thinking(t)) = output.content.get_mut(ci) {
@@ -321,20 +319,24 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
 
                 match output.content.get(ci) {
                     Some(AssistantContent::Text(t)) => {
-                        tx.send_blocking(StreamEvent::TextEnd {
-                            content_index: ci,
-                            content: t.text.clone(),
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::TextEnd {
+                                content_index: ci,
+                                content: t.text.clone(),
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     Some(AssistantContent::Thinking(t)) => {
-                        tx.send_blocking(StreamEvent::ThinkingEnd {
-                            content_index: ci,
-                            content: t.thinking.clone(),
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::ThinkingEnd {
+                                content_index: ci,
+                                content: t.thinking.clone(),
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     Some(AssistantContent::ToolCall(_)) => {
                         // Parse accumulated JSON into arguments
@@ -348,12 +350,14 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                             Some(AssistantContent::ToolCall(tc)) => tc.clone(),
                             _ => continue,
                         };
-                        tx.send_blocking(StreamEvent::ToolcallEnd {
-                            content_index: ci,
-                            tool_call: tc,
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::ToolcallEnd {
+                                content_index: ci,
+                                tool_call: tc,
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                     None => {}
                 }
@@ -372,11 +376,13 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                 }
             }
             "message_stop" => {
-                tx.send_blocking(StreamEvent::Done {
-                    reason: output.stop_reason,
-                    message: output,
-                })
-                .map_err(|_| crate::Error::ChannelClosed)?;
+                send_event(
+                    tx,
+                    StreamEvent::Done {
+                        reason: output.stop_reason,
+                        message: output,
+                    },
+                )?;
                 return Ok(());
             }
             "error" => {
@@ -392,11 +398,13 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                     .unwrap_or_else(|| format!("SSE error: {}", data));
                 output.stop_reason = StopReason::Error;
                 output.error_message = Some(error_msg);
-                tx.send_blocking(StreamEvent::Error {
-                    reason: StopReason::Error,
-                    error: output,
-                })
-                .map_err(|_| crate::Error::ChannelClosed)?;
+                send_event(
+                    tx,
+                    StreamEvent::Error {
+                        reason: StopReason::Error,
+                        error: output,
+                    },
+                )?;
                 return Ok(());
             }
             _ => {}
@@ -405,11 +413,13 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
 
     output.stop_reason = StopReason::Error;
     output.error_message = Some("Stream ended unexpectedly".into());
-    tx.send_blocking(StreamEvent::Error {
-        reason: StopReason::Error,
-        error: output,
-    })
-    .map_err(|_| crate::Error::ChannelClosed)?;
+    send_event(
+        tx,
+        StreamEvent::Error {
+            reason: StopReason::Error,
+            error: output,
+        },
+    )?;
     Ok(())
 }
 

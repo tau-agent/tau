@@ -5,6 +5,7 @@ pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod orchestration;
+pub mod paths;
 pub mod plugin;
 pub mod protocol;
 pub mod provider;
@@ -25,6 +26,72 @@ pub mod worker;
 
 pub use provider::{Provider, ProviderRegistry};
 pub use types::*;
+
+// ---------------------------------------------------------------------------
+// JSON-line I/O helpers
+// ---------------------------------------------------------------------------
+
+/// Serialize `val` as a single JSON line and flush the writer (sync).
+pub fn write_json_line<T: serde::Serialize>(
+    writer: &mut impl std::io::Write,
+    val: &T,
+) -> Result<()> {
+    let mut line = serde_json::to_string(val).map_err(|e| Error::Io(e.to_string()))?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| Error::Io(e.to_string()))?;
+    writer.flush().map_err(|e| Error::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Serialize `val` as a single JSON line and flush the writer (async).
+pub async fn write_json_line_async<T: serde::Serialize>(
+    writer: &mut (impl futures::io::AsyncWrite + Unpin),
+    val: &T,
+) -> Result<()> {
+    use futures::io::AsyncWriteExt;
+    let mut line = serde_json::to_string(val).map_err(|e| Error::Io(e.to_string()))?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| Error::Io(e.to_string()))?;
+    writer.flush().await.map_err(|e| Error::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Read a single JSON line (sync).  Returns `Ok(None)` on EOF.
+pub fn read_json_line<T: serde::de::DeserializeOwned>(
+    reader: &mut impl std::io::BufRead,
+) -> Result<Option<T>> {
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let val = serde_json::from_str(&line).map_err(|e| Error::Parse(e.to_string()))?;
+    Ok(Some(val))
+}
+
+/// Read a single JSON line (async).  Returns `Ok(None)` on EOF.
+pub async fn read_json_line_async<T: serde::de::DeserializeOwned>(
+    reader: &mut (impl futures::io::AsyncBufRead + Unpin),
+) -> Result<Option<T>> {
+    use futures::io::AsyncBufReadExt;
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| Error::Io(e.to_string()))?;
+    if n == 0 {
+        return Ok(None);
+    }
+    let val = serde_json::from_str(&line).map_err(|e| Error::Parse(e.to_string()))?;
+    Ok(Some(val))
+}
 
 // ---------------------------------------------------------------------------
 // String utilities

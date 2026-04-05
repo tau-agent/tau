@@ -141,17 +141,11 @@ pub fn repair_messages(messages: &[Message]) -> Vec<Message> {
     let mut stubs = Vec::new();
     for (id, name) in &tool_call_ids {
         if !existing_result_ids.contains(id) {
-            stubs.push(Message::ToolResult(ToolResultMessage {
-                tool_call_id: id.to_string(),
-                tool_name: name.to_string(),
-                content: vec![ToolResultContent::Text(TextContent {
-                    text: "error: session interrupted before execution".into(),
-                    text_signature: None,
-                })],
-                details: None,
-                is_error: true,
-                timestamp: crate::types::timestamp_ms(),
-            }));
+            stubs.push(Message::ToolResult(ToolResultMessage::error(
+                *id,
+                *name,
+                "error: session interrupted before execution",
+            )));
         }
     }
 
@@ -175,6 +169,13 @@ async fn cancellable_sleep(
         }
         let chunk = remaining.min(std::time::Duration::from_millis(100));
         smol::Timer::after(chunk).await;
+    }
+}
+
+/// Emit a message via the on_message callback, if configured.
+fn emit_message(config: &AgentConfig, msg: &Message) {
+    if let Some(ref on_msg) = config.on_message {
+        on_msg.lock().expect("on_message mutex poisoned")(msg);
     }
 }
 
@@ -238,9 +239,7 @@ pub async fn run(
 
         let stop_reason = message.stop_reason;
         let assistant_msg = Message::Assistant(message.clone());
-        if let Some(ref on_msg) = config.on_message {
-            on_msg.lock().expect("on_message mutex poisoned")(&assistant_msg);
-        }
+        emit_message(config, &assistant_msg);
         new_messages.push(assistant_msg);
         context.messages.push(Message::Assistant(message.clone()));
 
@@ -284,19 +283,11 @@ pub async fn run(
             // so the message history stays valid (every tool_use needs a tool_result).
             if config.should_stop.as_ref().is_some_and(|f| f()) {
                 for remaining_tc in &tool_calls[tc_idx..] {
-                    let stub = crate::types::ToolResultMessage {
-                        tool_call_id: remaining_tc.id.clone(),
-                        tool_name: remaining_tc.name.clone(),
-                        content: vec![crate::types::ToolResultContent::Text(
-                            crate::types::TextContent {
-                                text: "error: cancelled before execution".into(),
-                                text_signature: None,
-                            },
-                        )],
-                        details: None,
-                        is_error: true,
-                        timestamp: crate::types::timestamp_ms(),
-                    };
+                    let stub = crate::types::ToolResultMessage::error(
+                        remaining_tc.id.clone(),
+                        remaining_tc.name.clone(),
+                        "error: cancelled before execution",
+                    );
                     let _ = event_tx.try_send(StreamEvent::ToolResult {
                         tool_call_id: remaining_tc.id.clone(),
                         tool_name: remaining_tc.name.clone(),
@@ -304,9 +295,7 @@ pub async fn run(
                         content: "error: cancelled before execution".into(),
                     });
                     let tool_msg = Message::ToolResult(stub.clone());
-                    if let Some(ref on_msg) = config.on_message {
-                        on_msg.lock().expect("on_message mutex poisoned")(&tool_msg);
-                    }
+                    emit_message(config, &tool_msg);
                     new_messages.push(tool_msg);
                     context.messages.push(Message::ToolResult(stub));
                 }
@@ -341,19 +330,11 @@ pub async fn run(
             let (result, _) = futures::future::join(tool_future, forward_future).await;
             let result = match result {
                 Ok(r) => r,
-                Err(e) => crate::types::ToolResultMessage {
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    content: vec![crate::types::ToolResultContent::Text(
-                        crate::types::TextContent {
-                            text: format!("error: {}", e),
-                            text_signature: None,
-                        },
-                    )],
-                    details: None,
-                    is_error: true,
-                    timestamp: crate::types::timestamp_ms(),
-                },
+                Err(e) => crate::types::ToolResultMessage::error(
+                    tc.id.clone(),
+                    tc.name.clone(),
+                    format!("error: {}", e),
+                ),
             };
 
             // Emit full tool result
@@ -374,9 +355,7 @@ pub async fn run(
             });
 
             let tool_msg = Message::ToolResult(result.clone());
-            if let Some(ref on_msg) = config.on_message {
-                on_msg.lock().expect("on_message mutex poisoned")(&tool_msg);
-            }
+            emit_message(config, &tool_msg);
             new_messages.push(tool_msg);
             context.messages.push(Message::ToolResult(result));
         }
@@ -416,9 +395,7 @@ pub async fn run(
                     })],
                     timestamp: crate::types::timestamp_ms(),
                 });
-                if let Some(ref on_msg) = config.on_message {
-                    on_msg.lock().expect("on_message mutex poisoned")(&nudge);
-                }
+                emit_message(config, &nudge);
                 let _ = event_tx.try_send(StreamEvent::Status {
                     message: format!(
                         "Loop review at turn {}: session appears stuck, injecting nudge.",
@@ -1241,17 +1218,7 @@ mod tests {
                         a.stop_reason = StopReason::ToolUse;
                         a
                     }),
-                    Message::ToolResult(ToolResultMessage {
-                        tool_call_id: "tc1".into(),
-                        tool_name: "bash".into(),
-                        content: vec![ToolResultContent::Text(TextContent {
-                            text: "hello\n".into(),
-                            text_signature: None,
-                        })],
-                        details: None,
-                        is_error: false,
-                        timestamp: 0,
-                    }),
+                    Message::ToolResult(ToolResultMessage::success("tc1", "bash", "hello\n")),
                 ],
                 tools: Vec::new(),
             };
@@ -1667,17 +1634,7 @@ mod tests {
         let messages = vec![
             Message::User(UserMessage::text("hi")),
             Message::Assistant(a),
-            Message::ToolResult(ToolResultMessage {
-                tool_call_id: "tc1".into(),
-                tool_name: "bash".into(),
-                content: vec![ToolResultContent::Text(TextContent {
-                    text: "ok".into(),
-                    text_signature: None,
-                })],
-                details: None,
-                is_error: false,
-                timestamp: 0,
-            }),
+            Message::ToolResult(ToolResultMessage::success("tc1", "bash", "ok")),
         ];
         assert!(repair_messages(&messages).is_empty());
     }
@@ -1734,17 +1691,7 @@ mod tests {
         let messages = vec![
             Message::User(UserMessage::text("hi")),
             Message::Assistant(a),
-            Message::ToolResult(ToolResultMessage {
-                tool_call_id: "tc1".into(),
-                tool_name: "bash".into(),
-                content: vec![ToolResultContent::Text(TextContent {
-                    text: "ok".into(),
-                    text_signature: None,
-                })],
-                details: None,
-                is_error: false,
-                timestamp: 0,
-            }),
+            Message::ToolResult(ToolResultMessage::success("tc1", "bash", "ok")),
         ];
         let stubs = repair_messages(&messages);
         assert_eq!(stubs.len(), 1);

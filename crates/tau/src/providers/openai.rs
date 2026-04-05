@@ -4,22 +4,13 @@
 //! via different base_url and model settings.
 
 use std::io::{BufRead, BufReader};
-use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::common::{self, StreamCtx, send_event};
 use super::openai_types;
 use crate::provider::{EventReceiver, EventSender, Provider};
 use crate::types::*;
-
-/// Timeout for TCP + TLS connection establishment.
-const TIMEOUT_CONNECT: Duration = Duration::from_secs(30);
-/// Timeout for sending the request headers.
-const TIMEOUT_SEND_REQUEST: Duration = Duration::from_secs(30);
-/// Timeout for sending the request body (JSON payload).
-const TIMEOUT_SEND_BODY: Duration = Duration::from_secs(30);
-/// Timeout for receiving response headers (time-to-first-byte).
-const TIMEOUT_RECV_RESPONSE: Duration = Duration::from_secs(120);
 
 const API_ID: &str = "openai-completions";
 
@@ -91,15 +82,6 @@ impl Provider for OpenAi {
     }
 }
 
-struct StreamCtx<'a> {
-    base_url: &'a str,
-    api_key: &'a str,
-    api_id: &'a str,
-    provider_name: &'a str,
-    model_id: &'a str,
-    model: &'a Model,
-}
-
 // ---------------------------------------------------------------------------
 // SSE stream processing
 // ---------------------------------------------------------------------------
@@ -122,10 +104,10 @@ fn run_stream(
 
     let mut resp = req
         .config()
-        .timeout_connect(Some(TIMEOUT_CONNECT))
-        .timeout_send_request(Some(TIMEOUT_SEND_REQUEST))
-        .timeout_send_body(Some(TIMEOUT_SEND_BODY))
-        .timeout_recv_response(Some(TIMEOUT_RECV_RESPONSE))
+        .timeout_connect(Some(common::TIMEOUT_CONNECT))
+        .timeout_send_request(Some(common::TIMEOUT_SEND_REQUEST))
+        .timeout_send_body(Some(common::TIMEOUT_SEND_BODY))
+        .timeout_recv_response(Some(common::TIMEOUT_RECV_RESPONSE))
         .http_status_as_error(false)
         .build()
         .send_json(body)
@@ -151,10 +133,12 @@ fn run_stream(
     let reader = BufReader::new(resp.body_mut().as_reader());
     let mut output = AssistantMessage::empty(ctx.api_id, ctx.provider_name, ctx.model_id);
 
-    tx.send_blocking(StreamEvent::Start {
-        partial: output.clone(),
-    })
-    .map_err(|_| crate::Error::ChannelClosed)?;
+    send_event(
+        tx,
+        StreamEvent::Start {
+            partial: output.clone(),
+        },
+    )?;
 
     // Track tool calls by index (OpenAI streams them incrementally)
     struct ToolAccum {
@@ -219,22 +203,26 @@ fn run_stream(
                         redacted: false,
                     }));
                 thinking_started = true;
-                tx.send_blocking(StreamEvent::ThinkingStart {
-                    content_index: output.content.len() - 1,
-                    partial: output.clone(),
-                })
-                .map_err(|_| crate::Error::ChannelClosed)?;
+                send_event(
+                    tx,
+                    StreamEvent::ThinkingStart {
+                        content_index: output.content.len() - 1,
+                        partial: output.clone(),
+                    },
+                )?;
             }
             let ci = output.content.len() - 1;
             if let Some(AssistantContent::Thinking(t)) = output.content.get_mut(ci) {
                 t.thinking.push_str(thinking);
             }
-            tx.send_blocking(StreamEvent::ThinkingDelta {
-                content_index: ci,
-                delta: thinking.clone(),
-                partial: output.clone(),
-            })
-            .map_err(|_| crate::Error::ChannelClosed)?;
+            send_event(
+                tx,
+                StreamEvent::ThinkingDelta {
+                    content_index: ci,
+                    delta: thinking.clone(),
+                    partial: output.clone(),
+                },
+            )?;
         }
 
         // Text content
@@ -243,12 +231,14 @@ fn run_stream(
             if thinking_started {
                 let ci = output.content.len() - 1;
                 if let Some(AssistantContent::Thinking(t)) = output.content.get(ci) {
-                    tx.send_blocking(StreamEvent::ThinkingEnd {
-                        content_index: ci,
-                        content: t.thinking.clone(),
-                        partial: output.clone(),
-                    })
-                    .map_err(|_| crate::Error::ChannelClosed)?;
+                    send_event(
+                        tx,
+                        StreamEvent::ThinkingEnd {
+                            content_index: ci,
+                            content: t.thinking.clone(),
+                            partial: output.clone(),
+                        },
+                    )?;
                 }
                 thinking_started = false;
             }
@@ -259,22 +249,26 @@ fn run_stream(
                     text_signature: None,
                 }));
                 text_started = true;
-                tx.send_blocking(StreamEvent::TextStart {
-                    content_index: output.content.len() - 1,
-                    partial: output.clone(),
-                })
-                .map_err(|_| crate::Error::ChannelClosed)?;
+                send_event(
+                    tx,
+                    StreamEvent::TextStart {
+                        content_index: output.content.len() - 1,
+                        partial: output.clone(),
+                    },
+                )?;
             }
             let ci = output.content.len() - 1;
             if let Some(AssistantContent::Text(t)) = output.content.get_mut(ci) {
                 t.text.push_str(text);
             }
-            tx.send_blocking(StreamEvent::TextDelta {
-                content_index: ci,
-                delta: text.clone(),
-                partial: output.clone(),
-            })
-            .map_err(|_| crate::Error::ChannelClosed)?;
+            send_event(
+                tx,
+                StreamEvent::TextDelta {
+                    content_index: ci,
+                    delta: text.clone(),
+                    partial: output.clone(),
+                },
+            )?;
         }
 
         // Tool calls
@@ -283,12 +277,14 @@ fn run_stream(
             if text_started {
                 let ci = output.content.len() - 1;
                 if let Some(AssistantContent::Text(t)) = output.content.get(ci) {
-                    tx.send_blocking(StreamEvent::TextEnd {
-                        content_index: ci,
-                        content: t.text.clone(),
-                        partial: output.clone(),
-                    })
-                    .map_err(|_| crate::Error::ChannelClosed)?;
+                    send_event(
+                        tx,
+                        StreamEvent::TextEnd {
+                            content_index: ci,
+                            content: t.text.clone(),
+                            partial: output.clone(),
+                        },
+                    )?;
                 }
                 text_started = false;
             }
@@ -309,11 +305,13 @@ fn run_stream(
                         arguments: String::new(),
                         content_index: ci,
                     });
-                    tx.send_blocking(StreamEvent::ToolcallStart {
-                        content_index: ci,
-                        partial: output.clone(),
-                    })
-                    .map_err(|_| crate::Error::ChannelClosed)?;
+                    send_event(
+                        tx,
+                        StreamEvent::ToolcallStart {
+                            content_index: ci,
+                            partial: output.clone(),
+                        },
+                    )?;
                 }
 
                 let accum = &mut tool_accums[tc.index];
@@ -326,12 +324,14 @@ fn run_stream(
                     }
                     if let Some(ref args) = func.arguments {
                         accum.arguments.push_str(args);
-                        tx.send_blocking(StreamEvent::ToolcallDelta {
-                            content_index: accum.content_index,
-                            delta: args.clone(),
-                            partial: output.clone(),
-                        })
-                        .map_err(|_| crate::Error::ChannelClosed)?;
+                        send_event(
+                            tx,
+                            StreamEvent::ToolcallDelta {
+                                content_index: accum.content_index,
+                                delta: args.clone(),
+                                partial: output.clone(),
+                            },
+                        )?;
                     }
                 }
             }
@@ -342,23 +342,27 @@ fn run_stream(
     if thinking_started {
         let ci = output.content.len() - 1;
         if let Some(AssistantContent::Thinking(t)) = output.content.get(ci) {
-            tx.send_blocking(StreamEvent::ThinkingEnd {
-                content_index: ci,
-                content: t.thinking.clone(),
-                partial: output.clone(),
-            })
-            .map_err(|_| crate::Error::ChannelClosed)?;
+            send_event(
+                tx,
+                StreamEvent::ThinkingEnd {
+                    content_index: ci,
+                    content: t.thinking.clone(),
+                    partial: output.clone(),
+                },
+            )?;
         }
     }
     if text_started {
         let ci = output.content.len() - 1;
         if let Some(AssistantContent::Text(t)) = output.content.get(ci) {
-            tx.send_blocking(StreamEvent::TextEnd {
-                content_index: ci,
-                content: t.text.clone(),
-                partial: output.clone(),
-            })
-            .map_err(|_| crate::Error::ChannelClosed)?;
+            send_event(
+                tx,
+                StreamEvent::TextEnd {
+                    content_index: ci,
+                    content: t.text.clone(),
+                    partial: output.clone(),
+                },
+            )?;
         }
     }
 
@@ -371,24 +375,28 @@ fn run_stream(
             tc.name = accum.name.clone();
             tc.arguments = args;
         }
-        tx.send_blocking(StreamEvent::ToolcallEnd {
-            content_index: accum.content_index,
-            tool_call: ToolCall {
-                id: accum.id.clone(),
-                name: accum.name.clone(),
-                arguments: serde_json::from_str(&accum.arguments)
-                    .unwrap_or(serde_json::Value::Object(Default::default())),
+        send_event(
+            tx,
+            StreamEvent::ToolcallEnd {
+                content_index: accum.content_index,
+                tool_call: ToolCall {
+                    id: accum.id.clone(),
+                    name: accum.name.clone(),
+                    arguments: serde_json::from_str(&accum.arguments)
+                        .unwrap_or(serde_json::Value::Object(Default::default())),
+                },
+                partial: output.clone(),
             },
-            partial: output.clone(),
-        })
-        .map_err(|_| crate::Error::ChannelClosed)?;
+        )?;
     }
 
-    tx.send_blocking(StreamEvent::Done {
-        reason: output.stop_reason,
-        message: output,
-    })
-    .map_err(|_| crate::Error::ChannelClosed)?;
+    send_event(
+        tx,
+        StreamEvent::Done {
+            reason: output.stop_reason,
+            message: output,
+        },
+    )?;
 
     Ok(())
 }

@@ -5,7 +5,19 @@ pub mod edit;
 pub mod read;
 pub mod write;
 
+use std::path::{Path, PathBuf};
+
 use crate::types::*;
+
+/// Resolve a potentially relative path against the working directory.
+pub(crate) fn resolve_path(cwd: &str, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        Path::new(cwd).join(p)
+    }
+}
 
 /// Output from executing a tool.
 #[derive(Debug, Clone)]

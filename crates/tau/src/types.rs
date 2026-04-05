@@ -179,6 +179,40 @@ pub struct ToolResultMessage {
     pub timestamp: u64,
 }
 
+impl ToolResultMessage {
+    pub fn success(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Self {
+        Self {
+            tool_call_id: id.into(),
+            tool_name: name.into(),
+            content: vec![ToolResultContent::Text(TextContent {
+                text: text.into(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: false,
+            timestamp: timestamp_ms(),
+        }
+    }
+
+    pub fn error(id: impl Into<String>, name: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: id.into(),
+            tool_name: name.into(),
+            content: vec![ToolResultContent::Text(TextContent {
+                text: text.into(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: true,
+            timestamp: timestamp_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionSummaryMessage {
     pub summary: String,
