@@ -544,6 +544,25 @@ impl TasksDb {
                         .into(),
                 ));
             }
+            // refining -> ready requires non-empty affected_files
+            if task.state == "refining" && new_state == "ready" {
+                let has_files = match &task.affected_files {
+                    Some(serde_json::Value::Array(arr)) => !arr.is_empty(),
+                    _ => false,
+                };
+                // Also check if the update itself sets affected_files
+                let update_has_files = match &update.affected_files {
+                    Some(serde_json::Value::Array(arr)) => !arr.is_empty(),
+                    _ => false,
+                };
+                if !has_files && !update_has_files {
+                    return Err(crate::Error::Io(
+                        "cannot transition refining -> ready: affected_files must be \
+                         set and non-empty before a task can proceed to ready"
+                            .into(),
+                    ));
+                }
+            }
         }
 
         let now = crate::types::timestamp_ms() as i64;
@@ -3680,6 +3699,7 @@ mod tests {
             task.id,
             &TaskUpdate {
                 state: Some("ready".into()),
+                affected_files: Some(serde_json::json!(["src/main.rs"])),
                 ..Default::default()
             },
             None,
@@ -3766,6 +3786,189 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("invalid state transition"));
+    }
+
+    #[test]
+    fn test_refining_to_ready_rejected_without_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "No files", None, None, None, false, false)
+            .unwrap();
+
+        // interactive -> planning -> refining
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> ready without affected_files should fail
+        let err = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("ready".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("affected_files"),
+            "expected affected_files error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_refining_to_ready_rejected_with_empty_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Empty files", None, None, None, false, false)
+            .unwrap();
+
+        // interactive -> planning -> refining, set affected_files to empty array
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                affected_files: Some(serde_json::json!([])),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> ready with empty affected_files should fail
+        let err = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("ready".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("affected_files"),
+            "expected affected_files error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_refining_to_ready_succeeds_with_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "Has files", None, None, None, false, false)
+            .unwrap();
+
+        // interactive -> planning -> refining with affected_files set
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                affected_files: Some(serde_json::json!(["src/main.rs"])),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> ready with affected_files set should succeed
+        let updated = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("ready".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated.state, "ready");
+    }
+
+    #[test]
+    fn test_refining_to_ready_succeeds_when_files_set_in_same_update() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Files in update",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+
+        // interactive -> planning -> refining (no affected_files yet)
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> ready with affected_files set in the same update should succeed
+        let updated = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("ready".into()),
+                    affected_files: Some(serde_json::json!(["src/lib.rs"])),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated.state, "ready");
     }
 
     #[test]

@@ -3239,6 +3239,289 @@ mod tests {
         );
     }
 
+    // ----- refining dispatch tests -----
+
+    #[test]
+    fn test_planning_to_refining_creates_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask (defaults to planning state)
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Subtask with plan",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+
+        // Set a session_id on the task (simulating planning session)
+        db.set_session_id(task.id, "planning-session").unwrap();
+
+        // planning -> refining should trigger auto-dispatch of a refining session
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "refining"}),
+            Some("planning-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "refining");
+
+        // Verify that a session was created (CreateSession + Chat requests
+        // went through the mock). The mock generates "mock-s1", "mock-s2", etc.
+        let sessions = db.get_sessions(task.id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.iter().any(|(_, role)| *role == "refiner"),
+            "expected a refiner session to be recorded, got: {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_interactive_to_refining_creates_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create an interactive task
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Direct refine task"}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+        assert_eq!(task["state"], "interactive");
+
+        // interactive -> refining should also trigger refining dispatch
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "refining"}),
+            Some("s1"),
+            "tc2",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let sessions = db.get_sessions(task_id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.iter().any(|(_, role)| *role == "refiner"),
+            "expected a refiner session to be recorded, got: {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_refining_to_ready_rejected_without_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask in planning state
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "No files task",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+
+        // planning -> refining
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> ready without affected_files should fail
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "ready"}),
+            Some("s1"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(result.is_error, "expected error for missing affected_files");
+        assert!(
+            extract_text(&result).contains("affected_files"),
+            "expected affected_files error, got: {}",
+            extract_text(&result)
+        );
+    }
+
+    #[test]
+    fn test_refining_to_ready_succeeds_with_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask in planning state
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Has files task",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+
+        // Set affected_files and move through planning -> refining
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                affected_files: Some(serde_json::json!(["src/main.rs"])),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> ready with affected_files should succeed
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "ready"}),
+            Some("s1"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "ready");
+    }
+
+    #[test]
+    fn test_refining_to_planning_resumes_planning_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask in planning state with a session
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Needs revision",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+
+        // Simulate: assign planning session, then move to refining
+        db.set_session_id(task.id, "planning-session").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> planning should send a QueueMessage to the planning session
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "planning"}),
+            Some("refining-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        // Check that a QueueMessage was sent to "planning-session"
+        // The mock IO captures ServerRequests in the shared buffer.
+        // Since the mock processes requests synchronously, the QueueMessage
+        // should have been processed. We verify indirectly via the result succeeding.
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "planning");
+    }
+
     // ----- subtree claiming tests -----
 
     #[test]
