@@ -960,12 +960,58 @@ fn handle_task_update(
                 }
             }
 
+            // When a task transitions TO interactive (from any other state),
+            // ensure it has a live session. This covers the universal
+            // `any→interactive` override and `refining→interactive` scope
+            // expansion. The creating session (for parent_id) is the session
+            // that triggered the transition.
+            if task.state == "interactive" && old_state.as_deref() != Some("interactive") {
+                let needs_session = match &task.session_id {
+                    None => true,
+                    Some(sid) => {
+                        // Check if existing session is still alive
+                        let req = crate::protocol::Request::GetSessionInfo {
+                            session_id: sid.clone(),
+                        };
+                        match crate::tasks_scheduler::server_request(writer, reader, req) {
+                            Ok(crate::protocol::Response::SessionInfo { info }) => info.archived,
+                            _ => true, // session not found or error → need a new one
+                        }
+                    }
+                };
+                if needs_session {
+                    if let Some(new_sid) = create_interactive_session(
+                        db,
+                        &task,
+                        &task.project.clone(),
+                        session_id,
+                        writer,
+                        reader,
+                    ) {
+                        let _ = db.set_session_id(task.id, &new_sid);
+                        let _ = db.record_session(task.id, &new_sid, "interactive");
+                        if let Some(creator_sid) = session_id {
+                            let _ = db.record_session(task.id, creator_sid, "creator");
+                        }
+                    }
+                }
+            }
+
             // When a task transitions to done, auto-archive its session
             if task.state == "done" {
                 auto_archive_task_session(db, &task, writer, reader);
             }
 
-            match serde_json::to_string_pretty(&task) {
+            // Re-fetch task if we may have updated session_id after the
+            // initial update_task call (e.g. interactive session creation).
+            let final_task =
+                if task.state == "interactive" && old_state.as_deref() != Some("interactive") {
+                    db.get_task(task.id).ok().flatten().unwrap_or(task)
+                } else {
+                    task
+                };
+
+            match serde_json::to_string_pretty(&final_task) {
                 Ok(json) => tool_ok(tool_call_id, &json),
                 Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
             }
@@ -4785,5 +4831,336 @@ mod tests {
             .current_dir(repo_path)
             .output()
             .ok();
+    }
+
+    // ----- transition to interactive creates session tests -----
+
+    #[test]
+    fn test_transition_to_interactive_creates_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask (planning state, no session)
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Scope expansion",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+        assert!(task.session_id.is_none());
+
+        // planning -> interactive (scope expansion) should create a session
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "interactive"}),
+            Some("triggering-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "interactive");
+        // Should have a session_id (the new interactive session)
+        assert!(
+            !updated["session_id"].is_null(),
+            "expected session_id to be set on interactive transition"
+        );
+
+        // Check task_sessions has both interactive and creator records
+        let sessions = db.get_sessions(task.id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.iter().any(|(_, role)| *role == "interactive"),
+            "expected an interactive session to be recorded, got: {:?}",
+            roles
+        );
+        assert!(
+            roles.iter().any(|(_, role)| *role == "creator"),
+            "expected a creator session to be recorded, got: {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_transition_to_interactive_no_session_context() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask in planning state (no session)
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "CLI takeover",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+        assert!(task.session_id.is_none());
+
+        // planning -> interactive without session context
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "interactive"}),
+            None, // no session context
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "interactive");
+        // Session still created even without a parent session
+        assert!(
+            !updated["session_id"].is_null(),
+            "expected session_id even without session context"
+        );
+
+        // Only interactive session recorded (no creator since no session context)
+        let sessions = db.get_sessions(task.id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.iter().any(|(_, role)| *role == "interactive"),
+            "expected interactive session, got: {:?}",
+            roles
+        );
+        assert!(
+            !roles.iter().any(|(_, role)| *role == "creator"),
+            "should not have creator when no session context, got: {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_transition_to_interactive_with_live_session_no_new_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create an interactive task (gets mock-s1)
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Already has session"}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+        let original_sid = task["session_id"].as_str().unwrap().to_string();
+        assert_eq!(task["state"], "interactive");
+
+        // Move to planning, then back to interactive
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "planning"}),
+            Some("s1"),
+            "tc2",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+
+        // planning -> interactive: the task still has the original session_id,
+        // which is alive (not archived in mock), so no new session should be created
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "interactive"}),
+            Some("s1"),
+            "tc3",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "interactive");
+        // Session should be unchanged (reused, not replaced)
+        assert_eq!(
+            updated["session_id"].as_str().unwrap(),
+            original_sid,
+            "expected existing live session to be reused"
+        );
+    }
+
+    #[test]
+    fn test_transition_to_interactive_with_archived_session_creates_new() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create task with a session using normal mock
+        let (mut writer, mut reader) = mock_io();
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Session will be archived"}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+        let original_sid = task["session_id"].as_str().unwrap().to_string();
+
+        // Move to planning
+        let mut events = Vec::new();
+        db.update_task(
+            task_id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Now create mock IO where the original session is archived
+        let mut archived = std::collections::HashSet::new();
+        archived.insert(original_sid.clone());
+        let (mut writer2, mut reader2) = mock_io_with_archived(archived);
+
+        // planning -> interactive: archived session should trigger new session creation
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "interactive"}),
+            Some("triggering-session"),
+            "tc2",
+            &mut writer2,
+            &mut reader2,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "interactive");
+        // Should have a NEW session (different from the archived one)
+        let new_sid = updated["session_id"].as_str().unwrap();
+        assert_ne!(
+            new_sid, original_sid,
+            "expected new session when old one is archived"
+        );
+    }
+
+    #[test]
+    fn test_refining_to_interactive_creates_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask in refining state (simulating scope expansion)
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Needs scope expansion",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> interactive (scope expansion) should create a session
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "interactive"}),
+            Some("refiner-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "interactive");
+        assert!(
+            !updated["session_id"].is_null(),
+            "expected session_id on refining -> interactive"
+        );
+
+        // Check that refiner-session is recorded as creator
+        let sessions = db.get_sessions(task.id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles
+                .iter()
+                .any(|(sid, role)| *sid == "refiner-session" && *role == "creator"),
+            "expected refiner-session as creator, got: {:?}",
+            roles
+        );
     }
 }
