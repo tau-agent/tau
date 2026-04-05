@@ -401,7 +401,10 @@ fn handle_task_create(
         Ok(task) => {
             // Subtasks start in ready state — trigger a schedule pass.
             if task.state == "ready" {
-                pending_events.push(SchedulerEvent::ScheduleNeeded(project.to_string()));
+                pending_events.push(SchedulerEvent::ScheduleNeeded(
+                    project.to_string(),
+                    session_id.map(String::from),
+                ));
             }
 
             // Interactive tasks get a fresh session for the user to drive
@@ -712,7 +715,10 @@ fn handle_task_update(
             match task.state.as_str() {
                 "approved" => pending_events.push(SchedulerEvent::MergeNeeded),
                 "ready" => {
-                    pending_events.push(SchedulerEvent::ScheduleNeeded(task.project.clone()));
+                    pending_events.push(SchedulerEvent::ScheduleNeeded(
+                        task.project.clone(),
+                        session_id.map(String::from),
+                    ));
                 }
                 _ => {}
             }
@@ -1093,7 +1099,9 @@ enum SchedulerEvent {
     /// A task moved to `approved` — run the merge queue.
     MergeNeeded,
     /// A task moved to `ready` — run a scheduling pass for the given project.
-    ScheduleNeeded(String),
+    /// The optional session ID is the session that triggered the event, used
+    /// to inherit the model when auto-dispatching tasks.
+    ScheduleNeeded(String, Option<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,8 +1269,10 @@ pub fn run_tasks_plugin() {
                         "ready" => {
                             // Look up the task's project for the schedule pass.
                             if let Ok(Some(task)) = db.get_task(task_id) {
-                                pending_events
-                                    .push(SchedulerEvent::ScheduleNeeded(task.project.clone()));
+                                pending_events.push(SchedulerEvent::ScheduleNeeded(
+                                    task.project.clone(),
+                                    None,
+                                ));
                             }
                         }
                         _ => {}
@@ -1392,14 +1402,14 @@ fn drain_scheduler_events(
     let batch = std::mem::take(events);
 
     let mut need_merge = false;
-    let mut schedule_projects: Vec<String> = Vec::new();
+    let mut schedule_projects: Vec<(String, Option<String>)> = Vec::new();
 
     for ev in batch {
         match ev {
             SchedulerEvent::MergeNeeded => need_merge = true,
-            SchedulerEvent::ScheduleNeeded(project) => {
-                if !schedule_projects.contains(&project) {
-                    schedule_projects.push(project);
+            SchedulerEvent::ScheduleNeeded(project, session_id) => {
+                if !schedule_projects.iter().any(|(p, _)| p == &project) {
+                    schedule_projects.push((project, session_id));
                 }
             }
         }
@@ -1411,8 +1421,8 @@ fn drain_scheduler_events(
         run_merge_pass(db, writer, reader);
     }
 
-    for project in &schedule_projects {
-        run_schedule_pass(db, project, writer, reader);
+    for (project, session_id) in &schedule_projects {
+        run_schedule_pass(db, project, session_id.as_deref(), writer, reader);
     }
 }
 
@@ -1453,6 +1463,7 @@ fn run_merge_pass(db: &TasksDb, writer: &mut impl Write, reader: &mut impl BufRe
 fn run_schedule_pass(
     db: &TasksDb,
     project: &str,
+    session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) {
@@ -1464,9 +1475,8 @@ fn run_schedule_pass(
                     st.id, st.title, st.branch
                 );
                 // Dispatch each scheduled task (create session + send initial message).
-                // Pass None for parent_session_id — dispatch() will resolve the parent
-                // task's session automatically for auto-dispatched tasks.
-                if let Err(e) = tasks_scheduler::dispatch(db, st.id, None, writer, reader) {
+                // Pass the triggering session_id so dispatch() can inherit its model.
+                if let Err(e) = tasks_scheduler::dispatch(db, st.id, session_id, writer, reader) {
                     eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
                 }
             }
@@ -2712,7 +2722,10 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(
             events,
-            vec![SchedulerEvent::ScheduleNeeded("/project".into())]
+            vec![SchedulerEvent::ScheduleNeeded(
+                "/project".into(),
+                Some("s1".into())
+            )]
         );
     }
 
@@ -2754,7 +2767,10 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(
             events,
-            vec![SchedulerEvent::ScheduleNeeded("/project".into())]
+            vec![SchedulerEvent::ScheduleNeeded(
+                "/project".into(),
+                Some("s1".into())
+            )]
         );
     }
 
@@ -2800,30 +2816,42 @@ mod tests {
         let mut events = vec![
             SchedulerEvent::MergeNeeded,
             SchedulerEvent::MergeNeeded,
-            SchedulerEvent::ScheduleNeeded("/project-a".into()),
-            SchedulerEvent::ScheduleNeeded("/project-a".into()),
-            SchedulerEvent::ScheduleNeeded("/project-b".into()),
+            SchedulerEvent::ScheduleNeeded("/project-a".into(), Some("s1".into())),
+            SchedulerEvent::ScheduleNeeded("/project-a".into(), Some("s2".into())),
+            SchedulerEvent::ScheduleNeeded("/project-b".into(), None),
         ];
 
         // We can't easily test the actual passes (they need real git repos),
         // but we can verify the event collection logic by inspecting it.
         let batch = std::mem::take(&mut events);
         let mut need_merge = false;
-        let mut schedule_projects: Vec<String> = Vec::new();
+        let mut schedule_projects: Vec<(String, Option<String>)> = Vec::new();
         for ev in batch {
             match ev {
                 SchedulerEvent::MergeNeeded => need_merge = true,
-                SchedulerEvent::ScheduleNeeded(project) => {
-                    if !schedule_projects.contains(&project) {
-                        schedule_projects.push(project);
+                SchedulerEvent::ScheduleNeeded(project, session_id) => {
+                    if !schedule_projects.iter().any(|(p, _)| p == &project) {
+                        schedule_projects.push((project, session_id));
                     }
                 }
             }
         }
         assert!(need_merge);
         assert_eq!(schedule_projects.len(), 2);
-        assert!(schedule_projects.contains(&"/project-a".to_string()));
-        assert!(schedule_projects.contains(&"/project-b".to_string()));
+        assert!(schedule_projects.iter().any(|(p, _)| p == "/project-a"));
+        assert!(schedule_projects.iter().any(|(p, _)| p == "/project-b"));
+        // First occurrence of project-a wins — carries s1's session ID
+        let a_entry = schedule_projects
+            .iter()
+            .find(|(p, _)| p == "/project-a")
+            .unwrap();
+        assert_eq!(a_entry.1, Some("s1".into()));
+        // project-b had no session
+        let b_entry = schedule_projects
+            .iter()
+            .find(|(p, _)| p == "/project-b")
+            .unwrap();
+        assert_eq!(b_entry.1, None);
     }
 
     // ----- review → active notification tests -----
