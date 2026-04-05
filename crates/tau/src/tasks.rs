@@ -560,19 +560,19 @@ fn handle_task_assign(
     };
 
     // Capture old session before assign (for reparenting)
-    let old_session = db
-        .get_task(id)
-        .ok()
-        .flatten()
-        .and_then(|t| t.session_id.clone());
+    // Note: assign_task now handles descendant DB updates atomically in its
+    // transaction and returns the old session + descendant session info.
 
     match db.assign_task(id, sid) {
-        Ok(task) => {
-            // For interactive tasks, claim the whole subtree and reparent sessions
+        Ok(result) => {
+            let task = &result.task;
+            // For interactive tasks with a changed session, reparent sessions via RPC.
+            // The DB updates (session_id on task + all descendants) were already done
+            // atomically inside assign_task's transaction.
             if task.state == "interactive" {
-                if let Some(ref old_sid) = old_session {
+                if let Some(ref old_sid) = result.old_session_id {
                     if old_sid != sid {
-                        // Reparent child sessions from the old session to the new one
+                        // Reparent direct child sessions from the old session
                         let req = crate::protocol::Request::ReparentChildren {
                             old_parent_id: old_sid.clone(),
                             new_parent_id: sid.to_string(),
@@ -585,42 +585,30 @@ fn handle_task_assign(
                             );
                         }
 
-                        // Update session_id on all descendant tasks and
-                        // reparent their sessions if they were parented
-                        // under the old session.
-                        if let Ok(descendants) = db.get_descendant_tasks(id) {
-                            for desc in &descendants {
-                                if let Err(e) = db.update_descendant_session(desc.id, sid) {
+                        // Reparent descendant task sessions that were parented
+                        // under the old owner. Deduplicate since multiple
+                        // descendants may share the same old session.
+                        let mut reparented = std::collections::HashSet::new();
+                        for desc_old_sid in &result.descendant_old_sessions {
+                            if reparented.insert(desc_old_sid.clone()) {
+                                let req = crate::protocol::Request::ReparentChildren {
+                                    old_parent_id: desc_old_sid.clone(),
+                                    new_parent_id: sid.to_string(),
+                                };
+                                if let Err(e) =
+                                    crate::tasks_scheduler::server_request(writer, reader, req)
+                                {
                                     eprintln!(
-                                        "warning: failed to update session on descendant task {}: {}",
-                                        desc.id, e
+                                        "warning: failed to reparent children of {} to {}: {}",
+                                        desc_old_sid, sid, e
                                     );
-                                }
-
-                                // Reparent descendant task sessions that were
-                                // parented under the old owner.
-                                if let Some(ref desc_sid) = desc.session_id {
-                                    if desc_sid == old_sid {
-                                        let req = crate::protocol::Request::ReparentChildren {
-                                            old_parent_id: desc_sid.clone(),
-                                            new_parent_id: sid.to_string(),
-                                        };
-                                        if let Err(e) = crate::tasks_scheduler::server_request(
-                                            writer, reader, req,
-                                        ) {
-                                            eprintln!(
-                                                "warning: failed to reparent children of {} to {}: {}",
-                                                desc_sid, sid, e
-                                            );
-                                        }
-                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            match serde_json::to_string_pretty(&task) {
+            match serde_json::to_string_pretty(&result.task) {
                 Ok(json) => tool_ok(tool_call_id, &json),
                 Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
             }

@@ -62,6 +62,21 @@ pub struct TaskUpdate {
     pub skip_review: Option<bool>,
 }
 
+/// Result of `assign_task`, containing the updated task plus information
+/// needed for session reparenting (which requires RPC calls outside the DB
+/// transaction).
+#[derive(Debug, Clone)]
+pub struct AssignResult {
+    /// The updated task after assignment.
+    pub task: Task,
+    /// The old session_id before reassignment (if any).
+    pub old_session_id: Option<String>,
+    /// Descendant task sessions that should be reparented — each entry is
+    /// the old session_id of a descendant that was parented under the old
+    /// owner. Only populated for interactive task reassignments.
+    pub descendant_old_sessions: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // State transition validation
 // ---------------------------------------------------------------------------
@@ -1019,35 +1034,17 @@ impl TasksDb {
         Ok(descendants)
     }
 
-    /// Update `session_id` on a task (and optionally record in task_sessions).
-    /// Used by the subtree-claim logic to update descendants.
-    pub fn update_descendant_session(&self, task_id: i64, session_id: &str) -> crate::Result<()> {
-        let now = crate::types::timestamp_ms() as i64;
-        self.conn
-            .execute(
-                "UPDATE tasks SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
-                params![session_id, now, task_id],
-            )
-            .map_err(|e| crate::Error::Io(format!("update_descendant_session: {}", e)))?;
-
-        // Record in task_sessions
-        self.conn
-            .execute(
-                "INSERT OR IGNORE INTO task_sessions (task_id, session_id, role, created_at) \
-                 VALUES (?1, ?2, 'assigned', ?3)",
-                params![task_id, session_id, now],
-            )
-            .map_err(|e| crate::Error::Io(format!("record descendant session: {}", e)))?;
-
-        Ok(())
-    }
-
     // ----- assign -----
 
     /// Assign a task to a session. Validates task is in `ready` state,
     /// transitions to `active`, sets `session_id`, records in
     /// `task_sessions` and `task_history`.
-    pub fn assign_task(&self, task_id: i64, session_id: &str) -> crate::Result<Task> {
+    ///
+    /// For interactive tasks being reassigned, also updates `session_id` on
+    /// all descendant tasks within the same transaction. Returns an
+    /// `AssignResult` containing the updated task plus information needed
+    /// for session reparenting (which requires RPC calls outside the DB).
+    pub fn assign_task(&self, task_id: i64, session_id: &str) -> crate::Result<AssignResult> {
         let task = self
             .get_task(task_id)?
             .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
@@ -1066,6 +1063,9 @@ impl TasksDb {
         } else {
             "active"
         };
+
+        let old_session_id = task.session_id.clone();
+        let session_changed = old_session_id.as_deref() != Some(session_id);
 
         let tx = self
             .conn
@@ -1112,11 +1112,80 @@ impl TasksDb {
         )
         .map_err(|e| crate::Error::Io(format!("assign task session: {}", e)))?;
 
+        // For interactive tasks with a changed session, update all descendant
+        // tasks' session_id within this same transaction (atomic).
+        let mut descendant_old_sessions = Vec::new();
+        if task.state == "interactive" && session_changed {
+            if let Some(ref old_sid) = old_session_id {
+                // Collect descendant task IDs using BFS via direct SQL within
+                // the transaction (can't call self.get_subtasks inside tx).
+                let descendant_ids = {
+                    let mut ids = Vec::new();
+                    let mut queue = std::collections::VecDeque::new();
+                    queue.push_back(task_id);
+                    while let Some(pid) = queue.pop_front() {
+                        let mut stmt = tx
+                            .prepare("SELECT id, session_id FROM tasks WHERE parent_id = ?1")
+                            .map_err(|e| {
+                                crate::Error::Io(format!("prepare descendant query: {}", e))
+                            })?;
+                        let rows: Vec<(i64, Option<String>)> = stmt
+                            .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))
+                            .map_err(|e| crate::Error::Io(format!("query descendants: {}", e)))?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|e| crate::Error::Io(format!("read descendant row: {}", e)))?;
+                        for (child_id, child_session) in rows {
+                            // Track old sessions that were parented under
+                            // the old owner (for reparenting RPCs later).
+                            if let Some(ref cs) = child_session {
+                                if cs == old_sid {
+                                    descendant_old_sessions.push(cs.clone());
+                                }
+                            }
+                            ids.push(child_id);
+                            queue.push_back(child_id);
+                        }
+                    }
+                    ids
+                };
+
+                // Update session_id on all descendants and record in task_sessions.
+                for desc_id in &descendant_ids {
+                    tx.execute(
+                        "UPDATE tasks SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
+                        params![session_id, now, desc_id],
+                    )
+                    .map_err(|e| {
+                        crate::Error::Io(format!("update descendant {} session: {}", desc_id, e))
+                    })?;
+
+                    tx.execute(
+                        "INSERT OR IGNORE INTO task_sessions (task_id, session_id, role, created_at) \
+                         VALUES (?1, ?2, 'assigned', ?3)",
+                        params![desc_id, session_id, now],
+                    )
+                    .map_err(|e| {
+                        crate::Error::Io(format!(
+                            "record descendant {} session: {}",
+                            desc_id, e
+                        ))
+                    })?;
+                }
+            }
+        }
+
         tx.commit()
             .map_err(|e| crate::Error::Io(format!("assign_task commit: {}", e)))?;
 
-        self.get_task(task_id)?
-            .ok_or_else(|| crate::Error::Io("task not found after assign".into()))
+        let updated_task = self
+            .get_task(task_id)?
+            .ok_or_else(|| crate::Error::Io("task not found after assign".into()))?;
+
+        Ok(AssignResult {
+            task: updated_task,
+            old_session_id,
+            descendant_old_sessions,
+        })
     }
 
     // ----- session tracking -----
@@ -2095,7 +2164,7 @@ mod tests {
         .unwrap();
 
         // Assign
-        let assigned = db.assign_task(task.id, "session-1").unwrap();
+        let assigned = db.assign_task(task.id, "session-1").unwrap().task;
         assert_eq!(assigned.state, "active");
         assert_eq!(assigned.session_id.as_deref(), Some("session-1"));
 
@@ -2155,7 +2224,7 @@ mod tests {
         assert_eq!(task.state, "interactive");
 
         // Assigning an interactive task should succeed and stay interactive
-        let assigned = db.assign_task(task.id, "s1").unwrap();
+        let assigned = db.assign_task(task.id, "s1").unwrap().task;
         assert_eq!(assigned.state, "interactive");
         assert_eq!(assigned.session_id.as_deref(), Some("s1"));
     }

@@ -1500,9 +1500,9 @@ impl App {
 
     fn run_task_claim(&mut self, id: i64) -> tau::Result<()> {
         let db = tau::tasks_db::TasksDb::open_default()?;
-        let task = db.assign_task(id, &self.session_id)?;
+        let result = db.assign_task(id, &self.session_id)?;
         self.messages.push(MessageItem::Status {
-            text: format!("Claimed task #{}: {}", task.id, task.title),
+            text: format!("Claimed task #{}: {}", result.task.id, result.task.title),
         });
         Ok(())
     }

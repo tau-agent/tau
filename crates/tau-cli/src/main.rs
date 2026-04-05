@@ -1880,8 +1880,8 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
             println!("approved task #{}: {}", task.id, task.title);
         }
         TaskAction::Claim { id, session } => {
-            let task = db.assign_task(id, &session)?;
-            println!("Claimed task #{}: {}", task.id, task.title);
+            let result = db.assign_task(id, &session)?;
+            println!("Claimed task #{}: {}", result.task.id, result.task.title);
         }
         TaskAction::Ready { id } => {
             let update = tau::tasks_db::TaskUpdate {
