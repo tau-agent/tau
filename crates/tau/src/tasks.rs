@@ -5163,4 +5163,161 @@ mod tests {
             roles
         );
     }
+
+    // ----- dispatch idempotency / deduplication tests -----
+
+    /// Verify that calling `task_dispatch` twice for the same task does NOT
+    /// create a duplicate session.  The second call should return the already-
+    /// live worker session without creating a new one.
+    #[test]
+    fn test_dispatch_is_idempotent_for_already_dispatched_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create and prepare a task (active state).
+        let task = db
+            .create_task(
+                "/project",
+                "Idempotent dispatch test",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "pre-existing-session").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-worktree").unwrap();
+        // Record as worker session (simulating a previous successful dispatch).
+        db.record_session(task.id, "pre-existing-session", "worker")
+            .unwrap();
+
+        // First dispatch: task is already active with a worker session.
+        // find_reusable_session will query GetSessionInfo, mock_io returns
+        // SessionInfo with archived=false → session is reused.
+        let result = tasks_scheduler::dispatch(
+            &db,
+            task.id,
+            Some("parent-session"),
+            &mut writer,
+            &mut reader,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        let sid1 = result.unwrap();
+
+        // The returned session must be the pre-existing one (not a new mock-s*).
+        assert_eq!(
+            sid1, "pre-existing-session",
+            "expected the pre-existing worker session to be returned, got: {}",
+            sid1
+        );
+
+        // Second call: same result, still no new session created.
+        let result2 = tasks_scheduler::dispatch(
+            &db,
+            task.id,
+            Some("parent-session"),
+            &mut writer,
+            &mut reader,
+        );
+        assert!(result2.is_ok(), "expected Ok on second call, got: {:?}", result2);
+        let sid2 = result2.unwrap();
+        assert_eq!(
+            sid2, "pre-existing-session",
+            "second dispatch should return the same session, got: {}",
+            sid2
+        );
+
+        // Verify only one worker session was recorded (no duplicates).
+        let sessions = db.get_sessions(task.id).unwrap();
+        let worker_sessions: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.role == "worker")
+            .collect();
+        assert_eq!(
+            worker_sessions.len(),
+            1,
+            "expected exactly one worker session, got: {:?}",
+            worker_sessions
+        );
+    }
+
+    /// Verify that `run_schedule_pass` (triggered by a state transition to
+    /// `ready`) does NOT dispatch a duplicate session for a task that already
+    /// has a live worker session.
+    ///
+    /// Scenario:
+    /// 1. Task transitions to `ready` — schedule pass runs, dispatches task.
+    /// 2. Task transitions through planning/refining/ready again.
+    /// 3. Second schedule pass runs — must not create a duplicate session.
+    #[test]
+    fn test_schedule_pass_does_not_duplicate_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a task and simulate it having already been dispatched as worker.
+        let task = db
+            .create_task(
+                "/project",
+                "No duplicate session test",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "live-worker-session").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-worktree").unwrap();
+        db.record_session(task.id, "live-worker-session", "worker")
+            .unwrap();
+
+        // Record how many sessions exist before the second dispatch attempt.
+        let sessions_before = db.get_sessions(task.id).unwrap();
+        let worker_count_before = sessions_before
+            .iter()
+            .filter(|s| s.role == "worker")
+            .count();
+        assert_eq!(worker_count_before, 1);
+
+        // Call dispatch directly (as run_schedule_pass would).
+        // The mock_io will answer GetSessionInfo with archived=false → reuse.
+        let result = tasks_scheduler::dispatch(
+            &db,
+            task.id,
+            None,
+            &mut writer,
+            &mut reader,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+
+        // No new worker session should have been created.
+        let sessions_after = db.get_sessions(task.id).unwrap();
+        let worker_count_after = sessions_after
+            .iter()
+            .filter(|s| s.role == "worker")
+            .count();
+        assert_eq!(
+            worker_count_after, worker_count_before,
+            "dispatch created an extra worker session!"
+        );
+    }
 }

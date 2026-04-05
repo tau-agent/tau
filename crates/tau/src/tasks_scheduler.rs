@@ -301,13 +301,26 @@ pub fn dispatch(
         .get_task(task_id)?
         .ok_or_else(|| crate::Error::Io(format!("task {} not found after prepare", task_id)))?;
 
+    // If there is already a live worker session for this task, reuse it
+    // instead of creating a duplicate.  This makes dispatch idempotent:
+    // calling it twice (e.g. from a second schedule pass after a partial
+    // failure, or via a manual task_dispatch call) will not spawn a second
+    // session.
+    if let Some(existing_sid) = find_reusable_session(db, task_id, "worker", writer, reader) {
+        eprintln!(
+            "tasks scheduler: task {} already has a live worker session {}, reusing",
+            task_id, existing_sid
+        );
+        return Ok(existing_sid);
+    }
+
     // If the task has a session_id from a previous lifecycle phase (e.g. a
     // planner or refiner session), log and continue — the old session is
     // already recorded in the task_sessions table, and set_session_id below
     // will overwrite with the new worker session.
     if let Some(ref existing_sid) = task.session_id {
         eprintln!(
-            "tasks scheduler: task {} replacing previous session {} with new dispatch",
+            "tasks scheduler: task {} replacing previous session {} with new worker dispatch",
             task_id, existing_sid
         );
     }
@@ -408,6 +421,17 @@ fn dispatch_planning(
     reader: &mut impl BufRead,
 ) -> crate::Result<String> {
     let task_id = task.id;
+
+    // If there is already a live planner session for this task, reuse it
+    // instead of creating a duplicate.  This makes dispatch idempotent when
+    // the schedule pass runs more than once while the task is still planning.
+    if let Some(existing_sid) = find_reusable_session(db, task_id, "planner", writer, reader) {
+        eprintln!(
+            "tasks scheduler: planning task {} already has a live planner session {}, reusing",
+            task_id, existing_sid
+        );
+        return Ok(existing_sid);
+    }
 
     // If the task has a session_id from a previous lifecycle phase, log and
     // continue — the old session is already recorded in task_sessions.
@@ -2133,6 +2157,64 @@ mod tests {
         assert!(
             !err_msg.contains("already has session"),
             "dispatch should not reject stale session_id, but got: {}",
+            err_msg
+        );
+    }
+
+    /// Verify that `dispatch` is idempotent: if a live worker session already
+    /// exists for the task, it returns the existing session without creating a
+    /// duplicate.
+    ///
+    /// With an empty reader (no real server), `find_reusable_session` returns
+    /// `None` (server unreachable), so dispatch falls through to create a new
+    /// session — which also fails on the empty reader.  The test verifies that
+    /// the error is NOT "already has session" and that the code path compiles
+    /// and executes without panicking.  The full session-reuse assertion is in
+    /// the integration tests in `tasks.rs` which have mock_io infrastructure.
+    #[test]
+    fn test_dispatch_reuses_existing_worker_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Create a task and simulate it having already been dispatched.
+        let task = db
+            .create_task(
+                "/project",
+                "Already dispatched task",
+                Some(5),
+                None,
+                None,
+                true,
+                false,
+            )
+            .unwrap();
+        // interactive -> ready
+        db.update_task(
+            task.id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        // ready -> active + record worker session
+        db.assign_task(task.id, "existing-worker-session").unwrap();
+        db.set_session_id(task.id, "existing-worker-session").unwrap();
+        // record_session so find_reusable_session can find it
+        db.record_session(task.id, "existing-worker-session", "worker").unwrap();
+
+        // With an empty reader, find_reusable_session can't reach the server
+        // → returns None → dispatch falls through to CreateSession → fails EOF.
+        let mut buf = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let result = dispatch(&db, task.id, Some("caller-session"), &mut buf, &mut reader);
+
+        // Error is expected (no server), but must NOT be "already has session".
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            !err_msg.contains("already has session"),
+            "dispatch should not return 'already has session', got: {}",
             err_msg
         );
     }
