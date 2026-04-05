@@ -91,7 +91,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "Top-level tasks start in 'interactive' state for spec refinement".into(),
                 "Subtasks (with parent_id) start in 'ready' state with skip_review=false".into(),
-                "Valid states: interactive, ready, active, review, approved, merging, failed, done".into(),
+                "Valid states: interactive, planning, refining, ready, active, review, approved, merging, failed, done".into(),
             ],
         },
         PluginToolDef {
@@ -122,7 +122,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "properties": {
                     "state": {
                         "type": "string",
-                        "description": "Filter by state (interactive, ready, active, review, approved, merging, failed, done)"
+                        "description": "Filter by state (interactive, planning, refining, ready, active, review, approved, merging, failed, done)"
                     },
                     "parent_id": {
                         "type": "integer",
@@ -205,7 +205,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Update task fields (title, state, priority, tags, etc.)".into()),
             prompt_guidelines: vec![
-                "State transitions are validated: interactive->ready->active->review->approved->merging->done".into(),
+                "State transitions are validated: interactive->planning->refining->ready->active->review->approved->merging->done".into(),
                 "Shortcuts: interactive->approved, active->approved (skip_review only)".into(),
                 "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active (recoverable), merging->failed (terminal), failed->active (manual retry)".into(),
                 "Universal overrides: any state->done (manual close), any state->interactive (human takes over)".into(),

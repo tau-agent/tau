@@ -83,6 +83,8 @@ pub struct AssignResult {
 
 const VALID_STATES: &[&str] = &[
     "interactive",
+    "planning",
+    "refining",
     "ready",
     "active",
     "review",
@@ -95,13 +97,17 @@ const VALID_STATES: &[&str] = &[
 /// Check whether a state transition is allowed.
 ///
 /// Forward (happy path):
-///   interactive -> ready -> active -> review -> approved -> merging -> done
+///   interactive -> planning -> refining -> ready -> active -> review -> approved -> merging -> done
 ///
 /// Shortcuts:
+///   interactive -> ready      (skip planning/refining)
 ///   interactive -> approved   (skip straight to approval)
+///   interactive -> refining   (user wants LLM review of their spec)
 ///   active -> approved        (only when skip_review=true, enforced in update_task)
 ///
 /// Backward (error recovery / human override):
+///   refining -> planning      (plan needs revision)
+///   refining -> interactive   (scope expansion needs human sign-off)
 ///   review -> active          (reviewer requests changes)
 ///   approved -> active        (merge error, agent needs to fix)
 ///   approved -> ready         (unapprove, send back to queue)
@@ -122,6 +128,10 @@ pub fn validate_state_transition(from: &str, to: &str) -> bool {
         // Forward transitions
         ("interactive", "ready")
             | ("interactive", "approved")
+            | ("interactive", "planning")
+            | ("interactive", "refining")
+            | ("planning", "refining")
+            | ("refining", "ready")
             | ("ready", "active")
             | ("active", "review")
             | ("active", "approved")
@@ -129,6 +139,8 @@ pub fn validate_state_transition(from: &str, to: &str) -> bool {
             | ("approved", "merging")
             | ("merging", "done")
             // Backward transitions (error recovery)
+            | ("refining", "planning")
+            | ("refining", "interactive")
             | ("review", "active")
             | ("approved", "active")
             | ("approved", "ready")
@@ -1616,6 +1628,10 @@ mod tests {
         // Forward transitions
         assert!(validate_state_transition("interactive", "ready"));
         assert!(validate_state_transition("interactive", "approved"));
+        assert!(validate_state_transition("interactive", "planning"));
+        assert!(validate_state_transition("interactive", "refining"));
+        assert!(validate_state_transition("planning", "refining"));
+        assert!(validate_state_transition("refining", "ready"));
         assert!(validate_state_transition("ready", "active"));
         assert!(validate_state_transition("active", "review"));
         assert!(validate_state_transition("active", "approved"));
@@ -1624,6 +1640,8 @@ mod tests {
         assert!(validate_state_transition("merging", "done"));
 
         // Backward transitions (error recovery)
+        assert!(validate_state_transition("refining", "planning"));
+        assert!(validate_state_transition("refining", "interactive"));
         assert!(validate_state_transition("review", "active"));
         assert!(validate_state_transition("approved", "active"));
         assert!(validate_state_transition("approved", "ready"));
@@ -1634,12 +1652,16 @@ mod tests {
 
         // Universal overrides: any state -> done
         assert!(validate_state_transition("interactive", "done"));
+        assert!(validate_state_transition("planning", "done"));
+        assert!(validate_state_transition("refining", "done"));
         assert!(validate_state_transition("ready", "done"));
         assert!(validate_state_transition("active", "done"));
         assert!(validate_state_transition("review", "done"));
         assert!(validate_state_transition("approved", "done"));
 
         // Universal overrides: any state -> interactive
+        assert!(validate_state_transition("planning", "interactive"));
+        assert!(validate_state_transition("refining", "interactive"));
         assert!(validate_state_transition("ready", "interactive"));
         assert!(validate_state_transition("active", "interactive"));
         assert!(validate_state_transition("review", "interactive"));
@@ -1649,10 +1671,16 @@ mod tests {
         // Self-loops are not allowed
         assert!(!validate_state_transition("done", "done"));
         assert!(!validate_state_transition("interactive", "interactive"));
+        assert!(!validate_state_transition("planning", "planning"));
+        assert!(!validate_state_transition("refining", "refining"));
 
         // Skip transitions that don't make sense
         assert!(!validate_state_transition("interactive", "active"));
         assert!(!validate_state_transition("interactive", "merging"));
+        assert!(!validate_state_transition("planning", "active"));
+        assert!(!validate_state_transition("planning", "approved"));
+        assert!(!validate_state_transition("refining", "approved"));
+        assert!(!validate_state_transition("refining", "active"));
 
         // failed state transitions
         assert!(validate_state_transition("merging", "failed"));
