@@ -3,5 +3,9 @@ name = "cargo fmt"
 command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo fmt --check"
 
 [[check]]
+name = "cargo build"
+command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo build -p tau-cli"
+
+[[check]]
 name = "cargo test"
 command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo test --workspace"
