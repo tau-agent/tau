@@ -1137,6 +1137,15 @@ impl TasksDb {
                         for (child_id, child_session) in rows {
                             // Track old sessions that were parented under
                             // the old owner (for reparenting RPCs later).
+                            //
+                            // Pragmatic simplification: we compare the
+                            // descendant task's `session_id` field against
+                            // the old owner's session_id. Ideally we'd
+                            // check the actual session's `parent_id`
+                            // (a session-level property), but that requires
+                            // an RPC which we can't do inside a DB
+                            // transaction. In practice, tasks dispatched by
+                            // the same owner will have matching session_ids.
                             if let Some(ref cs) = child_session {
                                 if cs == old_sid {
                                     descendant_old_sessions.push(cs.clone());
