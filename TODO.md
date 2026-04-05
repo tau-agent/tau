@@ -172,7 +172,4 @@ Move `session_*` tools out of `worker.rs` into a `tau plugin sessions`
 subprocess (global plugin). Design exists in project memory. Decouples
 orchestration from the core worker loop.
 
-### worker2 integration
 
-Async worker exists (`worker2.rs`) but isn't the default yet. Needs testing,
-validation against the current worker, then replacement of `worker.rs`.
