@@ -336,7 +336,10 @@ pub fn dispatch(
     };
 
     // Send initial chat message.
-    let chat_msg = build_initial_message(&task);
+    let merge_target = db
+        .get_merge_target(task_id)
+        .unwrap_or_else(|_| "main".into());
+    let chat_msg = build_initial_message(&task, &merge_target);
     let chat_req = crate::protocol::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
@@ -568,7 +571,10 @@ pub fn dispatch_review(
     // Load project-specific review instructions
     let project_instructions = load_project_instructions(&task.project, "review");
 
-    let chat_msg = build_review_message(task, &project_instructions);
+    let merge_target = db
+        .get_merge_target(task.id)
+        .unwrap_or_else(|_| "main".into());
+    let chat_msg = build_review_message(task, &project_instructions, &merge_target);
     let chat_req = crate::protocol::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
@@ -602,7 +608,7 @@ pub fn dispatch_review(
 }
 
 /// Build the initial message for a review session.
-fn build_review_message(task: &Task, project_instructions: &str) -> String {
+fn build_review_message(task: &Task, project_instructions: &str, merge_target: &str) -> String {
     let mut msg = format!(
         "You are REVIEWING task {id}: {title}\n\
          \n\
@@ -619,7 +625,7 @@ fn build_review_message(task: &Task, project_instructions: &str) -> String {
          5. Run the project checklist if available\n\
          \n\
          Examine the changes using git diff and read the modified files.\n\
-         Use `bash` with `git diff main...HEAD` or similar to see all changes.\n\
+         Use `bash` with `git diff {target}...HEAD` or similar to see all changes.\n\
          \n\
          After your review:\n\
          - If approved: call `task_update` with {{\"id\": {id}, \"state\": \"approved\"}}\n\
@@ -627,6 +633,7 @@ fn build_review_message(task: &Task, project_instructions: &str) -> String {
            `task_update` with {{\"id\": {id}, \"state\": \"active\"}} to send it back to the worker\n",
         id = task.id,
         title = task.title,
+        target = merge_target,
     );
 
     if !project_instructions.is_empty() {
@@ -1060,7 +1067,7 @@ fn merge_one_task(
 }
 
 /// Build the initial chat message sent to a dispatched task's session.
-fn build_initial_message(task: &Task) -> String {
+fn build_initial_message(task: &Task, merge_target: &str) -> String {
     let review_instruction = if task.skip_review {
         format!(
             "- Call the `task_update` tool with arguments: {{\"id\": {id}, \"state\": \"approved\"}}  (skip_review is true for this task)",
@@ -1081,17 +1088,18 @@ fn build_initial_message(task: &Task) -> String {
          Then assign yourself:\n\
          - Call the `task_assign` tool with arguments: {{\"id\": {id}}}\n\
          \n\
-         Do the work in this worktree. Commit your changes on the current branch — do NOT merge into main.\n\
+         Do the work in this worktree. Commit your changes on the current branch — do NOT merge into {target}.\n\
          When done, run the project checklist, then mark the task:\n\
          {review}\n\
          \n\
-         Before marking the task for review, ensure your branch is rebased on current main.\n\
-         Run `git rebase main` in your worktree and resolve any conflicts.\n\
+         Before marking the task for review, ensure your branch is rebased on the target branch.\n\
+         Run `git rebase {target}` in your worktree and resolve any conflicts.\n\
          \n\
          Note: task_get, task_assign, and task_update are agent tools (like bash or edit), not CLI commands.",
         id = task.id,
         title = task.title,
         review = review_instruction,
+        target = merge_target,
     )
 }
 
@@ -1351,7 +1359,7 @@ mod tests {
     #[test]
     fn test_build_initial_message_with_review() {
         let task = make_task(5, 0, None);
-        let msg = build_initial_message(&task);
+        let msg = build_initial_message(&task, "main");
         assert!(msg.contains("task 5"));
         assert!(msg.contains("task_get"));
         assert!(msg.contains("task_assign"));
@@ -1368,7 +1376,7 @@ mod tests {
     fn test_build_initial_message_skip_review() {
         let mut task = make_task(7, 0, None);
         task.skip_review = true;
-        let msg = build_initial_message(&task);
+        let msg = build_initial_message(&task, "main");
         assert!(msg.contains("\"state\": \"approved\""));
         assert!(msg.contains("skip_review is true"));
     }
@@ -1376,7 +1384,7 @@ mod tests {
     #[test]
     fn test_build_initial_message_tool_call_format() {
         let task = make_task(42, 0, None);
-        let msg = build_initial_message(&task);
+        let msg = build_initial_message(&task, "main");
         // Should include JSON argument hint so agent knows the invocation format
         assert!(msg.contains(r#"{"id": 42}"#));
         // task_update should also use JSON format, not CLI-style positional args
@@ -1386,6 +1394,23 @@ mod tests {
         assert!(msg.contains("current branch"));
         // Should NOT use CLI-style format like "task_update 42 state=review"
         assert!(!msg.contains(&format!("task_update {} state=", 42)));
+    }
+
+    #[test]
+    fn test_build_initial_message_uses_merge_target() {
+        let task = make_task(42, 0, None);
+        let msg = build_initial_message(&task, "task-1-5");
+        assert!(msg.contains("do NOT merge into task-1-5"));
+        assert!(!msg.contains("merge into main"));
+        assert!(msg.contains("git rebase task-1-5"));
+    }
+
+    #[test]
+    fn test_build_review_message_uses_merge_target() {
+        let task = make_task(10, 0, None);
+        let msg = build_review_message(&task, "", "task-1-5");
+        assert!(msg.contains("git diff task-1-5...HEAD"));
+        assert!(!msg.contains("git diff main"));
     }
 
     #[test]
@@ -1869,10 +1894,10 @@ mod tests {
     #[test]
     fn test_build_review_message() {
         let task = make_task(10, 0, None);
-        let msg = build_review_message(&task, "");
+        let msg = build_review_message(&task, "", "main");
         assert!(msg.contains("REVIEWING task 10"));
         assert!(msg.contains("task_get"));
-        assert!(msg.contains("git diff"));
+        assert!(msg.contains("git diff main...HEAD"));
         assert!(msg.contains("approved"));
         assert!(msg.contains("active"));
     }
@@ -1880,7 +1905,7 @@ mod tests {
     #[test]
     fn test_build_review_message_with_instructions() {
         let task = make_task(10, 0, None);
-        let msg = build_review_message(&task, "Check for SQL injection.");
+        let msg = build_review_message(&task, "Check for SQL injection.", "main");
         assert!(msg.contains("Check for SQL injection"));
         assert!(msg.contains("Project-specific review instructions"));
     }
