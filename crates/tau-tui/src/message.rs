@@ -195,10 +195,18 @@ impl MessageItem {
                     .render_complete(name, args, output, *is_error, *duration, theme, width);
                 Text::from(lines)
             }
-            MessageItem::Status { text } => Text::from(Line::from(Span::styled(
-                format!(" {}", text),
-                theme.status_style(),
-            ))),
+            MessageItem::Status { text } => {
+                let style = theme.status_style();
+                let lines: Vec<Line> = text
+                    .lines()
+                    .map(|line| Line::from(Span::styled(format!(" {}", line), style)))
+                    .collect();
+                if lines.is_empty() {
+                    Text::from(Line::from(Span::styled(" ", style)))
+                } else {
+                    Text::from(lines)
+                }
+            }
             MessageItem::Error { text } => {
                 let bg_style = theme.error_style();
                 let mut lines = vec![
