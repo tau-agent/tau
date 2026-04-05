@@ -488,6 +488,48 @@ pub fn notify_parent_if_all_done(
     Ok(())
 }
 
+/// Notify the parent task's session that an individual subtask has completed.
+/// This fires for each subtask completion (unlike `notify_parent_if_all_done`
+/// which only fires when ALL subtasks are done). Best-effort — errors are
+/// logged but don't affect the caller.
+pub fn notify_parent_of_subtask_done(
+    db: &TasksDb,
+    task_id: i64,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let task = match db.get_task(task_id) {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+
+    let parent_id = match task.parent_id {
+        Some(pid) => pid,
+        None => return, // root task, nothing to notify
+    };
+
+    let parent = match db.get_task(parent_id) {
+        Ok(Some(p)) => p,
+        _ => return,
+    };
+
+    // Only notify if the parent has an active session
+    if let Some(ref session_id) = parent.session_id {
+        let content = format!("✓ Subtask #{} done: {}", task_id, task.title);
+        let _ = server_request(
+            writer,
+            reader,
+            Request::QueueMessage {
+                target_session_id: session_id.clone(),
+                content,
+                sender_info: format!("task-system (task {})", task_id),
+                await_reply: false,
+                reply_to: None,
+            },
+        );
+    }
+}
+
 /// Send a QueueMessage to notify a session about merge failure.
 /// Best-effort — errors are ignored.
 pub fn notify_session_of_merge_failure(
@@ -1053,6 +1095,111 @@ command = "cargo test"
         let output = String::from_utf8(writer).unwrap();
         assert!(output.contains("queue_message"), "output: {}", output);
         assert!(output.contains("parent-session"), "output: {}", output);
+    }
+
+    // ----- notify_parent_of_subtask_done tests -----
+
+    #[test]
+    fn test_notify_subtask_done_sends_queue_message() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        db.set_session_id(parent.id, "parent-session").unwrap();
+
+        let child = db
+            .create_task(
+                "/project",
+                "Child Task",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+
+        // Move child to done
+        db.assign_task(child.id, "s1").unwrap();
+        for state in ["review", "approved", "merging", "done"] {
+            db.update_task(
+                child.id,
+                &TaskUpdate {
+                    state: Some(state.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        // Reader returns EOF → server_request fails, but the function is
+        // best-effort and won't panic.
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        notify_parent_of_subtask_done(&db, child.id, &mut writer, &mut reader);
+
+        // Verify that a QueueMessage was attempted with the right content
+        let output = String::from_utf8(writer).unwrap();
+        assert!(output.contains("queue_message"), "output: {}", output);
+        assert!(output.contains("parent-session"), "output: {}", output);
+        assert!(
+            output.contains("Child Task"),
+            "should contain task title: {}",
+            output
+        );
+        assert!(
+            output.contains(&format!("#{}", child.id)),
+            "should contain task id: {}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_notify_subtask_done_root_task_noop() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let task = db
+            .create_task("/project", "Root", None, None, None, false, false)
+            .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        // Should be a no-op for root tasks — no writes
+        notify_parent_of_subtask_done(&db, task.id, &mut writer, &mut reader);
+        assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn test_notify_subtask_done_parent_without_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        // Don't set session_id on parent
+
+        let child = db
+            .create_task(
+                "/project",
+                "Child",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+
+        // Should be a no-op — no session to notify
+        notify_parent_of_subtask_done(&db, child.id, &mut writer, &mut reader);
+        assert!(writer.is_empty());
     }
 
     // ----- merging state transition helpers -----

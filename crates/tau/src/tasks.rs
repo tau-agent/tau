@@ -1022,8 +1022,21 @@ fn handle_task_update(
             }
 
             // When a task transitions to done, auto-archive its session
+            // and notify the parent task's session.
             if task.state == "done" {
                 auto_archive_task_session(db, &task, writer, reader);
+
+                // Notify parent session that this individual subtask is done
+                tasks_merge::notify_parent_of_subtask_done(db, task.id, writer, reader);
+
+                // Check if ALL subtasks are now done and notify parent
+                if let Err(e) = tasks_merge::notify_parent_if_all_done(db, task.id, writer, reader)
+                {
+                    eprintln!(
+                        "tasks: parent notification failed for task {}: {}",
+                        task.id, e
+                    );
+                }
             }
 
             // Re-fetch task if we may have updated session_id after the
@@ -1336,7 +1349,10 @@ fn handle_task_merge(
                     );
                 }
 
-                // Check parent notification
+                // Notify parent session that this individual subtask is done
+                tasks_merge::notify_parent_of_subtask_done(db, id, writer, reader);
+
+                // Check if ALL subtasks are now done and notify parent
                 if let Err(e) = tasks_merge::notify_parent_if_all_done(db, id, writer, reader) {
                     eprintln!("tasks: parent notification failed for task {}: {}", id, e);
                 }
@@ -3177,6 +3193,78 @@ mod tests {
         // which means all three ArchiveSession server_requests were processed
         // by the mock. If any failed, the mock would have returned an error
         // and the function would have errored out.
+    }
+
+    // ----- parent notification on done tests -----
+
+    #[test]
+    fn test_update_to_done_notifies_parent_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+        let mut events = Vec::new();
+
+        // Create parent with a session
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false)
+            .unwrap();
+        db.set_session_id(parent.id, "parent-session").unwrap();
+
+        // Child subtask starts in ready state (skip_planning=true)
+        let child = db
+            .create_task(
+                "/project",
+                "Child Task",
+                None,
+                Some(parent.id),
+                None,
+                true,
+                true,
+            )
+            .unwrap();
+        db.assign_task(child.id, "worker-session").unwrap();
+
+        // Transition child to done via handle_task_update (universal override)
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": child.id, "state": "done"}),
+            Some("s1"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+
+        // Verify that a QueueMessage was sent to "parent-session" with subtask info
+        // Flush unprocessed writes and inspect written_lines.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let buf = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let all_written = writer.shared.lock().unwrap().written_lines.join("\n");
+
+        // Should contain a QueueMessage to "parent-session" with the subtask title
+        assert!(
+            all_written.contains("parent-session"),
+            "expected notification to parent-session in:\n{}",
+            all_written
+        );
+        assert!(
+            all_written.contains("Child Task"),
+            "expected subtask title in notification:\n{}",
+            all_written
+        );
+        assert!(
+            all_written.contains("Subtask"),
+            "expected 'Subtask' in notification message:\n{}",
+            all_written
+        );
     }
 
     // ----- scheduler event tests -----

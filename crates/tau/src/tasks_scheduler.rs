@@ -1091,6 +1091,9 @@ fn merge_one_task(
                     );
                 }
 
+                // Notify parent session that this individual subtask is done
+                crate::tasks_merge::notify_parent_of_subtask_done(db, task_id, writer, reader);
+
                 // Notify parent if all subtasks are done
                 if let Err(e) =
                     crate::tasks_merge::notify_parent_if_all_done(db, task_id, writer, reader)
