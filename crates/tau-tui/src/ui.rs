@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use tau::protocol::format_tokens;
 use tau::truncate_str;
 use tau::types::AgentPhase;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AppMode};
 use crate::theme::{Theme, ThemeColor};
@@ -582,10 +583,27 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
                     let prefix = format!(" {} tagline: ", id_short);
                     let cursor = "█";
                     let edit_display = format!("{}{}{}", prefix, edit_text, cursor);
-                    let edit_padded = if edit_display.len() < w {
-                        format!("{}{}", edit_display, " ".repeat(w - edit_display.len()))
+                    let display_width = UnicodeWidthStr::width(edit_display.as_str());
+                    let edit_padded = if display_width < w {
+                        format!("{}{}", edit_display, " ".repeat(w - display_width))
                     } else {
-                        edit_display[..w].to_string()
+                        // Truncate to w display columns, respecting char boundaries
+                        let mut col = 0;
+                        let mut byte_end = edit_display.len();
+                        for (i, ch) in edit_display.char_indices() {
+                            let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                            if col + ch_w > w {
+                                byte_end = i;
+                                break;
+                            }
+                            col += ch_w;
+                        }
+                        let truncated = &edit_display[..byte_end];
+                        if col < w {
+                            format!("{}{}", truncated, " ".repeat(w - col))
+                        } else {
+                            truncated.to_string()
+                        }
                     };
                     let style = Style::default()
                         .fg(theme.accent.to_ratatui())
