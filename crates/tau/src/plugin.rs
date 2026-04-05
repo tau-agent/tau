@@ -871,7 +871,7 @@ impl SessionPlugins {
         let prefix = config.session_prefix.as_deref().unwrap_or(&[]);
 
         let entries: Vec<_> = if config.session.is_empty() && !config.no_default_worker {
-            // No config: use default built-in worker (async worker2)
+            // No config: use default built-in worker
             let exe = std::env::current_exe()
                 .map_err(|e| crate::Error::Io(e.to_string()))?
                 .to_string_lossy()
@@ -879,7 +879,7 @@ impl SessionPlugins {
             vec![(
                 "worker".to_string(),
                 PluginEntry {
-                    command: vec![exe, "worker2".to_string()],
+                    command: vec![exe, "worker".to_string()],
                     env: HashMap::new(),
                 },
             )]

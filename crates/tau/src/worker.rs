@@ -1,28 +1,40 @@
 //! Built-in worker plugin for tool execution.
 //!
-//! The worker speaks the plugin protocol (JSON lines over stdin/stdout).
-//! It registers the built-in tools (bash, read, write, edit) plus session
-//! orchestration tools (session_spawn, session_join, etc.).
+//! Speaks the plugin protocol (JSON lines over stdin/stdout) and runs
+//! tools concurrently using non-blocking I/O throughout.
 //!
-//! Session tools use the ServerRequest/ServerResponse tunnel to communicate
-//! with the tau server without opening a separate socket connection.
+//! Architecture:
+//!
+//! ```text
+//! stdin → reader task (demuxes ToolCall vs ServerResponse vs Hook/Idle)
+//! tool calls → concurrent async tasks (one per tool call)
+//! all outbound messages → writer task → stdout
+//! ```
 //!
 //! Can be wrapped with sandbox or other execution environments:
 //!   worker_command = ["sandbox", "run", "--", "tau", "worker"]
 //!
-//! Can be wrapped with sandbox or other execution environments:
-//!   worker_command = ["sandbox", "run", "--", "tau", "worker"]
+//! Usage: `tau worker` (hidden subcommand, used by daemon).
 
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::collections::{HashMap, HashSet};
+use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 
+use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use smol::channel::{Receiver, Sender};
+use smol::lock::Mutex;
+
 use crate::plugin::{
-    PluginMessage, PluginRegistration, PluginRequest, PluginToolDef, PluginToolResult,
+    HookResult, PluginMessage, PluginRegistration, PluginRequest, PluginToolDef, PluginToolResult,
 };
-use crate::system_prompt::ToolPrompt;
 use crate::types::*;
+
+// ---------------------------------------------------------------------------
+// ToolExecutor trait and InProcessWorker (for testing / in-process use)
+// ---------------------------------------------------------------------------
 
 /// Trait for tool execution (allows plugin-based or in-process).
 #[async_trait]
@@ -66,16 +78,223 @@ impl ToolExecutor for InProcessWorker {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in tool prompt definitions (for system prompt via plugin registration)
+// Request ID generation (safe for concurrent use)
 // ---------------------------------------------------------------------------
 
-fn builtin_tool_prompts() -> Vec<ToolPrompt> {
-    crate::system_prompt::default_tool_prompts()
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_request_id() -> String {
+    let n = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("sr-{}-{}", crate::types::timestamp_ms(), n)
 }
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Run the worker. Called from `tau worker`.
+pub fn run() {
+    smol::block_on(async_main()).expect("worker failed");
+}
+
+async fn async_main() -> crate::Result<()> {
+    // Wrap stdin/stdout in async buffered I/O.
+    // Safety: fd 0 (stdin) and fd 1 (stdout) are valid file descriptors.
+    let async_stdin = unsafe { smol::Async::new(std::fs::File::from_raw_fd(0)) }
+        .map_err(|e| crate::Error::Io(format!("async wrap stdin: {}", e)))?;
+    let async_stdout = unsafe { smol::Async::new(std::fs::File::from_raw_fd(1)) }
+        .map_err(|e| crate::Error::Io(format!("async wrap stdout: {}", e)))?;
+
+    let reader = BufReader::new(async_stdin);
+    let mut writer = BufWriter::new(async_stdout);
+
+    // -----------------------------------------------------------------------
+    // Registration: send tool list synchronously before spawning tasks
+    // -----------------------------------------------------------------------
+
+    let mut all_tools = builtin_plugin_tools();
+    all_tools.extend(crate::orchestration::orchestration_tools());
+    let reg = PluginRegistration {
+        name: "worker".to_string(),
+        tools: all_tools,
+        hooks: Vec::new(),
+        commands: Vec::new(),
+    };
+    write_message(&mut writer, &PluginMessage::Register(reg)).await?;
+
+    // -----------------------------------------------------------------------
+    // Channels
+    // -----------------------------------------------------------------------
+
+    // Outbound message channel: all tasks send PluginMessages here; the
+    // writer task serialises them onto stdout.
+    let (msg_tx, msg_rx): (Sender<PluginMessage>, Receiver<PluginMessage>) =
+        smol::channel::unbounded();
+
+    // Pending server-request responses: maps request_id → oneshot sender.
+    let pending_responses: Arc<Mutex<HashMap<String, Sender<crate::protocol::Response>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Shared unjoined-children set (for session_join_all / session_join_any).
+    let unjoined: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // -----------------------------------------------------------------------
+    // Writer task: drains msg_rx → stdout
+    // -----------------------------------------------------------------------
+
+    let writer_handle = smol::spawn(async move {
+        while let Ok(msg) = msg_rx.recv().await {
+            write_message(&mut writer, &msg).await?;
+        }
+        Ok::<(), crate::Error>(())
+    });
+
+    // -----------------------------------------------------------------------
+    // Reader task: reads stdin, routes messages
+    // -----------------------------------------------------------------------
+
+    let reader_msg_tx = msg_tx.clone();
+    let reader_pending = pending_responses.clone();
+    let reader_unjoined = unjoined.clone();
+
+    let reader_handle = smol::spawn(async move {
+        let mut reader = reader;
+        let mut line = String::new();
+
+        loop {
+            line.clear();
+            let n = reader
+                .read_line(&mut line)
+                .await
+                .map_err(|e| crate::Error::Io(format!("stdin read: {}", e)))?;
+            if n == 0 {
+                break; // EOF
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let req: PluginRequest = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("worker: bad request: {}", e);
+                    continue;
+                }
+            };
+
+            match req {
+                PluginRequest::ToolCall {
+                    tool_call_id,
+                    name,
+                    arguments,
+                    cwd,
+                    session_id,
+                } => {
+                    // Spawn a concurrent task for each tool call.
+                    let msg_tx = reader_msg_tx.clone();
+                    let pending = reader_pending.clone();
+                    let unjoined = reader_unjoined.clone();
+
+                    smol::spawn(async move {
+                        let cwd = cwd.unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
+                        });
+
+                        let result = if name.starts_with("session_") {
+                            handle_session_tool(
+                                &name,
+                                &arguments,
+                                session_id.as_deref(),
+                                &msg_tx,
+                                &pending,
+                                &unjoined,
+                            )
+                            .await
+                        } else if name == "bash" {
+                            execute_bash_async(&tool_call_id, &arguments, &cwd, &msg_tx).await
+                        } else {
+                            // read, write, edit — run blocking tool on thread pool
+                            let tools = crate::tools::default_tools();
+                            let tc = ToolCall {
+                                id: tool_call_id.clone(),
+                                name: name.clone(),
+                                arguments,
+                            };
+                            smol::unblock(move || crate::tools::execute_tool(&tools, &tc, &cwd))
+                                .await
+                        };
+
+                        let _ = msg_tx
+                            .send(PluginMessage::ToolResult(PluginToolResult {
+                                tool_call_id,
+                                content: result.content,
+                                is_error: result.is_error,
+                            }))
+                            .await;
+                    })
+                    .detach();
+                }
+
+                PluginRequest::ServerResponse {
+                    request_id,
+                    response,
+                } => {
+                    let mut pending = reader_pending.lock().await;
+                    if let Some(sender) = pending.remove(&request_id) {
+                        let _ = sender.send(response).await;
+                    }
+                }
+
+                PluginRequest::Hook { .. } => {
+                    let _ = reader_msg_tx
+                        .send(PluginMessage::HookResult(HookResult::default()))
+                        .await;
+                }
+
+                PluginRequest::Init { .. } | PluginRequest::SessionStart { .. } => {
+                    let _ = reader_msg_tx
+                        .send(PluginMessage::HookResult(HookResult::default()))
+                        .await;
+                }
+
+                PluginRequest::Idle => {
+                    break; // exit
+                }
+            }
+        }
+
+        Ok::<(), crate::Error>(())
+    });
+
+    // -----------------------------------------------------------------------
+    // Wait for the reader to finish (EOF or Idle), then shut down.
+    // -----------------------------------------------------------------------
+
+    // The reader task drives the lifecycle. When it exits, close the msg
+    // channel so the writer drains and exits too.
+    let reader_result = reader_handle.await;
+
+    // Close outbound channel — writer will drain remaining messages and stop.
+    drop(msg_tx);
+
+    let writer_result = writer_handle.await;
+
+    reader_result?;
+    writer_result?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Plugin tool definitions
+// ---------------------------------------------------------------------------
 
 fn builtin_plugin_tools() -> Vec<PluginToolDef> {
     let tools = crate::tools::default_tools();
-    let prompts = builtin_tool_prompts();
+    let prompts = crate::system_prompt::default_tool_prompts();
 
     tools
         .iter()
@@ -93,175 +312,36 @@ fn builtin_plugin_tools() -> Vec<PluginToolDef> {
 }
 
 // ---------------------------------------------------------------------------
-// Worker main loop (runs in the subprocess, speaks plugin protocol)
+// Async message helpers
 // ---------------------------------------------------------------------------
 
-/// Helper to send a plugin message to stdout.
-fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
-    if let Ok(mut line) = serde_json::to_string(msg) {
-        line.push('\n');
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.flush();
-    }
-}
-
-/// Run the worker loop: register tools, then handle tool calls.
-/// Called from `tau worker` subcommand.
-pub fn run_worker_loop() {
-    let tools = crate::tools::default_tools();
-
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
-
-    // Track unjoined child sessions for session_join_all / session_join_any.
-    let mut unjoined_children: HashSet<String> = HashSet::new();
-
-    // Send registration (plugin protocol)
-    let mut all_tools = builtin_plugin_tools();
-    all_tools.extend(crate::orchestration::orchestration_tools());
-    let registration = PluginRegistration {
-        name: "worker".to_string(),
-        tools: all_tools,
-        hooks: Vec::new(),
-        commands: Vec::new(),
-    };
-    send_message(&mut writer, &PluginMessage::Register(registration));
-
-    // Handle requests
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(_) => break,
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let req: PluginRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("worker: bad request: {}", e);
-                continue;
-            }
-        };
-
-        match req {
-            PluginRequest::ToolCall {
-                tool_call_id,
-                name,
-                arguments,
-                cwd,
-                session_id,
-            } => {
-                let cwd = cwd.unwrap_or_else(|| {
-                    std::env::current_dir()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string()
-                });
-
-                let tool_call = ToolCall {
-                    id: tool_call_id.clone(),
-                    name: name.clone(),
-                    arguments,
-                };
-
-                // Session orchestration tools use ServerRequest tunnel
-                if name.starts_with("session_") {
-                    let result = handle_session_tool(
-                        &name,
-                        &tool_call.arguments,
-                        session_id.as_deref(),
-                        &mut writer,
-                        &mut reader,
-                        &mut unjoined_children,
-                    );
-                    send_message(
-                        &mut writer,
-                        &PluginMessage::ToolResult(PluginToolResult {
-                            tool_call_id,
-                            content: result.content,
-                            is_error: result.is_error,
-                        }),
-                    );
-                } else if name == "bash" {
-                    // For bash, use streaming execution
-                    let result = crate::tools::bash::execute_streaming(
-                        &tool_call.arguments,
-                        &cwd,
-                        |delta| {
-                            send_message(
-                                &mut writer,
-                                &PluginMessage::OutputDelta {
-                                    tool_call_id: tool_call_id.clone(),
-                                    text: delta.to_string(),
-                                },
-                            );
-                        },
-                    );
-
-                    send_message(
-                        &mut writer,
-                        &PluginMessage::ToolResult(PluginToolResult {
-                            tool_call_id,
-                            content: result.content,
-                            is_error: result.is_error,
-                        }),
-                    );
-                } else {
-                    // Non-streaming tools
-                    let result = crate::tools::execute_tool(&tools, &tool_call, &cwd);
-
-                    send_message(
-                        &mut writer,
-                        &PluginMessage::ToolResult(PluginToolResult {
-                            tool_call_id,
-                            content: result.content,
-                            is_error: result.is_error,
-                        }),
-                    );
-                }
-            }
-            PluginRequest::Init { .. } | PluginRequest::SessionStart { .. } => {
-                // Acknowledge with empty hook result
-                send_message(
-                    &mut writer,
-                    &PluginMessage::HookResult(crate::plugin::HookResult::default()),
-                );
-            }
-            PluginRequest::Hook { .. } => {
-                send_message(
-                    &mut writer,
-                    &PluginMessage::HookResult(crate::plugin::HookResult::default()),
-                );
-            }
-            PluginRequest::Idle => {
-                // Exit cleanly on idle notification
-                break;
-            }
-            PluginRequest::ServerResponse { .. } => {
-                // Handled inline during server_request calls -- ignore stray ones
-            }
-        }
-    }
+async fn write_message(
+    writer: &mut (impl AsyncWriteExt + Unpin),
+    msg: &PluginMessage,
+) -> crate::Result<()> {
+    let mut line =
+        serde_json::to_string(msg).map_err(|e| crate::Error::Io(format!("serialize: {}", e)))?;
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| crate::Error::Io(format!("write: {}", e)))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| crate::Error::Io(format!("flush: {}", e)))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Session orchestration tools (use ServerRequest tunnel)
+// Tool result helpers
 // ---------------------------------------------------------------------------
 
-use crate::types::ToolResultContent;
-
-/// Simple tool result helper.
-fn tool_ok(text: &str) -> crate::types::ToolResultMessage {
-    crate::types::ToolResultMessage {
-        tool_call_id: String::new(),
+fn tool_ok(tool_call_id: &str, text: &str) -> ToolResultMessage {
+    ToolResultMessage {
+        tool_call_id: tool_call_id.to_string(),
         tool_name: String::new(),
-        content: vec![ToolResultContent::Text(crate::types::TextContent {
+        content: vec![ToolResultContent::Text(TextContent {
             text: text.to_string(),
             text_signature: None,
         })],
@@ -271,11 +351,11 @@ fn tool_ok(text: &str) -> crate::types::ToolResultMessage {
     }
 }
 
-fn tool_err(text: &str) -> crate::types::ToolResultMessage {
-    crate::types::ToolResultMessage {
-        tool_call_id: String::new(),
+fn tool_err(tool_call_id: &str, text: &str) -> ToolResultMessage {
+    ToolResultMessage {
+        tool_call_id: tool_call_id.to_string(),
         tool_name: String::new(),
-        content: vec![ToolResultContent::Text(crate::types::TextContent {
+        content: vec![ToolResultContent::Text(TextContent {
             text: text.to_string(),
             text_signature: None,
         })],
@@ -285,57 +365,245 @@ fn tool_err(text: &str) -> crate::types::ToolResultMessage {
     }
 }
 
-/// Send a ServerRequest via plugin protocol and wait for the ServerResponse.
-fn server_request(
-    writer: &mut impl Write,
-    reader: &mut impl BufRead,
+// ---------------------------------------------------------------------------
+// Server request tunnel (async)
+// ---------------------------------------------------------------------------
+
+/// Send a `Request` to the tau server via the plugin protocol tunnel and
+/// wait for the corresponding `Response`. Multiple concurrent calls are
+/// safe — each gets a unique request_id and its own oneshot channel.
+async fn server_request(
+    msg_tx: &Sender<PluginMessage>,
+    pending: &Arc<Mutex<HashMap<String, Sender<crate::protocol::Response>>>>,
     request: crate::protocol::Request,
 ) -> Result<crate::protocol::Response, String> {
-    let request_id = format!("sr-{}", crate::types::timestamp_ms());
-    send_message(
-        writer,
-        &PluginMessage::ServerRequest {
+    let request_id = next_request_id();
+
+    // Register a oneshot channel for the response.
+    let (resp_tx, resp_rx) = smol::channel::bounded(1);
+    pending.lock().await.insert(request_id.clone(), resp_tx);
+
+    // Send the request.
+    msg_tx
+        .send(PluginMessage::ServerRequest {
             request_id: request_id.clone(),
             request,
-        },
-    );
+        })
+        .await
+        .map_err(|e| format!("send failed: {}", e))?;
 
-    // Read lines until we get our ServerResponse
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return Err("stdin closed while waiting for server response".into()),
-            Ok(_) => {}
-            Err(e) => return Err(format!("read error: {}", e)),
+    // Wait for the response.
+    resp_rx
+        .recv()
+        .await
+        .map_err(|e| format!("recv failed: {}", e))
+}
+
+// ---------------------------------------------------------------------------
+// Async bash execution
+// ---------------------------------------------------------------------------
+
+async fn execute_bash_async(
+    tool_call_id: &str,
+    args: &serde_json::Value,
+    cwd: &str,
+    msg_tx: &Sender<PluginMessage>,
+) -> ToolResultMessage {
+    let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
+        return tool_err(tool_call_id, "missing 'command' argument");
+    };
+    let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
+
+    // Spawn child with setsid for process-group kill.
+    let child = {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(command)
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .env("SUDO_ASKPASS", "/bin/false")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .pre_exec(|| {
+                    nix::unistd::setsid().map_err(std::io::Error::other)?;
+                    Ok(())
+                })
+                .spawn()
         }
-        if line.trim().is_empty() {
-            continue;
+    };
+
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return tool_err(tool_call_id, &format!("failed to execute command: {}", e)),
+    };
+
+    let child_id = child.id();
+
+    // Extract stdout/stderr and wrap in async readers.
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout configured with piped output");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr configured with piped output");
+
+    let async_stdout =
+        unsafe { smol::Async::new(std::fs::File::from_raw_fd(stdout.into_raw_fd())) };
+    let async_stderr =
+        unsafe { smol::Async::new(std::fs::File::from_raw_fd(stderr.into_raw_fd())) };
+
+    let (async_stdout, async_stderr) = match (async_stdout, async_stderr) {
+        (Ok(o), Ok(e)) => (o, e),
+        _ => return tool_err(tool_call_id, "failed to create async pipes"),
+    };
+
+    let mut stdout_reader = BufReader::new(async_stdout);
+    let mut stderr_reader = BufReader::new(async_stderr);
+
+    // Spawn a timeout killer task.
+    let timed_out = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let timed_out_for_killer = timed_out.clone();
+    let killer = smol::spawn(async move {
+        smol::Timer::after(std::time::Duration::from_secs(timeout_secs)).await;
+        timed_out_for_killer.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(child_id as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    });
+
+    // Read stdout (with streaming deltas) and stderr concurrently.
+    let tcid = tool_call_id.to_string();
+    let msg_tx_clone = msg_tx.clone();
+
+    let (collected_stdout, collected_stderr) = futures::future::join(
+        async {
+            let mut collected = String::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stdout_reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        // Stream delta to the host.
+                        let _ = msg_tx_clone
+                            .send(PluginMessage::OutputDelta {
+                                tool_call_id: tcid.clone(),
+                                text: line.clone(),
+                            })
+                            .await;
+                        collected.push_str(&line);
+                    }
+                }
+            }
+            collected
+        },
+        async {
+            let mut collected = String::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match stderr_reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => collected.push_str(&line),
+                }
+            }
+            collected
+        },
+    )
+    .await;
+
+    // Wait for child to exit (blocking, so offload to thread pool).
+    let exit_code =
+        smol::unblock(move || child.wait().ok().and_then(|s| s.code()).unwrap_or(-1)).await;
+
+    // Cancel the killer (child already exited).
+    killer.cancel().await;
+
+    // Format output.
+    format_bash_output(
+        tool_call_id,
+        collected_stdout,
+        collected_stderr,
+        exit_code,
+        timed_out.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Format bash output into a `ToolResultMessage`, applying truncation for
+/// very long output. Mirrors `tools::bash::format_output`.
+fn format_bash_output(
+    tool_call_id: &str,
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    timed_out: bool,
+) -> ToolResultMessage {
+    let mut text = stdout;
+    if !stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
         }
-        let req: PluginRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if let PluginRequest::ServerResponse {
-            request_id: rid,
-            response,
-        } = req
-            && rid == request_id
-        {
-            return Ok(response);
+        text.push_str("STDERR:\n");
+        text.push_str(&stderr);
+    }
+
+    // Truncate very long output.
+    if text.len() > 100_000 {
+        let head = &text[..50_000];
+        let tail = &text[text.len() - 50_000..];
+        text = format!(
+            "{}\n\n... [truncated {} bytes] ...\n\n{}",
+            head,
+            text.len() - 100_000,
+            tail
+        );
+    }
+
+    if timed_out {
+        if !text.is_empty() {
+            text.push('\n');
         }
+        text.push_str("(timed out)");
+        return tool_err(tool_call_id, text.trim_end());
+    }
+
+    let success = exit_code == 0;
+    if text.is_empty() {
+        text = format!("(exit code: {})", exit_code);
+    } else if !success {
+        text.push_str(&format!("\n(exit code: {})", exit_code));
+    }
+
+    let text = text.trim_end().to_string();
+    if success {
+        tool_ok(tool_call_id, &text)
+    } else {
+        tool_err(tool_call_id, &text)
     }
 }
 
-/// Handle session_* tool calls.
-fn handle_session_tool(
+// ---------------------------------------------------------------------------
+// Session orchestration tools (async)
+// ---------------------------------------------------------------------------
+
+async fn handle_session_tool(
     name: &str,
     args: &serde_json::Value,
     session_id: Option<&str>,
-    writer: &mut impl Write,
-    reader: &mut impl BufRead,
-    unjoined_children: &mut HashSet<String>,
-) -> crate::types::ToolResultMessage {
+    msg_tx: &Sender<PluginMessage>,
+    pending: &Arc<Mutex<HashMap<String, Sender<crate::protocol::Response>>>>,
+    unjoined: &Arc<Mutex<HashSet<String>>>,
+) -> ToolResultMessage {
+    // We use an empty tool_call_id for session tool results since the
+    // dispatch loop overwrites it from the PluginRequest anyway.
+    let tcid = "";
+
     match name {
         "session_spawn" => {
             let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("");
@@ -354,7 +622,7 @@ fn handle_session_tool(
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            // Create session
+            // Create session.
             let create_req = crate::protocol::Request::CreateSession {
                 model,
                 provider: None,
@@ -372,52 +640,56 @@ fn handle_session_tool(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true),
             };
-            let resp = match server_request(writer, reader, create_req) {
+            let resp = match server_request(msg_tx, pending, create_req).await {
                 Ok(r) => r,
-                Err(e) => return tool_err(&format!("server request failed: {}", e)),
+                Err(e) => return tool_err(tcid, &format!("server request failed: {}", e)),
             };
             let child_id = match resp {
                 crate::protocol::Response::SessionCreated { session_id } => session_id,
                 crate::protocol::Response::Error { message } => {
-                    return tool_err(&format!("spawn failed: {}", message));
+                    return tool_err(tcid, &format!("spawn failed: {}", message));
                 }
-                other => return tool_err(&format!("unexpected response: {:?}", other)),
+                other => {
+                    return tool_err(tcid, &format!("unexpected response: {:?}", other));
+                }
             };
 
-            // Send initial message via ServerRequest tunnel.
-            // The server processes this as an async agent turn for the child.
+            // Send initial message.
             if !task.is_empty() {
                 let chat_req = crate::protocol::Request::Chat {
                     session_id: child_id.clone(),
                     text: task.to_string(),
                 };
-                match server_request(writer, reader, chat_req) {
+                match server_request(msg_tx, pending, chat_req).await {
                     Ok(crate::protocol::Response::Ok) => {}
                     Ok(crate::protocol::Response::Error { message }) => {
-                        return tool_err(&format!(
-                            "session {} created but chat failed: {}",
-                            child_id, message
-                        ));
+                        return tool_err(
+                            tcid,
+                            &format!("session {} created but chat failed: {}", child_id, message),
+                        );
                     }
                     Ok(other) => {
-                        return tool_err(&format!(
-                            "session {} created but unexpected chat response: {:?}",
-                            child_id, other
-                        ));
+                        return tool_err(
+                            tcid,
+                            &format!(
+                                "session {} created but unexpected chat response: {:?}",
+                                child_id, other
+                            ),
+                        );
                     }
                     Err(e) => {
-                        return tool_err(&format!(
-                            "session {} created but chat failed: {}",
-                            child_id, e
-                        ));
+                        return tool_err(
+                            tcid,
+                            &format!("session {} created but chat failed: {}", child_id, e),
+                        );
                     }
                 }
             }
 
-            // Track as unjoined
-            unjoined_children.insert(child_id.clone());
+            // Track as unjoined.
+            unjoined.lock().await.insert(child_id.clone());
 
-            tool_ok(&format!("Spawned session {}", child_id))
+            tool_ok(tcid, &format!("Spawned session {}", child_id))
         }
 
         "session_join" => {
@@ -433,19 +705,22 @@ fn handle_session_tool(
             let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(300);
 
             if session_ids.is_empty() {
-                return tool_err("session_ids is required");
+                return tool_err(tcid, "session_ids is required");
             }
 
-            // Remove joined IDs from unjoined set
-            for sid in &session_ids {
-                unjoined_children.remove(sid);
+            // Remove joined IDs from unjoined set.
+            {
+                let mut uj = unjoined.lock().await;
+                for sid in &session_ids {
+                    uj.remove(sid);
+                }
             }
 
             let req = crate::protocol::Request::WaitSessions {
                 session_ids,
                 timeout_secs: timeout,
             };
-            match server_request(writer, reader, req) {
+            match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::SessionsCompleted { results }) => {
                     let mut text = String::new();
                     for r in &results {
@@ -460,28 +735,30 @@ fn handle_session_tool(
                             }
                         ));
                     }
-                    tool_ok(text.trim_end())
+                    tool_ok(tcid, text.trim_end())
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e),
             }
         }
 
         "session_join_all" => {
             let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(300);
 
-            if unjoined_children.is_empty() {
-                return tool_ok("No unjoined child sessions.");
-            }
-
-            let session_ids: Vec<String> = unjoined_children.drain().collect();
+            let session_ids: Vec<String> = {
+                let mut uj = unjoined.lock().await;
+                if uj.is_empty() {
+                    return tool_ok(tcid, "No unjoined child sessions.");
+                }
+                uj.drain().collect()
+            };
 
             let req = crate::protocol::Request::WaitSessions {
                 session_ids,
                 timeout_secs: timeout,
             };
-            match server_request(writer, reader, req) {
+            match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::SessionsCompleted { results }) => {
                     let mut text = String::new();
                     for r in &results {
@@ -496,32 +773,37 @@ fn handle_session_tool(
                             }
                         ));
                     }
-                    tool_ok(text.trim_end())
+                    tool_ok(tcid, text.trim_end())
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e),
             }
         }
 
         "session_join_any" => {
             let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(300);
 
-            if unjoined_children.is_empty() {
-                return tool_ok("No unjoined child sessions.");
-            }
-
-            let session_ids: Vec<String> = unjoined_children.iter().cloned().collect();
+            let session_ids: Vec<String> = {
+                let uj = unjoined.lock().await;
+                if uj.is_empty() {
+                    return tool_ok(tcid, "No unjoined child sessions.");
+                }
+                uj.iter().cloned().collect()
+            };
 
             let req = crate::protocol::Request::WaitAnySessions {
                 session_ids,
                 timeout_secs: timeout,
             };
-            match server_request(writer, reader, req) {
+            match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::SessionsCompleted { results }) => {
-                    // Remove completed sessions from unjoined set
-                    for r in &results {
-                        unjoined_children.remove(&r.session_id);
+                    // Remove completed sessions from unjoined set.
+                    {
+                        let mut uj = unjoined.lock().await;
+                        for r in &results {
+                            uj.remove(&r.session_id);
+                        }
                     }
                     let mut text = String::new();
                     for r in &results {
@@ -536,11 +818,11 @@ fn handle_session_tool(
                             }
                         ));
                     }
-                    tool_ok(text.trim_end())
+                    tool_ok(tcid, text.trim_end())
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e),
             }
         }
 
@@ -550,38 +832,41 @@ fn handle_session_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if sid.is_empty() {
-                return tool_err("session_id is required");
+                return tool_err(tcid, "session_id is required");
             }
             let req = crate::protocol::Request::GetSessionInfo {
                 session_id: sid.to_string(),
             };
-            match server_request(writer, reader, req) {
-                Ok(crate::protocol::Response::SessionInfo { info }) => tool_ok(&format!(
-                    "Session {}: {}/{}, {} messages, {} children",
-                    info.id, info.provider, info.model, info.message_count, info.child_count
-                )),
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+            match server_request(msg_tx, pending, req).await {
+                Ok(crate::protocol::Response::SessionInfo { info }) => tool_ok(
+                    tcid,
+                    &format!(
+                        "Session {}: {}/{}, {} messages, {} children",
+                        info.id, info.provider, info.model, info.message_count, info.child_count
+                    ),
+                ),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e),
             }
         }
 
         "session_list_children" => {
             let parent = session_id.unwrap_or("");
             if parent.is_empty() {
-                return tool_err("no session context available");
+                return tool_err(tcid, "no session context available");
             }
             let req = crate::protocol::Request::ListSessions {
                 include_archived: false,
             };
-            match server_request(writer, reader, req) {
+            match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::Sessions { sessions }) => {
                     let children: Vec<_> = sessions
                         .iter()
                         .filter(|s| s.parent_id.as_deref() == Some(parent))
                         .collect();
                     if children.is_empty() {
-                        tool_ok("No child sessions")
+                        tool_ok(tcid, "No child sessions")
                     } else {
                         let mut text = String::new();
                         for c in &children {
@@ -590,12 +875,12 @@ fn handle_session_tool(
                                 c.id, c.provider, c.model, c.message_count
                             ));
                         }
-                        tool_ok(text.trim_end())
+                        tool_ok(tcid, text.trim_end())
                     }
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e),
             }
         }
 
@@ -606,12 +891,12 @@ fn handle_session_tool(
                 .unwrap_or("");
             let last_n = args.get("last_n").and_then(|v| v.as_u64());
             if sid.is_empty() {
-                return tool_err("session_id is required");
+                return tool_err(tcid, "session_id is required");
             }
             let req = crate::protocol::Request::GetMessages {
                 session_id: sid.to_string(),
             };
-            match server_request(writer, reader, req) {
+            match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::Messages { messages }) => {
                     let msgs = if let Some(n) = last_n {
                         let skip = messages.len().saturating_sub(n as usize);
@@ -651,18 +936,21 @@ fn handle_session_tool(
                             crate::types::Message::ToolResult(tr) => {
                                 text.push_str(&format!("[tool:{}] ...\n", tr.tool_name));
                             }
+                            crate::types::Message::Info(i) => {
+                                text.push_str(&format!("[info] {}\n", i.text));
+                            }
                             _ => {}
                         }
                     }
                     if text.is_empty() {
-                        tool_ok("(no messages)")
+                        tool_ok(tcid, "(no messages)")
                     } else {
-                        tool_ok(text.trim_end())
+                        tool_ok(tcid, text.trim_end())
                     }
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e),
             }
         }
 
@@ -672,16 +960,18 @@ fn handle_session_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if sid.is_empty() {
-                return tool_err("session_id is required");
+                return tool_err(tcid, "session_id is required");
             }
             let req = crate::protocol::Request::CancelChat {
                 session_id: sid.to_string(),
             };
-            match server_request(writer, reader, req) {
-                Ok(crate::protocol::Response::Ok) => tool_ok(&format!("Cancelled session {}", sid)),
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+            match server_request(msg_tx, pending, req).await {
+                Ok(crate::protocol::Response::Ok) => {
+                    tool_ok(tcid, &format!("Cancelled session {}", sid))
+                }
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e),
             }
         }
 
@@ -692,10 +982,10 @@ fn handle_session_tool(
                     .iter()
                     .filter_map(|v| v.as_str().map(str::to_string))
                     .collect(),
-                _ => return tool_err("session_id is required (string or array of strings)"),
+                _ => return tool_err(tcid, "session_id is required (string or array of strings)"),
             };
             if sids.is_empty() {
-                return tool_err("session_id is required (string or array of strings)");
+                return tool_err(tcid, "session_id is required (string or array of strings)");
             }
             let mut archived = Vec::new();
             let mut errors = Vec::new();
@@ -704,7 +994,7 @@ fn handle_session_tool(
                     session_id: sid.clone(),
                     require_ancestor: session_id.map(|s| s.to_string()),
                 };
-                match server_request(writer, reader, req) {
+                match server_request(msg_tx, pending, req).await {
                     Ok(crate::protocol::Response::SessionArchived) => archived.push(sid.as_str()),
                     Ok(crate::protocol::Response::Error { message }) => {
                         errors.push(format!("{}: {}", sid, message));
@@ -719,37 +1009,40 @@ fn handle_session_tool(
             }
             if errors.is_empty() {
                 if archived.len() == 1 {
-                    tool_ok(&format!("Archived session {}", archived[0]))
+                    tool_ok(tcid, &format!("Archived session {}", archived[0]))
                 } else {
-                    tool_ok(&format!("Archived {} sessions", archived.len()))
+                    tool_ok(tcid, &format!("Archived {} sessions", archived.len()))
                 }
             } else if archived.is_empty() {
-                tool_err(&errors.join("; "))
+                tool_err(tcid, &errors.join("; "))
             } else {
-                tool_ok(&format!(
-                    "Archived {} session(s); {} failed: {}",
-                    archived.len(),
-                    errors.len(),
-                    errors.join("; ")
-                ))
+                tool_ok(
+                    tcid,
+                    &format!(
+                        "Archived {} session(s); {} failed: {}",
+                        archived.len(),
+                        errors.len(),
+                        errors.join("; ")
+                    ),
+                )
             }
         }
 
         "session_restore" => {
             let sid = match args.get("session_id").and_then(|v| v.as_str()) {
                 Some(s) if !s.is_empty() => s.to_string(),
-                _ => return tool_err("session_id is required"),
+                _ => return tool_err(tcid, "session_id is required"),
             };
             let req = crate::protocol::Request::RestoreSession {
                 session_id: sid.clone(),
             };
-            match server_request(writer, reader, req) {
+            match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::SessionRestored) => {
-                    tool_ok(&format!("Restored session {}", sid))
+                    tool_ok(tcid, &format!("Restored session {}", sid))
                 }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e.to_string()),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e.to_string()),
             }
         }
 
@@ -759,15 +1052,11 @@ fn handle_session_tool(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let await_reply = args
-                .get("await_reply")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
             if target.is_empty() {
-                return tool_err("session_id is required");
+                return tool_err(tcid, "session_id is required");
             }
             if content.is_empty() {
-                return tool_err("content is required");
+                return tool_err(tcid, "content is required");
             }
             let sender_info = match session_id {
                 Some(sid) => format!("session:{}", sid),
@@ -777,158 +1066,24 @@ fn handle_session_tool(
                 target_session_id: target.to_string(),
                 content: content.to_string(),
                 sender_info,
-                await_reply,
+                await_reply: false,
                 reply_to: None,
             };
-            match server_request(writer, reader, req) {
+            match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::Ok) => {
-                    tool_ok(&format!("Message sent to session {}", target))
+                    tool_ok(tcid, &format!("Message sent to session {}", target))
                 }
-                Ok(crate::protocol::Response::MessageReply {
-                    content: reply_content,
-                }) => tool_ok(&reply_content),
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
-            }
-        }
-
-        "session_reply" => {
-            let msg_id = args.get("msg_id").and_then(|v| v.as_str()).unwrap_or("");
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if msg_id.is_empty() {
-                return tool_err("msg_id is required");
-            }
-            if content.is_empty() {
-                return tool_err("content is required");
-            }
-            let req = crate::protocol::Request::ReplyToMessage {
-                msg_id: msg_id.to_string(),
-                content: content.to_string(),
-            };
-            match server_request(writer, reader, req) {
-                Ok(crate::protocol::Response::Ok) => {
-                    tool_ok(&format!("Reply sent for msg_id={}", msg_id))
-                }
-                Ok(crate::protocol::Response::Error { message }) => tool_err(&message),
-                Ok(other) => tool_err(&format!("unexpected response: {:?}", other)),
-                Err(e) => tool_err(&e),
+                Ok(crate::protocol::Response::Error { message }) => tool_err(tcid, &message),
+                Ok(other) => tool_err(tcid, &format!("unexpected response: {:?}", other)),
+                Err(e) => tool_err(tcid, &e),
             }
         }
 
         "session_id" => match session_id {
-            Some(sid) => tool_ok(&serde_json::json!({"session_id": sid}).to_string()),
-            None => tool_err("session_id not available"),
+            Some(sid) => tool_ok(tcid, &serde_json::json!({"session_id": sid}).to_string()),
+            None => tool_err(tcid, "session_id not available"),
         },
 
-        _ => tool_err(&format!("unknown session tool: {}", name)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn sequential_reads_share_buffer() {
-        // Test that multiple reads from the same BufReader work correctly.
-        // This is the core of the bug fix: with separate stdin.lock() calls,
-        // data buffered by one lock would be lost when that lock was dropped.
-        let response1 = crate::protocol::Response::SessionCreated {
-            session_id: "child-1".into(),
-        };
-        let response2 = crate::protocol::Response::SessionCreated {
-            session_id: "child-2".into(),
-        };
-
-        let line1 = serde_json::to_string(&PluginRequest::ServerResponse {
-            request_id: "req-1".into(),
-            response: response1,
-        })
-        .unwrap();
-        let line2 = serde_json::to_string(&PluginRequest::ServerResponse {
-            request_id: "req-2".into(),
-            response: response2,
-        })
-        .unwrap();
-
-        // Both lines in one buffer -- simulates kernel delivering them together
-        let input = format!("{}\n{}\n", line1, line2);
-        let mut reader = Cursor::new(input.into_bytes());
-
-        // Read first line
-        let mut buf = String::new();
-        reader.read_line(&mut buf).unwrap();
-        let req1: PluginRequest = serde_json::from_str(&buf).unwrap();
-        if let PluginRequest::ServerResponse { request_id, .. } = &req1 {
-            assert_eq!(request_id, "req-1");
-        } else {
-            panic!("expected ServerResponse");
-        }
-
-        // Read second line from same reader (this would fail with separate stdin.lock())
-        buf.clear();
-        reader.read_line(&mut buf).unwrap();
-        let req2: PluginRequest = serde_json::from_str(&buf).unwrap();
-        if let PluginRequest::ServerResponse { request_id, .. } = &req2 {
-            assert_eq!(request_id, "req-2");
-        } else {
-            panic!("expected ServerResponse");
-        }
-    }
-
-    #[test]
-    fn server_request_skips_blank_lines() {
-        let response = crate::protocol::Response::Ok;
-        let resp_line = serde_json::to_string(&PluginRequest::ServerResponse {
-            request_id: "req-1".into(),
-            response,
-        })
-        .unwrap();
-
-        // Blank lines before the response
-        let input = format!("\n  \n{}\n", resp_line);
-        let mut reader = Cursor::new(input.into_bytes());
-
-        let mut line = String::new();
-        // Skip blank lines like the real code does
-        loop {
-            line.clear();
-            let n = reader.read_line(&mut line).unwrap();
-            if n == 0 {
-                panic!("unexpected EOF");
-            }
-            if line.trim().is_empty() {
-                continue;
-            }
-            break;
-        }
-
-        let req: PluginRequest = serde_json::from_str(&line).unwrap();
-        assert!(matches!(
-            req,
-            PluginRequest::ServerResponse {
-                request_id: _,
-                response: crate::protocol::Response::Ok,
-            }
-        ));
-    }
-
-    #[test]
-    fn server_request_eof_returns_error() {
-        let mut reader = Cursor::new(Vec::new()); // empty = immediate EOF
-        let mut writer: Vec<u8> = Vec::new();
-
-        let result = server_request(
-            &mut writer,
-            &mut reader,
-            crate::protocol::Request::ListSessions {
-                include_archived: false,
-            },
-        );
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("stdin closed"));
+        _ => tool_err(tcid, &format!("unknown session tool: {}", name)),
     }
 }

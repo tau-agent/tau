@@ -36,12 +36,9 @@ enum Commands {
         #[arg(default_value = "anthropic")]
         provider: String,
     },
-    /// Tool execution worker - sync/sequential (internal, used by daemon)
+    /// Tool execution worker (internal, used by daemon)
     #[command(hide = true)]
     Worker,
-    /// Async tool execution worker - default (internal, used by daemon)
-    #[command(hide = true)]
-    Worker2,
     /// Task system plugin (internal, used by daemon)
     #[command(name = "plugin-tasks", hide = true)]
     PluginTasks,
@@ -338,11 +335,7 @@ async fn run(cli: Cli) -> tau::Result<()> {
             cmd_chat(message, session, &model, no_tui, child_budget).await?;
         }
         Commands::Worker => {
-            tau::worker::run_worker_loop();
-            return Ok(());
-        }
-        Commands::Worker2 => {
-            tau::worker2::run();
+            tau::worker::run();
             return Ok(());
         }
         Commands::PluginTasks => {

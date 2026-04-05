@@ -273,7 +273,7 @@ fn start_server_with_tasks(
         session: [(
             "worker".to_string(),
             PluginEntry {
-                command: vec![tau_bin_str, "worker2".into()],
+                command: vec![tau_bin_str, "worker".into()],
                 env: HashMap::new(),
             },
         )]
