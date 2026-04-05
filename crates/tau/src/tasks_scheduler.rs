@@ -301,13 +301,15 @@ pub fn dispatch(
         .get_task(task_id)?
         .ok_or_else(|| crate::Error::Io(format!("task {} not found after prepare", task_id)))?;
 
-    // Reject if the task already has a session — dispatching again would
-    // create a duplicate session working in the same worktree.
+    // If the task has a session_id from a previous lifecycle phase (e.g. a
+    // planner or refiner session), log and continue — the old session is
+    // already recorded in the task_sessions table, and set_session_id below
+    // will overwrite with the new worker session.
     if let Some(ref existing_sid) = task.session_id {
-        return Err(crate::Error::Io(format!(
-            "task {} already has session {}, cannot dispatch again",
+        eprintln!(
+            "tasks scheduler: task {} replacing previous session {} with new dispatch",
             task_id, existing_sid
-        )));
+        );
     }
 
     let cwd = task.worktree_path.clone();
@@ -407,12 +409,13 @@ fn dispatch_planning(
 ) -> crate::Result<String> {
     let task_id = task.id;
 
-    // Reject if the task already has a session
+    // If the task has a session_id from a previous lifecycle phase, log and
+    // continue — the old session is already recorded in task_sessions.
     if let Some(ref existing_sid) = task.session_id {
-        return Err(crate::Error::Io(format!(
-            "task {} already has session {}, cannot dispatch again",
+        eprintln!(
+            "tasks scheduler: planning task {} replacing previous session {} with new dispatch",
             task_id, existing_sid
-        )));
+        );
     }
 
     // Resolve the effective parent session
@@ -2084,10 +2087,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_rejects_task_with_existing_session() {
+    fn test_dispatch_replaces_stale_session_from_previous_phase() {
         let db = TasksDb::open_memory().unwrap();
 
-        // Create a task and move it to active state with a session_id already set.
+        // Create a task and move it to active state with a session_id already
+        // set (simulating a stale session from a previous lifecycle phase).
         let task = db
             .create_task(
                 "/project",
@@ -2114,21 +2118,18 @@ mod tests {
         // Also record the session_id directly, simulating a previous dispatch.
         db.set_session_id(task.id, "existing-session").unwrap();
 
-        // Now try to dispatch again — must fail with a clear error.
+        // Dispatch should NOT reject a stale session_id — it should log and
+        // proceed.  It will fail later when trying to talk to the server
+        // (empty reader), but the error must NOT be "already has session".
         let mut buf = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
         let result = dispatch(&db, task.id, Some("caller-session"), &mut buf, &mut reader);
 
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected an error from server_request (empty reader)");
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("already has session"),
-            "unexpected error: {}",
-            err_msg
-        );
-        assert!(
-            err_msg.contains("existing-session"),
-            "unexpected error: {}",
+            !err_msg.contains("already has session"),
+            "dispatch should not reject stale session_id, but got: {}",
             err_msg
         );
     }
