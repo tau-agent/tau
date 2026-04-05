@@ -172,6 +172,8 @@ pub struct PluginHandle {
     spawn_command: Vec<String>,
     /// Working directory used to spawn this plugin.
     spawn_cwd: String,
+    /// Environment variables used to spawn this plugin.
+    spawn_env: HashMap<String, String>,
     /// When the plugin last had activity (tool call, hook, etc.).
     pub last_activity: Instant,
     /// When set, a background task owns the async I/O pipes.
@@ -184,17 +186,25 @@ pub struct PluginHandle {
 
 impl PluginHandle {
     /// Spawn a plugin process and read its registration.
-    pub fn spawn(command: &[String], cwd: &str) -> crate::Result<Self> {
+    pub fn spawn(
+        command: &[String],
+        cwd: &str,
+        env: &HashMap<String, String>,
+    ) -> crate::Result<Self> {
         if command.is_empty() {
             return Err(crate::Error::Io("empty plugin command".into()));
         }
 
-        let mut child = Command::new(&command[0])
-            .args(&command[1..])
+        let mut cmd = Command::new(&command[0]);
+        cmd.args(&command[1..])
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, val) in env {
+            cmd.env(key, val);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| crate::Error::Io(format!("spawn plugin {:?}: {}", command, e)))?;
 
@@ -229,6 +239,7 @@ impl PluginHandle {
             stderr_pipe,
             spawn_command: command.to_vec(),
             spawn_cwd: cwd.to_string(),
+            spawn_env: env.clone(),
             last_activity: Instant::now(),
             bg_msg_rx: None,
             bg_write_tx: None,
@@ -652,12 +663,17 @@ impl PluginHandle {
         let cmd = &self.spawn_command;
         let cwd = &self.spawn_cwd;
 
-        let mut child = Command::new(&cmd[0])
+        let mut cmd_proc = Command::new(&cmd[0]);
+        cmd_proc
             .args(&cmd[1..])
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, val) in &self.spawn_env {
+            cmd_proc.env(key, val);
+        }
+        let mut child = cmd_proc
             .spawn()
             .map_err(|e| crate::Error::Io(format!("respawn plugin {:?}: {}", cmd, e)))?;
 
@@ -864,6 +880,7 @@ impl SessionPlugins {
                 "worker".to_string(),
                 PluginEntry {
                     command: vec![exe, "worker2".to_string()],
+                    env: HashMap::new(),
                 },
             )]
         } else {
@@ -879,7 +896,7 @@ impl SessionPlugins {
             cmd.extend(entry.command.iter().cloned());
 
             eprintln!("spawning session plugin '{}': {:?}", name, cmd);
-            match PluginHandle::spawn(&cmd, cwd) {
+            match PluginHandle::spawn(&cmd, cwd, &entry.env) {
                 Ok(handle) => {
                     let tools: Vec<&str> = handle
                         .registration
@@ -1040,7 +1057,7 @@ impl PluginManager {
         self.global_plugins.clear();
 
         for (name, entry) in &self.config.global {
-            match PluginHandle::spawn(&entry.command, cwd) {
+            match PluginHandle::spawn(&entry.command, cwd, &entry.env) {
                 Ok(handle) => {
                     let tools: Vec<&str> = handle
                         .registration
@@ -1071,7 +1088,7 @@ impl PluginManager {
         {
             let exe = exe.to_string_lossy().to_string();
             let cmd = vec![exe, "plugin-tasks".to_string()];
-            match PluginHandle::spawn(&cmd, cwd) {
+            match PluginHandle::spawn(&cmd, cwd, &HashMap::new()) {
                 Ok(handle) => {
                     eprintln!(
                         "auto-spawned tasks plugin: {} tools",
@@ -1602,6 +1619,9 @@ impl Default for PluginsConfig {
 pub struct PluginEntry {
     /// Command to spawn the plugin (e.g. ["node", "/path/to/plugin.js"]).
     pub command: Vec<String>,
+    /// Environment variables to set on the plugin subprocess.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Load plugins config from `~/.config/tau/plugins.toml`.

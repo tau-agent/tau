@@ -1,5 +1,6 @@
 //! Integration tests for the subprocess plugin system.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tau::plugin::*;
 use tau::types::ToolCall;
@@ -19,7 +20,7 @@ fn test_plugin_command() -> Vec<String> {
 #[test]
 fn plugin_registration() {
     let cmd = test_plugin_command();
-    let handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     assert_eq!(handle.name, "test-plugin");
     assert_eq!(handle.registration.tools.len(), 3);
@@ -79,7 +80,7 @@ fn plugin_registration() {
 #[test]
 fn plugin_tool_schemas() {
     let cmd = test_plugin_command();
-    let handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     let schemas = handle.tool_schemas();
     assert_eq!(schemas.len(), 3);
@@ -91,7 +92,7 @@ fn plugin_tool_schemas() {
 #[test]
 fn plugin_tool_prompts() {
     let cmd = test_plugin_command();
-    let handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     let prompts = handle.tool_prompts();
     // Only tools with prompt_snippet get a ToolPrompt
@@ -103,7 +104,7 @@ fn plugin_tool_prompts() {
 #[test]
 fn plugin_echo_tool() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     let tc = ToolCall {
         id: "tc1".into(),
@@ -135,7 +136,7 @@ fn plugin_echo_tool() {
 #[test]
 fn plugin_slow_tool_streaming() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     let tc = ToolCall {
         id: "tc2".into(),
@@ -168,7 +169,7 @@ fn plugin_slow_tool_streaming() {
 #[test]
 fn plugin_fail_tool() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     let tc = ToolCall {
         id: "tc3".into(),
@@ -197,7 +198,7 @@ fn plugin_fail_tool() {
 #[test]
 fn plugin_before_agent_start_hook() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     let result = handle
         .call_hook(
@@ -214,7 +215,7 @@ fn plugin_before_agent_start_hook() {
 #[test]
 fn plugin_session_start_hook() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     // session_start is sent as a SessionStart request, not a Hook
     handle
@@ -231,7 +232,7 @@ fn plugin_session_start_hook() {
 #[test]
 fn plugin_multiple_tool_calls() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     // Call echo multiple times on the same plugin
     for i in 0..3 {
@@ -260,9 +261,15 @@ fn plugin_manager_integration() {
     let cmd = test_plugin_command();
     let config = PluginsConfig {
         session_prefix: None,
-        global: [("test".into(), PluginEntry { command: cmd })]
-            .into_iter()
-            .collect(),
+        global: [(
+            "test".into(),
+            PluginEntry {
+                command: cmd,
+                env: HashMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
         session: Default::default(),
         no_default_worker: false,
         idle_timeout_secs: 30,
@@ -319,9 +326,15 @@ fn tool_schemas_stable_during_take() {
     let cmd = test_plugin_command();
     let config = PluginsConfig {
         session_prefix: None,
-        global: [("test".into(), PluginEntry { command: cmd })]
-            .into_iter()
-            .collect(),
+        global: [(
+            "test".into(),
+            PluginEntry {
+                command: cmd,
+                env: HashMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
         session: Default::default(),
         no_default_worker: true,
         idle_timeout_secs: 30,
@@ -370,7 +383,7 @@ fn tool_schemas_stable_during_take() {
 #[test]
 fn plugin_wants_hook() {
     let cmd = test_plugin_command();
-    let handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     assert!(handle.wants_hook("before_agent_start"));
     assert!(handle.wants_hook("session_start"));
@@ -381,7 +394,7 @@ fn plugin_wants_hook() {
 #[test]
 fn plugin_after_tool_result_hook() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     let result = handle
         .call_hook(
@@ -419,7 +432,7 @@ fn plugin_send_idle_kills_worker() {
     }
 
     let cmd = vec![exe.to_string_lossy().to_string(), "worker".to_string()];
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
     assert!(handle.is_alive());
 
     handle.send_idle();
@@ -432,7 +445,7 @@ fn plugin_send_idle_kills_worker() {
 #[test]
 fn plugin_is_alive_tracks_state() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     // Plugin should be alive after spawn
     assert!(handle.is_alive());
@@ -445,7 +458,7 @@ fn plugin_is_alive_tracks_state() {
 #[test]
 fn plugin_respawn_after_kill() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     // Kill the plugin
     handle.kill();
@@ -466,7 +479,7 @@ fn plugin_respawn_after_kill() {
 #[test]
 fn plugin_ensure_alive_no_op_when_running() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     // Should be a no-op when already alive
     handle.ensure_alive().unwrap();
@@ -487,7 +500,7 @@ fn plugin_ensure_alive_no_op_when_running() {
 #[test]
 fn plugin_ensure_alive_respawns_when_dead() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     // Kill it
     handle.kill();
@@ -522,7 +535,7 @@ fn plugin_ensure_alive_respawns_when_dead() {
 #[test]
 fn plugin_last_activity_updates_on_send() {
     let cmd = test_plugin_command();
-    let mut handle = PluginHandle::spawn(&cmd, "/tmp").unwrap();
+    let mut handle = PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).unwrap();
 
     let t1 = handle.last_activity;
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -539,9 +552,15 @@ fn session_plugins_idle_sweep() {
     let config = PluginsConfig {
         session_prefix: None,
         global: Default::default(),
-        session: [("test".into(), PluginEntry { command: cmd })]
-            .into_iter()
-            .collect(),
+        session: [(
+            "test".into(),
+            PluginEntry {
+                command: cmd,
+                env: HashMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
         no_default_worker: true,
         idle_timeout_secs: 0, // immediate idle
     };
@@ -565,9 +584,15 @@ fn session_plugins_idle_sweep_skips_subscribed() {
     let config = PluginsConfig {
         session_prefix: None,
         global: Default::default(),
-        session: [("test".into(), PluginEntry { command: cmd })]
-            .into_iter()
-            .collect(),
+        session: [(
+            "test".into(),
+            PluginEntry {
+                command: cmd,
+                env: HashMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
         no_default_worker: true,
         idle_timeout_secs: 0,
     };

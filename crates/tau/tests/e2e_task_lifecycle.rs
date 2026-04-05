@@ -248,12 +248,22 @@ fn start_server_with_tasks(
     let tau_bin = tau_binary();
     let tau_bin_str = tau_bin.to_string_lossy().to_string();
 
+    // Create an isolated XDG_DATA_HOME so the tasks plugin doesn't hit the
+    // production tasks database.  We place it as a sibling of the repo inside
+    // the same tmpdir so it shares the tmpdir lifetime.
+    let data_home = _repo_path.parent().unwrap().join("xdg_data");
+    std::fs::create_dir_all(&data_home).unwrap();
+    let data_home_str = data_home.to_string_lossy().to_string();
+
     let plugins_config = PluginsConfig {
         no_default_worker: true,
         global: [(
             "tasks".to_string(),
             PluginEntry {
                 command: vec![tau_bin_str.clone(), "plugin-tasks".into()],
+                env: [("XDG_DATA_HOME".to_string(), data_home_str)]
+                    .into_iter()
+                    .collect(),
             },
         )]
         .into_iter()
@@ -264,6 +274,7 @@ fn start_server_with_tasks(
             "worker".to_string(),
             PluginEntry {
                 command: vec![tau_bin_str, "worker2".into()],
+                env: HashMap::new(),
             },
         )]
         .into_iter()

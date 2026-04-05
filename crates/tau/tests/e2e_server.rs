@@ -1728,6 +1728,7 @@ done
             "bg-test".to_string(),
             tau::plugin::PluginEntry {
                 command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
+                env: Default::default(),
             },
         )]
         .into_iter()
@@ -1845,6 +1846,7 @@ done
             "bg-create-test".to_string(),
             tau::plugin::PluginEntry {
                 command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
+                env: Default::default(),
             },
         )]
         .into_iter()
@@ -1983,6 +1985,7 @@ done
             "dispatch-test".to_string(),
             tau::plugin::PluginEntry {
                 command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
+                env: Default::default(),
             },
         )]
         .into_iter()
@@ -2107,6 +2110,7 @@ done
             "bg-tool-test".to_string(),
             tau::plugin::PluginEntry {
                 command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
+                env: Default::default(),
             },
         )]
         .into_iter()
