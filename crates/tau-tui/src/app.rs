@@ -127,6 +127,8 @@ pub struct App {
     pub picker_filter: String,
     /// Whether the picker is in filter-input mode (`/` was pressed).
     pub picker_filter_mode: bool,
+    /// Tagline edit mode: Some((cursor_in_picker, current_text)) when editing.
+    pub picker_edit_tagline: Option<(usize, String)>,
 }
 
 /// Saved state when navigating to a child session.
@@ -186,6 +188,7 @@ impl App {
             picker_previous_mode: AppMode::Input,
             picker_filter: String::new(),
             picker_filter_mode: false,
+            picker_edit_tagline: None,
         }
     }
 
@@ -594,6 +597,40 @@ impl App {
     }
 
     fn handle_picker_key(&mut self, key: &KeyEvent) -> Option<Action> {
+        // If in tagline edit mode, handle keys for text editing
+        if let Some((_, ref mut text)) = self.picker_edit_tagline {
+            match key.code {
+                KeyCode::Esc => {
+                    self.picker_edit_tagline = None;
+                    return None;
+                }
+                KeyCode::Enter => {
+                    let new_tagline = text.clone();
+                    self.picker_edit_tagline = None;
+                    if let Some(idx) = self.picker_selected_session_idx()
+                        && let Some(session) = self.picker_sessions.get_mut(idx)
+                    {
+                        let session_id = session.id.clone();
+                        session.tagline = Some(new_tagline.clone());
+                        return Some(Action::SetTagline {
+                            session_id,
+                            tagline: new_tagline,
+                        });
+                    }
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    text.pop();
+                    return None;
+                }
+                KeyCode::Char(c) => {
+                    text.push(c);
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
         // If in filter input mode, handle keys for text editing
         if self.picker_filter_mode {
             match key.code {
@@ -731,6 +768,7 @@ impl App {
                         self.mode = AppMode::Input;
                         self.picker_confirm_delete = None;
                         self.picker_confirm_archive = None;
+                        self.picker_edit_tagline = None;
                         self.picker_filter.clear();
                         self.picker_filter_mode = false;
                         if session_id == self.session_id {
@@ -745,6 +783,7 @@ impl App {
                     self.mode = self.picker_previous_mode;
                     self.picker_confirm_delete = None;
                     self.picker_confirm_archive = None;
+                    self.picker_edit_tagline = None;
                     self.picker_filter.clear();
                     self.picker_filter_mode = false;
                     None
@@ -761,6 +800,7 @@ impl App {
                             self.mode = self.picker_previous_mode;
                             self.picker_confirm_delete = None;
                             self.picker_confirm_archive = None;
+                            self.picker_edit_tagline = None;
                             self.picker_filter.clear();
                             self.picker_filter_mode = false;
                         } else {
@@ -781,11 +821,22 @@ impl App {
                             self.mode = self.picker_previous_mode;
                             self.picker_confirm_delete = None;
                             self.picker_confirm_archive = None;
+                            self.picker_edit_tagline = None;
                             self.picker_filter.clear();
                             self.picker_filter_mode = false;
                         } else {
                             self.picker_confirm_archive = Some(self.picker_cursor);
                         }
+                    }
+                    None
+                }
+                // r (lowercase): edit tagline of selected session
+                (KeyCode::Char('r'), _) => {
+                    if let Some(idx) = self.picker_selected_session_idx()
+                        && let Some(session) = self.picker_sessions.get(idx)
+                    {
+                        let current = session.tagline.clone().unwrap_or_default();
+                        self.picker_edit_tagline = Some((self.picker_cursor, current));
                     }
                     None
                 }
@@ -799,6 +850,7 @@ impl App {
                         self.mode = self.picker_previous_mode;
                         self.picker_confirm_delete = None;
                         self.picker_confirm_archive = None;
+                        self.picker_edit_tagline = None;
                         self.picker_filter.clear();
                         self.picker_filter_mode = false;
                         return Some(Action::RestoreSession { session_id });
@@ -810,6 +862,7 @@ impl App {
                     self.mode = self.picker_previous_mode;
                     self.picker_confirm_delete = None;
                     self.picker_confirm_archive = None;
+                    self.picker_edit_tagline = None;
                     self.picker_filter.clear();
                     self.picker_filter_mode = false;
                     None
@@ -1651,6 +1704,7 @@ impl App {
                         .unwrap_or(0);
                     self.picker_confirm_delete = None;
                     self.picker_confirm_archive = None;
+                    self.picker_edit_tagline = None;
                     return;
                 }
 
@@ -1888,6 +1942,11 @@ pub enum Action {
     OpenSessionPicker,
     /// Delete a session.
     DeleteSession(String),
+    /// Set the tagline for a session.
+    SetTagline {
+        session_id: String,
+        tagline: String,
+    },
     /// Archive a session, optionally switching to another session first.
     ArchiveSession {
         session_id: String,

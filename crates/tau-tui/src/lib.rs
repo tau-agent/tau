@@ -304,6 +304,7 @@ async fn run_inner(
                     app.mode = AppMode::SessionPicker;
                     app.picker_sessions.clear();
                     app.picker_confirm_delete = None;
+                    app.picker_edit_tagline = None;
                     app.picker_filter.clear();
                     app.picker_filter_mode = false;
                     send_request_and_recv(
@@ -314,6 +315,23 @@ async fn run_inner(
                     )
                     .await?;
                 }
+                Action::SetTagline {
+                    session_id,
+                    tagline,
+                } => match tau::db::Db::open_default() {
+                    Ok(db) => {
+                        if let Err(e) = db.update_tagline(&session_id, &tagline) {
+                            app.messages.push(crate::message::MessageItem::Error {
+                                text: format!("set tagline: {}", e),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        app.messages.push(crate::message::MessageItem::Error {
+                            text: format!("set tagline: {}", e),
+                        });
+                    }
+                },
                 Action::DeleteSession(session_id) => {
                     send_request_and_recv(
                         Request::DeleteSession {

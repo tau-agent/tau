@@ -538,6 +538,10 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             let is_selected = cursor_pos == Some(app.picker_cursor);
             let is_confirming_delete = cursor_pos == app.picker_confirm_delete;
             let is_confirming_archive = cursor_pos == app.picker_confirm_archive;
+            let is_editing_tagline = app
+                .picker_edit_tagline
+                .as_ref()
+                .is_some_and(|(c, _)| cursor_pos == Some(*c));
 
             // Delete confirmation
             if is_confirming_delete {
@@ -569,6 +573,26 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
                     .bg(ThemeColor::Rgb(0x28, 0x28, 0x3c).to_ratatui());
                 lines.push(Line::from(Span::styled(confirm_padded, style)));
                 continue;
+            }
+
+            // Tagline editing
+            if is_editing_tagline {
+                if let Some((_, ref edit_text)) = app.picker_edit_tagline {
+                    let id_short = &session.id[..session.id.len().min(8)];
+                    let prefix = format!(" {} tagline: ", id_short);
+                    let cursor = "█";
+                    let edit_display = format!("{}{}{}", prefix, edit_text, cursor);
+                    let edit_padded = if edit_display.len() < w {
+                        format!("{}{}", edit_display, " ".repeat(w - edit_display.len()))
+                    } else {
+                        edit_display[..w].to_string()
+                    };
+                    let style = Style::default()
+                        .fg(theme.accent.to_ratatui())
+                        .bg(theme.selected_bg.to_ratatui());
+                    lines.push(Line::from(Span::styled(edit_padded, style)));
+                    continue;
+                }
             }
 
             // Build spans for this row
@@ -699,8 +723,10 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     // Footer hint
     let hint = if app.picker_filter_mode {
         " type to filter  enter accept  esc clear"
+    } else if app.picker_edit_tagline.is_some() {
+        " type tagline  enter save  esc cancel"
     } else {
-        " /search  j/k nav  enter switch  A archive  R restore  D del  tab/esc close"
+        " /search  j/k nav  enter switch  r rename  A archive  R restore  D del  tab/esc close"
     };
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()
