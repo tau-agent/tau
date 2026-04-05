@@ -1085,6 +1085,9 @@ fn build_initial_message(task: &Task) -> String {
          When done, run the project checklist, then mark the task:\n\
          {review}\n\
          \n\
+         Before marking the task for review, ensure your branch is rebased on current main.\n\
+         Run `git rebase main` in your worktree and resolve any conflicts.\n\
+         \n\
          Note: task_get, task_assign, and task_update are agent tools (like bash or edit), not CLI commands.",
         id = task.id,
         title = task.title,
@@ -1358,6 +1361,7 @@ mod tests {
         // Must clarify these are tool calls, not CLI commands
         assert!(msg.contains("not a bash command") || msg.contains("not CLI commands"));
         assert!(msg.contains("do NOT merge into main") || msg.contains("do not merge"));
+        assert!(msg.contains("rebase"));
     }
 
     #[test]

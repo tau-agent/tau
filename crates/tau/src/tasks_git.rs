@@ -150,6 +150,68 @@ pub fn task_worktree_path(repo_root: &str, task_id: i64) -> crate::Result<String
     Ok(parent.join(worktree_dir).to_string_lossy().into_owned())
 }
 
+/// Check whether a branch is rebased on main (i.e., main is an ancestor of the branch).
+pub fn is_rebased_on_main(worktree_path: &str, branch: &str) -> crate::Result<bool> {
+    let output = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "main", branch])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|e| crate::Error::Io(format!("git merge-base --is-ancestor: {}", e)))?;
+
+    Ok(output.status.success())
+}
+
+/// Abort a partial rebase if one is in progress in the given worktree.
+///
+/// Uses `git rev-parse --git-dir` to find the actual git directory (which differs
+/// for worktrees), then checks for `rebase-merge` or `rebase-apply` directories.
+/// If either exists, runs `git rebase --abort`. Always returns `Ok(())` if no
+/// partial rebase is found.
+pub fn abort_partial_rebase(worktree_path: &str) -> crate::Result<()> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|e| crate::Error::Io(format!("git rev-parse --git-dir: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::Error::Io(format!(
+            "git rev-parse --git-dir in {}: {}",
+            worktree_path,
+            stderr.trim()
+        )));
+    }
+
+    let git_dir_raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let git_dir = if Path::new(&git_dir_raw).is_absolute() {
+        std::path::PathBuf::from(&git_dir_raw)
+    } else {
+        Path::new(worktree_path).join(&git_dir_raw)
+    };
+
+    let has_rebase = git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists();
+
+    if has_rebase {
+        let output = Command::new("git")
+            .args(["rebase", "--abort"])
+            .current_dir(worktree_path)
+            .output()
+            .map_err(|e| crate::Error::Io(format!("git rebase --abort: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(crate::Error::Io(format!(
+                "git rebase --abort in {}: {}",
+                worktree_path,
+                stderr.trim()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +435,50 @@ mod tests {
 
         let result = delete_branch(path, "nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_rebased_on_main_true() {
+        let dir = init_test_repo();
+        let path = dir.path().to_str().unwrap();
+
+        create_branch(path, "feature", "main").unwrap();
+        assert!(is_rebased_on_main(path, "feature").unwrap());
+    }
+
+    #[test]
+    fn test_is_rebased_on_main_false() {
+        let dir = init_test_repo();
+        let path = dir.path().to_str().unwrap();
+
+        // Create branch from current main
+        create_branch(path, "feature", "main").unwrap();
+
+        // Make a new commit on main so feature is behind
+        let file = dir.path().join("new_file.txt");
+        std::fs::write(&file, "new content\n").unwrap();
+
+        Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .expect("git add");
+
+        Command::new("git")
+            .args(["commit", "-m", "new commit on main"])
+            .current_dir(path)
+            .output()
+            .expect("git commit");
+
+        assert!(!is_rebased_on_main(path, "feature").unwrap());
+    }
+
+    #[test]
+    fn test_abort_partial_rebase_no_rebase() {
+        let dir = init_test_repo();
+        let path = dir.path().to_str().unwrap();
+
+        // Should return Ok even when no rebase is in progress
+        abort_partial_rebase(path).unwrap();
     }
 }
