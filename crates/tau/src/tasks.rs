@@ -80,6 +80,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                         "type": "boolean",
                         "description": "If true, task skips review and goes directly to approved when done"
                     },
+                    "skip_planning": {
+                        "type": "boolean",
+                        "description": "If true, subtask starts in ready state instead of planning"
+                    },
                     "message": {
                         "type": "string",
                         "description": "Initial message/description for the task"
@@ -90,7 +94,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Create a new task in the project task board".into()),
             prompt_guidelines: vec![
                 "Top-level tasks start in 'interactive' state for spec refinement".into(),
-                "Subtasks (with parent_id) start in 'ready' state with skip_review=false".into(),
+                "Subtasks (with parent_id) start in 'planning' state by default, or 'ready' if skip_planning=true".into(),
                 "Valid states: interactive, planning, refining, ready, active, review, approved, merging, failed, done".into(),
             ],
         },
@@ -199,6 +203,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "skip_review": {
                         "type": "boolean",
                         "description": "Whether to skip review"
+                    },
+                    "skip_planning": {
+                        "type": "boolean",
+                        "description": "Whether to skip planning"
                     }
                 },
                 "required": ["id"]
@@ -206,9 +214,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Update task fields (title, state, priority, tags, etc.)".into()),
             prompt_guidelines: vec![
                 "State transitions are validated: interactive->planning->refining->ready->active->review->approved->merging->done".into(),
-                "Shortcuts: interactive->approved, active->approved (skip_review only)".into(),
+                "Shortcuts: interactive->ready (skip planning), interactive->approved, active->approved (skip_review only)".into(),
+                "Planning cycle: planning->refining, refining->planning (revise), refining->ready (approved), refining->interactive (scope expansion)".into(),
                 "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active (recoverable), merging->failed (terminal), failed->active (manual retry)".into(),
-                "Universal overrides: any state->done (manual close), any state->interactive (human takes over)".into(),
+                "Universal overrides: any state->done (manual close), any state->interactive (human takes over), any state->failed".into(),
                 "active -> approved is only allowed if skip_review=true on the task".into(),
             ],
         },
@@ -303,7 +312,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
         },
         PluginToolDef {
             name: "task_schedule".into(),
-            description: "Run a scheduling pass: find ready tasks, pick a non-conflicting batch, create branches and worktrees, and transition them to active. Returns the list of tasks ready to dispatch.".into(),
+            description: "Run a scheduling pass: find ready/planning tasks, pick a non-conflicting batch, create branches and worktrees (for ready tasks), and transition them. Returns the list of tasks ready to dispatch.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -315,7 +324,8 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Run a scheduling pass to prepare ready tasks for dispatch".into()),
             prompt_guidelines: vec![
-                "Finds all ready tasks, selects a non-conflicting batch based on affected_files, creates branches/worktrees, transitions to active.".into(),
+                "Finds all ready and planning tasks, selects a non-conflicting batch based on affected_files, creates branches/worktrees for ready tasks, transitions them.".into(),
+                "Planning tasks are dispatched without worktrees (read-only sessions).".into(),
                 "After scheduling, use task_dispatch to create sessions and start work.".into(),
             ],
         },
@@ -395,12 +405,24 @@ fn handle_task_create(
         .get("skip_review")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let skip_planning = args
+        .get("skip_planning")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str());
 
-    match db.create_task(project, title, priority, parent_id, tags, skip_review) {
+    match db.create_task(
+        project,
+        title,
+        priority,
+        parent_id,
+        tags,
+        skip_review,
+        skip_planning,
+    ) {
         Ok(task) => {
-            // Subtasks start in ready state — trigger a schedule pass.
-            if task.state == "ready" {
+            // Subtasks start in ready or planning state — trigger a schedule pass.
+            if task.state == "ready" || task.state == "planning" {
                 pending_events.push(SchedulerEvent::ScheduleNeeded(
                     project.to_string(),
                     session_id.map(String::from),
@@ -725,6 +747,7 @@ fn handle_task_update(
         tags: args.get("tags").cloned(),
         affected_files: args.get("affected_files").cloned(),
         skip_review: args.get("skip_review").and_then(|v| v.as_bool()),
+        skip_planning: args.get("skip_planning").and_then(|v| v.as_bool()),
     };
 
     // Track session as reviewer if transitioning to review or approved
@@ -736,14 +759,47 @@ fn handle_task_update(
     }
 
     // Capture the old state before updating, so we can detect review → active.
-    let old_state = db.get_task(id).ok().flatten().map(|t| t.state);
+    let old_state = db.get_task(id).ok().flatten().map(|t| t.state.clone());
+    let old_task = db.get_task(id).ok().flatten();
+
+    // Rebase enforcement: active → review requires branch to be rebased on
+    // merge target. This prevents merges from failing due to conflicts.
+    if let (Some(new_state), Some(old_s)) = (&update.state, &old_state) {
+        if new_state == "review" && old_s == "active" {
+            if let Some(ref task) = old_task {
+                if task.branch.is_some() && task.worktree_path.is_some() {
+                    match tasks_scheduler::is_rebased_on_target(db, task) {
+                        Ok(true) => {} // good, rebased
+                        Ok(false) => {
+                            let merge_target = db.get_merge_target(id).unwrap_or("main".into());
+                            return tool_err(
+                                tool_call_id,
+                                &format!(
+                                    "cannot transition to review: branch is not rebased on '{}'. \
+                                     Please run `git rebase {}` in the worktree first.",
+                                    merge_target, merge_target
+                                ),
+                            );
+                        }
+                        Err(e) => {
+                            // If we can't check, log warning but allow transition
+                            eprintln!(
+                                "tasks: rebase check for task {} failed: {} (allowing transition)",
+                                id, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     match db.update_task(id, &update, session_id) {
         Ok(task) => {
             // Trigger scheduler events based on the new state.
             match task.state.as_str() {
                 "approved" => pending_events.push(SchedulerEvent::MergeNeeded),
-                "ready" => {
+                "ready" | "planning" => {
                     pending_events.push(SchedulerEvent::ScheduleNeeded(
                         task.project.clone(),
                         session_id.map(String::from),
@@ -769,6 +825,71 @@ fn handle_task_update(
                             target_session_id: sid.clone(),
                             content: msg,
                             sender_info: format!("task-system (review task {})", task.id),
+                            await_reply: false,
+                            reply_to: None,
+                        },
+                    );
+                }
+            }
+
+            // Automated review dispatch: when transitioning to review,
+            // auto-launch a review session.
+            if task.state == "review" && old_state.as_deref() == Some("active") {
+                match tasks_scheduler::dispatch_review(db, &task, session_id, writer, reader) {
+                    Ok(review_sid) => {
+                        eprintln!(
+                            "tasks: auto-dispatched review session {} for task {}",
+                            review_sid, task.id
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "tasks: failed to auto-dispatch review for task {}: {}",
+                            task.id, e
+                        );
+                    }
+                }
+            }
+
+            // Automated refining dispatch: when transitioning to refining,
+            // auto-launch a refining session.
+            if task.state == "refining"
+                && (old_state.as_deref() == Some("planning")
+                    || old_state.as_deref() == Some("interactive"))
+            {
+                match tasks_scheduler::dispatch_refining(db, &task, session_id, writer, reader) {
+                    Ok(refining_sid) => {
+                        eprintln!(
+                            "tasks: auto-dispatched refining session {} for task {}",
+                            refining_sid, task.id
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "tasks: failed to auto-dispatch refining for task {}: {}",
+                            task.id, e
+                        );
+                    }
+                }
+            }
+
+            // Session reuse: when refining → planning, resume the planning
+            // session by sending it a message with the refining feedback.
+            if task.state == "planning" && old_state.as_deref() == Some("refining") {
+                if let Some(ref sid) = task.session_id {
+                    let msg = format!(
+                        "Task {} was sent back to planning (plan needs revision). \
+                         Please run task_get to read the latest refining feedback \
+                         and revise your plan.",
+                        task.id
+                    );
+                    let _ = crate::tasks_scheduler::server_request(
+                        writer,
+                        reader,
+                        crate::protocol::Request::QueueMessage {
+                            target_session_id: sid.clone(),
+                            content: msg,
+                            sender_info: format!("task-system (refine task {})", task.id),
                             await_reply: false,
                             reply_to: None,
                         },
@@ -1295,7 +1416,7 @@ pub fn run_tasks_plugin() {
                         "approved" => {
                             pending_events.push(SchedulerEvent::MergeNeeded);
                         }
-                        "ready" => {
+                        "ready" | "planning" => {
                             // Look up the task's project for the schedule pass.
                             if let Ok(Some(task)) = db.get_task(task_id) {
                                 pending_events.push(SchedulerEvent::ScheduleNeeded(
@@ -1485,10 +1606,10 @@ fn run_merge_pass(db: &TasksDb, writer: &mut impl Write, reader: &mut impl BufRe
     }
 }
 
-/// Run a schedule + dispatch pass for a project: find ready tasks, prepare
-/// branches/worktrees, and dispatch sessions for them.
+/// Run a schedule + dispatch pass for a project: find ready/planning tasks,
+/// prepare branches/worktrees, and dispatch sessions for them.
 ///
-/// Triggered when a task transitions to `ready`.
+/// Triggered when a task transitions to `ready` or `planning`.
 fn run_schedule_pass(
     db: &TasksDb,
     project: &str,
@@ -1499,10 +1620,18 @@ fn run_schedule_pass(
     match tasks_scheduler::schedule(db, project) {
         Ok(scheduled) => {
             for st in &scheduled {
-                eprintln!(
-                    "tasks scheduler: scheduled task {} ({}) on branch {}",
-                    st.id, st.title, st.branch
-                );
+                if st.branch.is_empty() {
+                    // Planning task — dispatch planning session
+                    eprintln!(
+                        "tasks scheduler: dispatching planning for task {} ({})",
+                        st.id, st.title
+                    );
+                } else {
+                    eprintln!(
+                        "tasks scheduler: scheduled task {} ({}) on branch {}",
+                        st.id, st.title, st.branch
+                    );
+                }
                 // Dispatch each scheduled task (create session + send initial message).
                 // Pass the triggering session_id so dispatch() can inherit its model.
                 if let Err(e) = tasks_scheduler::dispatch(db, st.id, session_id, writer, reader) {
@@ -1815,8 +1944,12 @@ mod tests {
     #[test]
     fn test_tool_relate() {
         let db = TasksDb::open_memory().unwrap();
-        let t1 = db.create_task("/p", "A", None, None, None, false).unwrap();
-        let t2 = db.create_task("/p", "B", None, None, None, false).unwrap();
+        let t1 = db
+            .create_task("/p", "A", None, None, None, false, false)
+            .unwrap();
+        let t2 = db
+            .create_task("/p", "B", None, None, None, false, false)
+            .unwrap();
 
         let result = handle_task_relate(
             &db,
@@ -1837,7 +1970,9 @@ mod tests {
     #[test]
     fn test_tool_message_edit() {
         let db = TasksDb::open_memory().unwrap();
-        let task = db.create_task("/p", "A", None, None, None, false).unwrap();
+        let task = db
+            .create_task("/p", "A", None, None, None, false, false)
+            .unwrap();
         let msg = db.add_message(task.id, "original", None).unwrap();
 
         let result = handle_task_message_edit(
@@ -2084,7 +2219,7 @@ mod tests {
         let parent_id = parent["id"].as_i64().unwrap();
         assert_eq!(parent["state"], "interactive");
 
-        // Create subtask — should default to ready state, skip_review=false
+        // Create subtask — should default to planning state, skip_review=false
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id, "skip_review": true}),
@@ -2099,8 +2234,25 @@ mod tests {
         );
         assert!(!result.is_error);
         let subtask: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(subtask["state"], "ready");
+        assert_eq!(subtask["state"], "planning");
         assert_eq!(subtask["skip_review"], false);
+
+        // Create subtask with skip_planning — should default to ready state
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Subtask skip plan", "parent_id": parent_id, "skip_planning": true}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc3",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let subtask2: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(subtask2["state"], "ready");
     }
 
     #[test]
@@ -2110,7 +2262,7 @@ mod tests {
 
         // Create task without skip_review
         let task = db
-            .create_task("/project", "No skip", None, None, None, false)
+            .create_task("/project", "No skip", None, None, None, false, false)
             .unwrap();
         db.update_task(
             task.id,
@@ -2156,7 +2308,7 @@ mod tests {
 
         // Create task with skip_review=true
         let task = db
-            .create_task("/project", "Skip review", None, None, None, true)
+            .create_task("/project", "Skip review", None, None, None, true, false)
             .unwrap();
         db.update_task(
             task.id,
@@ -2188,7 +2340,7 @@ mod tests {
     fn test_session_tracking_on_message() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Tracked", None, None, None, false)
+            .create_task("/project", "Tracked", None, None, None, false, false)
             .unwrap();
 
         // Add a message with a session — should record contributor
@@ -2211,7 +2363,7 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
         let task = db
-            .create_task("/project", "Review track", None, None, None, false)
+            .create_task("/project", "Review track", None, None, None, false, false)
             .unwrap();
         db.update_task(
             task.id,
@@ -2249,7 +2401,7 @@ mod tests {
     fn test_session_tracking_idempotent() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Idempotent", None, None, None, false)
+            .create_task("/project", "Idempotent", None, None, None, false, false)
             .unwrap();
 
         // Record same session twice — should be idempotent
@@ -2302,7 +2454,7 @@ mod tests {
     fn test_task_relate_self_referential_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Self", None, None, None, false)
+            .create_task("/project", "Self", None, None, None, false, false)
             .unwrap();
 
         let result = handle_task_relate(
@@ -2318,10 +2470,10 @@ mod tests {
     fn test_task_relate_cross_project_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project-a", "A", None, None, None, false)
+            .create_task("/project-a", "A", None, None, None, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project-b", "B", None, None, None, false)
+            .create_task("/project-b", "B", None, None, None, false, false)
             .unwrap();
 
         let result = handle_task_relate(
@@ -2337,10 +2489,10 @@ mod tests {
     fn test_task_relate_circular_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project", "T1", None, None, None, false)
+            .create_task("/project", "T1", None, None, None, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project", "T2", None, None, None, false)
+            .create_task("/project", "T2", None, None, None, false, false)
             .unwrap();
 
         // T1 depends_on T2 — OK
@@ -2365,10 +2517,10 @@ mod tests {
     fn test_task_get_dependency_status_blocking() {
         let db = TasksDb::open_memory().unwrap();
         let dep = db
-            .create_task("/project", "Dependency", None, None, None, false)
+            .create_task("/project", "Dependency", None, None, None, false, false)
             .unwrap();
         let task = db
-            .create_task("/project", "Dependent", None, None, None, false)
+            .create_task("/project", "Dependent", None, None, None, false, false)
             .unwrap();
 
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
@@ -2389,7 +2541,7 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         // Create dep and move to done
         let dep = db
-            .create_task("/project", "Dependency", None, None, None, true)
+            .create_task("/project", "Dependency", None, None, None, true, false)
             .unwrap();
         db.update_task(
             dep.id,
@@ -2430,7 +2582,7 @@ mod tests {
         .unwrap();
 
         let task = db
-            .create_task("/project", "Dependent", None, None, None, false)
+            .create_task("/project", "Dependent", None, None, None, false, false)
             .unwrap();
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
 
@@ -2449,10 +2601,10 @@ mod tests {
     fn test_task_get_non_depends_on_has_no_status() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project", "T1", None, None, None, false)
+            .create_task("/project", "T1", None, None, None, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project", "T2", None, None, None, false)
+            .create_task("/project", "T2", None, None, None, false, false)
             .unwrap();
 
         db.add_relation(t1.id, t2.id, "related").unwrap();
@@ -2578,7 +2730,7 @@ mod tests {
         let text = extract_text(&result);
         let subtask: serde_json::Value = serde_json::from_str(&text).unwrap();
 
-        assert_eq!(subtask["state"], "ready");
+        assert_eq!(subtask["state"], "planning");
         // Subtask should NOT have session auto-linked (it's not interactive)
         assert!(subtask["session_id"].is_null());
     }
@@ -2592,7 +2744,7 @@ mod tests {
 
         // Create a task with a session_id
         let task = db
-            .create_task("/project", "Auto archive", None, None, None, true)
+            .create_task("/project", "Auto archive", None, None, None, true, false)
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
         db.update_task(
@@ -2656,7 +2808,7 @@ mod tests {
 
         // Create a task without a session_id and transition to done
         let task = db
-            .create_task("/project", "No session", None, None, None, false)
+            .create_task("/project", "No session", None, None, None, false, false)
             .unwrap();
 
         // Transition to done directly (universal override)
@@ -2685,7 +2837,7 @@ mod tests {
 
         // Create a task with skip_review and move to approved
         let task = db
-            .create_task("/project", "Merge trigger", None, None, None, true)
+            .create_task("/project", "Merge trigger", None, None, None, true, false)
             .unwrap();
         db.update_task(
             task.id,
@@ -2807,7 +2959,7 @@ mod tests {
 
         // Create task and move to active (via assign)
         let task = db
-            .create_task("/project", "No event", None, None, None, false)
+            .create_task("/project", "No event", None, None, None, false, false)
             .unwrap();
         db.update_task(
             task.id,
@@ -2887,7 +3039,15 @@ mod tests {
 
         // Create a task, assign it a session, advance to review state
         let task = db
-            .create_task("/project", "Review notify test", None, None, None, false)
+            .create_task(
+                "/project",
+                "Review notify test",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
         db.update_task(
@@ -2950,7 +3110,15 @@ mod tests {
         // assign_task now sets session_id, so we clear it afterwards to
         // simulate a task whose session was removed.
         let task = db
-            .create_task("/project", "No session review", None, None, None, false)
+            .create_task(
+                "/project",
+                "No session review",
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -3001,7 +3169,7 @@ mod tests {
         // Test that approved → active does NOT send a QueueMessage
         // (only review → active should trigger the notification)
         let task = db
-            .create_task("/project", "Approved bounce", None, None, None, true)
+            .create_task("/project", "Approved bounce", None, None, None, true, false)
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
         db.update_task(

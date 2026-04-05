@@ -1444,7 +1444,7 @@ impl App {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let task = db.create_task(&project, title, None, None, None, false)?;
+        let task = db.create_task(&project, title, None, None, None, false, false)?;
         self.messages.push(MessageItem::Status {
             text: format!("Created task #{}: {}", task.id, task.title),
         });

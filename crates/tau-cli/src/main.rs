@@ -1848,8 +1848,15 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
             priority,
         } => {
             let project = project_key();
-            let task =
-                db.create_task(&project, &title, Some(priority), parent, None, skip_review)?;
+            let task = db.create_task(
+                &project,
+                &title,
+                Some(priority),
+                parent,
+                None,
+                skip_review,
+                false,
+            )?;
             println!("created task #{}: {}", task.id, task.title);
         }
         TaskAction::Update {
