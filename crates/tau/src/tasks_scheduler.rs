@@ -2125,7 +2125,10 @@ mod tests {
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
         let result = dispatch(&db, task.id, Some("caller-session"), &mut buf, &mut reader);
 
-        assert!(result.is_err(), "expected an error from server_request (empty reader)");
+        assert!(
+            result.is_err(),
+            "expected an error from server_request (empty reader)"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
             !err_msg.contains("already has session"),
