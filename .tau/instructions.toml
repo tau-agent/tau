@@ -1,0 +1,15 @@
+[common]
+instructions = """
+ - No unwrap() in non-test code (use expect() instead)
+"""
+
+[refining]
+instructions = """
+ - Watch out for race conditions with DB accesses - use transactions if they help
+"""
+
+[review]
+instructions = """
+ - Ensure no unrelated changes are included
+ - Be strict, don't allow minor issues
+"""
