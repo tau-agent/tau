@@ -67,10 +67,10 @@ fn line_bg_color(line: &Line<'_>) -> Option<ratatui::style::Color> {
         return Some(bg);
     }
     // Fall back: check the first span's resolved style
-    if let Some(span) = line.spans.first() {
-        if let Some(bg) = span.style.bg {
-            return Some(bg);
-        }
+    if let Some(span) = line.spans.first()
+        && let Some(bg) = span.style.bg
+    {
+        return Some(bg);
     }
     None
 }
@@ -577,40 +577,38 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             }
 
             // Tagline editing
-            if is_editing_tagline {
-                if let Some((_, ref edit_text)) = app.picker_edit_tagline {
-                    let id_short = &session.id[..session.id.len().min(8)];
-                    let prefix = format!(" {} tagline: ", id_short);
-                    let cursor = "█";
-                    let edit_display = format!("{}{}{}", prefix, edit_text, cursor);
-                    let display_width = UnicodeWidthStr::width(edit_display.as_str());
-                    let edit_padded = if display_width < w {
-                        format!("{}{}", edit_display, " ".repeat(w - display_width))
+            if is_editing_tagline && let Some((_, ref edit_text)) = app.picker_edit_tagline {
+                let id_short = &session.id[..session.id.len().min(8)];
+                let prefix = format!(" {} tagline: ", id_short);
+                let cursor = "█";
+                let edit_display = format!("{}{}{}", prefix, edit_text, cursor);
+                let display_width = UnicodeWidthStr::width(edit_display.as_str());
+                let edit_padded = if display_width < w {
+                    format!("{}{}", edit_display, " ".repeat(w - display_width))
+                } else {
+                    // Truncate to w display columns, respecting char boundaries
+                    let mut col = 0;
+                    let mut byte_end = edit_display.len();
+                    for (i, ch) in edit_display.char_indices() {
+                        let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if col + ch_w > w {
+                            byte_end = i;
+                            break;
+                        }
+                        col += ch_w;
+                    }
+                    let truncated = &edit_display[..byte_end];
+                    if col < w {
+                        format!("{}{}", truncated, " ".repeat(w - col))
                     } else {
-                        // Truncate to w display columns, respecting char boundaries
-                        let mut col = 0;
-                        let mut byte_end = edit_display.len();
-                        for (i, ch) in edit_display.char_indices() {
-                            let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                            if col + ch_w > w {
-                                byte_end = i;
-                                break;
-                            }
-                            col += ch_w;
-                        }
-                        let truncated = &edit_display[..byte_end];
-                        if col < w {
-                            format!("{}{}", truncated, " ".repeat(w - col))
-                        } else {
-                            truncated.to_string()
-                        }
-                    };
-                    let style = Style::default()
-                        .fg(theme.accent.to_ratatui())
-                        .bg(theme.selected_bg.to_ratatui());
-                    lines.push(Line::from(Span::styled(edit_padded, style)));
-                    continue;
-                }
+                        truncated.to_string()
+                    }
+                };
+                let style = Style::default()
+                    .fg(theme.accent.to_ratatui())
+                    .bg(theme.selected_bg.to_ratatui());
+                lines.push(Line::from(Span::styled(edit_padded, style)));
+                continue;
             }
 
             // Build spans for this row
@@ -759,7 +757,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
 
     if lines.len() > available_lines {
         let num_sessions = lines.len() - 1; // exclude hint
-        let hint_line = lines.pop().unwrap();
+        let hint_line = lines.pop().expect("lines not empty: hint was just pushed");
 
         let scroll_start = if app.picker_cursor >= session_lines {
             app.picker_cursor - session_lines + 1

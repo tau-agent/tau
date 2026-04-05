@@ -609,41 +609,38 @@ fn handle_task_assign(
             // For interactive tasks with a changed session, reparent sessions via RPC.
             // The DB updates (session_id on task + all descendants) were already done
             // atomically inside assign_task's transaction.
-            if task.state == "interactive" {
-                if let Some(ref old_sid) = result.old_session_id {
-                    if old_sid != sid {
-                        // Reparent direct child sessions from the old session
+            if task.state == "interactive"
+                && let Some(ref old_sid) = result.old_session_id
+                && old_sid != sid
+            {
+                // Reparent direct child sessions from the old session
+                let req = crate::protocol::Request::ReparentChildren {
+                    old_parent_id: old_sid.clone(),
+                    new_parent_id: sid.to_string(),
+                };
+                if let Err(e) = crate::tasks_scheduler::server_request(writer, reader, req) {
+                    eprintln!(
+                        "warning: failed to reparent children from {} to {}: {}",
+                        old_sid, sid, e
+                    );
+                }
+
+                // Reparent descendant task sessions that were parented
+                // under the old owner. Deduplicate since multiple
+                // descendants may share the same old session.
+                let mut reparented = std::collections::HashSet::new();
+                for desc_old_sid in &result.descendant_old_sessions {
+                    if reparented.insert(desc_old_sid.clone()) {
                         let req = crate::protocol::Request::ReparentChildren {
-                            old_parent_id: old_sid.clone(),
+                            old_parent_id: desc_old_sid.clone(),
                             new_parent_id: sid.to_string(),
                         };
                         if let Err(e) = crate::tasks_scheduler::server_request(writer, reader, req)
                         {
                             eprintln!(
-                                "warning: failed to reparent children from {} to {}: {}",
-                                old_sid, sid, e
+                                "warning: failed to reparent children of {} to {}: {}",
+                                desc_old_sid, sid, e
                             );
-                        }
-
-                        // Reparent descendant task sessions that were parented
-                        // under the old owner. Deduplicate since multiple
-                        // descendants may share the same old session.
-                        let mut reparented = std::collections::HashSet::new();
-                        for desc_old_sid in &result.descendant_old_sessions {
-                            if reparented.insert(desc_old_sid.clone()) {
-                                let req = crate::protocol::Request::ReparentChildren {
-                                    old_parent_id: desc_old_sid.clone(),
-                                    new_parent_id: sid.to_string(),
-                                };
-                                if let Err(e) =
-                                    crate::tasks_scheduler::server_request(writer, reader, req)
-                                {
-                                    eprintln!(
-                                        "warning: failed to reparent children of {} to {}: {}",
-                                        desc_old_sid, sid, e
-                                    );
-                                }
-                            }
                         }
                     }
                 }
@@ -782,57 +779,58 @@ fn handle_task_update(
 
     // Rebase enforcement: active → review requires branch to be rebased on
     // merge target. This prevents merges from failing due to conflicts.
-    if let (Some(new_state), Some(old_s)) = (&update.state, &old_state) {
-        if new_state == "review" && old_s == "active" {
-            if let Some(ref task) = old_task {
-                if task.branch.is_some() && task.worktree_path.is_some() {
-                    match tasks_scheduler::is_rebased_on_target(db, task) {
-                        Ok(true) => {} // good, rebased
-                        Ok(false) => {
-                            let merge_target = db.get_merge_target(id).unwrap_or("main".into());
+    if let (Some(new_state), Some(old_s)) = (&update.state, &old_state)
+        && new_state == "review"
+        && old_s == "active"
+    {
+        if let Some(ref task) = old_task {
+            if task.branch.is_some() && task.worktree_path.is_some() {
+                match tasks_scheduler::is_rebased_on_target(db, task) {
+                    Ok(true) => {} // good, rebased
+                    Ok(false) => {
+                        let merge_target = db.get_merge_target(id).unwrap_or("main".into());
 
-                            // Clean up any partial rebase state.
-                            if let Some(ref wt_path) = task.worktree_path {
-                                let _ = crate::tasks_git::abort_partial_rebase(wt_path);
-                            }
+                        // Clean up any partial rebase state.
+                        if let Some(ref wt_path) = task.worktree_path {
+                            let _ = crate::tasks_git::abort_partial_rebase(wt_path);
+                        }
 
-                            // Notify the worker session.
-                            if let Some(ref sid) = task.session_id {
-                                let branch_name = task.branch.as_deref().unwrap_or("(unknown)");
-                                let msg = format!(
-                                    "Task {} transition to review was rejected: branch {} is not rebased on '{}'.\n\
+                        // Notify the worker session.
+                        if let Some(ref sid) = task.session_id {
+                            let branch_name = task.branch.as_deref().unwrap_or("(unknown)");
+                            let msg = format!(
+                                "Task {} transition to review was rejected: branch {} is not rebased on '{}'.\n\
                                      Please run `git rebase {}` in your worktree, resolve any conflicts, then try again:\n\
                                      - Call `task_update` with arguments {{\"id\": {}, \"state\": \"review\"}}",
-                                    task.id, branch_name, merge_target, merge_target, task.id
-                                );
-                                let _ = crate::tasks_scheduler::server_request(
-                                    writer,
-                                    reader,
-                                    crate::protocol::Request::QueueMessage {
-                                        target_session_id: sid.clone(),
-                                        content: msg,
-                                        sender_info: format!(
-                                            "task-system (rebase check task {})",
-                                            task.id
-                                        ),
-                                        await_reply: false,
-                                        reply_to: None,
-                                    },
-                                );
-                            }
-
-                            return tool_err(
-                                tool_call_id,
-                                &format!(
-                                    "cannot transition to review: branch is not rebased on '{}'. \
-                                     Please run `git rebase {}` in the worktree first.",
-                                    merge_target, merge_target
-                                ),
+                                task.id, branch_name, merge_target, merge_target, task.id
+                            );
+                            let _ = crate::tasks_scheduler::server_request(
+                                writer,
+                                reader,
+                                crate::protocol::Request::QueueMessage {
+                                    target_session_id: sid.clone(),
+                                    content: msg,
+                                    sender_info: format!(
+                                        "task-system (rebase check task {})",
+                                        task.id
+                                    ),
+                                    await_reply: false,
+                                    reply_to: None,
+                                },
                             );
                         }
-                        Err(e) => {
-                            return tool_err(tool_call_id, &format!("rebase check failed: {}", e));
-                        }
+
+                        return tool_err(
+                            tool_call_id,
+                            &format!(
+                                "cannot transition to review: branch is not rebased on '{}'. \
+                                     Please run `git rebase {}` in the worktree first.",
+                                merge_target, merge_target
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        return tool_err(tool_call_id, &format!("rebase check failed: {}", e));
                     }
                 }
             }
@@ -855,26 +853,27 @@ fn handle_task_update(
 
             // When a task transitions from review back to active (changes
             // requested), notify the worker session so it knows to resume.
-            if task.state == "active" && old_state.as_deref() == Some("review") {
-                if let Some(ref sid) = task.session_id {
-                    let msg = format!(
-                        "Task {} was moved back to active (changes requested). \
-                        Please run task_get to read the latest review feedback \
-                        and address the requested changes.",
-                        task.id
-                    );
-                    let _ = crate::tasks_scheduler::server_request(
-                        writer,
-                        reader,
-                        crate::protocol::Request::QueueMessage {
-                            target_session_id: sid.clone(),
-                            content: msg,
-                            sender_info: format!("task-system (review task {})", task.id),
-                            await_reply: false,
-                            reply_to: None,
-                        },
-                    );
-                }
+            if task.state == "active"
+                && old_state.as_deref() == Some("review")
+                && let Some(ref sid) = task.session_id
+            {
+                let msg = format!(
+                    "Task {} was moved back to active (changes requested). \
+                    Please run task_get to read the latest review feedback \
+                    and address the requested changes.",
+                    task.id
+                );
+                let _ = crate::tasks_scheduler::server_request(
+                    writer,
+                    reader,
+                    crate::protocol::Request::QueueMessage {
+                        target_session_id: sid.clone(),
+                        content: msg,
+                        sender_info: format!("task-system (review task {})", task.id),
+                        await_reply: false,
+                        reply_to: None,
+                    },
+                );
             }
 
             // Automated review dispatch: when transitioning to review,
@@ -938,26 +937,27 @@ fn handle_task_update(
 
             // Session reuse: when refining → planning, resume the planning
             // session by sending it a message with the refining feedback.
-            if task.state == "planning" && old_state.as_deref() == Some("refining") {
-                if let Some(ref sid) = task.session_id {
-                    let msg = format!(
-                        "Task {} was sent back to planning (plan needs revision). \
-                         Please run task_get to read the latest refining feedback \
-                         and revise your plan.",
-                        task.id
-                    );
-                    let _ = crate::tasks_scheduler::server_request(
-                        writer,
-                        reader,
-                        crate::protocol::Request::QueueMessage {
-                            target_session_id: sid.clone(),
-                            content: msg,
-                            sender_info: format!("task-system (refine task {})", task.id),
-                            await_reply: false,
-                            reply_to: None,
-                        },
-                    );
-                }
+            if task.state == "planning"
+                && old_state.as_deref() == Some("refining")
+                && let Some(ref sid) = task.session_id
+            {
+                let msg = format!(
+                    "Task {} was sent back to planning (plan needs revision). \
+                     Please run task_get to read the latest refining feedback \
+                     and revise your plan.",
+                    task.id
+                );
+                let _ = crate::tasks_scheduler::server_request(
+                    writer,
+                    reader,
+                    crate::protocol::Request::QueueMessage {
+                        target_session_id: sid.clone(),
+                        content: msg,
+                        sender_info: format!("task-system (refine task {})", task.id),
+                        await_reply: false,
+                        reply_to: None,
+                    },
+                );
             }
 
             // When a task transitions TO interactive (from any other state),

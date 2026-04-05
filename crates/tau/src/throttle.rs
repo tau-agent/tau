@@ -28,7 +28,7 @@ impl ProviderThrottle {
     /// Check if a provider is currently throttled.
     /// Returns `Some(remaining_duration)` if blocked, `None` if clear.
     pub fn check(&self, provider: &str) -> Option<Duration> {
-        let state = self.inner.lock().unwrap();
+        let state = self.inner.lock().expect("throttle mutex poisoned");
         if let Some(until) = state.blocked_until.get(provider) {
             let now = Instant::now();
             if now < *until {
@@ -40,7 +40,7 @@ impl ProviderThrottle {
 
     /// Block a provider for `duration` from now.
     pub fn block_for(&self, provider: &str, duration: Duration) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().expect("throttle mutex poisoned");
         let until = Instant::now() + duration;
         // Only extend, never shorten an existing block
         let entry = state
@@ -59,7 +59,7 @@ impl ProviderThrottle {
 
     /// Clear throttle for a provider.
     pub fn clear(&self, provider: &str) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().expect("throttle mutex poisoned");
         state.blocked_until.remove(provider);
     }
 

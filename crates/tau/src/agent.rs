@@ -239,7 +239,7 @@ pub async fn run(
         let stop_reason = message.stop_reason;
         let assistant_msg = Message::Assistant(message.clone());
         if let Some(ref on_msg) = config.on_message {
-            on_msg.lock().unwrap()(&assistant_msg);
+            on_msg.lock().expect("on_message mutex poisoned")(&assistant_msg);
         }
         new_messages.push(assistant_msg);
         context.messages.push(Message::Assistant(message.clone()));
@@ -305,7 +305,7 @@ pub async fn run(
                     });
                     let tool_msg = Message::ToolResult(stub.clone());
                     if let Some(ref on_msg) = config.on_message {
-                        on_msg.lock().unwrap()(&tool_msg);
+                        on_msg.lock().expect("on_message mutex poisoned")(&tool_msg);
                     }
                     new_messages.push(tool_msg);
                     context.messages.push(Message::ToolResult(stub));
@@ -375,7 +375,7 @@ pub async fn run(
 
             let tool_msg = Message::ToolResult(result.clone());
             if let Some(ref on_msg) = config.on_message {
-                on_msg.lock().unwrap()(&tool_msg);
+                on_msg.lock().expect("on_message mutex poisoned")(&tool_msg);
             }
             new_messages.push(tool_msg);
             context.messages.push(Message::ToolResult(result));
@@ -417,7 +417,7 @@ pub async fn run(
                     timestamp: crate::types::timestamp_ms(),
                 });
                 if let Some(ref on_msg) = config.on_message {
-                    on_msg.lock().unwrap()(&nudge);
+                    on_msg.lock().expect("on_message mutex poisoned")(&nudge);
                 }
                 let _ = event_tx.try_send(StreamEvent::Status {
                     message: format!(
@@ -467,15 +467,8 @@ async fn run_loop_review(
     });
 
     // Extract the last N messages for review.
-    let recent: Vec<Message> = messages
-        .iter()
-        .rev()
-        .take(LOOP_REVIEW_MESSAGE_COUNT)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let start = messages.len().saturating_sub(LOOP_REVIEW_MESSAGE_COUNT);
+    let recent: Vec<Message> = messages[start..].to_vec();
 
     // Format them as a single user message for the reviewer.
     let mut review_text = String::from("Here are the last messages from the session:\n\n");
@@ -696,7 +689,7 @@ async fn stream_with_retry(
                                 * 0.25
                                 * (std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
+                                    .expect("system clock before unix epoch")
                                     .subsec_nanos() as f64
                                     / 1_000_000_000.0))
                                 as u64;

@@ -690,7 +690,7 @@ fn handle_session_tool(
                 Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
                 Some(serde_json::Value::Array(arr)) => arr
                     .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter_map(|v| v.as_str().map(str::to_string))
                     .collect(),
                 _ => return tool_err("session_id is required (string or array of strings)"),
             };

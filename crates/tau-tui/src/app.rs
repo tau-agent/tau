@@ -168,7 +168,7 @@ impl App {
             tick_counter: 0,
             last_escape: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(10))
-                .unwrap(),
+                .expect("10s subtraction should not underflow Instant"),
             queued_messages: Vec::new(),
             history_index: None,
             history_saved_text: String::new(),
@@ -176,7 +176,7 @@ impl App {
             subscription_usage: None,
             last_usage_fetch: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(3600))
-                .unwrap(),
+                .expect("3600s subtraction should not underflow Instant"),
             server_done: false,
             nav_stack: Vec::new(),
             parent_id: None,

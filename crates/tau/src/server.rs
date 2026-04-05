@@ -258,7 +258,7 @@ type SessionLocks = Arc<Mutex<HashMap<String, Arc<smol::lock::Mutex<()>>>>>;
 
 /// Get or create an async lock for a session.
 fn session_lock(locks: &SessionLocks, session_id: &str) -> Arc<smol::lock::Mutex<()>> {
-    let mut map = locks.lock().unwrap();
+    let mut map = locks.lock().expect("session locks mutex poisoned");
     map.entry(session_id.to_string())
         .or_insert_with(|| Arc::new(smol::lock::Mutex::new(())))
         .clone()
@@ -298,7 +298,7 @@ impl ShutdownHandle {
         self.restart.store(restart, Ordering::Relaxed);
         self.flag.store(true, Ordering::Relaxed);
         // Broadcast to all connected clients
-        let clients = self.clients.lock().unwrap();
+        let clients = self.clients.lock().expect("clients mutex poisoned");
         let msg = Response::ServerShutdown { restart };
         for tx in clients.iter() {
             if tx.try_send(msg.clone()).is_err() {
@@ -309,7 +309,10 @@ impl ShutdownHandle {
 
     fn register_client(&self) -> smol::channel::Receiver<Response> {
         let (tx, rx) = smol::channel::bounded(1);
-        self.clients.lock().unwrap().push(tx);
+        self.clients
+            .lock()
+            .expect("clients mutex poisoned")
+            .push(tx);
         rx
     }
 
@@ -337,7 +340,10 @@ fn spawn_idle_sweep(
     state: SharedState,
     shutdown: ShutdownHandle,
 ) {
-    let idle_timeout = plugins.lock().unwrap().idle_timeout();
+    let idle_timeout = plugins
+        .lock()
+        .expect("plugins mutex poisoned")
+        .idle_timeout();
     if idle_timeout.is_zero() {
         return; // Idle sweep disabled
     }
@@ -361,7 +367,7 @@ fn spawn_idle_sweep(
             // Run sweep on a blocking thread since plugin I/O is synchronous
             let plugins_clone = plugins.clone();
             let _ = smol::unblock(move || {
-                let mut pm = plugins_clone.lock().unwrap();
+                let mut pm = plugins_clone.lock().expect("plugins mutex poisoned");
                 pm.idle_sweep(idle_timeout, &|session_id: &str| {
                     subscribed_sessions.contains(session_id)
                 });
@@ -469,7 +475,7 @@ fn spawn_global_plugin_background_tasks(
     test_overrides: &SharedTestOverrides,
 ) {
     let io_pairs = {
-        let mut pm = plugins.lock().unwrap();
+        let mut pm = plugins.lock().expect("plugins mutex poisoned");
         pm.setup_background_io()
     };
 
@@ -500,7 +506,7 @@ fn spawn_global_plugin_background_tasks(
         // Get a sender clone for the writer channel so the reader task can
         // send ServerResponse messages back to the plugin.
         let resp_tx = {
-            let pm = plugins.lock().unwrap();
+            let pm = plugins.lock().expect("plugins mutex poisoned");
             pm.get_global_write_tx(&plugin_name)
         };
         let resp_tx = match resp_tx {
@@ -1192,7 +1198,7 @@ async fn handle_client(
                         st.db.get_session(&id).ok().flatten().and_then(|s| s.cwd)
                     };
                     let cwd_str = cwd_resolved.as_deref().unwrap_or("/tmp");
-                    let mut pm = plugins.lock().unwrap();
+                    let mut pm = plugins.lock().expect("plugins mutex poisoned");
                     if let Err(e) = pm.ensure_session_plugins(&id, cwd_str) {
                         eprintln!("failed to spawn session plugins: {}", e);
                     }
@@ -1277,7 +1283,7 @@ async fn handle_client(
 
                     // Ensure session plugins are spawned and notify session start
                     {
-                        let mut pm = plugins.lock().unwrap();
+                        let mut pm = plugins.lock().expect("plugins mutex poisoned");
                         if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
                             eprintln!("failed to spawn session plugins: {}", e);
                         }
@@ -1339,7 +1345,7 @@ async fn handle_client(
                     // Call before_agent_start hooks (plugins inject context)
                     let mut system_prompt = stored.system_prompt.clone();
                     {
-                        let mut pm = plugins.lock().unwrap();
+                        let mut pm = plugins.lock().expect("plugins mutex poisoned");
                         let hook_data = serde_json::json!({
                             "prompt": &text,
                             "system_prompt": &system_prompt,
@@ -1700,7 +1706,7 @@ async fn handle_client(
 
                 // Idle all session plugins for archived sessions
                 {
-                    let mut pm = plugins.lock().unwrap();
+                    let mut pm = plugins.lock().expect("plugins mutex poisoned");
                     for sid in &subtree_ids {
                         pm.destroy_session_plugins(sid);
                     }
@@ -1776,7 +1782,7 @@ async fn handle_client(
                 }
                 // Clean up session plugins for all deleted sessions
                 {
-                    let mut pm = plugins.lock().unwrap();
+                    let mut pm = plugins.lock().expect("plugins mutex poisoned");
                     for id in &subtree_ids {
                         pm.destroy_session_plugins(id);
                     }
@@ -2246,7 +2252,7 @@ async fn handle_client(
                         .unwrap_or_else(|| "/tmp".to_string())
                 };
                 let result = {
-                    let mut pm = plugins.lock().unwrap();
+                    let mut pm = plugins.lock().expect("plugins mutex poisoned");
                     pm.reload_config();
                     pm.destroy_session_plugins(&session_id);
                     pm.ensure_session_plugins(&session_id, &cwd)
@@ -2380,7 +2386,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
         // preventing deadlocks when tools make ServerRequest calls that need
         // to interact with other sessions (which also need plugin access).
         let taken = {
-            let mut pm = self.plugins.lock().unwrap();
+            let mut pm = self.plugins.lock().expect("plugins mutex poisoned");
             pm.take_tool_plugin(&self.session_id, &tool_call.name)
         };
         let (mut handle, source) = match taken {
@@ -2398,7 +2404,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
             && let Err(e) = handle.upgrade_to_async()
         {
             // Return the (broken) handle before propagating error.
-            let mut pm = self.plugins.lock().unwrap();
+            let mut pm = self.plugins.lock().expect("plugins mutex poisoned");
             pm.return_tool_plugin(source, handle);
             return Err(e);
         }
@@ -2463,14 +2469,14 @@ impl crate::worker::ToolExecutor for PluginExecutor {
 
         // Always return the plugin handle, even on error (brief lock).
         {
-            let mut pm = self.plugins.lock().unwrap();
+            let mut pm = self.plugins.lock().expect("plugins mutex poisoned");
             pm.return_tool_plugin(source, handle);
         }
 
         // Run after_tool_hooks only on success.
         let mut result = result?;
         {
-            let mut pm = self.plugins.lock().unwrap();
+            let mut pm = self.plugins.lock().expect("plugins mutex poisoned");
             pm.run_after_tool_hooks(&self.session_id, &tool_call_for_hooks, &mut result);
         }
 
@@ -2597,7 +2603,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         })),
         drain_queued: Some(Box::new(move || {
             if has_queued_clone.swap(false, Ordering::Acquire) {
-                let st = state_clone_drain.lock().unwrap();
+                let st = state_clone_drain.lock().expect("state mutex poisoned");
                 st.db
                     .drain_queued_messages(&session_id_drain)
                     .unwrap_or_default()
@@ -2606,7 +2612,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             }
         })),
         on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
-            let st = state_clone_persist.lock().unwrap();
+            let st = state_clone_persist.lock().expect("state mutex poisoned");
             if let Err(e) = st.db.append_message(&session_id_persist, msg) {
                 eprintln!("db error persisting agent message: {}", e);
             }
@@ -2615,7 +2621,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             let state_clone_refresh = state.clone();
             let provider_name = model.provider.clone();
             Some(Box::new(move || {
-                let st = state_clone_refresh.lock().unwrap();
+                let st = state_clone_refresh.lock().expect("state mutex poisoned");
                 resolve_api_key(&st.auth, &st.config, &provider_name)
                     .ok()
                     .flatten()
@@ -2644,7 +2650,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     let plugin_tools = if !test_overrides.mock_tools.is_empty() {
         test_overrides.mock_tools.clone()
     } else {
-        let pm = plugins.lock().unwrap();
+        let pm = plugins.lock().expect("plugins mutex poisoned");
         pm.tool_schemas(session_id, child_budget)
     };
 
@@ -2754,21 +2760,21 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             // Update stored phase from implicit stream events.
             match &event {
                 StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
-                    let mut st = state_clone.lock().unwrap();
+                    let mut st = state_clone.lock().expect("state mutex poisoned");
                     st.phases
                         .insert(session_id_owned.clone(), crate::types::AgentPhase::Thinking);
                 }
                 StreamEvent::TextStart { .. }
                 | StreamEvent::TextDelta { .. }
                 | StreamEvent::ToolcallStart { .. } => {
-                    let mut st = state_clone.lock().unwrap();
+                    let mut st = state_clone.lock().expect("state mutex poisoned");
                     st.phases.insert(
                         session_id_owned.clone(),
                         crate::types::AgentPhase::Responding,
                     );
                 }
                 StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
-                    let mut st = state_clone.lock().unwrap();
+                    let mut st = state_clone.lock().expect("state mutex poisoned");
                     st.phases
                         .insert(session_id_owned.clone(), crate::types::AgentPhase::ToolExec);
                 }
@@ -2849,7 +2855,7 @@ async fn run_child_chat(
 
         // Ensure session plugins
         {
-            let mut pm = plugins.lock().unwrap();
+            let mut pm = plugins.lock().expect("plugins mutex poisoned");
             if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
                 eprintln!("child session {} plugin spawn error: {}", session_id, e);
             }
@@ -2858,7 +2864,7 @@ async fn run_child_chat(
 
         // Build system prompt if not set
         let system_prompt = stored.system_prompt.clone().or_else(|| {
-            let pm = plugins.lock().unwrap();
+            let pm = plugins.lock().expect("plugins mutex poisoned");
             let tool_prompts = pm.tool_prompts(&session_id, stored.child_budget);
             Some(crate::system_prompt::build(
                 &crate::system_prompt::PromptOptions {
@@ -3079,7 +3085,7 @@ async fn resume_child_session(
 
         // Ensure session plugins
         {
-            let mut pm = plugins.lock().unwrap();
+            let mut pm = plugins.lock().expect("plugins mutex poisoned");
             if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
                 eprintln!("resume session {} plugin spawn error: {}", session_id, e);
             }
@@ -3105,7 +3111,7 @@ async fn resume_child_session(
 
         // Build system prompt if not set
         let system_prompt = stored.system_prompt.clone().or_else(|| {
-            let pm = plugins.lock().unwrap();
+            let pm = plugins.lock().expect("plugins mutex poisoned");
             let tool_prompts = pm.tool_prompts(&session_id, stored.child_budget);
             Some(crate::system_prompt::build(
                 &crate::system_prompt::PromptOptions {
@@ -3573,7 +3579,7 @@ async fn execute_tool_impl(
 
     // 2. Ensure session plugins are spawned
     {
-        let mut pm = plugins.lock().unwrap();
+        let mut pm = plugins.lock().expect("plugins mutex poisoned");
         if let Err(e) = pm.ensure_session_plugins(session_id, &cwd) {
             eprintln!("execute_tool: failed to spawn session plugins: {}", e);
         }
@@ -4038,7 +4044,7 @@ async fn handle_server_request(
 
             // Destroy session plugins for archived sessions
             {
-                let mut pm = plugins.lock().unwrap();
+                let mut pm = plugins.lock().expect("plugins mutex poisoned");
                 for sid in &subtree_ids {
                     pm.destroy_session_plugins(sid);
                 }
@@ -4088,7 +4094,7 @@ async fn handle_server_request(
             Response::SessionRestored
         }
         Request::FireHook { name, data } => {
-            let mut pm = plugins.lock().unwrap();
+            let mut pm = plugins.lock().expect("plugins mutex poisoned");
             pm.call_hook_excluding(session_id, name, data, None);
             Response::Ok
         }

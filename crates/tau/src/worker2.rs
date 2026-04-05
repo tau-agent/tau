@@ -393,8 +393,14 @@ async fn execute_bash_async(
     let child_id = child.id();
 
     // Extract stdout/stderr and wrap in async readers.
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
+    let stdout = child
+        .stdout
+        .take()
+        .expect("stdout configured with piped output");
+    let stderr = child
+        .stderr
+        .take()
+        .expect("stderr configured with piped output");
 
     let async_stdout =
         unsafe { smol::Async::new(std::fs::File::from_raw_fd(stdout.into_raw_fd())) };
@@ -924,7 +930,7 @@ async fn handle_session_tool(
                 Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
                 Some(serde_json::Value::Array(arr)) => arr
                     .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter_map(|v| v.as_str().map(str::to_string))
                     .collect(),
                 _ => return tool_err(tcid, "session_id is required (string or array of strings)"),
             };

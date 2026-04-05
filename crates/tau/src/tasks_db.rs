@@ -583,7 +583,7 @@ impl TasksDb {
             ($field:ident, $col:expr, $old_val:expr) => {
                 if let Some(ref val) = update.$field {
                     let old_str = $old_val;
-                    let new_str = format!("{}", val);
+                    let new_str = val.to_string();
                     params_vec.push(Box::new(val.clone()));
                     sets.push(format!("{} = ?", $col));
                     tx.execute(
@@ -1207,71 +1207,69 @@ impl TasksDb {
         // For interactive tasks with a changed session, update all descendant
         // tasks' session_id within this same transaction (atomic).
         let mut descendant_old_sessions = Vec::new();
-        if task.state == "interactive" && session_changed {
-            if let Some(ref old_sid) = old_session_id {
-                // Collect descendant task IDs using BFS via direct SQL within
-                // the transaction (can't call self.get_subtasks inside tx).
-                let descendant_ids = {
-                    let mut ids = Vec::new();
-                    let mut queue = std::collections::VecDeque::new();
-                    queue.push_back(task_id);
-                    while let Some(pid) = queue.pop_front() {
-                        let mut stmt = tx
-                            .prepare("SELECT id, session_id FROM tasks WHERE parent_id = ?1")
-                            .map_err(|e| {
-                                crate::Error::Io(format!("prepare descendant query: {}", e))
-                            })?;
-                        let rows: Vec<(i64, Option<String>)> = stmt
-                            .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))
-                            .map_err(|e| crate::Error::Io(format!("query descendants: {}", e)))?
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(|e| crate::Error::Io(format!("read descendant row: {}", e)))?;
-                        for (child_id, child_session) in rows {
-                            // Track old sessions that were parented under
-                            // the old owner (for reparenting RPCs later).
-                            //
-                            // Pragmatic simplification: we compare the
-                            // descendant task's `session_id` field against
-                            // the old owner's session_id. Ideally we'd
-                            // check the actual session's `parent_id`
-                            // (a session-level property), but that requires
-                            // an RPC which we can't do inside a DB
-                            // transaction. In practice, tasks dispatched by
-                            // the same owner will have matching session_ids.
-                            if let Some(ref cs) = child_session {
-                                if cs == old_sid {
-                                    descendant_old_sessions.push(cs.clone());
-                                }
-                            }
-                            ids.push(child_id);
-                            queue.push_back(child_id);
+        if task.state == "interactive"
+            && session_changed
+            && let Some(ref old_sid) = old_session_id
+        {
+            // Collect descendant task IDs using BFS via direct SQL within
+            // the transaction (can't call self.get_subtasks inside tx).
+            let descendant_ids = {
+                let mut ids = Vec::new();
+                let mut queue = std::collections::VecDeque::new();
+                queue.push_back(task_id);
+                while let Some(pid) = queue.pop_front() {
+                    let mut stmt = tx
+                        .prepare("SELECT id, session_id FROM tasks WHERE parent_id = ?1")
+                        .map_err(|e| {
+                            crate::Error::Io(format!("prepare descendant query: {}", e))
+                        })?;
+                    let rows: Vec<(i64, Option<String>)> = stmt
+                        .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map_err(|e| crate::Error::Io(format!("query descendants: {}", e)))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| crate::Error::Io(format!("read descendant row: {}", e)))?;
+                    for (child_id, child_session) in rows {
+                        // Track old sessions that were parented under
+                        // the old owner (for reparenting RPCs later).
+                        //
+                        // Pragmatic simplification: we compare the
+                        // descendant task's `session_id` field against
+                        // the old owner's session_id. Ideally we'd
+                        // check the actual session's `parent_id`
+                        // (a session-level property), but that requires
+                        // an RPC which we can't do inside a DB
+                        // transaction. In practice, tasks dispatched by
+                        // the same owner will have matching session_ids.
+                        if let Some(ref cs) = child_session
+                            && cs == old_sid
+                        {
+                            descendant_old_sessions.push(cs.clone());
                         }
+                        ids.push(child_id);
+                        queue.push_back(child_id);
                     }
-                    ids
-                };
-
-                // Update session_id on all descendants and record in task_sessions.
-                for desc_id in &descendant_ids {
-                    tx.execute(
-                        "UPDATE tasks SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
-                        params![session_id, now, desc_id],
-                    )
-                    .map_err(|e| {
-                        crate::Error::Io(format!("update descendant {} session: {}", desc_id, e))
-                    })?;
-
-                    tx.execute(
-                        "INSERT OR IGNORE INTO task_sessions (task_id, session_id, role, created_at) \
-                         VALUES (?1, ?2, 'assigned', ?3)",
-                        params![desc_id, session_id, now],
-                    )
-                    .map_err(|e| {
-                        crate::Error::Io(format!(
-                            "record descendant {} session: {}",
-                            desc_id, e
-                        ))
-                    })?;
                 }
+                ids
+            };
+
+            // Update session_id on all descendants and record in task_sessions.
+            for desc_id in &descendant_ids {
+                tx.execute(
+                    "UPDATE tasks SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![session_id, now, desc_id],
+                )
+                .map_err(|e| {
+                    crate::Error::Io(format!("update descendant {} session: {}", desc_id, e))
+                })?;
+
+                tx.execute(
+                    "INSERT OR IGNORE INTO task_sessions (task_id, session_id, role, created_at) \
+                         VALUES (?1, ?2, 'assigned', ?3)",
+                    params![desc_id, session_id, now],
+                )
+                .map_err(|e| {
+                    crate::Error::Io(format!("record descendant {} session: {}", desc_id, e))
+                })?;
             }
         }
 
@@ -1462,7 +1460,7 @@ impl TasksDb {
                 let parent = self
                     .get_task(pid)?
                     .ok_or_else(|| crate::Error::Io(format!("parent task {} not found", pid)))?;
-                Ok(parent.branch.unwrap_or_else(|| "main".to_string()))
+                Ok(parent.branch.as_deref().unwrap_or("main").to_string())
             }
         }
     }

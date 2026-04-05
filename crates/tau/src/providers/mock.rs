@@ -96,12 +96,14 @@ impl MockProvider {
 impl MockProviderHandle {
     /// Return a snapshot of all captured contexts (one per `stream()` call).
     pub fn captures(&self) -> Vec<MockCapture> {
-        self.inner.captures.lock().unwrap().clone()
+        self.inner
+            .captures
+            .lock()
+            .expect("captures mutex poisoned")
+            .clone()
     }
-
-    /// Convenience: return the wall-clock duration of each turn pair (i→i+1).
     pub fn turn_durations(&self) -> Vec<std::time::Duration> {
-        let caps = self.inner.captures.lock().unwrap();
+        let caps = self.inner.captures.lock().expect("captures mutex poisoned");
         caps.windows(2)
             .map(|w| w[1].timestamp.duration_since(w[0].timestamp))
             .collect()
@@ -122,7 +124,7 @@ impl Provider for MockProvider {
     ) -> crate::Result<EventReceiver> {
         // Capture context before popping the response.
         {
-            let mut caps = self.inner.captures.lock().unwrap();
+            let mut caps = self.inner.captures.lock().expect("captures mutex poisoned");
             let index = caps.len();
             caps.push(MockCapture {
                 index,
@@ -137,7 +139,7 @@ impl Provider for MockProvider {
             .inner
             .responses
             .lock()
-            .unwrap()
+            .expect("responses mutex poisoned")
             .pop_front()
             .unwrap_or(MockResponse::Error("no more mock responses".into()));
 
@@ -358,7 +360,7 @@ impl MockToolExecutorHandle {
         self.inner
             .responses
             .lock()
-            .unwrap()
+            .expect("responses mutex poisoned")
             .entry(name.to_string())
             .or_default()
             .push_back(response);
@@ -366,12 +368,16 @@ impl MockToolExecutorHandle {
 
     /// Set the default response for tools with no queued response.
     pub fn set_default(&self, response: MockToolResponse) {
-        *self.inner.default.lock().unwrap() = Some(response);
+        *self.inner.default.lock().expect("default mutex poisoned") = Some(response);
     }
 
     /// Return a snapshot of all captured tool calls.
     pub fn captures(&self) -> Vec<MockToolCapture> {
-        self.inner.captures.lock().unwrap().clone()
+        self.inner
+            .captures
+            .lock()
+            .expect("captures mutex poisoned")
+            .clone()
     }
 
     /// Create a new `MockToolExecutor` sharing the same inner state.
@@ -430,21 +436,35 @@ impl ToolExecutor for MockToolExecutor {
         _output_tx: &smol::channel::Sender<String>,
     ) -> crate::Result<ToolResultMessage> {
         // Capture.
-        self.inner.captures.lock().unwrap().push(MockToolCapture {
-            tool_call: tool_call.clone(),
-            timestamp: std::time::Instant::now(),
-        });
+        self.inner
+            .captures
+            .lock()
+            .expect("captures mutex poisoned")
+            .push(MockToolCapture {
+                tool_call: tool_call.clone(),
+                timestamp: std::time::Instant::now(),
+            });
 
         // Pop queued response, or use default, or error.
         let resp = {
-            let mut map = self.inner.responses.lock().unwrap();
+            let mut map = self
+                .inner
+                .responses
+                .lock()
+                .expect("responses mutex poisoned");
             if let Some(queue) = map.get_mut(&tool_call.name) {
                 queue.pop_front()
             } else {
                 None
             }
         }
-        .or_else(|| self.inner.default.lock().unwrap().clone())
+        .or_else(|| {
+            self.inner
+                .default
+                .lock()
+                .expect("default mutex poisoned")
+                .clone()
+        })
         .unwrap_or(MockToolResponse::ExecutorError(format!(
             "no mock response for tool '{}'",
             tool_call.name

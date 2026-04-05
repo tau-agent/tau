@@ -186,7 +186,7 @@ fn prepare_task(db: &TasksDb, task: &Task, repo_root: &str) -> crate::Result<Sch
             let parent = db
                 .get_task(pid)?
                 .ok_or_else(|| crate::Error::Io(format!("parent task {} not found", pid)))?;
-            parent.branch.unwrap_or_else(|| "main".to_string())
+            parent.branch.as_deref().unwrap_or("main").to_string()
         }
         None => "main".to_string(),
     };
@@ -329,10 +329,9 @@ pub fn dispatch(
 
     // Resolve the effective parent session: use the explicit parent_session_id
     // (from a manual tool call), or fall back to the parent task's session.
-    let effective_parent_session = match parent_session_id {
-        Some(sid) => Some(sid.to_string()),
-        None => resolve_parent_session(db, &task),
-    };
+    let effective_parent_session = parent_session_id
+        .map(str::to_string)
+        .or_else(|| resolve_parent_session(db, &task));
 
     // Inherit model from the parent session so child tasks use the same model.
     let model = effective_parent_session
@@ -443,10 +442,9 @@ fn dispatch_planning(
     }
 
     // Resolve the effective parent session
-    let effective_parent_session = match parent_session_id {
-        Some(sid) => Some(sid.to_string()),
-        None => resolve_parent_session(db, task),
-    };
+    let effective_parent_session = parent_session_id
+        .map(str::to_string)
+        .or_else(|| resolve_parent_session(db, task));
 
     let model = effective_parent_session
         .as_deref()
@@ -658,10 +656,9 @@ pub fn dispatch_review(
     // No reusable session found — create a new one.
 
     // Resolve the effective parent session
-    let effective_parent_session = match parent_session_id {
-        Some(sid) => Some(sid.to_string()),
-        None => resolve_parent_session(db, task),
-    };
+    let effective_parent_session = parent_session_id
+        .map(str::to_string)
+        .or_else(|| resolve_parent_session(db, task));
 
     let model = effective_parent_session
         .as_deref()
@@ -816,10 +813,9 @@ pub fn dispatch_refining(
 
     // No reusable session found — create a new one.
 
-    let effective_parent_session = match parent_session_id {
-        Some(sid) => Some(sid.to_string()),
-        None => resolve_parent_session(db, task),
-    };
+    let effective_parent_session = parent_session_id
+        .map(str::to_string)
+        .or_else(|| resolve_parent_session(db, task));
 
     let model = effective_parent_session
         .as_deref()
