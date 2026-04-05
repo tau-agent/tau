@@ -1736,11 +1736,13 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
                 println!("no tasks");
                 return Ok(());
             }
+            let tree = tau::tasks_db::tree_order(tasks);
             println!("  {:>4}  {:<12}  {:>8}  TITLE", "ID", "STATE", "PRIORITY");
-            for t in &tasks {
+            for (depth, t) in &tree {
+                let indent = "  ".repeat(*depth);
                 println!(
-                    "  {:>4}  {:<12}  {:>8}  {}",
-                    t.id, t.state, t.priority, t.title
+                    "  {:>4}  {:<12}  {:>8}  {}{}",
+                    t.id, t.state, t.priority, indent, t.title
                 );
             }
         }

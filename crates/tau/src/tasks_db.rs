@@ -126,6 +126,66 @@ pub fn validate_state_transition(from: &str, to: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Tree ordering
+// ---------------------------------------------------------------------------
+
+/// Reorder tasks into a depth-first tree, returning `(depth, task)` pairs.
+///
+/// Top-level tasks (those with `parent_id = None` or whose parent is not in the
+/// input list) appear as roots. Children appear immediately after their parent.
+/// Siblings at each level are sorted by priority descending, then by id ascending.
+pub fn tree_order(tasks: Vec<Task>) -> Vec<(usize, Task)> {
+    use std::collections::{HashMap, HashSet};
+
+    if tasks.is_empty() {
+        return Vec::new();
+    }
+
+    // Set of all task ids present in the input.
+    let ids: HashSet<i64> = tasks.iter().map(|t| t.id).collect();
+
+    // Group children by parent_id.
+    let mut children_map: HashMap<Option<i64>, Vec<Task>> = HashMap::new();
+    for task in tasks {
+        let key = match task.parent_id {
+            Some(pid) if ids.contains(&pid) => Some(pid),
+            _ => None, // treat as root
+        };
+        children_map.entry(key).or_default().push(task);
+    }
+
+    // Sort each group: priority desc, then id asc.
+    for group in children_map.values_mut() {
+        group.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
+    }
+
+    // Walk depth-first from roots.
+    let mut result = Vec::new();
+    let mut stack: Vec<(usize, Task)> = Vec::new();
+
+    // Seed with roots in reverse order (so first pops out first).
+    if let Some(mut roots) = children_map.remove(&None) {
+        for task in roots.drain(..).rev() {
+            stack.push((0, task));
+        }
+    }
+
+    while let Some((depth, task)) = stack.pop() {
+        let task_id = task.id;
+        result.push((depth, task));
+
+        // Push children in reverse order so they pop in sorted order.
+        if let Some(mut kids) = children_map.remove(&Some(task_id)) {
+            for child in kids.drain(..).rev() {
+                stack.push((depth + 1, child));
+            }
+        }
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
 
@@ -2948,5 +3008,88 @@ mod tests {
         // Higher priority should come first
         assert_eq!(approved[0].id, t2.id);
         assert_eq!(approved[1].id, t1.id);
+    }
+
+    fn make_task(id: i64, parent_id: Option<i64>, priority: i64) -> Task {
+        Task {
+            id,
+            project: "test".into(),
+            title: format!("Task {}", id),
+            state: "ready".into(),
+            priority,
+            parent_id,
+            tags: None,
+            affected_files: None,
+            assigned_session: None,
+            branch: None,
+            worktree_path: None,
+            session_id: None,
+            skip_review: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn test_tree_order_empty() {
+        let result = tree_order(vec![]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_tree_order_flat() {
+        let tasks = vec![
+            make_task(1, None, 0),
+            make_task(2, None, 5),
+            make_task(3, None, 0),
+        ];
+        let result = tree_order(tasks);
+        // sorted by priority desc, then id asc
+        assert_eq!(result[0].0, 0); // depth
+        assert_eq!(result[0].1.id, 2); // highest priority
+        assert_eq!(result[1].1.id, 1);
+        assert_eq!(result[2].1.id, 3);
+    }
+
+    #[test]
+    fn test_tree_order_parent_child() {
+        let tasks = vec![
+            make_task(1, None, 0),
+            make_task(2, Some(1), 5),
+            make_task(3, Some(1), 7),
+            make_task(4, None, 0),
+        ];
+        let result = tree_order(tasks);
+        // Roots: 1, 4 (same priority, id order)
+        // Children of 1: 3 (pri 7), 2 (pri 5)
+        assert_eq!(result.len(), 4);
+        assert_eq!((result[0].0, result[0].1.id), (0, 1));
+        assert_eq!((result[1].0, result[1].1.id), (1, 3)); // higher priority child first
+        assert_eq!((result[2].0, result[2].1.id), (1, 2));
+        assert_eq!((result[3].0, result[3].1.id), (0, 4));
+    }
+
+    #[test]
+    fn test_tree_order_nested() {
+        let tasks = vec![
+            make_task(1, None, 0),
+            make_task(2, Some(1), 0),
+            make_task(3, Some(2), 0),
+        ];
+        let result = tree_order(tasks);
+        assert_eq!(result.len(), 3);
+        assert_eq!((result[0].0, result[0].1.id), (0, 1));
+        assert_eq!((result[1].0, result[1].1.id), (1, 2));
+        assert_eq!((result[2].0, result[2].1.id), (2, 3));
+    }
+
+    #[test]
+    fn test_tree_order_orphan_parent_not_in_list() {
+        // Task 5 has parent_id=99 but 99 is not in the list; treat as root
+        let tasks = vec![make_task(1, None, 0), make_task(5, Some(99), 0)];
+        let result = tree_order(tasks);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 0);
+        assert_eq!(result[1].0, 0);
     }
 }

@@ -1301,17 +1301,19 @@ impl App {
             });
             return Ok(());
         }
+        let tree = tau::tasks_db::tree_order(tasks);
         self.messages.push(MessageItem::Status {
             text: format!(
                 "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
                 "ID", "STATE", "PRIORITY", "SESSION"
             ),
         });
-        for t in &tasks {
+        for (depth, t) in &tree {
             let session = t.assigned_session.as_deref().unwrap_or("-");
+            let indent = "  ".repeat(*depth);
             let text = format!(
-                "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
-                t.id, t.state, t.priority, session, t.title
+                "  {:>4}  {:<12}  {:>8}  {:<8}  {}{}",
+                t.id, t.state, t.priority, session, indent, t.title
             );
             if t.state == "failed" {
                 self.messages.push(MessageItem::Error { text });
