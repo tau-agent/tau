@@ -1102,8 +1102,6 @@ fn build_initial_message(task: &Task, merge_target: &str) -> String {
          \n\
          Use the task_get tool (not a bash command) to read the full specification:\n\
          - Call the `task_get` tool with arguments: {{\"id\": {id}}}\n\
-         Then assign yourself:\n\
-         - Call the `task_assign` tool with arguments: {{\"id\": {id}}}\n\
          \n\
          Do the work in this worktree. Commit your changes on the current branch — do NOT merge into {target}.\n\
          When done, run the project checklist, then mark the task:\n\
@@ -1112,7 +1110,7 @@ fn build_initial_message(task: &Task, merge_target: &str) -> String {
          Before marking the task for review, ensure your branch is rebased on the target branch.\n\
          Run `git rebase {target}` in your worktree and resolve any conflicts.\n\
          \n\
-         Note: task_get, task_assign, and task_update are agent tools (like bash or edit), not CLI commands.",
+         Note: task_get and task_update are agent tools (like bash or edit), not CLI commands.",
         id = task.id,
         title = task.title,
         review = review_instruction,
@@ -1379,7 +1377,7 @@ mod tests {
         let msg = build_initial_message(&task, "main");
         assert!(msg.contains("task 5"));
         assert!(msg.contains("task_get"));
-        assert!(msg.contains("task_assign"));
+        assert!(!msg.contains("task_assign"));
         assert!(msg.contains("task_update"));
         assert!(msg.contains("\"state\": \"review\""));
         assert!(msg.contains("skip_review is false"));
