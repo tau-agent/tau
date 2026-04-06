@@ -852,8 +852,11 @@ pub struct SessionPlugins {
 
 impl SessionPlugins {
     /// Spawn session plugins from config entries, prepending session_prefix.
-    pub fn spawn(config: &PluginsConfig, cwd: &str) -> crate::Result<Self> {
+    /// Returns the plugin set and a list of failure messages for any plugins
+    /// that failed to start.
+    pub fn spawn(config: &PluginsConfig, cwd: &str) -> crate::Result<(Self, Vec<String>)> {
         let mut plugins = Vec::new();
+        let mut failures = Vec::new();
         let prefix = config.session_prefix.as_deref().unwrap_or(&[]);
 
         let entries: Vec<_> = if config.session.is_empty() && !config.no_default_worker {
@@ -900,11 +903,12 @@ impl SessionPlugins {
                 }
                 Err(e) => {
                     eprintln!("session plugin '{}' failed to spawn: {}", name, e);
+                    failures.push(format!("\u{26a0} Plugin '{}' failed to start: {}", name, e));
                 }
             }
         }
 
-        Ok(Self { plugins })
+        Ok((Self { plugins }, failures))
     }
 
     pub fn tool_schemas(&self) -> Vec<Tool> {
@@ -1157,14 +1161,18 @@ impl PluginManager {
     }
 
     /// Ensure session plugins are spawned for the given session.
-    /// Returns Ok(()) if already spawned or newly spawned.
-    pub fn ensure_session_plugins(&mut self, session_id: &str, cwd: &str) -> crate::Result<()> {
+    /// Returns a list of failure messages for any plugins that failed to start.
+    pub fn ensure_session_plugins(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+    ) -> crate::Result<Vec<String>> {
         if self.session_plugins.contains_key(session_id) {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        let sp = SessionPlugins::spawn(&self.config, cwd)?;
+        let (sp, failures) = SessionPlugins::spawn(&self.config, cwd)?;
         self.session_plugins.insert(session_id.to_string(), sp);
-        Ok(())
+        Ok(failures)
     }
 
     /// Destroy session plugins for a given session.

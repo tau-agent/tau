@@ -1176,8 +1176,13 @@ async fn handle_client(
                     };
                     let cwd_str = cwd_resolved.as_deref().unwrap_or("/tmp");
                     let mut pm = plugins.lock().expect("plugins mutex poisoned");
-                    if let Err(e) = pm.ensure_session_plugins(&id, cwd_str) {
-                        eprintln!("failed to spawn session plugins: {}", e);
+                    match pm.ensure_session_plugins(&id, cwd_str) {
+                        Ok(failures) => {
+                            for msg in &failures {
+                                queue_info_to_session(&state, &id, msg);
+                            }
+                        }
+                        Err(e) => eprintln!("failed to spawn session plugins: {}", e),
                     }
                     let tool_prompts = pm.tool_prompts(&id, child_budget);
                     let prompt =
@@ -1261,8 +1266,13 @@ async fn handle_client(
                     // Ensure session plugins are spawned and notify session start
                     {
                         let mut pm = plugins.lock().expect("plugins mutex poisoned");
-                        if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
-                            eprintln!("failed to spawn session plugins: {}", e);
+                        match pm.ensure_session_plugins(&session_id, &cwd) {
+                            Ok(failures) => {
+                                for msg in &failures {
+                                    queue_info_to_session(&state, &session_id, msg);
+                                }
+                            }
+                            Err(e) => eprintln!("failed to spawn session plugins: {}", e),
                         }
                         pm.notify_session_start_once(&cwd, &session_id);
                     }
@@ -2249,7 +2259,12 @@ async fn handle_client(
                     pm.reload_config();
                     pm.destroy_session_plugins(&session_id);
                     pm.ensure_session_plugins(&session_id, &cwd)
-                        .map(|()| pm.load_global_plugins(&cwd))
+                        .map(|failures| {
+                            for msg in &failures {
+                                queue_info_to_session(&state, &session_id, msg);
+                            }
+                            pm.load_global_plugins(&cwd)
+                        })
                 };
                 match result {
                     Ok(()) => {
@@ -2849,8 +2864,13 @@ async fn run_child_chat(
         // Ensure session plugins
         {
             let mut pm = plugins.lock().expect("plugins mutex poisoned");
-            if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
-                eprintln!("child session {} plugin spawn error: {}", session_id, e);
+            match pm.ensure_session_plugins(&session_id, &cwd) {
+                Ok(failures) => {
+                    for msg in &failures {
+                        queue_info_to_session(&state, &session_id, msg);
+                    }
+                }
+                Err(e) => eprintln!("child session {} plugin spawn error: {}", session_id, e),
             }
             pm.notify_session_start_once(&cwd, &session_id);
         }
@@ -3079,8 +3099,13 @@ async fn resume_child_session(
         // Ensure session plugins
         {
             let mut pm = plugins.lock().expect("plugins mutex poisoned");
-            if let Err(e) = pm.ensure_session_plugins(&session_id, &cwd) {
-                eprintln!("resume session {} plugin spawn error: {}", session_id, e);
+            match pm.ensure_session_plugins(&session_id, &cwd) {
+                Ok(failures) => {
+                    for msg in &failures {
+                        queue_info_to_session(&state, &session_id, msg);
+                    }
+                }
+                Err(e) => eprintln!("resume session {} plugin spawn error: {}", session_id, e),
             }
             pm.notify_session_start_once(&cwd, &session_id);
         }
@@ -3573,8 +3598,13 @@ async fn execute_tool_impl(
     // 2. Ensure session plugins are spawned
     {
         let mut pm = plugins.lock().expect("plugins mutex poisoned");
-        if let Err(e) = pm.ensure_session_plugins(session_id, &cwd) {
-            eprintln!("execute_tool: failed to spawn session plugins: {}", e);
+        match pm.ensure_session_plugins(session_id, &cwd) {
+            Ok(failures) => {
+                for msg in &failures {
+                    queue_info_to_session(state, session_id, msg);
+                }
+            }
+            Err(e) => eprintln!("execute_tool: failed to spawn session plugins: {}", e),
         }
     }
 
