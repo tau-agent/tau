@@ -582,38 +582,45 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             {
                 let id_short = &session.id[..session.id.len().min(8)];
                 let prefix = format!(" {} tagline: ", id_short);
-                let cursor_char = "█";
-                // Split the edit text at the cursor position (byte offset)
-                let before_cursor = &edit_text[..text_cursor];
-                let after_cursor = &edit_text[text_cursor..];
-                let edit_display =
-                    format!("{}{}{}{}", prefix, before_cursor, cursor_char, after_cursor);
-                let display_width = UnicodeWidthStr::width(edit_display.as_str());
-                let edit_padded = if display_width < w {
-                    format!("{}{}", edit_display, " ".repeat(w - display_width))
-                } else {
-                    // Truncate to w display columns, respecting char boundaries
-                    let mut col = 0;
-                    let mut byte_end = edit_display.len();
-                    for (i, ch) in edit_display.char_indices() {
-                        let ch_w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                        if col + ch_w > w {
-                            byte_end = i;
-                            break;
-                        }
-                        col += ch_w;
-                    }
-                    let truncated = &edit_display[..byte_end];
-                    if col < w {
-                        format!("{}{}", truncated, " ".repeat(w - col))
-                    } else {
-                        truncated.to_string()
-                    }
-                };
-                let style = Style::default()
+                let base_style = Style::default()
                     .fg(theme.accent.to_ratatui())
                     .bg(theme.selected_bg.to_ratatui());
-                lines.push(Line::from(Span::styled(edit_padded, style)));
+                let cursor_style = base_style.add_modifier(ratatui::style::Modifier::REVERSED);
+
+                // Character at cursor position (or space if at end of text)
+                let cursor_char = if text_cursor < edit_text.len() {
+                    edit_text[text_cursor..].chars().next().unwrap().to_string()
+                } else {
+                    " ".to_string()
+                };
+                let after_byte_pos = text_cursor + cursor_char.len();
+                let before_cursor = &edit_text[..text_cursor];
+                let after_cursor = if after_byte_pos <= edit_text.len() {
+                    &edit_text[after_byte_pos..]
+                } else {
+                    ""
+                };
+
+                // Calculate total display width for padding
+                let prefix_w = UnicodeWidthStr::width(prefix.as_str());
+                let before_w = UnicodeWidthStr::width(before_cursor);
+                let cursor_w = UnicodeWidthStr::width(cursor_char.as_str()).max(1);
+                let after_w = UnicodeWidthStr::width(after_cursor);
+                let total_w = prefix_w + before_w + cursor_w + after_w;
+
+                let padding = if total_w < w {
+                    " ".repeat(w - total_w)
+                } else {
+                    String::new()
+                };
+
+                // Build spans: prefix + before + cursor_char (reversed) + after + padding
+                let edit_spans = vec![
+                    Span::styled(format!("{}{}", prefix, before_cursor), base_style),
+                    Span::styled(cursor_char, cursor_style),
+                    Span::styled(format!("{}{}", after_cursor, padding), base_style),
+                ];
+                lines.push(Line::from(edit_spans));
                 continue;
             }
 
