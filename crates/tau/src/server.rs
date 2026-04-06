@@ -1037,7 +1037,6 @@ fn queue_message_to_session(state: &SharedState, target: &str, content: &str, se
 /// Persist an info message directly to a session's message history.
 /// Unlike `queue_message_to_session`, this does NOT wake the agent loop —
 /// the message is display-only and excluded from LLM context.
-#[allow(dead_code)] // Infrastructure for follow-up: convert notifications to Info messages
 fn queue_info_to_session(state: &SharedState, target: &str, text: &str) {
     let info_msg = Message::Info(crate::types::InfoMessage::new(text));
     let st = lock_state(state);
@@ -1676,6 +1675,11 @@ async fn handle_client(
                     continue;
                 }
 
+                // Send info messages before archiving
+                for sid in &subtree_ids {
+                    queue_info_to_session(&state, sid, "Session archived.");
+                }
+
                 // Archive in DB
                 {
                     let st = lock_state(&state);
@@ -1738,6 +1742,17 @@ async fn handle_client(
                 {
                     let st = lock_state(&state);
                     st.db.restore_session_tree(&session_id)?;
+                }
+
+                // Send info message to all sessions in the subtree after restoring
+                {
+                    let subtree_ids = {
+                        let st = lock_state(&state);
+                        st.db.get_subtree_ids(&session_id)?
+                    };
+                    for sid in &subtree_ids {
+                        queue_info_to_session(&state, sid, "Session restored.");
+                    }
                 }
 
                 send(&mut writer, &Response::SessionRestored).await?;
@@ -4010,6 +4025,11 @@ async fn handle_server_request(
                 }
             }
 
+            // Send info messages before archiving
+            for sid in &subtree_ids {
+                queue_info_to_session(state, sid, "Session archived.");
+            }
+
             // Archive in DB
             {
                 let st = lock_state(state);
@@ -4068,7 +4088,21 @@ async fn handle_server_request(
                     message: e.to_string(),
                 };
             }
+
+            // Send info message to all sessions in the subtree after restoring
+            let subtree_ids = match st.db.get_subtree_ids(session_id) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    eprintln!("failed to get subtree IDs for restore info: {}", e);
+                    vec![session_id.to_string()]
+                }
+            };
             drop(st);
+
+            for sid in &subtree_ids {
+                queue_info_to_session(state, sid, "Session restored.");
+            }
+
             Response::SessionRestored
         }
         Request::FireHook { name, data } => {
@@ -4261,19 +4295,37 @@ async fn send<W: futures::io::AsyncWrite + Unpin>(
 /// Auto-archive completed sessions that have `auto_archive=true`.
 /// Called after WaitSessions/WaitAnySessions collects results.
 fn auto_archive_done_sessions(state: &SharedState, results: &[crate::protocol::SessionResult]) {
-    let st = lock_state(state);
-    for r in results {
-        if r.status != "done" {
-            continue;
+    // Collect session IDs to archive while holding the lock
+    let to_archive: Vec<String> = {
+        let st = lock_state(state);
+        results
+            .iter()
+            .filter(|r| r.status == "done")
+            .filter(|r| {
+                st.db
+                    .get_session(&r.session_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|s| s.auto_archive)
+            })
+            .map(|r| r.session_id.clone())
+            .collect()
+    };
+    // Send info messages and archive (each call locks internally)
+    for sid in &to_archive {
+        // Get subtree IDs so we can send info to all sessions in the tree
+        let subtree_ids = {
+            let st = lock_state(state);
+            st.db
+                .get_subtree_ids(sid)
+                .unwrap_or_else(|_| vec![sid.clone()])
+        };
+        for tree_sid in &subtree_ids {
+            queue_info_to_session(state, tree_sid, "Session archived.");
         }
-        let should_archive = st
-            .db
-            .get_session(&r.session_id)
-            .ok()
-            .flatten()
-            .is_some_and(|s| s.auto_archive);
-        if should_archive && let Err(e) = st.db.archive_session_tree(&r.session_id) {
-            eprintln!("auto-archive session {} failed: {}", r.session_id, e);
+        let st = lock_state(state);
+        if let Err(e) = st.db.archive_session_tree(sid) {
+            eprintln!("auto-archive session {} failed: {}", sid, e);
         }
     }
 }
