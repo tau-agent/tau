@@ -1120,12 +1120,11 @@ impl App {
             "/archive" => {
                 let current = self.session_id.clone();
                 // Determine the session to switch to after archiving
-                let switch_to = if !self.nav_stack.is_empty() {
-                    // Navigate back restores cached state; extract the target session id
-                    Some(self.nav_stack.last().unwrap().session_id.clone())
-                } else {
-                    self.parent_id.clone()
-                };
+                let switch_to = self
+                    .nav_stack
+                    .last()
+                    .map(|entry| entry.session_id.clone())
+                    .or_else(|| self.parent_id.clone());
                 if switch_to.is_some() {
                     Some(Action::ArchiveSession {
                         session_id: current,
