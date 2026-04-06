@@ -113,6 +113,8 @@ pub struct App {
     pub parent_id: Option<String>,
     /// Number of direct child sessions.
     pub child_count: usize,
+    /// Working directory of the current session (used as project key for task queries).
+    pub session_cwd: Option<String>,
     /// Session list for the picker overlay.
     pub picker_sessions: Vec<SessionInfo>,
     /// Cursor position in the picker.
@@ -143,6 +145,8 @@ pub struct NavEntry {
     pub child_count: usize,
     pub subscription_usage: Option<SubscriptionUsage>,
     pub last_usage_fetch: std::time::Instant,
+    /// Working directory of the session at the time of navigation.
+    pub session_cwd: Option<String>,
 }
 
 impl App {
@@ -182,6 +186,7 @@ impl App {
             nav_stack: Vec::new(),
             parent_id: None,
             child_count: 0,
+            session_cwd: None,
             picker_sessions: Vec::new(),
             picker_cursor: 0,
             picker_confirm_delete: None,
@@ -1047,6 +1052,7 @@ impl App {
             child_count: self.child_count,
             subscription_usage: self.subscription_usage.take(),
             last_usage_fetch: self.last_usage_fetch,
+            session_cwd: self.session_cwd.clone(),
         });
     }
 
@@ -1058,6 +1064,7 @@ impl App {
         self.provider = info.provider.clone();
         self.parent_id = info.parent_id.clone();
         self.child_count = info.child_count;
+        self.session_cwd = info.cwd.clone();
         self.totals = UsageTotals::default();
         self.totals.context_window = info.stats.context_window;
         self.totals.is_subscription = info.stats.is_subscription;
@@ -1079,6 +1086,7 @@ impl App {
             self.child_count = entry.child_count;
             self.subscription_usage = entry.subscription_usage;
             self.last_usage_fetch = entry.last_usage_fetch;
+            self.session_cwd = entry.session_cwd;
             self.scroll_to_bottom();
             self.mode = AppMode::Input;
             true
@@ -1398,12 +1406,21 @@ impl App {
         None
     }
 
-    fn run_task_status(&mut self) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
-        let project = std::env::current_dir()
+    /// Get the project path for task DB queries.
+    /// Uses the current session's cwd if available, falls back to process cwd.
+    fn task_project(&self) -> String {
+        if let Some(ref cwd) = self.session_cwd {
+            return cwd.clone();
+        }
+        std::env::current_dir()
             .unwrap_or_default()
             .to_string_lossy()
-            .to_string();
+            .to_string()
+    }
+
+    fn run_task_status(&mut self) -> tau::Result<()> {
+        let db = tau::tasks_db::TasksDb::open_default()?;
+        let project = self.task_project();
         let status = tau::tasks_scheduler::get_status(&db, &project)?;
         let output = tau::tasks_scheduler::format_status(&status);
         self.messages.push(MessageItem::Status { text: output });
@@ -1412,10 +1429,7 @@ impl App {
 
     fn run_task_merge_queue(&mut self) -> tau::Result<()> {
         let db = tau::tasks_db::TasksDb::open_default()?;
-        let project = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let project = self.task_project();
         let approved = db.list_tasks(&project, Some("approved"), None, None, None)?;
         let merging = db.list_tasks(&project, Some("merging"), None, None, None)?;
         if approved.is_empty() && merging.is_empty() {
@@ -1444,10 +1458,7 @@ impl App {
 
     fn run_task_list(&mut self, state_filter: Option<&str>) -> tau::Result<()> {
         let db = tau::tasks_db::TasksDb::open_default()?;
-        let project = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let project = self.task_project();
         let tasks = db.list_tasks(&project, state_filter, None, None, None)?;
         if tasks.is_empty() {
             self.messages.push(MessageItem::Status {
@@ -1541,10 +1552,7 @@ impl App {
 
     fn run_task_create(&mut self, title: &str) -> tau::Result<()> {
         let db = tau::tasks_db::TasksDb::open_default()?;
-        let project = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let project = self.task_project();
         let task = db.create_task(&project, title, None, None, None, false, false, false)?;
         self.messages.push(MessageItem::Status {
             text: format!("Created task #{}: {}", task.id, task.title),
@@ -1554,10 +1562,7 @@ impl App {
 
     fn run_task_search(&mut self, query: &str) -> tau::Result<()> {
         let db = tau::tasks_db::TasksDb::open_default()?;
-        let project = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        let project = self.task_project();
         let tasks = db.search_tasks(&project, query, None)?;
         if tasks.is_empty() {
             self.messages.push(MessageItem::Status {

@@ -133,6 +133,7 @@ async fn run_inner(
     if let Ok(info) = fetch_session_info(&app.session_id).await {
         app.parent_id = info.parent_id;
         app.child_count = info.child_count;
+        app.session_cwd = info.cwd;
     }
 
     // Channel for server responses — background recv tasks push here.
