@@ -1033,6 +1033,42 @@ fn handle_task_update(
                         let _ = db.record_session(task.id, creator_sid, "creator");
                     }
                 }
+
+                // Notify the interactive session that the task returned from
+                // another state.  Re-read session_id since it may have been
+                // updated above (new session created).
+                let notify_sid = if needs_session {
+                    db.get_task(task.id)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.session_id)
+                } else {
+                    task.session_id.clone()
+                };
+                if let Some(ref target_sid) = notify_sid {
+                    let prev = old_state.as_deref().unwrap_or("unknown");
+                    let msg = format!(
+                        "Task #{id} returned to interactive from {prev}. \
+                         Review the latest task messages for context:\n\
+                         - Call task_get with arguments {{\"id\": {id}}}",
+                        id = task.id,
+                        prev = prev,
+                    );
+                    let _ = crate::tasks_scheduler::server_request(
+                        writer,
+                        reader,
+                        crate::protocol::Request::QueueMessage {
+                            target_session_id: target_sid.clone(),
+                            content: msg,
+                            sender_info: format!(
+                                "task-system (interactive return task {})",
+                                task.id
+                            ),
+                            await_reply: false,
+                            reply_to: None,
+                        },
+                    );
+                }
             }
 
             // When a task transitions to a terminal state, auto-archive its session
@@ -5532,6 +5568,266 @@ mod tests {
                 .any(|(sid, role)| *sid == "refiner-session" && *role == "creator"),
             "expected refiner-session as creator, got: {:?}",
             roles
+        );
+    }
+
+    // ----- transition to interactive notification tests -----
+
+    #[test]
+    fn test_transition_to_interactive_sends_info_message_new_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask in planning state (no session)
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Scope expansion notify",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+
+        // planning -> interactive: should create session AND send info message
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "interactive"}),
+            Some("triggering-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        // Flush unprocessed writes and inspect written_lines
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let buf = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let all_written = writer.shared.lock().unwrap().written_lines.join("\n");
+
+        // Should contain a QueueMessage with the info about returning from planning
+        assert!(
+            all_written.contains("returned to interactive from planning"),
+            "expected info message about returning from planning in:\n{}",
+            all_written
+        );
+        assert!(
+            all_written.contains("task_get"),
+            "expected task_get instruction in info message:\n{}",
+            all_written
+        );
+    }
+
+    #[test]
+    fn test_transition_to_interactive_sends_info_message_existing_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create an interactive task (gets mock-s1)
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Existing session notify"}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+        assert_eq!(task["state"], "interactive");
+
+        // Move to planning, then back to interactive
+        let mut events = Vec::new();
+        handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "planning"}),
+            Some("s1"),
+            "tc2",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+
+        // Clear written lines to only check new messages
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.written_lines.clear();
+            shared.write_buf.clear();
+        }
+
+        // planning -> interactive with live session: should send info message
+        // to the EXISTING session (no new session created)
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "interactive"}),
+            Some("s1"),
+            "tc3",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        // Flush and inspect
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let buf = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let all_written = writer.shared.lock().unwrap().written_lines.join("\n");
+
+        // Should contain an info message about returning from planning
+        assert!(
+            all_written.contains("returned to interactive from planning"),
+            "expected info message in:\n{}",
+            all_written
+        );
+    }
+
+    #[test]
+    fn test_refining_to_interactive_sends_info_with_correct_state() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a subtask and advance to refining
+        let parent = db
+            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .unwrap();
+        let task = db
+            .create_task(
+                "/project",
+                "Refine notify",
+                Some(5),
+                Some(parent.id),
+                None,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // refining -> interactive
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "interactive"}),
+            Some("refiner-session"),
+            "tc1",
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        // Flush and inspect
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let buf = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let all_written = writer.shared.lock().unwrap().written_lines.join("\n");
+
+        // Should mention "refining" as the previous state
+        assert!(
+            all_written.contains("returned to interactive from refining"),
+            "expected info message about returning from refining in:\n{}",
+            all_written
+        );
+    }
+
+    #[test]
+    fn test_initial_interactive_state_no_return_notification() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a top-level task (starts as interactive) — should NOT
+        // send a "returned to interactive" message since it was never
+        // in another state.
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Fresh interactive task"}),
+            &ToolCtx {
+                project: "/project",
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+
+        // Flush and inspect
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let buf = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let all_written = writer.shared.lock().unwrap().written_lines.join("\n");
+
+        // Should NOT contain "returned to interactive" since this is the
+        // initial creation — the task was never in another state.
+        assert!(
+            !all_written.contains("returned to interactive"),
+            "should not send return notification on initial creation:\n{}",
+            all_written
         );
     }
 
