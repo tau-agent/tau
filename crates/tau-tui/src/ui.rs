@@ -542,7 +542,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             let is_editing_tagline = app
                 .picker_edit_tagline
                 .as_ref()
-                .is_some_and(|(c, _)| cursor_pos == Some(*c));
+                .is_some_and(|(c, _, _)| cursor_pos == Some(*c));
 
             // Delete confirmation
             if is_confirming_delete {
@@ -577,11 +577,17 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             }
 
             // Tagline editing
-            if is_editing_tagline && let Some((_, ref edit_text)) = app.picker_edit_tagline {
+            if is_editing_tagline
+                && let Some((_, ref edit_text, text_cursor)) = app.picker_edit_tagline
+            {
                 let id_short = &session.id[..session.id.len().min(8)];
                 let prefix = format!(" {} tagline: ", id_short);
-                let cursor = "█";
-                let edit_display = format!("{}{}{}", prefix, edit_text, cursor);
+                let cursor_char = "█";
+                // Split the edit text at the cursor position (byte offset)
+                let before_cursor = &edit_text[..text_cursor];
+                let after_cursor = &edit_text[text_cursor..];
+                let edit_display =
+                    format!("{}{}{}{}", prefix, before_cursor, cursor_char, after_cursor);
                 let display_width = UnicodeWidthStr::width(edit_display.as_str());
                 let edit_padded = if display_width < w {
                     format!("{}{}", edit_display, " ".repeat(w - display_width))
@@ -740,7 +746,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     let hint = if app.picker_filter_mode {
         " type to filter  enter accept  esc clear"
     } else if app.picker_edit_tagline.is_some() {
-        " type tagline  enter save  esc cancel"
+        " type tagline  ←/→ move  enter save  esc cancel"
     } else {
         " /search  j/k nav  enter switch  r rename  A archive  R restore  D del  tab/esc close"
     };

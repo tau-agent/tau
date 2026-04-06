@@ -128,7 +128,8 @@ pub struct App {
     /// Whether the picker is in filter-input mode (`/` was pressed).
     pub picker_filter_mode: bool,
     /// Tagline edit mode: Some((cursor_in_picker, current_text)) when editing.
-    pub picker_edit_tagline: Option<(usize, String)>,
+    /// The third element is the text cursor position (byte offset).
+    pub picker_edit_tagline: Option<(usize, String, usize)>,
 }
 
 /// Saved state when navigating to a child session.
@@ -605,7 +606,7 @@ impl App {
 
     fn handle_picker_key(&mut self, key: &KeyEvent) -> Option<Action> {
         // If in tagline edit mode, handle keys for text editing
-        if let Some((_, ref mut text)) = self.picker_edit_tagline {
+        if let Some((_, ref mut text, ref mut cursor_pos)) = self.picker_edit_tagline {
             match key.code {
                 KeyCode::Esc => {
                     self.picker_edit_tagline = None;
@@ -627,11 +628,63 @@ impl App {
                     return None;
                 }
                 KeyCode::Backspace => {
-                    text.pop();
+                    if *cursor_pos > 0 {
+                        // Find the previous char boundary
+                        let prev = text[..*cursor_pos]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        text.drain(prev..*cursor_pos);
+                        *cursor_pos = prev;
+                    }
+                    return None;
+                }
+                KeyCode::Delete => {
+                    if *cursor_pos < text.len() {
+                        // Find the next char boundary
+                        let next = text[*cursor_pos..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(i, _)| *cursor_pos + i)
+                            .unwrap_or(text.len());
+                        text.drain(*cursor_pos..next);
+                    }
+                    return None;
+                }
+                KeyCode::Left => {
+                    if *cursor_pos > 0 {
+                        // Move to previous char boundary
+                        *cursor_pos = text[..*cursor_pos]
+                            .char_indices()
+                            .next_back()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                    return None;
+                }
+                KeyCode::Right => {
+                    if *cursor_pos < text.len() {
+                        // Move to next char boundary
+                        *cursor_pos = text[*cursor_pos..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(i, _)| *cursor_pos + i)
+                            .unwrap_or(text.len());
+                    }
+                    return None;
+                }
+                KeyCode::Home => {
+                    *cursor_pos = 0;
+                    return None;
+                }
+                KeyCode::End => {
+                    *cursor_pos = text.len();
                     return None;
                 }
                 KeyCode::Char(c) => {
-                    text.push(c);
+                    text.insert(*cursor_pos, c);
+                    *cursor_pos += c.len_utf8();
                     return None;
                 }
                 _ => return None,
@@ -843,7 +896,8 @@ impl App {
                         && let Some(session) = self.picker_sessions.get(idx)
                     {
                         let current = session.tagline.clone().unwrap_or_default();
-                        self.picker_edit_tagline = Some((self.picker_cursor, current));
+                        let cursor_pos = current.len();
+                        self.picker_edit_tagline = Some((self.picker_cursor, current, cursor_pos));
                     }
                     None
                 }
