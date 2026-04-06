@@ -2,7 +2,7 @@
 //!
 //! Exercises the complete task lifecycle through the real server+tasks plugin:
 //! planning → refining → ready → active → review → (changes requested) →
-//! active → review → approved → merging → done.
+//! active → review → approved → merging → merged.
 //!
 //! Also tests:
 //! - `skip_planning=true` subtask goes straight to ready
@@ -305,7 +305,7 @@ fn start_server_with_tasks(
 /// refining→ready → schedule (ready→active, creates branch+worktree) →
 /// worker makes changes → active→review (with rebase check) →
 /// review→active (changes requested) → active→review again →
-/// review→approved → merge → done.
+/// review→approved → merge → merged.
 ///
 /// This drives the lifecycle manually via ExecuteTool calls rather than
 /// relying on auto-dispatched LLM sessions, giving us deterministic control
@@ -554,13 +554,13 @@ fn full_task_lifecycle_pipeline() {
     assert_eq!(task["state"].as_str().unwrap(), "approved");
 
     // -----------------------------------------------------------------------
-    // Step 11: Merge (approved → merging → done)
+    // Step 11: Merge (approved → merging → merged)
     // The MergeNeeded event is auto-triggered. Wait for the task to reach
-    // done state. The merge pipeline: rebase, checklist (none configured),
+    // merged state. The merge pipeline: rebase, checklist (none configured),
     // fast-forward merge, cleanup.
     // -----------------------------------------------------------------------
-    let task_data = wait_for_task_state(&server, &sid, task_id, "done", Duration::from_secs(15));
-    assert_eq!(task_data["task"]["state"].as_str().unwrap(), "done");
+    let task_data = wait_for_task_state(&server, &sid, task_id, "merged", Duration::from_secs(15));
+    assert_eq!(task_data["task"]["state"].as_str().unwrap(), "merged");
 
     // -----------------------------------------------------------------------
     // Step 12: Verify merge results

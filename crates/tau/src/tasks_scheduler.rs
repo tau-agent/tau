@@ -1074,7 +1074,7 @@ pub fn merge_approved(
 
 /// Execute the merge sequence for a single approved task.
 ///
-/// Transitions: approved → merging → done (success) or merging → active (failure).
+/// Transitions: approved → merging → merged (success) or merging → active (failure).
 fn merge_one_task(
     db: &TasksDb,
     task: &Task,
@@ -1139,25 +1139,25 @@ fn merge_one_task(
     match crate::tasks_merge::merge_task(db, task_id, project_dir, writer, reader) {
         Ok(result) => {
             if result.success {
-                // Transition to done
+                // Transition to merged
                 if let Err(e) = db.update_task(
                     task_id,
                     &TaskUpdate {
-                        state: Some("done".into()),
+                        state: Some("merged".into()),
                         ..Default::default()
                     },
                     None,
                 ) {
                     eprintln!(
-                        "tasks scheduler: merge succeeded but transition to done failed for task {}: {}",
+                        "tasks scheduler: merge succeeded but transition to merged failed for task {}: {}",
                         task_id, e
                     );
                 }
 
-                // Notify parent session that this individual subtask is done
+                // Notify parent session that this individual subtask completed
                 crate::tasks_merge::notify_parent_of_subtask_done(db, task_id, writer, reader);
 
-                // Notify parent if all subtasks are done
+                // Notify parent if all subtasks are in a terminal state
                 if let Err(e) =
                     crate::tasks_merge::notify_parent_if_all_done(db, task_id, writer, reader)
                 {
@@ -1420,7 +1420,7 @@ pub fn get_status(db: &TasksDb, project: &str) -> crate::Result<SchedulerStatus>
     let inflight_count = db.count_inflight_tasks(project)?;
     let max_concurrent = MAX_CONCURRENT_TASKS;
 
-    // Get all non-done tasks for this project.
+    // Get all non-terminal tasks for this project.
     let all_tasks = db.list_tasks(project, None, None, None, None)?;
 
     // Collect active tasks (in-flight working states).
@@ -1526,7 +1526,7 @@ pub fn get_status(db: &TasksDb, project: &str) -> crate::Result<SchedulerStatus>
                 }
             }
         }
-        // Skip interactive, approved, failed, done — they aren't relevant to scheduler status.
+        // Skip interactive, approved, failed, merged, closed — they aren't relevant to scheduler status.
     }
 
     Ok(SchedulerStatus {
@@ -1939,9 +1939,9 @@ mod tests {
         db.get_task(task.id).unwrap().unwrap()
     }
 
-    /// Helper: move task through all states to done.
-    fn move_to_done(db: &TasksDb, task_id: i64) {
-        // Must be in ready → assign → active → approved → merging → done
+    /// Helper: move task through all states to merged.
+    fn move_to_merged(db: &TasksDb, task_id: i64) {
+        // Must be in ready → assign → active → approved → merging → merged
         let task = db.get_task(task_id).unwrap().unwrap();
         if task.state == "ready" {
             db.assign_task(task_id, "test-session").unwrap();
@@ -1967,7 +1967,7 @@ mod tests {
         db.update_task(
             task_id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("done".into()),
+                state: Some("merged".into()),
                 ..Default::default()
             },
             None,
@@ -2027,7 +2027,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dependency_becomes_schedulable_after_dep_done() {
+    fn test_dependency_becomes_schedulable_after_dep_merged() {
         let db = TasksDb::open_memory().unwrap();
         let dep = create_ready_task(&db, "/project", "Dep", 5, None);
         let task = create_ready_task(&db, "/project", "Task", 3, None);
@@ -2040,8 +2040,8 @@ mod tests {
         assert!(ids.contains(&dep.id));
         assert!(!ids.contains(&task.id));
 
-        // Move dep to done
-        move_to_done(&db, dep.id);
+        // Move dep to merged
+        move_to_merged(&db, dep.id);
 
         // After: task should now be schedulable
         let schedulable = db.get_schedulable_tasks("/project").unwrap();

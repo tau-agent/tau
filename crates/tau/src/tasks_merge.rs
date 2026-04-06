@@ -458,7 +458,7 @@ fn archive_session(writer: &mut impl Write, reader: &mut impl BufRead, session_i
 // ---------------------------------------------------------------------------
 
 /// After a subtask merges successfully, check if all sibling subtasks under
-/// the same parent are `done`. If so, add a message to the parent and
+/// the same parent are in a terminal state (`merged` or `closed`). If so, add a message to the parent and
 /// optionally notify its session.
 pub fn notify_parent_if_all_done(
     db: &TasksDb,
@@ -480,15 +480,18 @@ pub fn notify_parent_if_all_done(
         None => return Ok(()),
     };
 
-    // Check if all sibling subtasks are done
+    // Check if all sibling subtasks are in a terminal state
     let subtasks = db.get_subtasks(parent_id)?;
-    let all_done = !subtasks.is_empty() && subtasks.iter().all(|t| t.state == "done");
+    let all_done = !subtasks.is_empty()
+        && subtasks
+            .iter()
+            .all(|t| t.state == "merged" || t.state == "closed");
 
     if !all_done {
         return Ok(());
     }
 
-    // All subtasks done — notify parent
+    // All subtasks in terminal state — notify parent
     let parent_branch = parent.branch.as_deref().unwrap_or("main");
     let msg = format!(
         "All subtasks completed and merged into branch {}.",
@@ -516,7 +519,7 @@ pub fn notify_parent_if_all_done(
 
 /// Notify the parent task's session that an individual subtask has completed.
 /// This fires for each subtask completion (unlike `notify_parent_if_all_done`
-/// which only fires when ALL subtasks are done). Best-effort — errors are
+/// which only fires when ALL subtasks reach a terminal state). Best-effort — errors are
 /// logged but don't affect the caller.
 pub fn notify_parent_of_subtask_done(
     db: &TasksDb,
@@ -541,7 +544,7 @@ pub fn notify_parent_of_subtask_done(
 
     // Only notify if the parent has an active session
     if let Some(ref session_id) = parent.session_id {
-        let content = format!("✓ Subtask #{} done: {}", task_id, task.title);
+        let content = format!("✓ Subtask #{} {}: {}", task_id, task.state, task.title);
         let _ = server_request(
             writer,
             reader,
@@ -883,7 +886,7 @@ command = "cargo test"
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
 
-        // Create two subtasks and move them to done
+        // Create two subtasks and move them to merged
         let child1 = db
             .create_task(
                 "/project",
@@ -909,7 +912,7 @@ command = "cargo test"
             )
             .unwrap();
 
-        // Move both to done via full state machine
+        // Move both to merged via full state machine
         for child_id in [child1.id, child2.id] {
             db.assign_task(child_id, "s1").unwrap();
             db.update_task(
@@ -942,7 +945,7 @@ command = "cargo test"
             db.update_task(
                 child_id,
                 &TaskUpdate {
-                    state: Some("done".into()),
+                    state: Some("merged".into()),
                     ..Default::default()
                 },
                 None,
@@ -997,7 +1000,7 @@ command = "cargo test"
             )
             .unwrap();
 
-        // Only move child1 to done
+        // Only move child1 to merged
         db.assign_task(child1.id, "s1").unwrap();
         db.update_task(
             child1.id,
@@ -1029,7 +1032,7 @@ command = "cargo test"
         db.update_task(
             child1.id,
             &TaskUpdate {
-                state: Some("done".into()),
+                state: Some("merged".into()),
                 ..Default::default()
             },
             None,
@@ -1084,7 +1087,7 @@ command = "cargo test"
             )
             .unwrap();
 
-        // Move child to done
+        // Move child to merged
         db.assign_task(child.id, "s1").unwrap();
         db.update_task(
             child.id,
@@ -1116,7 +1119,7 @@ command = "cargo test"
         db.update_task(
             child.id,
             &TaskUpdate {
-                state: Some("done".into()),
+                state: Some("merged".into()),
                 ..Default::default()
             },
             None,
@@ -1188,9 +1191,9 @@ command = "cargo test"
             )
             .unwrap();
 
-        // Move child to done
+        // Move child to merged
         db.assign_task(child.id, "s1").unwrap();
-        for state in ["review", "approved", "merging", "done"] {
+        for state in ["review", "approved", "merging", "merged"] {
             db.update_task(
                 child.id,
                 &TaskUpdate {
@@ -1285,15 +1288,15 @@ command = "cargo test"
     }
 
     #[test]
-    fn test_merging_to_done_transition() {
+    fn test_merging_to_merged_transition() {
         let db = TasksDb::open_memory().unwrap();
         let task_id = make_merging_task(&db);
 
-        // merging -> done
+        // merging -> merged
         db.update_task(
             task_id,
             &TaskUpdate {
-                state: Some("done".into()),
+                state: Some("merged".into()),
                 ..Default::default()
             },
             None,
@@ -1301,7 +1304,7 @@ command = "cargo test"
         .unwrap();
 
         let task = db.get_task(task_id).unwrap().unwrap();
-        assert_eq!(task.state, "done");
+        assert_eq!(task.state, "merged");
     }
 
     #[test]

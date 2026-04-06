@@ -99,7 +99,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "Top-level tasks start in 'interactive' state for spec refinement".into(),
                 "Subtasks (with parent_id) start in 'planning' state by default, or 'ready' if skip_planning=true".into(),
-                "Valid states: interactive, planning, refining, ready, active, review, approved, merging, failed, done".into(),
+                "Valid states: interactive, planning, refining, ready, active, review, approved, merging, failed, merged, closed".into(),
             ],
         },
         PluginToolDef {
@@ -124,13 +124,13 @@ fn tasks_tools() -> Vec<PluginToolDef> {
         },
         PluginToolDef {
             name: "task_list".into(),
-            description: "List tasks filtered by state, parent, or tag. Default: all non-done tasks for current project.".into(),
+            description: "List tasks filtered by state, parent, or tag. Default: all non-terminal tasks for current project.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "state": {
                         "type": "string",
-                        "description": "Filter by state (interactive, planning, refining, ready, active, review, approved, merging, failed, done). Use 'all' to include done tasks."
+                        "description": "Filter by state (interactive, planning, refining, ready, active, review, approved, merging, failed, merged, closed). Use 'all' to include merged/closed tasks."
                     },
                     "parent_id": {
                         "type": "integer",
@@ -221,11 +221,11 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Update task fields (title, state, priority, tags, etc.)".into()),
             prompt_guidelines: vec![
-                "State transitions are validated: interactive->planning->refining->ready->active->review->approved->merging->done".into(),
+                "State transitions are validated: interactive->planning->refining->ready->active->review->approved->merging->merged".into(),
                 "Shortcuts: interactive->ready (skip planning), interactive->approved, active->approved (skip_review only)".into(),
                 "Planning cycle: planning->refining, refining->planning (revise), refining->ready (approved), refining->interactive (scope expansion)".into(),
                 "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active (recoverable), merging->failed (terminal), failed->active (manual retry)".into(),
-                "Universal overrides: any state->done (manual close), any state->interactive (human takes over), any state->failed".into(),
+                "Universal overrides: any state->closed (manual close), any state->interactive (human takes over, except from merged), any state->failed".into(),
                 "active -> approved is only allowed if skip_review=true on the task".into(),
             ],
         },
@@ -352,7 +352,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Merge an approved task into its target branch".into()),
             prompt_guidelines: vec![
-                "Task must be in 'approved' state. Transitions to 'merging', then 'done' on success, back to 'active' on recoverable error (rebase/checklist), or 'failed' on terminal error.".into(),
+                "Task must be in 'approved' state. Transitions to 'merging', then 'merged' on success, back to 'active' on recoverable error (rebase/checklist), or 'failed' on terminal error.".into(),
                 "Runs: rebase onto target, project checklist, fast-forward merge.".into(),
             ],
         },
@@ -391,7 +391,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Show active/queued/blocked tasks with wait reasons".into()),
             prompt_guidelines: vec![
                 "Shows what's running, what's queued, and why queued tasks are waiting.".into(),
-                "Wait reasons include: dependency not done, file conflict with active task, budget exhausted, not yet scheduled.".into(),
+                "Wait reasons include: dependency not met, file conflict with active task, budget exhausted, not yet scheduled.".into(),
             ],
         },
     ]
@@ -733,7 +733,7 @@ fn handle_task_get(db: &TasksDb, args: &serde_json::Value, tool_call_id: &str) -
                 && rel.from_task == id
                 && let Ok(Some(dep_task)) = db.get_task(rel.to_task)
             {
-                let satisfied = dep_task.state == "done";
+                let satisfied = dep_task.state == "merged" || dep_task.state == "closed";
                 obj["dependency_status"] = if satisfied {
                     serde_json::json!("satisfied")
                 } else {
@@ -1035,15 +1035,15 @@ fn handle_task_update(
                 }
             }
 
-            // When a task transitions to done, auto-archive its session
+            // When a task transitions to a terminal state, auto-archive its session
             // and notify the parent task's session.
-            if task.state == "done" {
+            if task.state == "merged" || task.state == "closed" {
                 auto_archive_task_session(db, &task, writer, reader);
 
-                // Notify parent session that this individual subtask is done
+                // Notify parent session that this individual subtask completed
                 tasks_merge::notify_parent_of_subtask_done(db, task.id, writer, reader);
 
-                // Check if ALL subtasks are now done and notify parent
+                // Check if ALL subtasks are now in a terminal state and notify parent
                 if let Err(e) = tasks_merge::notify_parent_if_all_done(db, task.id, writer, reader)
                 {
                     eprintln!(
@@ -1072,7 +1072,7 @@ fn handle_task_update(
 }
 
 /// Auto-archive a task's session and clean up worktree/branch when a task
-/// transitions to done. All operations are best-effort — errors are logged
+/// transitions to a terminal state (merged or closed). All operations are best-effort — errors are logged
 /// but don't fail the state transition.
 fn auto_archive_task_session(
     db: &TasksDb,
@@ -1348,25 +1348,25 @@ fn handle_task_merge(
     match tasks_merge::merge_task(db, id, project_dir, writer, reader) {
         Ok(result) => {
             if result.success {
-                // Transition to done
+                // Transition to merged
                 if let Err(e) = db.update_task(
                     id,
                     &TaskUpdate {
-                        state: Some("done".into()),
+                        state: Some("merged".into()),
                         ..Default::default()
                     },
                     session_id,
                 ) {
                     return tool_err(
                         tool_call_id,
-                        &format!("merge succeeded but transition to done failed: {}", e),
+                        &format!("merge succeeded but transition to merged failed: {}", e),
                     );
                 }
 
-                // Notify parent session that this individual subtask is done
+                // Notify parent session that this individual subtask completed
                 tasks_merge::notify_parent_of_subtask_done(db, id, writer, reader);
 
-                // Check if ALL subtasks are now done and notify parent
+                // Check if ALL subtasks are now in a terminal state and notify parent
                 if let Err(e) = tasks_merge::notify_parent_if_all_done(db, id, writer, reader) {
                     eprintln!("tasks: parent notification failed for task {}: {}", id, e);
                 }
@@ -1510,7 +1510,7 @@ pub fn run_tasks_plugin() {
     // after each tool call completes.
     let mut pending_events: Vec<SchedulerEvent> = Vec::new();
 
-    // Startup sweep: clean up stale worktrees for done/failed tasks.
+    // Startup sweep: clean up stale worktrees for merged/closed/failed tasks.
     // This catches historical leftovers from before cleanup was implemented
     // or from tasks that were manually closed without going through merge.
     if let Ok(stale_tasks) = db.get_stale_worktree_tasks() {
@@ -2923,7 +2923,7 @@ mod tests {
     #[test]
     fn test_task_get_dependency_status_satisfied() {
         let db = TasksDb::open_memory().unwrap();
-        // Create dep and move to done
+        // Create dep and move to merged
         let dep = db
             .create_task(
                 "/project",
@@ -2967,7 +2967,7 @@ mod tests {
         db.update_task(
             dep.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("done".into()),
+                state: Some("merged".into()),
                 ..Default::default()
             },
             None,
@@ -2996,7 +2996,7 @@ mod tests {
         let relations = parsed["relations"].as_array().unwrap();
         assert_eq!(relations.len(), 1);
         assert_eq!(relations[0]["dependency_status"], "satisfied");
-        assert_eq!(relations[0]["dependency_state"], "done");
+        assert_eq!(relations[0]["dependency_state"], "merged");
     }
 
     #[test]
@@ -3137,10 +3137,10 @@ mod tests {
         assert!(subtask["session_id"].is_null());
     }
 
-    // ----- auto-archive on done tests -----
+    // ----- auto-archive on terminal state tests -----
 
     #[test]
-    fn test_auto_archive_session_on_done() {
+    fn test_auto_archive_session_on_closed() {
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
 
@@ -3187,10 +3187,10 @@ mod tests {
         )
         .unwrap();
 
-        // Transition to done via handle_task_update
+        // Transition to closed via handle_task_update
         let result = handle_task_update(
             &db,
-            &serde_json::json!({"id": task.id, "state": "done"}),
+            &serde_json::json!({"id": task.id, "state": "closed"}),
             Some("s1"),
             "tc1",
             &mut writer,
@@ -3209,7 +3209,7 @@ mod tests {
         drop(shared);
 
         let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(updated["state"], "done");
+        assert_eq!(updated["state"], "closed");
     }
 
     #[test]
@@ -3217,7 +3217,7 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
 
-        // Create a task without a session_id and transition to done
+        // Create a task without a session_id and transition to closed
         let task = db
             .create_task(
                 "/project",
@@ -3231,10 +3231,10 @@ mod tests {
             )
             .unwrap();
 
-        // Transition to done directly (universal override)
+        // Transition to closed directly (universal override)
         let result = handle_task_update(
             &db,
-            &serde_json::json!({"id": task.id, "state": "done"}),
+            &serde_json::json!({"id": task.id, "state": "closed"}),
             None,
             "tc1",
             &mut writer,
@@ -3243,12 +3243,12 @@ mod tests {
         );
         assert!(!result.is_error);
         let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(updated["state"], "done");
+        assert_eq!(updated["state"], "closed");
         // No archive request should be sent (no session_id)
     }
 
     #[test]
-    fn test_auto_archive_all_task_sessions_on_done() {
+    fn test_auto_archive_all_task_sessions_on_closed() {
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
 
@@ -3285,7 +3285,7 @@ mod tests {
         db.record_session(task.id, "refiner-session", "refiner")
             .unwrap();
 
-        // Skip to done via universal override
+        // Skip to closed via universal override
         db.update_task(
             task.id,
             &TaskUpdate {
@@ -3305,10 +3305,10 @@ mod tests {
         )
         .unwrap();
 
-        // Transition to done via handle_task_update (triggers auto_archive)
+        // Transition to closed via handle_task_update (triggers auto_archive)
         let result = handle_task_update(
             &db,
-            &serde_json::json!({"id": task.id, "state": "done"}),
+            &serde_json::json!({"id": task.id, "state": "closed"}),
             Some("s1"),
             "tc1",
             &mut writer,
@@ -3318,7 +3318,7 @@ mod tests {
         assert!(!result.is_error);
 
         let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(updated["state"], "done");
+        assert_eq!(updated["state"], "closed");
 
         // Verify that ArchiveSession requests were sent for all three sessions
         let shared = writer.shared.lock().unwrap();
@@ -3333,10 +3333,10 @@ mod tests {
         // and the function would have errored out.
     }
 
-    // ----- parent notification on done tests -----
+    // ----- parent notification on terminal state tests -----
 
     #[test]
-    fn test_update_to_done_notifies_parent_session() {
+    fn test_update_to_closed_notifies_parent_session() {
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
         let mut events = Vec::new();
@@ -3362,10 +3362,10 @@ mod tests {
             .unwrap();
         db.assign_task(child.id, "worker-session").unwrap();
 
-        // Transition child to done via handle_task_update (universal override)
+        // Transition child to closed via handle_task_update (universal override)
         let result = handle_task_update(
             &db,
-            &serde_json::json!({"id": child.id, "state": "done"}),
+            &serde_json::json!({"id": child.id, "state": "closed"}),
             Some("s1"),
             "tc1",
             &mut writer,

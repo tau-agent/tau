@@ -95,13 +95,14 @@ const VALID_STATES: &[&str] = &[
     "approved",
     "merging",
     "failed",
-    "done",
+    "merged",
+    "closed",
 ];
 
 /// Check whether a state transition is allowed.
 ///
 /// Forward (happy path):
-///   interactive -> planning -> refining -> ready -> active -> review -> approved -> merging -> done
+///   interactive -> planning -> refining -> ready -> active -> review -> approved -> merging -> merged
 ///
 /// Planning/Refining cycle:
 ///   interactive -> planning   (user wants autonomous planning)
@@ -124,12 +125,22 @@ const VALID_STATES: &[&str] = &[
 ///   merging -> active         (merge failure, rework)
 ///
 /// Universal overrides (admin / bootstrap):
-///   any state -> done         (manual close)
-///   any state -> interactive  (human takes over)
+///   any state -> closed       (manual close)
+///   any state -> interactive  (human takes over — except from merged)
 ///   any state -> failed       (terminal error)
+///
+/// Terminal states:
+///   merged — fully terminal, no transitions out
+///   closed -> interactive     (reopen)
+///   failed -> closed          (give up)
 pub fn validate_state_transition(from: &str, to: &str) -> bool {
-    // Universal: any state can go to done, interactive, or failed (except self-loops)
-    if from != to && (to == "done" || to == "interactive" || to == "failed") {
+    // merged is fully terminal — no transitions out at all
+    if from == "merged" {
+        return false;
+    }
+
+    // Universal: any state can go to closed, interactive, or failed (except self-loops)
+    if from != to && (to == "closed" || to == "interactive" || to == "failed") {
         return true;
     }
 
@@ -149,7 +160,7 @@ pub fn validate_state_transition(from: &str, to: &str) -> bool {
             | ("active", "approved")
             | ("review", "approved")
             | ("approved", "merging")
-            | ("merging", "done")
+            | ("merging", "merged")
             // Backward transitions (error recovery)
             | ("active", "ready")
             | ("review", "active")
@@ -387,6 +398,23 @@ impl TasksDb {
             .map_err(|e| crate::Error::Io(format!("migrate require_approval: {}", e)))?;
         }
 
+        // Migrate done -> merged/closed terminal states.
+        let has_done: bool = conn
+            .prepare("SELECT COUNT(*) FROM tasks WHERE state = 'done'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if has_done {
+            conn.execute_batch(
+                "UPDATE tasks SET state = 'merged' WHERE state = 'done' AND id IN (
+                    SELECT DISTINCT task_id FROM task_history WHERE field = 'state' AND new_value = 'merging'
+                );
+                UPDATE tasks SET state = 'closed' WHERE state = 'done';",
+            )
+            .map_err(|e| crate::Error::Io(format!("migrate done to merged/closed: {}", e)))?;
+        }
+
         Ok(())
     }
 
@@ -491,9 +519,9 @@ impl TasksDb {
                 params_vec.push(Box::new(state.to_string()));
                 param_idx += 1;
             }
-            // "all" — no state filter, include done tasks
+            // "all" — no state filter, include merged/closed tasks
         } else {
-            sql.push_str(" AND state != 'done'");
+            sql.push_str(" AND state NOT IN ('merged', 'closed')");
         }
 
         if let Some(pid) = parent_id_filter {
@@ -945,8 +973,8 @@ impl TasksDb {
         Ok(relations)
     }
 
-    /// Get tasks that this task depends on that are NOT yet done.
-    /// Returns tasks where: relation(this_task, dep, 'depends_on') AND dep.state != 'done'
+    /// Get tasks that this task depends on that are NOT yet in a terminal state.
+    /// Returns tasks where: relation(this_task, dep, 'depends_on') AND dep.state NOT IN ('merged', 'closed')
     pub fn get_blocking_dependencies(&self, task_id: i64) -> crate::Result<Vec<Task>> {
         let mut stmt = self
             .conn
@@ -957,7 +985,7 @@ impl TasksDb {
                         t.updated_at
                  FROM task_relations r
                  JOIN tasks t ON t.id = r.to_task
-                 WHERE r.from_task = ?1 AND r.relation = 'depends_on' AND t.state != 'done'",
+                 WHERE r.from_task = ?1 AND r.relation = 'depends_on' AND t.state NOT IN ('merged', 'closed')",
             )
             .map_err(|e| crate::Error::Io(format!("prepare get_blocking_dependencies: {}", e)))?;
 
@@ -994,7 +1022,7 @@ impl TasksDb {
                        JOIN tasks dep ON dep.id = r.to_task
                        WHERE r.from_task = t.id
                          AND r.relation = 'depends_on'
-                         AND dep.state != 'done'
+                         AND dep.state NOT IN ('merged', 'closed')
                    )
                  ORDER BY t.priority DESC, t.created_at ASC",
             )
@@ -1533,7 +1561,7 @@ impl TasksDb {
         Ok(())
     }
 
-    /// Find tasks in terminal states (done/failed) that still have a worktree_path set.
+    /// Find tasks in terminal states (merged/closed/failed) that still have a worktree_path set.
     /// Used for startup cleanup of stale worktrees.
     pub fn get_stale_worktree_tasks(&self) -> crate::Result<Vec<Task>> {
         let mut stmt = self
@@ -1543,7 +1571,7 @@ impl TasksDb {
                         branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
                         created_at, updated_at
                  FROM tasks
-                 WHERE state IN ('done', 'failed') AND worktree_path IS NOT NULL",
+                 WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
             )
             .map_err(|e| crate::Error::Io(format!("prepare stale worktree query: {}", e)))?;
 
@@ -1710,7 +1738,7 @@ mod tests {
             .create_task("/other", "Task 3", None, None, None, false, false, false)
             .unwrap();
 
-        // All non-done tasks for /project
+        // All non-terminal tasks for /project
         let tasks = db.list_tasks("/project", None, None, None, None).unwrap();
         assert_eq!(tasks.len(), 2);
 
@@ -1827,7 +1855,7 @@ mod tests {
         assert!(validate_state_transition("active", "approved"));
         assert!(validate_state_transition("review", "approved"));
         assert!(validate_state_transition("approved", "merging"));
-        assert!(validate_state_transition("merging", "done"));
+        assert!(validate_state_transition("merging", "merged"));
 
         // Planning/Refining transitions
         assert!(validate_state_transition("interactive", "planning"));
@@ -1846,14 +1874,15 @@ mod tests {
         assert!(validate_state_transition("merging", "failed"));
         assert!(validate_state_transition("failed", "active"));
 
-        // Universal overrides: any state -> done
-        assert!(validate_state_transition("interactive", "done"));
-        assert!(validate_state_transition("planning", "done"));
-        assert!(validate_state_transition("refining", "done"));
-        assert!(validate_state_transition("ready", "done"));
-        assert!(validate_state_transition("active", "done"));
-        assert!(validate_state_transition("review", "done"));
-        assert!(validate_state_transition("approved", "done"));
+        // Universal overrides: any state -> closed
+        assert!(validate_state_transition("interactive", "closed"));
+        assert!(validate_state_transition("planning", "closed"));
+        assert!(validate_state_transition("refining", "closed"));
+        assert!(validate_state_transition("ready", "closed"));
+        assert!(validate_state_transition("active", "closed"));
+        assert!(validate_state_transition("review", "closed"));
+        assert!(validate_state_transition("approved", "closed"));
+        assert!(validate_state_transition("failed", "closed"));
 
         // Universal overrides: any state -> interactive
         assert!(validate_state_transition("planning", "interactive"));
@@ -1862,7 +1891,11 @@ mod tests {
         assert!(validate_state_transition("active", "interactive"));
         assert!(validate_state_transition("review", "interactive"));
         assert!(validate_state_transition("approved", "interactive"));
-        assert!(validate_state_transition("done", "interactive"));
+        assert!(validate_state_transition("closed", "interactive"));
+        // merged is fully terminal
+        assert!(!validate_state_transition("merged", "interactive"));
+        assert!(!validate_state_transition("merged", "closed"));
+        assert!(!validate_state_transition("merged", "failed"));
 
         // Universal overrides: any state -> failed
         assert!(validate_state_transition("planning", "failed"));
@@ -1871,7 +1904,8 @@ mod tests {
         assert!(validate_state_transition("review", "failed"));
 
         // Self-loops are not allowed
-        assert!(!validate_state_transition("done", "done"));
+        assert!(!validate_state_transition("merged", "merged"));
+        assert!(!validate_state_transition("closed", "closed"));
         assert!(!validate_state_transition("interactive", "interactive"));
         assert!(!validate_state_transition("planning", "planning"));
         assert!(!validate_state_transition("refining", "refining"));
@@ -1886,7 +1920,7 @@ mod tests {
         // failed state transitions
         assert!(validate_state_transition("merging", "failed"));
         assert!(validate_state_transition("failed", "active"));
-        assert!(validate_state_transition("failed", "done")); // universal
+        assert!(validate_state_transition("failed", "closed")); // universal
         assert!(validate_state_transition("failed", "interactive")); // universal
         assert!(!validate_state_transition("failed", "merging"));
         assert!(!validate_state_transition("failed", "approved"));
@@ -2017,10 +2051,10 @@ mod tests {
     }
 
     #[test]
-    fn test_universal_done_override() {
+    fn test_universal_closed_override() {
         let db = TasksDb::open_memory().unwrap();
 
-        // Any state -> done should work
+        // Any state -> closed should work
         for start_state in ["interactive", "ready", "active", "review", "approved"] {
             let task = db
                 .create_task(
@@ -2056,17 +2090,17 @@ mod tests {
                 .unwrap();
             }
 
-            // -> done
+            // -> closed
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("done".into()),
+                    state: Some("closed".into()),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
-            assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "done");
+            assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "closed");
         }
     }
 
@@ -2075,7 +2109,7 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
 
         // Any state -> interactive should work
-        for start_state in ["ready", "active", "review", "approved", "done"] {
+        for start_state in ["ready", "active", "review", "approved", "closed"] {
             let task = db
                 .create_task(
                     "/project",
@@ -2095,7 +2129,7 @@ mod tests {
                 "active" => &["ready", "active"],
                 "review" => &["ready", "active", "review"],
                 "approved" => &["ready", "active", "review", "approved"],
-                "done" => &["done"], // uses universal override
+                "closed" => &["closed"], // uses universal override
                 _ => unreachable!(),
             };
             for state in path_to_state {
@@ -2870,11 +2904,11 @@ mod tests {
     fn test_get_stale_worktree_tasks() {
         let db = TasksDb::open_memory().unwrap();
 
-        // Task 1: done with worktree (stale)
+        // Task 1: closed with worktree (stale)
         let t1 = db
             .create_task(
                 "/project",
-                "Done with worktree",
+                "Closed with worktree",
                 None,
                 None,
                 None,
@@ -2887,7 +2921,7 @@ mod tests {
         db.update_task(
             t1.id,
             &TaskUpdate {
-                state: Some("done".into()),
+                state: Some("closed".into()),
                 ..Default::default()
             },
             None,
@@ -2918,11 +2952,11 @@ mod tests {
         )
         .unwrap();
 
-        // Task 3: done without worktree (not stale)
+        // Task 3: closed without worktree (not stale)
         let t3 = db
             .create_task(
                 "/project",
-                "Done no worktree",
+                "Closed no worktree",
                 None,
                 None,
                 None,
@@ -2934,7 +2968,7 @@ mod tests {
         db.update_task(
             t3.id,
             &TaskUpdate {
-                state: Some("done".into()),
+                state: Some("closed".into()),
                 ..Default::default()
             },
             None,
@@ -2970,7 +3004,7 @@ mod tests {
         let ids: Vec<i64> = stale.iter().map(|t| t.id).collect();
         assert!(
             ids.contains(&t1.id),
-            "done task with worktree should be stale"
+            "closed task with worktree should be stale"
         );
         assert!(
             ids.contains(&t2.id),
@@ -2978,7 +3012,7 @@ mod tests {
         );
         assert!(
             !ids.contains(&t3.id),
-            "done task without worktree should not be stale"
+            "closed task without worktree should not be stale"
         );
         assert!(
             !ids.contains(&t4.id),
@@ -3078,7 +3112,8 @@ mod tests {
             "review" => &["ready"],
             "approved" => &["ready"],
             "failed" => &["ready"],
-            "done" => &["ready"],
+            "merged" => &["ready"],
+            "closed" => &["ready"],
             _ => panic!("unsupported target state: {}", state),
         };
         for &s in transitions {
@@ -3151,7 +3186,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            "done" => {
+            "merged" => {
                 db.assign_task(task.id, "test-session").unwrap();
                 db.update_task(
                     task.id,
@@ -3174,7 +3209,18 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("done".into()),
+                        state: Some("merged".into()),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap();
+            }
+            "closed" => {
+                db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some("closed".into()),
                         ..Default::default()
                     },
                     None,
@@ -3202,7 +3248,7 @@ mod tests {
     #[test]
     fn test_get_blocking_dependencies_with_met_dep() {
         let db = TasksDb::open_memory().unwrap();
-        let dep = create_task_in_state(&db, "/project", "Dependency", "done");
+        let dep = create_task_in_state(&db, "/project", "Dependency", "merged");
         let task = create_task_in_state(&db, "/project", "Dependent", "ready");
 
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
@@ -3250,7 +3296,7 @@ mod tests {
     #[test]
     fn test_get_schedulable_tasks_with_met_dep() {
         let db = TasksDb::open_memory().unwrap();
-        let dep = create_task_in_state(&db, "/project", "Dependency", "done");
+        let dep = create_task_in_state(&db, "/project", "Dependency", "merged");
         let task = create_task_in_state(&db, "/project", "Unblocked task", "ready");
 
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
@@ -3473,7 +3519,7 @@ mod tests {
     fn test_get_blocking_dependencies_multiple() {
         let db = TasksDb::open_memory().unwrap();
         let dep1 = create_task_in_state(&db, "/project", "Dep 1", "active");
-        let dep2 = create_task_in_state(&db, "/project", "Dep 2", "done");
+        let dep2 = create_task_in_state(&db, "/project", "Dep 2", "merged");
         let dep3 = create_task_in_state(&db, "/project", "Dep 3", "ready");
         let task = create_task_in_state(&db, "/project", "Main task", "ready");
 
@@ -3482,7 +3528,7 @@ mod tests {
         db.add_relation(task.id, dep3.id, "depends_on").unwrap();
 
         let blocking = db.get_blocking_dependencies(task.id).unwrap();
-        // dep1 (active) and dep3 (ready) are blocking; dep2 (done) is not
+        // dep1 (active) and dep3 (ready) are blocking; dep2 (merged) is not
         assert_eq!(blocking.len(), 2);
         let blocking_ids: Vec<i64> = blocking.iter().map(|t| t.id).collect();
         assert!(blocking_ids.contains(&dep1.id));
