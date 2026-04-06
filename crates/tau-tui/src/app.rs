@@ -1117,12 +1117,33 @@ impl App {
                     None
                 }
             }
+            "/archive" => {
+                let current = self.session_id.clone();
+                // Determine the session to switch to after archiving
+                let switch_to = if !self.nav_stack.is_empty() {
+                    // Navigate back restores cached state; extract the target session id
+                    Some(self.nav_stack.last().unwrap().session_id.clone())
+                } else {
+                    self.parent_id.clone()
+                };
+                if switch_to.is_some() {
+                    Some(Action::ArchiveSession {
+                        session_id: current,
+                        switch_to,
+                    })
+                } else {
+                    self.messages.push(MessageItem::Error {
+                        text: "no previous session to switch to".into(),
+                    });
+                    None
+                }
+            }
             "/reload" => Some(Action::ReloadPlugins),
             "/fork" => Some(Action::ForkSession),
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|status|mq] /reload /sessions /session <id> /back /fork /new /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|status|mq] /reload /sessions /session <id> /back /fork /new /archive /help /quit"
                         .into(),
                 });
                 None

@@ -348,19 +348,31 @@ async fn run_inner(
                     session_id,
                     switch_to,
                 } => {
-                    // If archiving the active session, switch to parent first
+                    let archiving_current = session_id == app.session_id;
                     if let Some(target_id) = switch_to {
-                        match fetch_session_info(&target_id).await {
-                            Ok(info) => {
-                                let messages = fetch_messages(&target_id).await.unwrap_or_default();
-                                app.save_nav_state();
-                                app.switch_to_session(&info, messages);
-                                sub_switch_tx.send(target_id).await.ok();
-                            }
-                            Err(e) => {
-                                app.messages.push(crate::message::MessageItem::Error {
-                                    text: format!("failed to switch to parent: {}", e),
-                                });
+                        if archiving_current
+                            && app.nav_stack.last().map(|e| &e.session_id) == Some(&target_id)
+                        {
+                            // Navigate back to the previous session from the nav stack
+                            // (don't save current state — we're archiving it)
+                            app.navigate_back();
+                            sub_switch_tx.send(app.session_id.clone()).await.ok();
+                        } else {
+                            match fetch_session_info(&target_id).await {
+                                Ok(info) => {
+                                    let messages =
+                                        fetch_messages(&target_id).await.unwrap_or_default();
+                                    if !archiving_current {
+                                        app.save_nav_state();
+                                    }
+                                    app.switch_to_session(&info, messages);
+                                    sub_switch_tx.send(target_id).await.ok();
+                                }
+                                Err(e) => {
+                                    app.messages.push(crate::message::MessageItem::Error {
+                                        text: format!("failed to switch session: {}", e),
+                                    });
+                                }
                             }
                         }
                     }
