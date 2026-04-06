@@ -589,7 +589,11 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
 
                 // Character at cursor position (or space if at end of text)
                 let cursor_char = if text_cursor < edit_text.len() {
-                    edit_text[text_cursor..].chars().next().unwrap().to_string()
+                    edit_text[text_cursor..]
+                        .chars()
+                        .next()
+                        .expect("text_cursor < len guarantees a char")
+                        .to_string()
                 } else {
                     " ".to_string()
                 };
