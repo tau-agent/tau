@@ -672,7 +672,7 @@ impl App {
         if let Some(cursor_pos) = self.picker_confirm_delete {
             let real_idx = self.picker_filtered_indices().get(cursor_pos).copied();
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.picker_confirm_delete = None;
                     if let Some(idx) = real_idx
                         && let Some(session) = self.picker_sessions.get(idx)
@@ -692,7 +692,7 @@ impl App {
         } else if let Some(cursor_pos) = self.picker_confirm_archive {
             let real_idx = self.picker_filtered_indices().get(cursor_pos).copied();
             match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.picker_confirm_archive = None;
                     if let Some(idx) = real_idx
                         && let Some(session) = self.picker_sessions.get(idx)
