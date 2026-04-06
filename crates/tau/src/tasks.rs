@@ -84,6 +84,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                         "type": "boolean",
                         "description": "If true, subtask starts in ready state instead of planning"
                     },
+                    "require_approval": {
+                        "type": "boolean",
+                        "description": "If true, refining transitions to interactive instead of ready (human sign-off required)"
+                    },
                     "message": {
                         "type": "string",
                         "description": "Initial message/description for the task"
@@ -207,6 +211,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "skip_planning": {
                         "type": "boolean",
                         "description": "Whether to skip planning"
+                    },
+                    "require_approval": {
+                        "type": "boolean",
+                        "description": "Whether to require human approval before work begins"
                     }
                 },
                 "required": ["id"]
@@ -427,6 +435,10 @@ fn handle_task_create(
         .get("skip_planning")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let require_approval = args
+        .get("require_approval")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str());
 
     match db.create_task(
@@ -437,6 +449,7 @@ fn handle_task_create(
         tags,
         skip_review,
         skip_planning,
+        require_approval,
     ) {
         Ok(task) => {
             // Subtasks start in ready or planning state — trigger a schedule pass.
@@ -787,6 +800,7 @@ fn handle_task_update(
         affected_files: args.get("affected_files").cloned(),
         skip_review: args.get("skip_review").and_then(|v| v.as_bool()),
         skip_planning: args.get("skip_planning").and_then(|v| v.as_bool()),
+        require_approval: args.get("require_approval").and_then(|v| v.as_bool()),
     };
 
     // Track session as reviewer if transitioning to review or approved
@@ -2270,10 +2284,10 @@ mod tests {
     fn test_tool_relate() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/p", "A", None, None, None, false, false)
+            .create_task("/p", "A", None, None, None, false, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/p", "B", None, None, None, false, false)
+            .create_task("/p", "B", None, None, None, false, false, false)
             .unwrap();
 
         let result = handle_task_relate(
@@ -2296,7 +2310,7 @@ mod tests {
     fn test_tool_message_edit() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/p", "A", None, None, None, false, false)
+            .create_task("/p", "A", None, None, None, false, false, false)
             .unwrap();
         let msg = db.add_message(task.id, "original", None).unwrap();
 
@@ -2587,7 +2601,7 @@ mod tests {
 
         // Create task without skip_review
         let task = db
-            .create_task("/project", "No skip", None, None, None, false, false)
+            .create_task("/project", "No skip", None, None, None, false, false, false)
             .unwrap();
         db.update_task(
             task.id,
@@ -2633,7 +2647,16 @@ mod tests {
 
         // Create task with skip_review=true
         let task = db
-            .create_task("/project", "Skip review", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "Skip review",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -2665,7 +2688,7 @@ mod tests {
     fn test_session_tracking_on_message() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Tracked", None, None, None, false, false)
+            .create_task("/project", "Tracked", None, None, None, false, false, false)
             .unwrap();
 
         // Add a message with a session — should record contributor
@@ -2688,7 +2711,16 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
         let task = db
-            .create_task("/project", "Review track", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "Review track",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -2726,7 +2758,16 @@ mod tests {
     fn test_session_tracking_idempotent() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Idempotent", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "Idempotent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
 
         // Record same session twice — should be idempotent
@@ -2779,7 +2820,7 @@ mod tests {
     fn test_task_relate_self_referential_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Self", None, None, None, false, false)
+            .create_task("/project", "Self", None, None, None, false, false, false)
             .unwrap();
 
         let result = handle_task_relate(
@@ -2795,10 +2836,10 @@ mod tests {
     fn test_task_relate_cross_project_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project-a", "A", None, None, None, false, false)
+            .create_task("/project-a", "A", None, None, None, false, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project-b", "B", None, None, None, false, false)
+            .create_task("/project-b", "B", None, None, None, false, false, false)
             .unwrap();
 
         let result = handle_task_relate(
@@ -2814,10 +2855,10 @@ mod tests {
     fn test_task_relate_circular_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project", "T1", None, None, None, false, false)
+            .create_task("/project", "T1", None, None, None, false, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project", "T2", None, None, None, false, false)
+            .create_task("/project", "T2", None, None, None, false, false, false)
             .unwrap();
 
         // T1 depends_on T2 — OK
@@ -2842,10 +2883,28 @@ mod tests {
     fn test_task_get_dependency_status_blocking() {
         let db = TasksDb::open_memory().unwrap();
         let dep = db
-            .create_task("/project", "Dependency", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "Dependency",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
-            .create_task("/project", "Dependent", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "Dependent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
 
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
@@ -2866,7 +2925,16 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         // Create dep and move to done
         let dep = db
-            .create_task("/project", "Dependency", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "Dependency",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             dep.id,
@@ -2907,7 +2975,16 @@ mod tests {
         .unwrap();
 
         let task = db
-            .create_task("/project", "Dependent", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "Dependent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
 
@@ -2926,10 +3003,10 @@ mod tests {
     fn test_task_get_non_depends_on_has_no_status() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project", "T1", None, None, None, false, false)
+            .create_task("/project", "T1", None, None, None, false, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project", "T2", None, None, None, false, false)
+            .create_task("/project", "T2", None, None, None, false, false, false)
             .unwrap();
 
         db.add_relation(t1.id, t2.id, "related").unwrap();
@@ -3069,7 +3146,16 @@ mod tests {
 
         // Create a task with a session_id
         let task = db
-            .create_task("/project", "Auto archive", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "Auto archive",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
         db.update_task(
@@ -3133,7 +3219,16 @@ mod tests {
 
         // Create a task without a session_id and transition to done
         let task = db
-            .create_task("/project", "No session", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "No session",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
 
         // Transition to done directly (universal override)
@@ -3166,6 +3261,7 @@ mod tests {
                 None,
                 None,
                 true,
+                false,
                 false,
             )
             .unwrap();
@@ -3247,7 +3343,7 @@ mod tests {
 
         // Create parent with a session
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
 
@@ -3261,6 +3357,7 @@ mod tests {
                 None,
                 true,
                 true,
+                false,
             )
             .unwrap();
         db.assign_task(child.id, "worker-session").unwrap();
@@ -3319,7 +3416,16 @@ mod tests {
 
         // Create a task with skip_review and move to approved
         let task = db
-            .create_task("/project", "Merge trigger", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "Merge trigger",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -3441,7 +3547,9 @@ mod tests {
 
         // Create task and move to active (via assign)
         let task = db
-            .create_task("/project", "No event", None, None, None, false, false)
+            .create_task(
+                "/project", "No event", None, None, None, false, false, false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -3529,6 +3637,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
@@ -3600,6 +3709,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3651,7 +3761,16 @@ mod tests {
         // Test that approved → active does NOT send a QueueMessage
         // (only review → active should trigger the notification)
         let task = db
-            .create_task("/project", "Approved bounce", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "Approved bounce",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
         db.update_task(
@@ -3709,6 +3828,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
                 false,
             )
@@ -3772,6 +3892,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3828,6 +3949,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
                 false,
             )
@@ -3941,6 +4063,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -4040,7 +4163,7 @@ mod tests {
 
         // Create a subtask in planning state
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -4049,6 +4172,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -4143,7 +4267,7 @@ mod tests {
 
         // Create a subtask in planning state
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -4152,6 +4276,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -4246,7 +4371,7 @@ mod tests {
 
         // Create a subtask (defaults to planning state)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -4255,6 +4380,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -4356,7 +4482,7 @@ mod tests {
 
         // Create a subtask in planning state
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -4365,6 +4491,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -4408,7 +4535,7 @@ mod tests {
 
         // Create a subtask in planning state
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -4417,6 +4544,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -4469,7 +4597,7 @@ mod tests {
 
         // Create a subtask in planning state with a session
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -4478,6 +4606,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -4744,7 +4873,16 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
         let task = db
-            .create_task("/project", "Rebased task", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "Rebased task",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -4832,6 +4970,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -4893,7 +5032,16 @@ mod tests {
         let (mut writer, mut reader) = mock_io();
 
         let task = db
-            .create_task("/project", "No branch task", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "No branch task",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -5011,6 +5159,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5061,7 +5210,7 @@ mod tests {
 
         // Create a subtask (planning state, no session)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -5070,6 +5219,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -5127,7 +5277,7 @@ mod tests {
 
         // Create a subtask in planning state (no session)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -5136,6 +5286,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -5321,7 +5472,7 @@ mod tests {
 
         // Create a subtask in refining state (simulating scope expansion)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -5330,6 +5481,7 @@ mod tests {
                 Some(5),
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -5401,6 +5553,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
                 false,
                 false,
             )
@@ -5494,6 +5647,7 @@ mod tests {
                 None,
                 false,
                 false,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5547,7 +5701,7 @@ mod tests {
 
         // Create a subtask in planning state (no git/worktree needed).
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -5556,6 +5710,7 @@ mod tests {
                 None,
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -5620,7 +5775,7 @@ mod tests {
         // Create a subtask and manually advance to active (simulating
         // what prepare_task does during schedule()).
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let task = db
             .create_task(
@@ -5631,6 +5786,7 @@ mod tests {
                 None,
                 false,
                 true, // skip_planning → starts in ready
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "ready");

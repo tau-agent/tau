@@ -931,6 +931,30 @@ pub fn dispatch_refining(
 
 /// Build the initial message for a refining session.
 fn build_refining_message(task: &Task, project_instructions: &str) -> String {
+    let approval_instructions = if task.require_approval {
+        format!(
+            "After your review:\n\
+             - If the plan is good: transition to interactive (human sign-off required) with \
+               `task_update` {{\"id\": {id}, \"state\": \"interactive\"}}\n\
+             - If the plan needs revision: add feedback via `task_message`, then send back to \
+               planning with `task_update` {{\"id\": {id}, \"state\": \"planning\"}}\n\
+             \n\
+             **Note**: This task has require_approval=true. The plan must be approved by a human \
+             before work begins. Transition to interactive instead of ready.\n",
+            id = task.id,
+        )
+    } else {
+        format!(
+            "After your review:\n\
+             - If the plan is good: transition to ready with `task_update` {{\"id\": {id}, \"state\": \"ready\"}}\n\
+             - If the plan needs revision: add feedback via `task_message`, then send back to \
+               planning with `task_update` {{\"id\": {id}, \"state\": \"planning\"}}\n\
+             - If the scope has expanded significantly and needs human sign-off: \
+               `task_update` {{\"id\": {id}, \"state\": \"interactive\"}}\n",
+            id = task.id,
+        )
+    };
+
     let mut msg = format!(
         "You are REFINING the plan for task {id}: {title}\n\
          \n\
@@ -948,14 +972,10 @@ fn build_refining_message(task: &Task, project_instructions: &str) -> String {
          \n\
          **Do NOT modify any files.** This is a review-only phase.\n\
          \n\
-         After your review:\n\
-         - If the plan is good: transition to ready with `task_update` {{\"id\": {id}, \"state\": \"ready\"}}\n\
-         - If the plan needs revision: add feedback via `task_message`, then send back to \
-           planning with `task_update` {{\"id\": {id}, \"state\": \"planning\"}}\n\
-         - If the scope has expanded significantly and needs human sign-off: \
-           `task_update` {{\"id\": {id}, \"state\": \"interactive\"}}\n",
+         {approval}\n",
         id = task.id,
         title = task.title,
+        approval = approval_instructions,
     );
 
     if !project_instructions.is_empty() {
@@ -1666,6 +1686,7 @@ mod tests {
             session_id: None,
             skip_review: false,
             skip_planning: false,
+            require_approval: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -1893,7 +1914,16 @@ mod tests {
         files: Option<&serde_json::Value>,
     ) -> crate::tasks_db::Task {
         let task = db
-            .create_task(project, title, Some(priority), None, None, true, true)
+            .create_task(
+                project,
+                title,
+                Some(priority),
+                None,
+                None,
+                true,
+                true,
+                false,
+            )
             .unwrap();
         // interactive -> ready
         db.update_task(
@@ -2052,7 +2082,16 @@ mod tests {
 
         // Create a task and move it to approved state
         let task = db
-            .create_task("/project", "Will be moved", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "Will be moved",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -2100,7 +2139,7 @@ mod tests {
 
         // Create and approve a task
         let task = db
-            .create_task("/project", "Merge me", None, None, None, true, false)
+            .create_task("/project", "Merge me", None, None, None, true, false, false)
             .unwrap();
         db.update_task(
             task.id,
@@ -2167,6 +2206,7 @@ mod tests {
                 None,
                 true,
                 false,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -2227,6 +2267,7 @@ mod tests {
                 None,
                 true,
                 false,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -2271,7 +2312,16 @@ mod tests {
 
         // Create a parent task with a session.
         let parent = db
-            .create_task("/project", "Parent task", Some(5), None, None, true, false)
+            .create_task(
+                "/project",
+                "Parent task",
+                Some(5),
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
 
@@ -2284,6 +2334,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 true,
+                false,
                 false,
             )
             .unwrap();
@@ -2326,7 +2377,16 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
 
         let task = db
-            .create_task("/project", "Test task", Some(5), None, None, true, false)
+            .create_task(
+                "/project",
+                "Test task",
+                Some(5),
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.record_session(task.id, "planner-session", "planner")
             .unwrap();
@@ -2506,6 +2566,8 @@ mod tests {
         assert!(msg.contains("task_get"));
         assert!(msg.contains("ready"));
         assert!(msg.contains("planning"));
+        // Default (require_approval=false): should not mention require_approval
+        assert!(!msg.contains("require_approval"));
     }
 
     #[test]
@@ -2517,12 +2579,40 @@ mod tests {
     }
 
     #[test]
+    fn test_build_refining_message_require_approval_true() {
+        let mut task = make_task(10, 0, None);
+        task.require_approval = true;
+        let msg = build_refining_message(&task, "");
+        assert!(msg.contains("REFINING the plan"));
+        assert!(msg.contains("task 10"));
+        // require_approval=true: should instruct to go to interactive, not ready
+        assert!(msg.contains("interactive"));
+        assert!(msg.contains("require_approval=true"));
+        assert!(msg.contains("human"));
+        // Should NOT contain transition to ready as the approval action
+        assert!(!msg.contains("\"state\": \"ready\""));
+        // Should still mention planning as the revision action
+        assert!(msg.contains("\"state\": \"planning\""));
+    }
+
+    #[test]
+    fn test_build_refining_message_require_approval_false() {
+        let mut task = make_task(10, 0, None);
+        task.require_approval = false;
+        let msg = build_refining_message(&task, "");
+        // require_approval=false: should instruct to go to ready
+        assert!(msg.contains("\"state\": \"ready\""));
+        // Should also mention interactive as a scope expansion option
+        assert!(msg.contains("\"state\": \"interactive\""));
+    }
+
+    #[test]
     fn test_schedule_includes_planning_tasks() {
         let db = TasksDb::open_memory().unwrap();
 
         // Create a parent task, then a subtask (which defaults to planning)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let child = db
             .create_task(
@@ -2531,6 +2621,7 @@ mod tests {
                 None,
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )
@@ -2548,7 +2639,16 @@ mod tests {
 
         // Create a task in planning state
         let task = db
-            .create_task("/project", "Interactive", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "Interactive",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -2633,7 +2733,7 @@ mod tests {
     fn test_get_status_planning_tasks() {
         let db = TasksDb::open_memory().unwrap();
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         let child = db
             .create_task(
@@ -2642,6 +2742,7 @@ mod tests {
                 None,
                 Some(parent.id),
                 None,
+                false,
                 false,
                 false,
             )

@@ -682,7 +682,16 @@ command = "cargo test"
 
     fn make_merging_task(db: &TasksDb) -> i64 {
         let task = db
-            .create_task("/project", "Test merge", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "Test merge",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         // interactive -> ready
         db.update_task(
@@ -725,7 +734,16 @@ command = "cargo test"
     fn test_merge_task_requires_merging_state() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Not merging", None, None, None, false, false)
+            .create_task(
+                "/project",
+                "Not merging",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
 
         // We can't call merge_task without real I/O, but we can validate
@@ -744,7 +762,16 @@ command = "cargo test"
     fn test_merge_task_requires_branch() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "No branch", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "No branch",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -791,7 +818,16 @@ command = "cargo test"
     fn test_merge_task_requires_worktree() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "No worktree", None, None, None, true, false)
+            .create_task(
+                "/project",
+                "No worktree",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -843,7 +879,7 @@ command = "cargo test"
 
         // Create parent
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
 
@@ -857,6 +893,7 @@ command = "cargo test"
                 None,
                 false,
                 true,
+                false,
             )
             .unwrap();
         let child2 = db
@@ -868,6 +905,7 @@ command = "cargo test"
                 None,
                 false,
                 true,
+                false,
             )
             .unwrap();
 
@@ -930,7 +968,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
 
@@ -943,6 +981,7 @@ command = "cargo test"
                 None,
                 false,
                 true,
+                false,
             )
             .unwrap();
         let _child2 = db
@@ -954,6 +993,7 @@ command = "cargo test"
                 None,
                 false,
                 true,
+                false,
             )
             .unwrap();
 
@@ -1011,7 +1051,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let task = db
-            .create_task("/project", "Root", None, None, None, false, false)
+            .create_task("/project", "Root", None, None, None, false, false, false)
             .unwrap();
 
         let mut writer: Vec<u8> = Vec::new();
@@ -1026,7 +1066,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -1040,6 +1080,7 @@ command = "cargo test"
                 None,
                 false,
                 true,
+                false,
             )
             .unwrap();
 
@@ -1130,7 +1171,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
 
@@ -1143,6 +1184,7 @@ command = "cargo test"
                 None,
                 false,
                 true,
+                false,
             )
             .unwrap();
 
@@ -1188,7 +1230,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let task = db
-            .create_task("/project", "Root", None, None, None, false, false)
+            .create_task("/project", "Root", None, None, None, false, false, false)
             .unwrap();
 
         let mut writer: Vec<u8> = Vec::new();
@@ -1204,7 +1246,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false)
+            .create_task("/project", "Parent", None, None, None, false, false, false)
             .unwrap();
         // Don't set session_id on parent
 
@@ -1217,6 +1259,7 @@ command = "cargo test"
                 None,
                 false,
                 true,
+                false,
             )
             .unwrap();
 

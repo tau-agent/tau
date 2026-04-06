@@ -112,6 +112,9 @@ enum TaskAction {
         /// Skip planning step (subtask starts in ready instead of planning)
         #[arg(long)]
         skip_planning: bool,
+        /// Require human approval before work begins (refining goes to interactive instead of ready)
+        #[arg(long)]
+        require_approval: bool,
         /// Priority (higher = more important)
         #[arg(long, default_value = "0")]
         priority: i64,
@@ -1760,6 +1763,7 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
 
             let skip = if task.skip_review { "yes" } else { "no" };
             let skip_plan = if task.skip_planning { "yes" } else { "no" };
+            let require_approval = if task.require_approval { "yes" } else { "no" };
             let branch = task.branch.as_deref().unwrap_or("none");
             let parent = task
                 .parent_id
@@ -1798,8 +1802,8 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
 
             println!("Task #{}: {}", task.id, task.title);
             println!(
-                "State: {} | Priority: {} | Skip review: {} | Skip planning: {}",
-                task.state, task.priority, skip, skip_plan
+                "State: {} | Priority: {} | Skip review: {} | Skip planning: {} | Require approval: {}",
+                task.state, task.priority, skip, skip_plan, require_approval
             );
             println!("Branch: {} | Parent: {}", branch, parent);
             println!("Tags: {}", tags);
@@ -1854,6 +1858,7 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
             parent,
             skip_review,
             skip_planning,
+            require_approval,
             priority,
         } => {
             let project = project_key();
@@ -1865,6 +1870,7 @@ fn cmd_task(action: TaskAction) -> tau::Result<()> {
                 None,
                 skip_review,
                 skip_planning,
+                require_approval,
             )?;
             println!("created task #{}: {}", task.id, task.title);
         }
