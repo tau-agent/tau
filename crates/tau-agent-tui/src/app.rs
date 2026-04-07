@@ -134,6 +134,14 @@ pub struct App {
     pub picker_edit_tagline: Option<(usize, String, usize)>,
     /// Set of session IDs whose subtrees are folded (children hidden).
     pub picker_folded: std::collections::HashSet<String>,
+    /// Whether a text block in the current turn has already been
+    /// finalized by a `StreamEvent::TextEnd`.  Used by `StreamEvent::Done`
+    /// to suppress its fallback append branch when `TextEnd` has already
+    /// converted the in-flight placeholder to its final `Assistant` form
+    /// — without this flag the fallback would duplicate every text-only
+    /// turn (regression from task #421).  Reset at the end of each turn
+    /// and by `Start`/`Error`.
+    pub turn_text_finalized: bool,
 }
 
 /// Saved state when navigating to a child session.
@@ -198,6 +206,7 @@ impl App {
             picker_filter_mode: false,
             picker_edit_tagline: None,
             picker_folded: std::collections::HashSet::new(),
+            turn_text_finalized: false,
         }
     }
 
@@ -1932,6 +1941,11 @@ impl App {
                 self.messages.push(MessageItem::AssistantStreaming {
                     text: String::new(),
                 });
+                // New turn starts: clear any stale finalization flag from
+                // a prior turn.  `Done` is normally responsible for
+                // resetting this, but be defensive in case of
+                // event-ordering quirks.
+                self.turn_text_finalized = false;
             }
             StreamEvent::TextDelta { delta, .. } => {
                 // Append to current streaming message
@@ -1949,6 +1963,9 @@ impl App {
                     && let MessageItem::AssistantStreaming { text } = item
                 {
                     *item = MessageItem::Assistant { text: text.clone() };
+                    // Record that this turn already has a finalized text
+                    // block so `Done` knows not to re-append it.
+                    self.turn_text_finalized = true;
                 }
             }
             StreamEvent::ThinkingStart { .. } => {
@@ -2080,13 +2097,26 @@ impl App {
                     // Convert the in-flight streaming placeholder to its
                     // final form.
                     *item = MessageItem::Assistant { text: final_text };
-                } else if !final_text.is_empty() {
-                    // No streaming placeholder (e.g. server sent Done
-                    // without prior text deltas) — append the final text
-                    // as a fresh assistant message so it isn't lost.
+                } else if !final_text.is_empty() && !self.turn_text_finalized {
+                    // No streaming placeholder and `TextEnd` has not
+                    // already finalized a text block for this turn (e.g.
+                    // server sent `Done` without any prior text
+                    // deltas) — append the final text as a fresh
+                    // assistant message so it isn't lost.
+                    //
+                    // The `turn_text_finalized` guard fixes the
+                    // regression from task #421: for a normal text-only
+                    // turn, `TextEnd` converts the `AssistantStreaming`
+                    // placeholder to `Assistant` *before* `Done` arrives,
+                    // so without this guard the fallback branch would
+                    // append a second copy of the message.
                     self.messages
                         .push(MessageItem::Assistant { text: final_text });
                 }
+
+                // Reset the per-turn finalization flag so the next turn
+                // starts clean.
+                self.turn_text_finalized = false;
 
                 // Treat Done as authoritative: clear streaming mode here
                 // rather than waiting for a separate `Phase::Idle` event,
@@ -2123,6 +2153,9 @@ impl App {
                 self.messages.push(MessageItem::Error { text: msg });
                 self.phase = AgentPhase::Idle;
                 self.mode = AppMode::Input;
+                // Reset the per-turn finalization flag so the next turn
+                // starts clean.
+                self.turn_text_finalized = false;
             }
             StreamEvent::Status { message } => {
                 self.messages.push(MessageItem::Status { text: message });
@@ -2472,5 +2505,196 @@ mod tests {
             Some(MessageItem::Error { .. })
         ));
         assert_eq!(app.mode, AppMode::Input);
+    }
+
+    /// Regression test for task #425: a normal text-only turn
+    /// (Start → TextStart → TextDelta → TextEnd → Done) must result in
+    /// *exactly one* final `Assistant` message, not two.  Before the
+    /// fix, `TextEnd` converted the streaming placeholder to `Assistant`
+    /// and then `Done`'s fallback branch appended a duplicate copy.
+    #[test]
+    fn normal_text_turn_renders_once_not_twice() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+
+        // 1. Start: push streaming placeholder.
+        app.handle_stream_event(StreamEvent::Start {
+            partial: assistant_message("", StopReason::Stop, None),
+        });
+        // 2. TextStart: noop (placeholder already present).
+        app.handle_stream_event(StreamEvent::TextStart {
+            content_index: 0,
+            partial: assistant_message("", StopReason::Stop, None),
+        });
+        // 3. TextDelta × 2: append to placeholder.
+        app.handle_stream_event(StreamEvent::TextDelta {
+            content_index: 0,
+            delta: "hello ".to_string(),
+            partial: assistant_message("hello ", StopReason::Stop, None),
+        });
+        app.handle_stream_event(StreamEvent::TextDelta {
+            content_index: 0,
+            delta: "world".to_string(),
+            partial: assistant_message("hello world", StopReason::Stop, None),
+        });
+        // 4. TextEnd: convert placeholder to final Assistant.
+        app.handle_stream_event(StreamEvent::TextEnd {
+            content_index: 0,
+            content: "hello world".to_string(),
+            partial: assistant_message("hello world", StopReason::Stop, None),
+        });
+        // 5. Done: final message carries the same text.
+        app.handle_stream_event(StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: assistant_message("hello world", StopReason::Stop, None),
+        });
+
+        // Exactly one Assistant message, no duplicates, no dangling
+        // streaming placeholder.
+        let assistant_count = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m, MessageItem::Assistant { .. }))
+            .count();
+        assert_eq!(
+            assistant_count, 1,
+            "expected exactly one Assistant message, got {assistant_count}: {:?}",
+            app.messages
+        );
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::AssistantStreaming { .. })),
+            "streaming placeholder should have been finalized"
+        );
+        match app
+            .messages
+            .iter()
+            .find(|m| matches!(m, MessageItem::Assistant { .. }))
+        {
+            Some(MessageItem::Assistant { text }) => assert_eq!(text, "hello world"),
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+        // `Done` clears the per-turn finalization flag so the next turn
+        // starts clean.
+        assert!(!app.turn_text_finalized);
+        assert_eq!(app.mode, AppMode::Input);
+        assert_eq!(app.phase, AgentPhase::Idle);
+    }
+
+    /// Safety-net path from task #421: `Done` arrives with text content
+    /// but no prior `Start`/`TextStart`/`TextDelta`/`TextEnd` events
+    /// (e.g. a server shortcut path) — the message must still be
+    /// rendered exactly once.
+    #[test]
+    fn done_without_any_text_events_appends_exactly_once() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        // No prior events: `turn_text_finalized` stays false.
+
+        app.handle_stream_event(StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: assistant_message("solo response", StopReason::Stop, None),
+        });
+
+        let assistant_count = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m, MessageItem::Assistant { .. }))
+            .count();
+        assert_eq!(assistant_count, 1);
+        match app
+            .messages
+            .iter()
+            .find(|m| matches!(m, MessageItem::Assistant { .. }))
+        {
+            Some(MessageItem::Assistant { text }) => assert_eq!(text, "solo response"),
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+        assert_eq!(app.mode, AppMode::Input);
+    }
+
+    /// Task #421's original concern: `Done` with empty content and
+    /// `StopReason::Error` yields a *single* `Error` item (and no stray
+    /// duplicates via the text fallback).
+    #[test]
+    fn done_with_empty_error_produces_exactly_one_error() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.messages.push(MessageItem::AssistantStreaming {
+            text: String::new(),
+        });
+
+        app.handle_stream_event(StreamEvent::Done {
+            reason: StopReason::Error,
+            message: assistant_message("", StopReason::Error, Some("boom")),
+        });
+
+        let error_count = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m, MessageItem::Error { .. }))
+            .count();
+        assert_eq!(error_count, 1);
+        let assistant_count = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m, MessageItem::Assistant { .. }))
+            .count();
+        assert_eq!(assistant_count, 0);
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::AssistantStreaming { .. })),
+            "no dangling streaming placeholder"
+        );
+    }
+
+    /// Simulate two consecutive text-only turns in a row.  The flag
+    /// must be reset by the first `Done` so the second turn behaves
+    /// identically and produces exactly one message (not two and not
+    /// zero).
+    #[test]
+    fn two_consecutive_text_turns_each_render_once() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+
+        for text in ["first reply", "second reply"] {
+            app.handle_stream_event(StreamEvent::Start {
+                partial: assistant_message("", StopReason::Stop, None),
+            });
+            app.handle_stream_event(StreamEvent::TextStart {
+                content_index: 0,
+                partial: assistant_message("", StopReason::Stop, None),
+            });
+            app.handle_stream_event(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: text.to_string(),
+                partial: assistant_message(text, StopReason::Stop, None),
+            });
+            app.handle_stream_event(StreamEvent::TextEnd {
+                content_index: 0,
+                content: text.to_string(),
+                partial: assistant_message(text, StopReason::Stop, None),
+            });
+            app.handle_stream_event(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message: assistant_message(text, StopReason::Stop, None),
+            });
+        }
+
+        let assistant_texts: Vec<&str> = app
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                MessageItem::Assistant { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistant_texts,
+            vec!["first reply", "second reply"],
+            "each turn should produce exactly one Assistant message in order"
+        );
     }
 }
