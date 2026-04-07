@@ -3,9 +3,9 @@
 use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui_textarea::TextArea;
 
-use tau::auth::SubscriptionUsage;
-use tau::protocol::{Response, SessionInfo};
-use tau::types::{
+use tau_agent::auth::SubscriptionUsage;
+use tau_agent::protocol::{Response, SessionInfo};
+use tau_agent::types::{
     AgentPhase, AssistantContent, Message, StreamEvent, ToolResultMessage, UserContent,
 };
 
@@ -14,7 +14,7 @@ use crate::message::MessageItem;
 use crate::render::RendererRegistry;
 use crate::theme::Theme;
 
-/// Cumulative usage tracking (mirrored from tau-cli).
+/// Cumulative usage tracking (mirrored from tau-agent-cli).
 #[derive(Default)]
 pub struct UsageTotals {
     pub input: u64,
@@ -28,7 +28,7 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    pub fn add(&mut self, usage: &tau::Usage) {
+    pub fn add(&mut self, usage: &tau_agent::Usage) {
         self.input += usage.input;
         self.output += usage.output;
         self.cache_read += usage.cache_read;
@@ -260,7 +260,7 @@ impl App {
                     let output = content
                         .iter()
                         .filter_map(|c| match c {
-                            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -1112,7 +1112,11 @@ impl App {
 
     /// Switch to a new session, replacing current state.
     /// Call `save_nav_state()` first if you want to preserve the current session.
-    pub fn switch_to_session(&mut self, info: &tau::protocol::SessionInfo, messages: Vec<Message>) {
+    pub fn switch_to_session(
+        &mut self,
+        info: &tau_agent::protocol::SessionInfo,
+        messages: Vec<Message>,
+    ) {
         self.session_id = info.id.clone();
         self.model = info.model.clone();
         self.provider = info.provider.clone();
@@ -1472,17 +1476,17 @@ impl App {
             .to_string()
     }
 
-    fn run_task_status(&mut self) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
+    fn run_task_status(&mut self) -> tau_agent::Result<()> {
+        let db = tau_agent::tasks_db::TasksDb::open_default()?;
         let project = self.task_project();
-        let status = tau::tasks_scheduler::get_status(&db, &project)?;
-        let output = tau::tasks_scheduler::format_status(&status);
+        let status = tau_agent::tasks_scheduler::get_status(&db, &project)?;
+        let output = tau_agent::tasks_scheduler::format_status(&status);
         self.messages.push(MessageItem::Status { text: output });
         Ok(())
     }
 
-    fn run_task_merge_queue(&mut self) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
+    fn run_task_merge_queue(&mut self) -> tau_agent::Result<()> {
+        let db = tau_agent::tasks_db::TasksDb::open_default()?;
         let project = self.task_project();
         let approved = db.list_tasks(&project, Some("approved"), None, None, None)?;
         let merging = db.list_tasks(&project, Some("merging"), None, None, None)?;
@@ -1510,8 +1514,8 @@ impl App {
         Ok(())
     }
 
-    fn run_task_list(&mut self, state_filter: Option<&str>) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
+    fn run_task_list(&mut self, state_filter: Option<&str>) -> tau_agent::Result<()> {
+        let db = tau_agent::tasks_db::TasksDb::open_default()?;
         let project = self.task_project();
         let tasks = db.list_tasks(&project, state_filter, None, None, None)?;
         if tasks.is_empty() {
@@ -1520,7 +1524,7 @@ impl App {
             });
             return Ok(());
         }
-        let tree = tau::tasks_db::tree_order(tasks);
+        let tree = tau_agent::tasks_db::tree_order(tasks);
         self.messages.push(MessageItem::Status {
             text: format!(
                 "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
@@ -1543,11 +1547,11 @@ impl App {
         Ok(())
     }
 
-    fn run_task_get(&mut self, id: i64) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
+    fn run_task_get(&mut self, id: i64) -> tau_agent::Result<()> {
+        let db = tau_agent::tasks_db::TasksDb::open_default()?;
         let task = db
             .get_task(id)?
-            .ok_or_else(|| tau::Error::Io(format!("task {} not found", id)))?;
+            .ok_or_else(|| tau_agent::Error::Io(format!("task {} not found", id)))?;
 
         let skip = if task.skip_review { "yes" } else { "no" };
         let branch = task.branch.as_deref().unwrap_or("none");
@@ -1604,8 +1608,8 @@ impl App {
         Ok(())
     }
 
-    fn run_task_create(&mut self, title: &str) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
+    fn run_task_create(&mut self, title: &str) -> tau_agent::Result<()> {
+        let db = tau_agent::tasks_db::TasksDb::open_default()?;
         let project = self.task_project();
         let task = db.create_task(&project, title, None, None, None, false, false, false)?;
         self.messages.push(MessageItem::Status {
@@ -1614,8 +1618,8 @@ impl App {
         Ok(())
     }
 
-    fn run_task_search(&mut self, query: &str) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
+    fn run_task_search(&mut self, query: &str) -> tau_agent::Result<()> {
+        let db = tau_agent::tasks_db::TasksDb::open_default()?;
         let project = self.task_project();
         let tasks = db.search_tasks(&project, query, None)?;
         if tasks.is_empty() {
@@ -1645,9 +1649,9 @@ impl App {
         Ok(())
     }
 
-    fn run_task_state_change(&mut self, id: i64, new_state: &str) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
-        let update = tau::tasks_db::TaskUpdate {
+    fn run_task_state_change(&mut self, id: i64, new_state: &str) -> tau_agent::Result<()> {
+        let db = tau_agent::tasks_db::TasksDb::open_default()?;
+        let update = tau_agent::tasks_db::TaskUpdate {
             state: Some(new_state.to_string()),
             ..Default::default()
         };
@@ -1658,8 +1662,8 @@ impl App {
         Ok(())
     }
 
-    fn run_task_claim(&mut self, id: i64) -> tau::Result<()> {
-        let db = tau::tasks_db::TasksDb::open_default()?;
+    fn run_task_claim(&mut self, id: i64) -> tau_agent::Result<()> {
+        let db = tau_agent::tasks_db::TasksDb::open_default()?;
         let result = db.assign_task(id, &self.session_id)?;
         self.messages.push(MessageItem::Status {
             text: format!("Claimed task #{}: {}", result.task.id, result.task.title),
@@ -1835,7 +1839,7 @@ impl App {
                 });
             }
             Response::SessionInfo { info } => {
-                let stats_str = tau::protocol::format_stats(&info.stats);
+                let stats_str = tau_agent::protocol::format_stats(&info.stats);
                 self.messages.push(MessageItem::Status {
                     text: format!(
                         "session: {} | {}/{} | {} msgs | {}",
@@ -1891,7 +1895,7 @@ impl App {
                         text: format!("{} child session(s):", children.len()),
                     });
                     for s in &children {
-                        let stats = tau::protocol::format_stats(&s.stats);
+                        let stats = tau_agent::protocol::format_stats(&s.stats);
                         self.messages.push(MessageItem::Status {
                             text: format!(
                                 "  {}  {}/{}  {} msgs  {}",

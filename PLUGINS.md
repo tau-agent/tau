@@ -336,4 +336,4 @@ View with `tau server start --foreground`.
 
 See `tests/test_plugin.py` for a complete example exercising all features (tools, streaming, hooks, errors).
 
-See `crates/tau/src/plugin.rs` for the Rust implementation and protocol types.
+See `crates/tau-agent/src/plugin.rs` for the Rust implementation and protocol types.

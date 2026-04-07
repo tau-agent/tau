@@ -7,7 +7,7 @@ use crossterm::event::{Event as CtEvent, EventStream};
 use futures::StreamExt;
 use smol::channel::Receiver;
 
-use tau::protocol::Response;
+use tau_agent::protocol::Response;
 
 /// Events the TUI reacts to.
 #[derive(Debug)]

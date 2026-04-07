@@ -7,8 +7,8 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use tau::protocol::{Request, Response};
-use tau::providers::mock::{MockProvider, MockResponse, mock_model};
+use tau_agent::protocol::{Request, Response};
+use tau_agent::providers::mock::{MockProvider, MockResponse, mock_model};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -393,9 +393,9 @@ fn server_chat_simple_text() {
                 messages.len(),
                 messages
             );
-            assert!(matches!(&messages[0], tau::types::Message::User(_)));
+            assert!(matches!(&messages[0], tau_agent::types::Message::User(_)));
             assert!(
-                matches!(&messages[1], tau::types::Message::Assistant(a) if a.text().contains("Hello from mock!"))
+                matches!(&messages[1], tau_agent::types::Message::Assistant(a) if a.text().contains("Hello from mock!"))
             );
         }
         other => panic!("expected Messages, got {:?}", other),
@@ -410,7 +410,7 @@ fn server_chat_tool_call_loop() {
     // The important thing is that the server handles this gracefully and
     // persists all messages (including the error tool result).
     let server = TestServer::start(vec![
-        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+        MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
             id: "tc1".into(),
             name: "nonexistent_tool".into(),
             arguments: serde_json::json!({"arg": "value"}),
@@ -467,10 +467,18 @@ fn server_chat_tool_call_loop() {
                 messages.len(),
                 messages
             );
-            assert!(matches!(&messages[0], tau::types::Message::User(_)));
-            assert!(matches!(&messages[1], tau::types::Message::Assistant(_)));
-            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if tr.is_error));
-            assert!(matches!(&messages[3], tau::types::Message::Assistant(_)));
+            assert!(matches!(&messages[0], tau_agent::types::Message::User(_)));
+            assert!(matches!(
+                &messages[1],
+                tau_agent::types::Message::Assistant(_)
+            ));
+            assert!(
+                matches!(&messages[2], tau_agent::types::Message::ToolResult(tr) if tr.is_error)
+            );
+            assert!(matches!(
+                &messages[3],
+                tau_agent::types::Message::Assistant(_)
+            ));
         }
         other => panic!("expected Messages, got {:?}", other),
     }
@@ -483,7 +491,7 @@ fn server_chat_error_preserves_partial_messages() {
     // First response is a tool call (will error since no worker), second mock not reached.
     // The important thing: partial messages (assistant + error tool_result) are persisted.
     let server = TestServer::start(vec![
-        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+        MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
             id: "tc1".into(),
             name: "some_tool".into(),
             arguments: serde_json::json!({"x": 1}),
@@ -541,9 +549,15 @@ fn server_chat_error_preserves_partial_messages() {
                 messages.len(),
                 messages
             );
-            assert!(matches!(&messages[0], tau::types::Message::User(_)));
-            assert!(matches!(&messages[1], tau::types::Message::Assistant(_)));
-            assert!(matches!(&messages[2], tau::types::Message::ToolResult(_)));
+            assert!(matches!(&messages[0], tau_agent::types::Message::User(_)));
+            assert!(matches!(
+                &messages[1],
+                tau_agent::types::Message::Assistant(_)
+            ));
+            assert!(matches!(
+                &messages[2],
+                tau_agent::types::Message::ToolResult(_)
+            ));
         }
         other => panic!("expected Messages, got {:?}", other),
     }
@@ -560,12 +574,12 @@ fn server_session_resume_after_restart() {
 
     // Start server 1
     let model = mock_model();
-    let mut registry = tau::provider::ProviderRegistry::new();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
     registry.register(MockProvider::new(vec![MockResponse::Text(
         "first response".into(),
     )]));
 
-    let config = tau::server::TestServerConfig {
+    let config = tau_agent::server::TestServerConfig {
         registry,
         models: vec![model],
         socket_path: sock_path.clone(),
@@ -577,7 +591,7 @@ fn server_session_resume_after_restart() {
 
     let handle = std::thread::spawn(move || {
         smol::block_on(async {
-            tau::server::run_with_config(config).await.ok();
+            tau_agent::server::run_with_config(config).await.ok();
         });
     });
 
@@ -632,10 +646,10 @@ fn server_session_resume_after_restart() {
     // Start server 2 with same DB
     std::fs::remove_file(&sock_path).ok();
     let model2 = mock_model();
-    let mut registry2 = tau::provider::ProviderRegistry::new();
+    let mut registry2 = tau_agent::provider::ProviderRegistry::new();
     registry2.register(MockProvider::new(vec![]));
 
-    let config2 = tau::server::TestServerConfig {
+    let config2 = tau_agent::server::TestServerConfig {
         registry: registry2,
         models: vec![model2],
         socket_path: sock_path.clone(),
@@ -647,7 +661,7 @@ fn server_session_resume_after_restart() {
 
     let _handle2 = std::thread::spawn(move || {
         smol::block_on(async {
-            tau::server::run_with_config(config2).await.ok();
+            tau_agent::server::run_with_config(config2).await.ok();
         });
     });
 
@@ -776,9 +790,11 @@ fn steer_queues_message_for_idle_session() {
                 messages
             );
             let has_injected = messages.iter().any(|m| {
-                if let tau::types::Message::User(u) = m {
+                if let tau_agent::types::Message::User(u) = m {
                     u.content.iter().any(|c| match c {
-                        tau::types::UserContent::Text(t) => t.text.contains("injected message"),
+                        tau_agent::types::UserContent::Text(t) => {
+                            t.text.contains("injected message")
+                        }
                         _ => false,
                     })
                 } else {
@@ -835,11 +851,11 @@ fn queue_message_persists_across_operations() {
     // This tests the DB methods directly without needing a server.
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
-    let db = tau::db::Db::open(&db_path).unwrap();
+    let db = tau_agent::db::Db::open(&db_path).unwrap();
 
     // Create a session
-    let model = tau::providers::mock::mock_model();
-    db.create_session(&tau::db::StoredSession {
+    let model = tau_agent::providers::mock::mock_model();
+    db.create_session(&tau_agent::db::StoredSession {
         id: "s1".into(),
         model,
         system_prompt: None,
@@ -885,7 +901,7 @@ fn queue_message_persists_across_operations() {
 #[test]
 fn server_chat_with_mock_tool_success() {
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -893,7 +909,7 @@ fn server_chat_with_mock_tool_success() {
     tool_handle.on_tool("read_file", MockToolResponse::Success("hello world".into()));
 
     let provider = MockProvider::new(vec![
-        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+        MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
             id: "tc1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/tmp/test.txt"}),
@@ -902,7 +918,7 @@ fn server_chat_with_mock_tool_success() {
     ]);
     let provider_handle = provider.handle();
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || {
             let h = tool_handle.clone();
             Box::new(h.executor())
@@ -913,10 +929,10 @@ fn server_chat_with_mock_tool_success() {
     let db_path = dir.path().join("test.db");
 
     let model = mock_model();
-    let mut registry = tau::provider::ProviderRegistry::new();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
     registry.register(provider);
 
-    let config = tau::server::TestServerConfig {
+    let config = tau_agent::server::TestServerConfig {
         registry,
         models: vec![model],
         socket_path: sock_path.clone(),
@@ -928,7 +944,7 @@ fn server_chat_with_mock_tool_success() {
 
     std::thread::spawn(move || {
         smol::block_on(async {
-            if let Err(e) = tau::server::run_with_config(config).await {
+            if let Err(e) = tau_agent::server::run_with_config(config).await {
                 eprintln!("test server error: {}", e);
             }
         });
@@ -1001,12 +1017,17 @@ fn server_chat_with_mock_tool_success() {
                 messages.len(),
                 messages
             );
-            assert!(matches!(&messages[0], tau::types::Message::User(_)));
-            assert!(matches!(&messages[1], tau::types::Message::Assistant(_)));
+            assert!(matches!(&messages[0], tau_agent::types::Message::User(_)));
+            assert!(matches!(
+                &messages[1],
+                tau_agent::types::Message::Assistant(_)
+            ));
             // Tool result should NOT be an error (mock returned Success)
-            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if !tr.is_error));
             assert!(
-                matches!(&messages[3], tau::types::Message::Assistant(a) if a.text().contains("hello world"))
+                matches!(&messages[2], tau_agent::types::Message::ToolResult(tr) if !tr.is_error)
+            );
+            assert!(
+                matches!(&messages[3], tau_agent::types::Message::Assistant(a) if a.text().contains("hello world"))
             );
         }
         other => panic!("expected Messages, got {:?}", other),
@@ -1022,8 +1043,8 @@ fn server_chat_with_mock_tool_success() {
     assert_eq!(captures.len(), 2);
     let second_ctx = &captures[1].context;
     assert!(second_ctx.messages.iter().any(
-        |m| matches!(m, tau::types::Message::ToolResult(tr) if tr.content.iter().any(|c|
-            matches!(c, tau::types::ToolResultContent::Text(t) if t.text.contains("hello world"))
+        |m| matches!(m, tau_agent::types::Message::ToolResult(tr) if tr.content.iter().any(|c|
+            matches!(c, tau_agent::types::ToolResultContent::Text(t) if t.text.contains("hello world"))
         ))
     ));
 
@@ -1040,7 +1061,7 @@ fn server_chat_with_mock_tool_error() {
     // Test that a tool returning is_error=true is handled correctly:
     // the error result is passed back to the LLM which can respond.
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -1051,7 +1072,7 @@ fn server_chat_with_mock_tool_error() {
     );
 
     let provider = MockProvider::new(vec![
-        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+        MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
             id: "tc1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/etc/shadow"}),
@@ -1060,7 +1081,7 @@ fn server_chat_with_mock_tool_error() {
     ]);
     let provider_handle = provider.handle();
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || {
             let h = tool_handle.clone();
             Box::new(h.executor())
@@ -1068,7 +1089,7 @@ fn server_chat_with_mock_tool_error() {
 
     let server = TestServer::start_with_config(vec![], |mut config| {
         config.registry = {
-            let mut r = tau::provider::ProviderRegistry::new();
+            let mut r = tau_agent::provider::ProviderRegistry::new();
             r.register(provider);
             r
         };
@@ -1117,7 +1138,9 @@ fn server_chat_with_mock_tool_error() {
     match resp {
         Response::Messages { messages } => {
             assert_eq!(messages.len(), 4);
-            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if tr.is_error));
+            assert!(
+                matches!(&messages[2], tau_agent::types::Message::ToolResult(tr) if tr.is_error)
+            );
         }
         other => panic!("{:?}", other),
     }
@@ -1127,9 +1150,9 @@ fn server_chat_with_mock_tool_error() {
     assert_eq!(captures.len(), 2);
     let second_ctx = &captures[1].context;
     assert!(second_ctx.messages.iter().any(|m|
-        matches!(m, tau::types::Message::ToolResult(tr)
+        matches!(m, tau_agent::types::Message::ToolResult(tr)
             if tr.is_error && tr.content.iter().any(|c|
-                matches!(c, tau::types::ToolResultContent::Text(t) if t.text.contains("permission denied"))
+                matches!(c, tau_agent::types::ToolResultContent::Text(t) if t.text.contains("permission denied"))
             )
         )
     ));
@@ -1146,7 +1169,7 @@ fn server_chat_with_mock_tool_error() {
 fn server_chat_multi_tool_calls() {
     // Test multiple tool calls in a single turn, each with different mock results.
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -1162,12 +1185,12 @@ fn server_chat_multi_tool_calls() {
 
     let provider = MockProvider::new(vec![
         MockResponse::ToolCalls(vec![
-            tau::types::ToolCall {
+            tau_agent::types::ToolCall {
                 id: "tc1".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": "a.txt"}),
             },
-            tau::types::ToolCall {
+            tau_agent::types::ToolCall {
                 id: "tc2".into(),
                 name: "list_dir".into(),
                 arguments: serde_json::json!({"path": "/tmp"}),
@@ -1177,7 +1200,7 @@ fn server_chat_multi_tool_calls() {
     ]);
     let provider_handle = provider.handle();
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || {
             let h = tool_handle.clone();
             Box::new(h.executor())
@@ -1185,7 +1208,7 @@ fn server_chat_multi_tool_calls() {
 
     let server = TestServer::start_with_config(vec![], |mut config| {
         config.registry = {
-            let mut r = tau::provider::ProviderRegistry::new();
+            let mut r = tau_agent::provider::ProviderRegistry::new();
             r.register(provider);
             r
         };
@@ -1238,8 +1261,12 @@ fn server_chat_multi_tool_calls() {
         Response::Messages { messages } => {
             // user + assistant + tool_result + tool_result + assistant = 5
             assert_eq!(messages.len(), 5, "got {:?}", messages);
-            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if !tr.is_error));
-            assert!(matches!(&messages[3], tau::types::Message::ToolResult(tr) if !tr.is_error));
+            assert!(
+                matches!(&messages[2], tau_agent::types::Message::ToolResult(tr) if !tr.is_error)
+            );
+            assert!(
+                matches!(&messages[3], tau_agent::types::Message::ToolResult(tr) if !tr.is_error)
+            );
         }
         other => panic!("{:?}", other),
     }
@@ -1257,7 +1284,7 @@ fn server_chat_multi_tool_calls() {
         .context
         .messages
         .iter()
-        .filter(|m| matches!(m, tau::types::Message::ToolResult(_)))
+        .filter(|m| matches!(m, tau_agent::types::Message::ToolResult(_)))
         .collect();
     assert_eq!(tool_results.len(), 2);
 
@@ -1269,7 +1296,7 @@ fn server_chat_multi_turn_tool_loop() {
     // Test: LLM makes tool call → gets result → makes another tool call → gets result → text
     // This verifies the agent loop handles multiple consecutive tool turns correctly.
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -1285,13 +1312,13 @@ fn server_chat_multi_turn_tool_loop() {
 
     let provider = MockProvider::new(vec![
         // Turn 1: LLM calls list_dir
-        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+        MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
             id: "tc1".into(),
             name: "list_dir".into(),
             arguments: serde_json::json!({"path": "."}),
         }]),
         // Turn 2: LLM sees directory listing, calls read_file
-        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+        MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
             id: "tc2".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "readme.md"}),
@@ -1301,7 +1328,7 @@ fn server_chat_multi_turn_tool_loop() {
     ]);
     let provider_handle = provider.handle();
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || {
             let h = tool_handle.clone();
             Box::new(h.executor())
@@ -1309,7 +1336,7 @@ fn server_chat_multi_turn_tool_loop() {
 
     let server = TestServer::start_with_config(vec![], |mut config| {
         config.registry = {
-            let mut r = tau::provider::ProviderRegistry::new();
+            let mut r = tau_agent::provider::ProviderRegistry::new();
             r.register(provider);
             r
         };
@@ -1368,13 +1395,23 @@ fn server_chat_multi_turn_tool_loop() {
                 messages.len(),
                 messages
             );
-            assert!(matches!(&messages[0], tau::types::Message::User(_)));
-            assert!(matches!(&messages[1], tau::types::Message::Assistant(_)));
-            assert!(matches!(&messages[2], tau::types::Message::ToolResult(tr) if !tr.is_error));
-            assert!(matches!(&messages[3], tau::types::Message::Assistant(_)));
-            assert!(matches!(&messages[4], tau::types::Message::ToolResult(tr) if !tr.is_error));
+            assert!(matches!(&messages[0], tau_agent::types::Message::User(_)));
+            assert!(matches!(
+                &messages[1],
+                tau_agent::types::Message::Assistant(_)
+            ));
             assert!(
-                matches!(&messages[5], tau::types::Message::Assistant(a) if a.text().contains("Hello world"))
+                matches!(&messages[2], tau_agent::types::Message::ToolResult(tr) if !tr.is_error)
+            );
+            assert!(matches!(
+                &messages[3],
+                tau_agent::types::Message::Assistant(_)
+            ));
+            assert!(
+                matches!(&messages[4], tau_agent::types::Message::ToolResult(tr) if !tr.is_error)
+            );
+            assert!(
+                matches!(&messages[5], tau_agent::types::Message::Assistant(a) if a.text().contains("Hello world"))
             );
         }
         other => panic!("{:?}", other),
@@ -1390,12 +1427,12 @@ fn server_chat_multi_turn_tool_loop() {
     // Call 2: user + assistant(tc1) + tool_result_1
     assert_eq!(captures[1].context.messages.len(), 3);
     assert!(matches!(&captures[1].context.messages[2],
-        tau::types::Message::ToolResult(tr) if tr.tool_name == "list_dir"));
+        tau_agent::types::Message::ToolResult(tr) if tr.tool_name == "list_dir"));
 
     // Call 3: user + assistant(tc1) + tool_result_1 + assistant(tc2) + tool_result_2
     assert_eq!(captures[2].context.messages.len(), 5);
     assert!(matches!(&captures[2].context.messages[4],
-        tau::types::Message::ToolResult(tr) if tr.tool_name == "read_file"));
+        tau_agent::types::Message::ToolResult(tr) if tr.tool_name == "read_file"));
 
     // Verify both tools were called in order
     let tool_captures = tool_handle_for_assert.captures();
@@ -1411,7 +1448,7 @@ fn server_chat_tool_schemas_in_context() {
     // Verify that mock tool schemas appear in the Context.tools field
     // that the provider sees.
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -1420,7 +1457,7 @@ fn server_chat_tool_schemas_in_context() {
     let provider = MockProvider::new(vec![MockResponse::Text("I see the tools.".into())]);
     let provider_handle = provider.handle();
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || {
             let h = tool_handle.clone();
             Box::new(h.executor())
@@ -1428,7 +1465,7 @@ fn server_chat_tool_schemas_in_context() {
 
     let server = TestServer::start_with_config(vec![], |mut config| {
         config.registry = {
-            let mut r = tau::provider::ProviderRegistry::new();
+            let mut r = tau_agent::provider::ProviderRegistry::new();
             r.register(provider);
             r
         };
@@ -1501,14 +1538,14 @@ fn server_chat_tool_schemas_in_context() {
 #[test]
 fn session_dump_and_replay() {
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     // Set up a server with mock tools
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
     tool_handle.on_tool("bash", MockToolResponse::Success("hello world".into()));
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || {
             let h = tool_handle.clone();
             Box::new(h.executor())
@@ -1519,9 +1556,9 @@ fn session_dump_and_replay() {
     let db_path = dir.path().join("test.db");
 
     let model = mock_model();
-    let mut registry = tau::provider::ProviderRegistry::new();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
     registry.register(MockProvider::new(vec![
-        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+        MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
             id: "tc1".into(),
             name: "bash".into(),
             arguments: serde_json::json!({"command": "echo hello world"}),
@@ -1529,7 +1566,7 @@ fn session_dump_and_replay() {
         MockResponse::Text("The command output hello world.".into()),
     ]));
 
-    let config = tau::server::TestServerConfig {
+    let config = tau_agent::server::TestServerConfig {
         registry,
         models: vec![model],
         socket_path: sock_path.clone(),
@@ -1541,7 +1578,7 @@ fn session_dump_and_replay() {
 
     std::thread::spawn(move || {
         smol::block_on(async {
-            if let Err(e) = tau::server::run_with_config(config).await {
+            if let Err(e) = tau_agent::server::run_with_config(config).await {
                 eprintln!("test server error: {}", e);
             }
         });
@@ -1598,8 +1635,8 @@ fn session_dump_and_replay() {
     std::thread::sleep(Duration::from_millis(200));
 
     // Dump the session from DB
-    let db = tau::db::Db::open(&db_path).unwrap();
-    let recording = tau::replay::dump_session(&db, &sid).unwrap();
+    let db = tau_agent::db::Db::open(&db_path).unwrap();
+    let recording = tau_agent::replay::dump_session(&db, &sid).unwrap();
 
     // Verify recording structure
     assert_eq!(
@@ -1623,11 +1660,11 @@ fn session_dump_and_replay() {
 
     // Verify JSON roundtrip
     let json = serde_json::to_string_pretty(&recording).unwrap();
-    let parsed: tau::replay::SessionRecording = serde_json::from_str(&json).unwrap();
+    let parsed: tau_agent::replay::SessionRecording = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.turns.len(), 2);
 
     // Replay the recording
-    let result = smol::block_on(tau::replay::replay_session(&recording));
+    let result = smol::block_on(tau_agent::replay::replay_session(&recording));
     assert!(
         result.success,
         "replay should succeed: error={:?}, turns={:?}",
@@ -1722,11 +1759,11 @@ done
         std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let plugins_config = tau::plugin::PluginsConfig {
+    let plugins_config = tau_agent::plugin::PluginsConfig {
         no_default_worker: true,
         global: [(
             "bg-test".to_string(),
-            tau::plugin::PluginEntry {
+            tau_agent::plugin::PluginEntry {
                 command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
                 env: Default::default(),
             },
@@ -1840,11 +1877,11 @@ done
         std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let plugins_config = tau::plugin::PluginsConfig {
+    let plugins_config = tau_agent::plugin::PluginsConfig {
         no_default_worker: true,
         global: [(
             "bg-create-test".to_string(),
-            tau::plugin::PluginEntry {
+            tau_agent::plugin::PluginEntry {
                 command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
                 env: Default::default(),
             },
@@ -1923,7 +1960,7 @@ done
 #[test]
 fn global_plugin_tools_in_dispatched_session_context() {
     use std::time::Duration;
-    use tau::providers::mock::{MockProvider, MockResponse};
+    use tau_agent::providers::mock::{MockProvider, MockResponse};
 
     let tmp = tempfile::tempdir().unwrap();
     let results_file = tmp.path().join("dispatch_test_results.txt");
@@ -1979,11 +2016,11 @@ done
         std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let plugins_config = tau::plugin::PluginsConfig {
+    let plugins_config = tau_agent::plugin::PluginsConfig {
         no_default_worker: true,
         global: [(
             "dispatch-test".to_string(),
-            tau::plugin::PluginEntry {
+            tau_agent::plugin::PluginEntry {
                 command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
                 env: Default::default(),
             },
@@ -1999,7 +2036,7 @@ done
 
     let server = TestServer::start_with_config(vec![], |mut config| {
         config.registry = {
-            let mut r = tau::provider::ProviderRegistry::new();
+            let mut r = tau_agent::provider::ProviderRegistry::new();
             r.register(provider);
             r
         };
@@ -2056,7 +2093,7 @@ done
 /// `ListSessions` ServerRequest after registration.
 #[test]
 fn global_plugin_background_io_with_tool_calls() {
-    use tau::providers::mock::MockResponse;
+    use tau_agent::providers::mock::MockResponse;
 
     let tmp = tempfile::tempdir().unwrap();
     let bg_results_file = tmp.path().join("bg_tool_results.txt");
@@ -2104,11 +2141,11 @@ done
         std::fs::set_permissions(&plugin_script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let plugins_config = tau::plugin::PluginsConfig {
+    let plugins_config = tau_agent::plugin::PluginsConfig {
         no_default_worker: true,
         global: [(
             "bg-tool-test".to_string(),
-            tau::plugin::PluginEntry {
+            tau_agent::plugin::PluginEntry {
                 command: vec!["bash".into(), plugin_script.to_string_lossy().into()],
                 env: Default::default(),
             },
@@ -2120,7 +2157,7 @@ done
 
     // Mock LLM response: call the echo_bg tool, then produce final text.
     let mock_responses = vec![
-        MockResponse::ToolCalls(vec![tau::types::ToolCall {
+        MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
             id: "tc-bg-1".into(),
             name: "echo_bg".into(),
             arguments: serde_json::json!({"msg": "hello"}),
@@ -2198,18 +2235,18 @@ done
             // Should have: User, Assistant(tool_call), ToolResult, Assistant(text)
             let tool_result = messages
                 .iter()
-                .find(|m| matches!(m, tau::types::Message::ToolResult(_)));
+                .find(|m| matches!(m, tau_agent::types::Message::ToolResult(_)));
             assert!(
                 tool_result.is_some(),
                 "no tool result in messages: {:?}",
                 messages
             );
-            if let tau::types::Message::ToolResult(tr) = tool_result.unwrap() {
+            if let tau_agent::types::Message::ToolResult(tr) = tool_result.unwrap() {
                 let text: String = tr
                     .content
                     .iter()
                     .filter_map(|c| match c {
-                        tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                        tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
                         _ => None,
                     })
                     .collect();
@@ -2230,7 +2267,7 @@ done
 #[test]
 fn server_execute_tool_basic() {
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -2239,7 +2276,7 @@ fn server_execute_tool_basic() {
         MockToolResponse::Success("hello from tool".into()),
     );
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || Box::new(tool_handle.clone().executor()));
 
     let server = TestServer::start_with_config(vec![], |mut config| {
@@ -2290,7 +2327,7 @@ fn server_execute_tool_basic() {
 #[test]
 fn server_execute_tool_error() {
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -2299,7 +2336,7 @@ fn server_execute_tool_error() {
         MockToolResponse::ToolError("something broke".into()),
     );
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || Box::new(tool_handle.clone().executor()));
 
     let server = TestServer::start_with_config(vec![], |mut config| {
@@ -2350,7 +2387,7 @@ fn server_execute_tool_error() {
 #[test]
 fn server_execute_tool_persistence() {
     use std::sync::Arc;
-    use tau::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
+    use tau_agent::providers::mock::{MockToolExecutor, MockToolResponse, mock_tool};
 
     let mock_executor = MockToolExecutor::new();
     let tool_handle = mock_executor.handle();
@@ -2359,7 +2396,7 @@ fn server_execute_tool_persistence() {
         MockToolResponse::Success("persisted result".into()),
     );
 
-    let tool_factory: Arc<dyn Fn() -> Box<dyn tau::worker::ToolExecutor> + Send + Sync> =
+    let tool_factory: Arc<dyn Fn() -> Box<dyn tau_agent::worker::ToolExecutor> + Send + Sync> =
         Arc::new(move || Box::new(tool_handle.clone().executor()));
 
     let server = TestServer::start_with_config(vec![], |mut config| {
@@ -2413,11 +2450,11 @@ fn server_execute_tool_persistence() {
             );
             // First: Assistant with ToolCall
             match &messages[0] {
-                tau::types::Message::Assistant(a) => {
-                    assert_eq!(a.stop_reason, tau::types::StopReason::ToolUse);
+                tau_agent::types::Message::Assistant(a) => {
+                    assert_eq!(a.stop_reason, tau_agent::types::StopReason::ToolUse);
                     assert!(a.content.iter().any(|c| matches!(
                         c,
-                        tau::types::AssistantContent::ToolCall(tc)
+                        tau_agent::types::AssistantContent::ToolCall(tc)
                             if tc.name == "my_tool"
                     )));
                 }
@@ -2425,14 +2462,14 @@ fn server_execute_tool_persistence() {
             }
             // Second: ToolResult
             match &messages[1] {
-                tau::types::Message::ToolResult(tr) => {
+                tau_agent::types::Message::ToolResult(tr) => {
                     assert!(!tr.is_error);
                     assert_eq!(tr.tool_name, "my_tool");
                     let text: String = tr
                         .content
                         .iter()
                         .filter_map(|c| match c {
-                            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
                             _ => None,
                         })
                         .collect();
@@ -2474,7 +2511,7 @@ fn server_execute_tool_nonexistent_session() {
 
 #[test]
 fn server_log_provider_chat_returns_immediately() {
-    use tau::providers::log::{LogProvider, log_model};
+    use tau_agent::providers::log::{LogProvider, log_model};
 
     let dir = tempfile::tempdir().unwrap();
     let sock_path = dir.path().join("tau-test.sock");
@@ -2482,10 +2519,10 @@ fn server_log_provider_chat_returns_immediately() {
     let sock_clone = sock_path.clone();
 
     let model = log_model();
-    let mut registry = tau::provider::ProviderRegistry::new();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
     registry.register(LogProvider);
 
-    let config = tau::server::TestServerConfig {
+    let config = tau_agent::server::TestServerConfig {
         registry,
         models: vec![model],
         socket_path: sock_clone,
@@ -2497,7 +2534,7 @@ fn server_log_provider_chat_returns_immediately() {
 
     std::thread::spawn(move || {
         smol::block_on(async {
-            if let Err(e) = tau::server::run_with_config(config).await {
+            if let Err(e) = tau_agent::server::run_with_config(config).await {
                 eprintln!("test server error: {}", e);
             }
         });
@@ -2555,7 +2592,7 @@ fn server_log_provider_chat_returns_immediately() {
     // Should NOT have any meaningful text deltas
     let has_text = responses.iter().any(|r| {
         if let Response::Stream { event } = r {
-            if let tau::types::StreamEvent::TextDelta { delta, .. } = event.as_ref() {
+            if let tau_agent::types::StreamEvent::TextDelta { delta, .. } = event.as_ref() {
                 !delta.is_empty()
             } else {
                 false

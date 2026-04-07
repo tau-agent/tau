@@ -2384,7 +2384,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tau"
+name = "tau-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -2406,7 +2406,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tau-cli"
+name = "tau-agent-cli"
 version = "0.1.0"
 dependencies = [
  "chrono",
@@ -2416,12 +2416,12 @@ dependencies = [
  "rustyline",
  "serde_json",
  "smol",
- "tau",
- "tau-tui",
+ "tau-agent",
+ "tau-agent-tui",
 ]
 
 [[package]]
-name = "tau-tui"
+name = "tau-agent-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
@@ -2432,7 +2432,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smol",
- "tau",
+ "tau-agent",
  "toml",
  "unicode-width",
 ]

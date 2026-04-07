@@ -9,7 +9,7 @@ license = "MIT"
 authors = ["Kaspar Schleiser <kaspar@schleiser.de>"]
 
 [workspace.dependencies]
-tau = { path = "crates/tau" }
+tau-agent = { path = "crates/tau-agent" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smol = "2"
@@ -28,7 +28,7 @@ base64 = "0.22"
 rand = "0.10"
 fs2 = "0.4"
 nix = { version = "0.30", features = ["signal", "process"] }
-tau-tui = { path = "crates/tau-tui" }
+tau-agent-tui = { path = "crates/tau-agent-tui" }
 
 [profile.release]
 lto = true

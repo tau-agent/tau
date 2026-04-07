@@ -7,9 +7,9 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use tau::protocol::format_tokens;
-use tau::truncate_str;
-use tau::types::AgentPhase;
+use tau_agent::protocol::format_tokens;
+use tau_agent::truncate_str;
+use tau_agent::types::AgentPhase;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AppMode};
@@ -293,7 +293,7 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     // Subscription usage limits: (5h 50% 16h | 7d 12% 2d | sonnet 6% 1d)
     if let Some(ref usage) = app.subscription_usage
-        && let Some(usage_str) = tau::protocol::format_subscription_usage(usage)
+        && let Some(usage_str) = tau_agent::protocol::format_subscription_usage(usage)
     {
         if !left_parts.is_empty() {
             left_parts.push(Span::styled(" ", dim));
@@ -384,7 +384,7 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
 /// Build a flat display list from sessions, ordered as a tree.
 /// Returns (display_index, session_index, depth, is_last_sibling) tuples.
-fn build_session_tree(sessions: &[tau::protocol::SessionInfo]) -> Vec<(usize, usize, bool)> {
+fn build_session_tree(sessions: &[tau_agent::protocol::SessionInfo]) -> Vec<(usize, usize, bool)> {
     // Map parent_id -> children indices
     let mut children_of: std::collections::HashMap<Option<&str>, Vec<usize>> =
         std::collections::HashMap::new();
@@ -399,7 +399,7 @@ fn build_session_tree(sessions: &[tau::protocol::SessionInfo]) -> Vec<(usize, us
     fn walk_recursive(
         parent: Option<&str>,
         depth: usize,
-        sessions: &[tau::protocol::SessionInfo],
+        sessions: &[tau_agent::protocol::SessionInfo],
         children_of: &std::collections::HashMap<Option<&str>, Vec<usize>>,
         result: &mut Vec<(usize, usize, bool)>,
     ) {

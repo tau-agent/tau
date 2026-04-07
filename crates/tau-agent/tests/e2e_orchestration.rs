@@ -6,8 +6,8 @@ use common::{TestServer, send_recv, send_recv_all};
 use std::io::Write;
 use std::time::Duration;
 
-use tau::protocol::{Request, Response};
-use tau::providers::mock::MockResponse;
+use tau_agent::protocol::{Request, Response};
+use tau_agent::providers::mock::MockResponse;
 
 // ---------------------------------------------------------------------------
 // Tests that don't need a running server (protocol-level / DB-level)
@@ -16,12 +16,12 @@ use tau::providers::mock::MockResponse;
 #[test]
 fn session_tree_budget_enforcement() {
     let dir = tempfile::tempdir().unwrap();
-    let db = tau::db::Db::open(&dir.path().join("test.db")).unwrap();
+    let db = tau_agent::db::Db::open(&dir.path().join("test.db")).unwrap();
 
     // Create root with budget 3
-    let root = tau::db::StoredSession {
+    let root = tau_agent::db::StoredSession {
         id: "root".into(),
-        model: tau::providers::mock::mock_model(),
+        model: tau_agent::providers::mock::mock_model(),
         system_prompt: None,
         cwd: Some("/tmp".into()),
         is_subscription: false,
@@ -38,9 +38,9 @@ fn session_tree_budget_enforcement() {
     db.create_session(&root).unwrap();
 
     // Spawn child 1 (leaf, cost=1)
-    let c1 = tau::db::StoredSession {
+    let c1 = tau_agent::db::StoredSession {
         id: "c1".into(),
-        model: tau::providers::mock::mock_model(),
+        model: tau_agent::providers::mock::mock_model(),
         system_prompt: None,
         cwd: Some("/tmp".into()),
         is_subscription: false,
@@ -58,9 +58,9 @@ fn session_tree_budget_enforcement() {
     assert_eq!(db.budget_used("root").unwrap(), 1);
 
     // Spawn child 2 with budget=1 (cost=2)
-    let c2 = tau::db::StoredSession {
+    let c2 = tau_agent::db::StoredSession {
         id: "c2".into(),
-        model: tau::providers::mock::mock_model(),
+        model: tau_agent::providers::mock::mock_model(),
         system_prompt: None,
         cwd: Some("/tmp".into()),
         is_subscription: false,
@@ -88,9 +88,9 @@ fn session_tree_budget_enforcement() {
     );
 
     // Grandchild under c2 (has budget=1, cost=1)
-    let gc1 = tau::db::StoredSession {
+    let gc1 = tau_agent::db::StoredSession {
         id: "gc1".into(),
-        model: tau::providers::mock::mock_model(),
+        model: tau_agent::providers::mock::mock_model(),
         system_prompt: None,
         cwd: Some("/tmp".into()),
         is_subscription: false,
@@ -120,7 +120,7 @@ fn session_tree_budget_enforcement() {
 #[test]
 fn session_tree_recursive_delete() {
     let dir = tempfile::tempdir().unwrap();
-    let db = tau::db::Db::open(&dir.path().join("test.db")).unwrap();
+    let db = tau_agent::db::Db::open(&dir.path().join("test.db")).unwrap();
 
     // root -> c1 -> gc1
     //      -> c2
@@ -130,9 +130,9 @@ fn session_tree_recursive_delete() {
         ("gc1", Some("c1"), 0),
         ("c2", Some("root"), 0),
     ] {
-        db.create_session(&tau::db::StoredSession {
+        db.create_session(&tau_agent::db::StoredSession {
             id: id.into(),
-            model: tau::providers::mock::mock_model(),
+            model: tau_agent::providers::mock::mock_model(),
             system_prompt: None,
             cwd: None,
             is_subscription: false,
@@ -152,7 +152,7 @@ fn session_tree_recursive_delete() {
     // Add messages to verify cascade
     db.append_message(
         "gc1",
-        &tau::types::Message::User(tau::types::UserMessage::text("hello")),
+        &tau_agent::types::Message::User(tau_agent::types::UserMessage::text("hello")),
     )
     .unwrap();
     assert_eq!(db.get_messages("gc1").unwrap().len(), 1);
@@ -174,12 +174,12 @@ fn session_tree_recursive_delete() {
 #[test]
 fn session_model_inheritance() {
     let dir = tempfile::tempdir().unwrap();
-    let db = tau::db::Db::open(&dir.path().join("test.db")).unwrap();
+    let db = tau_agent::db::Db::open(&dir.path().join("test.db")).unwrap();
 
-    let mut parent_model = tau::providers::mock::mock_model();
+    let mut parent_model = tau_agent::providers::mock::mock_model();
     parent_model.id = "parent-model".into();
 
-    db.create_session(&tau::db::StoredSession {
+    db.create_session(&tau_agent::db::StoredSession {
         id: "parent".into(),
         model: parent_model.clone(),
         system_prompt: None,
@@ -206,7 +206,7 @@ fn session_model_inheritance() {
     let child_model: Option<String> = None;
     let resolved_model = child_model
         .as_ref()
-        .map(|_| tau::providers::mock::mock_model())
+        .map(|_| tau_agent::providers::mock::mock_model())
         .unwrap_or_else(|| parent.model.clone());
     assert_eq!(resolved_model.id, "parent-model");
 
@@ -218,11 +218,11 @@ fn session_model_inheritance() {
 #[test]
 fn session_info_includes_tree_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let db = tau::db::Db::open(&dir.path().join("test.db")).unwrap();
+    let db = tau_agent::db::Db::open(&dir.path().join("test.db")).unwrap();
 
-    db.create_session(&tau::db::StoredSession {
+    db.create_session(&tau_agent::db::StoredSession {
         id: "root".into(),
-        model: tau::providers::mock::mock_model(),
+        model: tau_agent::providers::mock::mock_model(),
         system_prompt: None,
         cwd: None,
         is_subscription: false,
@@ -238,9 +238,9 @@ fn session_info_includes_tree_fields() {
     })
     .unwrap();
 
-    db.create_session(&tau::db::StoredSession {
+    db.create_session(&tau_agent::db::StoredSession {
         id: "child".into(),
-        model: tau::providers::mock::mock_model(),
+        model: tau_agent::providers::mock::mock_model(),
         system_prompt: None,
         cwd: None,
         is_subscription: false,
@@ -270,7 +270,7 @@ fn session_info_includes_tree_fields() {
 
 #[test]
 fn orchestration_tool_definitions() {
-    let tools = tau::orchestration::orchestration_tools();
+    let tools = tau_agent::orchestration::orchestration_tools();
     assert_eq!(tools.len(), 13);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -354,7 +354,7 @@ fn protocol_wait_sessions_roundtrip() {
     }
 
     let resp = Response::SessionsCompleted {
-        results: vec![tau::protocol::SessionResult {
+        results: vec![tau_agent::protocol::SessionResult {
             session_id: "s1".into(),
             status: "done".into(),
             summary: "All good".into(),
@@ -372,7 +372,7 @@ fn protocol_wait_sessions_roundtrip() {
 
 #[test]
 fn protocol_session_info_tree_fields() {
-    let info = tau::protocol::SessionInfo {
+    let info = tau_agent::protocol::SessionInfo {
         id: "s1".into(),
         model: "mock-model".into(),
         provider: "mock".into(),
@@ -394,7 +394,7 @@ fn protocol_session_info_tree_fields() {
     assert!(json.contains("child_count"));
     assert!(json.contains("child_budget"));
 
-    let parsed: tau::protocol::SessionInfo = serde_json::from_str(&json).unwrap();
+    let parsed: tau_agent::protocol::SessionInfo = serde_json::from_str(&json).unwrap();
     assert_eq!(parsed.parent_id.as_deref(), Some("s0"));
     assert_eq!(parsed.child_count, 2);
     assert_eq!(parsed.child_budget, 10);
@@ -484,9 +484,9 @@ fn spawn_child_chat_produces_messages() {
                 messages.len(),
                 messages
             );
-            assert!(matches!(&messages[0], tau::types::Message::User(_)));
+            assert!(matches!(&messages[0], tau_agent::types::Message::User(_)));
             assert!(
-                matches!(&messages[1], tau::types::Message::Assistant(a) if a.text().contains("Child response"))
+                matches!(&messages[1], tau_agent::types::Message::Assistant(a) if a.text().contains("Child response"))
             );
         }
         other => panic!("expected Messages, got {:?}", other),
@@ -1389,25 +1389,31 @@ fn second_child_completion_notifies_parent() {
     );
 
     // Structure: alternating User (notification) / Assistant (response)
-    assert!(matches!(&all_messages[0], tau::types::Message::User(_)));
+    assert!(matches!(
+        &all_messages[0],
+        tau_agent::types::Message::User(_)
+    ));
     assert!(matches!(
         &all_messages[1],
-        tau::types::Message::Assistant(_)
+        tau_agent::types::Message::Assistant(_)
     ));
-    assert!(matches!(&all_messages[2], tau::types::Message::User(_)));
+    assert!(matches!(
+        &all_messages[2],
+        tau_agent::types::Message::User(_)
+    ));
     assert!(matches!(
         &all_messages[3],
-        tau::types::Message::Assistant(_)
+        tau_agent::types::Message::Assistant(_)
     ));
 
     // Both notifications should mention the child session id
-    let extract_user_text = |msg: &tau::types::Message| -> String {
+    let extract_user_text = |msg: &tau_agent::types::Message| -> String {
         match msg {
-            tau::types::Message::User(u) => u
+            tau_agent::types::Message::User(u) => u
                 .content
                 .iter()
                 .filter_map(|c| match c {
-                    tau::types::UserContent::Text(t) => Some(t.text.as_str()),
+                    tau_agent::types::UserContent::Text(t) => Some(t.text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -1618,12 +1624,12 @@ fn await_reply_e2e() {
     let msg_text = messages
         .iter()
         .find_map(|m| {
-            if let tau::types::Message::User(u) = m {
+            if let tau_agent::types::Message::User(u) = m {
                 let text: String = u
                     .content
                     .iter()
                     .filter_map(|c| match c {
-                        tau::types::UserContent::Text(t) => Some(t.text.as_str()),
+                        tau_agent::types::UserContent::Text(t) => Some(t.text.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()

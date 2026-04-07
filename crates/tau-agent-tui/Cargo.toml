@@ -1,5 +1,5 @@
 [package]
-name = "tau-tui"
+name = "tau-agent-tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ authors.workspace = true
 description = "Terminal UI for tau"
 
 [dependencies]
-tau.workspace = true
+tau-agent.workspace = true
 smol.workspace = true
 serde.workspace = true
 serde_json.workspace = true

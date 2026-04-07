@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tau::plugin::*;
-use tau::types::ToolCall;
+use tau_agent::plugin::*;
+use tau_agent::types::ToolCall;
 
 fn test_plugin_command() -> Vec<String> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -125,7 +125,7 @@ fn plugin_echo_tool() {
         .content
         .iter()
         .filter_map(|c| match c {
-            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -158,7 +158,7 @@ fn plugin_slow_tool_streaming() {
         .content
         .iter()
         .filter_map(|c| match c {
-            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -187,7 +187,7 @@ fn plugin_fail_tool() {
         .content
         .iter()
         .filter_map(|c| match c {
-            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -247,7 +247,7 @@ fn plugin_multiple_tool_calls() {
             .content
             .iter()
             .filter_map(|c| match c {
-                tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -423,11 +423,11 @@ fn plugin_send_idle_kills_worker() {
         .unwrap()
         .parent()
         .unwrap()
-        .join("tau-cli");
+        .join("tau");
 
     // Only run if the binary exists (it may not in all test environments)
     if !exe.exists() {
-        eprintln!("skipping: tau-cli binary not found at {:?}", exe);
+        eprintln!("skipping: tau binary not found at {:?}", exe);
         return;
     }
 
@@ -524,7 +524,7 @@ fn plugin_ensure_alive_respawns_when_dead() {
         .content
         .iter()
         .filter_map(|c| match c {
-            tau::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()

@@ -351,7 +351,7 @@ pub struct StreamOptions {
 
 /// Current phase of the agent loop, broadcast to subscribers for UI display.
 /// The TUI also derives phase implicitly from certain stream events
-/// (see `App::update_phase_from_event` in tau-tui).
+/// (see `App::update_phase_from_event` in tau-agent-tui).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AgentPhase {
     /// No agent turn running.

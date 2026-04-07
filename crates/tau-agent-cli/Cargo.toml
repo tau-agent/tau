@@ -1,5 +1,5 @@
 [package]
-name = "tau-cli"
+name = "tau-agent-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,8 +11,8 @@ name = "tau"
 path = "src/main.rs"
 
 [dependencies]
-tau.workspace = true
-tau-tui.workspace = true
+tau-agent.workspace = true
+tau-agent-tui.workspace = true
 smol.workspace = true
 chrono.workspace = true
 clap.workspace = true
