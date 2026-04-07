@@ -1,11 +1,11 @@
 [[check]]
-name = "cargo fmt"
-command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo fmt --check"
+name = "just fmt"
+command = "just fmt"
 
 [[check]]
-name = "cargo build"
-command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo build -p tau-cli"
+name = "just build"
+command = "just build"
 
 [[check]]
-name = "cargo test"
-command = "PATH=\"/usr/bin:$HOME/.cargo/bin:$PATH\" cargo test --workspace"
+name = "just test"
+command = "just test"
