@@ -132,6 +132,8 @@ pub struct App {
     /// Tagline edit mode: Some((cursor_in_picker, current_text)) when editing.
     /// The third element is the text cursor position (byte offset).
     pub picker_edit_tagline: Option<(usize, String, usize)>,
+    /// Set of session IDs whose subtrees are folded (children hidden).
+    pub picker_folded: std::collections::HashSet<String>,
 }
 
 /// Saved state when navigating to a child session.
@@ -195,6 +197,7 @@ impl App {
             picker_filter: String::new(),
             picker_filter_mode: false,
             picker_edit_tagline: None,
+            picker_folded: std::collections::HashSet::new(),
         }
     }
 
@@ -570,16 +573,23 @@ impl App {
     }
 
     /// Return indices into `picker_sessions` that match the current filter.
-    /// If the filter is empty, all indices are returned.
+    /// If the filter is empty, all non-hidden indices are returned. Sessions
+    /// whose ancestor is folded are also excluded.
     pub fn picker_filtered_indices(&self) -> Vec<usize> {
-        if self.picker_filter.is_empty() {
-            return (0..self.picker_sessions.len()).collect();
-        }
+        let hidden = self.picker_hidden_by_fold();
         let needle = self.picker_filter.to_lowercase();
+        let filter_empty = self.picker_filter.is_empty();
+
         self.picker_sessions
             .iter()
             .enumerate()
-            .filter(|(_, s)| {
+            .filter(|(idx, s)| {
+                if hidden.contains(idx) {
+                    return false;
+                }
+                if filter_empty {
+                    return true;
+                }
                 s.id.to_lowercase().contains(&needle)
                     || s.tagline
                         .as_deref()
@@ -590,6 +600,53 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Compute the set of session indices that are hidden because some
+    /// ancestor session is in `picker_folded`. The folded session itself
+    /// is NOT hidden — only its descendants.
+    fn picker_hidden_by_fold(&self) -> std::collections::HashSet<usize> {
+        use std::collections::{HashMap, HashSet};
+        if self.picker_folded.is_empty() {
+            return HashSet::new();
+        }
+        // Map session id -> index for ancestor walk.
+        let id_to_idx: HashMap<&str, usize> = self
+            .picker_sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id.as_str(), i))
+            .collect();
+
+        let mut hidden = HashSet::new();
+        for (idx, s) in self.picker_sessions.iter().enumerate() {
+            // Walk up parents; if any ancestor is folded, mark this idx hidden.
+            let mut parent = s.parent_id.as_deref();
+            while let Some(pid) = parent {
+                if self.picker_folded.contains(pid) {
+                    hidden.insert(idx);
+                    break;
+                }
+                match id_to_idx.get(pid) {
+                    Some(&pidx) => {
+                        parent = self.picker_sessions[pidx].parent_id.as_deref();
+                    }
+                    None => break,
+                }
+            }
+        }
+        hidden
+    }
+
+    /// Reset transient picker state (confirm dialogs, edit, filter, fold).
+    /// Used when closing the picker.
+    fn picker_reset_transient(&mut self) {
+        self.picker_confirm_delete = None;
+        self.picker_confirm_archive = None;
+        self.picker_edit_tagline = None;
+        self.picker_filter.clear();
+        self.picker_filter_mode = false;
+        self.picker_folded.clear();
     }
 
     /// Clamp picker_cursor to remain valid within filtered results.
@@ -831,11 +888,7 @@ impl App {
                     {
                         let session_id = session.id.clone();
                         self.mode = AppMode::Input;
-                        self.picker_confirm_delete = None;
-                        self.picker_confirm_archive = None;
-                        self.picker_edit_tagline = None;
-                        self.picker_filter.clear();
-                        self.picker_filter_mode = false;
+                        self.picker_reset_transient();
                         if session_id == self.session_id {
                             return None;
                         }
@@ -846,11 +899,7 @@ impl App {
                 // TAB or ESC: close picker, return to previous mode
                 (KeyCode::Tab | KeyCode::Esc, _) => {
                     self.mode = self.picker_previous_mode;
-                    self.picker_confirm_delete = None;
-                    self.picker_confirm_archive = None;
-                    self.picker_edit_tagline = None;
-                    self.picker_filter.clear();
-                    self.picker_filter_mode = false;
+                    self.picker_reset_transient();
                     None
                 }
                 // D (shift+d): delete selected session
@@ -863,11 +912,7 @@ impl App {
                                 text: "cannot delete active session".into(),
                             });
                             self.mode = self.picker_previous_mode;
-                            self.picker_confirm_delete = None;
-                            self.picker_confirm_archive = None;
-                            self.picker_edit_tagline = None;
-                            self.picker_filter.clear();
-                            self.picker_filter_mode = false;
+                            self.picker_reset_transient();
                         } else {
                             self.picker_confirm_delete = Some(self.picker_cursor);
                         }
@@ -884,11 +929,7 @@ impl App {
                                 text: "cannot archive active session".into(),
                             });
                             self.mode = self.picker_previous_mode;
-                            self.picker_confirm_delete = None;
-                            self.picker_confirm_archive = None;
-                            self.picker_edit_tagline = None;
-                            self.picker_filter.clear();
-                            self.picker_filter_mode = false;
+                            self.picker_reset_transient();
                         } else {
                             self.picker_confirm_archive = Some(self.picker_cursor);
                         }
@@ -906,6 +947,24 @@ impl App {
                     }
                     None
                 }
+                // f (lowercase): toggle fold/unfold of selected session's subtree
+                (KeyCode::Char('f'), _) => {
+                    if let Some(idx) = self.picker_selected_session_idx()
+                        && let Some(session) = self.picker_sessions.get(idx)
+                    {
+                        let sid = session.id.clone();
+                        if self.picker_folded.contains(&sid) {
+                            self.picker_folded.remove(&sid);
+                        } else if session.child_count > 0 {
+                            // Only fold if there's something to hide.
+                            self.picker_folded.insert(sid);
+                        }
+                        // Cursor stays on the folded session (still visible);
+                        // clamp defensively in case the filtered set shrinks.
+                        self.picker_clamp_cursor();
+                    }
+                    None
+                }
                 // R (shift+r): restore (un-archive) selected session
                 (KeyCode::Char('R'), _) => {
                     if let Some(idx) = self.picker_selected_session_idx()
@@ -914,11 +973,7 @@ impl App {
                     {
                         let session_id = session.id.clone();
                         self.mode = self.picker_previous_mode;
-                        self.picker_confirm_delete = None;
-                        self.picker_confirm_archive = None;
-                        self.picker_edit_tagline = None;
-                        self.picker_filter.clear();
-                        self.picker_filter_mode = false;
+                        self.picker_reset_transient();
                         return Some(Action::RestoreSession { session_id });
                     }
                     None
@@ -926,11 +981,7 @@ impl App {
                 // Ctrl+C: close picker, return to previous mode
                 (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
                     self.mode = self.picker_previous_mode;
-                    self.picker_confirm_delete = None;
-                    self.picker_confirm_archive = None;
-                    self.picker_edit_tagline = None;
-                    self.picker_filter.clear();
-                    self.picker_filter_mode = false;
+                    self.picker_reset_transient();
                     None
                 }
                 _ => None,
@@ -1811,6 +1862,7 @@ impl App {
                     self.picker_confirm_delete = None;
                     self.picker_confirm_archive = None;
                     self.picker_edit_tagline = None;
+                    self.picker_folded.clear();
                     return;
                 }
 

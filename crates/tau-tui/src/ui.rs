@@ -643,6 +643,24 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             spans.push(Span::raw(format!(" {}", connector)));
             used += 1 + connector.len();
 
+            // Fold indicator: ▼ (has children, unfolded), ▶ (has children,
+            // folded), or two spaces (no children) for alignment.
+            let fold_indicator = if session.child_count > 0 {
+                if app.picker_folded.contains(&session.id) {
+                    "▶ "
+                } else {
+                    "▼ "
+                }
+            } else {
+                "  "
+            };
+            spans.push(Span::styled(
+                fold_indicator.to_string(),
+                theme.fg(theme.dim),
+            ));
+            // Both triangle glyphs render at width 1, plus one trailing space.
+            used += 2;
+
             // State indicator
             let (state_char, state_color) = if is_current {
                 ("*", theme.accent)
@@ -759,7 +777,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     } else if app.picker_edit_tagline.is_some() {
         " type tagline  ←/→ move  enter save  esc cancel"
     } else {
-        " /search  j/k nav  enter switch  r rename  A archive  R restore  D del  tab/esc close"
+        " /search  j/k nav  enter switch  f fold  r rename  A archive  R restore  D del  tab/esc close"
     };
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()
