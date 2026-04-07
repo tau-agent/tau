@@ -10,7 +10,8 @@ A plugin can:
   `read`, `edit`, `write`).
 - Subscribe to **hooks** to observe and modify the agent's behavior at
   specific points (`before_agent_start`, `after_tool_result`, `session_start`).
-- Register **slash commands** that appear in `/help`.
+- Register **slash commands** as metadata (currently dead — see
+  [Commands](#commands) below).
 - Call back into the tau server via the **`ServerRequest` tunnel** to create
   child sessions, queue messages between sessions, fire hooks, archive
   sessions, execute tools directly, etc.
@@ -511,7 +512,8 @@ For Rust reference implementations, see
 
 ## Commands
 
-Register slash commands that appear in `/help`:
+The `commands` field on `register` lets a plugin attach a list of slash
+commands as metadata:
 
 ```json
 {
@@ -523,9 +525,21 @@ Register slash commands that appear in `/help`:
 }
 ```
 
-Commands are currently **informational only** — they're listed in
-`/help` but execution routing is not yet implemented. To expose
-plugin functionality to users today, register a **tool** instead.
+**⚠ This field is currently dead metadata.** As of today:
+
+- The TUI's `/help` output is a hardcoded string in
+  `crates/tau-agent-tui/src/app.rs` that does not include plugin-registered
+  commands.
+- There is no execution routing — typing `/my-cmd` in the TUI will not
+  invoke the plugin.
+- The only consumer of `PluginManager::commands()` in the codebase is a
+  unit test.
+
+The field is preserved on the wire and stored on the plugin handle for
+future use, but **plugin authors should not rely on it being surfaced
+anywhere user-visible**. To expose plugin functionality to users today,
+register a **tool** instead — tools appear in the LLM's tool list and
+can be invoked through normal conversation.
 
 ## Complete example
 
