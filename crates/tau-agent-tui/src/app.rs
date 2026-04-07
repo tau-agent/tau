@@ -6,7 +6,7 @@ use ratatui_textarea::TextArea;
 use tau_agent::auth::SubscriptionUsage;
 use tau_agent::protocol::{Response, SessionInfo};
 use tau_agent::types::{
-    AgentPhase, AssistantContent, Message, StreamEvent, ToolResultMessage, UserContent,
+    AgentPhase, AssistantContent, Message, StopReason, StreamEvent, ToolResultMessage, UserContent,
 };
 
 use crate::events::Event;
@@ -2052,12 +2052,48 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                // Convert last streaming message to complete
-                if let Some(item) = self.messages.last_mut()
+                // Belt-and-suspenders: if the agent reports an empty
+                // response with `StopReason::Error`, surface the error
+                // text instead of leaving an invisible empty assistant
+                // message.  This guards against any code path where the
+                // server forgot to emit a separate `StreamEvent::Error`.
+                let error_fallback =
+                    if final_text.is_empty() && message.stop_reason == StopReason::Error {
+                        Some(
+                            message
+                                .error_message
+                                .clone()
+                                .unwrap_or_else(|| "agent stopped with error".to_string()),
+                        )
+                    } else {
+                        None
+                    };
+
+                if let Some(err_text) = error_fallback {
+                    // Drop any dangling streaming placeholder, then surface
+                    // the error.
+                    self.finalize_in_flight();
+                    self.messages.push(MessageItem::Error { text: err_text });
+                } else if let Some(item) = self.messages.last_mut()
                     && let MessageItem::AssistantStreaming { .. } = item
                 {
+                    // Convert the in-flight streaming placeholder to its
+                    // final form.
                     *item = MessageItem::Assistant { text: final_text };
+                } else if !final_text.is_empty() {
+                    // No streaming placeholder (e.g. server sent Done
+                    // without prior text deltas) — append the final text
+                    // as a fresh assistant message so it isn't lost.
+                    self.messages
+                        .push(MessageItem::Assistant { text: final_text });
                 }
+
+                // Treat Done as authoritative: clear streaming mode here
+                // rather than waiting for a separate `Phase::Idle` event,
+                // so the TUI is robust to event-ordering quirks or a
+                // dropped Idle event.
+                self.phase = AgentPhase::Idle;
+                self.mode = AppMode::Input;
             }
             StreamEvent::Error { error, .. } => {
                 let msg = error
@@ -2080,7 +2116,12 @@ impl App {
                             text
                         }
                     });
+                // Finalize any in-flight streaming placeholder *before*
+                // pushing the error item so we don't leave a dangling
+                // spinner alongside the error.
+                self.finalize_in_flight();
                 self.messages.push(MessageItem::Error { text: msg });
+                self.phase = AgentPhase::Idle;
                 self.mode = AppMode::Input;
             }
             StreamEvent::Status { message } => {
@@ -2213,4 +2254,223 @@ fn tree_sort_sessions(sessions: Vec<SessionInfo>) -> Vec<SessionInfo> {
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tau_agent::types::{AssistantMessage, TextContent, Usage};
+
+    fn make_app() -> App {
+        App::new(
+            "sess-test".to_string(),
+            "test-model".to_string(),
+            "test-provider".to_string(),
+            crate::theme::dark(),
+        )
+    }
+
+    fn assistant_message(
+        text: &str,
+        stop_reason: StopReason,
+        error_message: Option<&str>,
+    ) -> AssistantMessage {
+        let content = if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![AssistantContent::Text(TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            })]
+        };
+        AssistantMessage {
+            content,
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason,
+            error_message: error_message.map(String::from),
+            timestamp: 0,
+        }
+    }
+
+    /// Push a streaming placeholder followed by a `Done` whose message has
+    /// no content and `stop_reason: Error`.  The placeholder must be
+    /// replaced by an `Error` item (not an empty `Assistant`), and the
+    /// app must return to `Input` mode without waiting for `Phase::Idle`.
+    #[test]
+    fn done_with_empty_error_replaces_placeholder_with_error() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.messages.push(MessageItem::AssistantStreaming {
+            text: String::new(),
+        });
+
+        let event = StreamEvent::Done {
+            reason: StopReason::Error,
+            message: assistant_message("", StopReason::Error, Some("boom")),
+        };
+        app.handle_stream_event(event);
+
+        assert_eq!(app.mode, AppMode::Input, "mode should reset to Input");
+        assert_eq!(app.phase, AgentPhase::Idle);
+        // No dangling streaming placeholder.
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::AssistantStreaming { .. })),
+            "streaming placeholder should be gone"
+        );
+        // Last message is an Error carrying the error text.
+        match app.messages.last() {
+            Some(MessageItem::Error { text }) => assert_eq!(text, "boom"),
+            other => panic!("expected MessageItem::Error, got {other:?}"),
+        }
+    }
+
+    /// `Done` with empty content and `StopReason::Error` but no
+    /// `error_message` should still surface a non-empty error item.
+    #[test]
+    fn done_with_empty_error_uses_fallback_text_when_no_error_message() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.messages.push(MessageItem::AssistantStreaming {
+            text: String::new(),
+        });
+
+        let event = StreamEvent::Done {
+            reason: StopReason::Error,
+            message: assistant_message("", StopReason::Error, None),
+        };
+        app.handle_stream_event(event);
+
+        match app.messages.last() {
+            Some(MessageItem::Error { text }) => {
+                assert!(!text.is_empty(), "fallback error text should be non-empty")
+            }
+            other => panic!("expected MessageItem::Error, got {other:?}"),
+        }
+        assert_eq!(app.mode, AppMode::Input);
+    }
+
+    /// `Done` with normal text content should still finalize the
+    /// placeholder to `Assistant` *and* clear streaming mode (no longer
+    /// dependent on a separate `Phase::Idle` event).
+    #[test]
+    fn done_with_text_finalizes_placeholder_and_clears_mode() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.messages.push(MessageItem::AssistantStreaming {
+            text: "hello".to_string(),
+        });
+
+        let event = StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: assistant_message("hello world", StopReason::Stop, None),
+        };
+        app.handle_stream_event(event);
+
+        assert_eq!(app.mode, AppMode::Input);
+        assert_eq!(app.phase, AgentPhase::Idle);
+        match app.messages.last() {
+            Some(MessageItem::Assistant { text }) => assert_eq!(text, "hello world"),
+            other => panic!("expected MessageItem::Assistant, got {other:?}"),
+        }
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::AssistantStreaming { .. })),
+            "streaming placeholder should have been replaced"
+        );
+    }
+
+    /// `Done` arriving with no prior streaming placeholder (e.g. server
+    /// sent the final message in a single shot) should still surface the
+    /// text as a fresh assistant message instead of dropping it.
+    #[test]
+    fn done_without_placeholder_appends_assistant_message() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+
+        let event = StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: assistant_message("solo response", StopReason::Stop, None),
+        };
+        app.handle_stream_event(event);
+
+        assert_eq!(app.mode, AppMode::Input);
+        match app.messages.last() {
+            Some(MessageItem::Assistant { text }) => assert_eq!(text, "solo response"),
+            other => panic!("expected MessageItem::Assistant, got {other:?}"),
+        }
+    }
+
+    /// `StreamEvent::Error` arriving while a streaming placeholder is
+    /// still in the message list must finalize that placeholder before
+    /// pushing the new error item — we should never end up with
+    /// `[..., AssistantStreaming, Error]` adjacent.
+    #[test]
+    fn error_finalizes_dangling_streaming_placeholder() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        // Non-empty streaming text: should be converted to a final
+        // Assistant entry rather than dropped.
+        app.messages.push(MessageItem::AssistantStreaming {
+            text: "partial".to_string(),
+        });
+
+        let event = StreamEvent::Error {
+            reason: StopReason::Error,
+            error: assistant_message("", StopReason::Error, Some("network down")),
+        };
+        app.handle_stream_event(event);
+
+        assert_eq!(app.mode, AppMode::Input);
+        assert_eq!(app.phase, AgentPhase::Idle);
+        // No dangling streaming items left.
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::AssistantStreaming { .. })),
+            "streaming placeholder must be finalized before the error item"
+        );
+        // Expect [..., Assistant("partial"), Error("network down")]
+        assert!(app.messages.len() >= 2);
+        match &app.messages[app.messages.len() - 2] {
+            MessageItem::Assistant { text } => assert_eq!(text, "partial"),
+            other => panic!("expected finalized Assistant, got {other:?}"),
+        }
+        match app.messages.last() {
+            Some(MessageItem::Error { text }) => assert_eq!(text, "network down"),
+            other => panic!("expected MessageItem::Error, got {other:?}"),
+        }
+    }
+
+    /// An `Error` event whose streaming placeholder was empty should
+    /// drop the placeholder entirely (not leave an empty Assistant
+    /// alongside the error).
+    #[test]
+    fn error_drops_empty_streaming_placeholder() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.messages.push(MessageItem::AssistantStreaming {
+            text: String::new(),
+        });
+
+        let event = StreamEvent::Error {
+            reason: StopReason::Error,
+            error: assistant_message("", StopReason::Error, Some("nope")),
+        };
+        app.handle_stream_event(event);
+
+        // Only the Error item should remain.
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(
+            app.messages.last(),
+            Some(MessageItem::Error { .. })
+        ));
+        assert_eq!(app.mode, AppMode::Input);
+    }
 }
