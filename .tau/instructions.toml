@@ -3,6 +3,14 @@ instructions = """
  - No unwrap() in non-test code (use expect() instead)
 """
 
+[worker]
+instruction = """
+  - Keep the diff focused on the task; no unrelated refactors or drive-by fixes
+  - Prefer small commits with conventional-commit style messages
+  - A git hook will `cargo fmt` your changes at commit time.
+  - Run the project checklist (`just`) ONCE before marking for review — capture output to a file if you need both exit code and tail
+ - If you discover a separate bug, cleanup or optimization opportunity while working, file a new task instead of expanding scope
+ """
 [refining]
 instructions = """
  - Watch out for race conditions with DB accesses - use transactions if they help
