@@ -1290,7 +1290,7 @@ fn build_initial_message(task: &Task, merge_target: &str, project_instructions: 
     let trimmed = project_instructions.trim();
     if !trimmed.is_empty() {
         msg.push_str(&format!(
-            "\n\n## Project-specific instructions\n\n{}\n",
+            "\n\n## Project-specific worker instructions\n\n{}\n",
             trimmed
         ));
     }
@@ -1851,7 +1851,7 @@ mod tests {
         assert!(msg.contains("do NOT merge into main") || msg.contains("do not merge"));
         assert!(msg.contains("rebase"));
         // No project instructions supplied — the section header must not appear.
-        assert!(!msg.contains("Project-specific instructions"));
+        assert!(!msg.contains("Project-specific worker instructions"));
     }
 
     #[test]
@@ -1892,7 +1892,7 @@ mod tests {
         let task = make_task(9, 0, None);
         let instructions = "- Follow project style\n- Keep diffs minimal";
         let msg = build_initial_message(&task, "main", instructions);
-        assert!(msg.contains("Project-specific instructions"));
+        assert!(msg.contains("Project-specific worker instructions"));
         assert!(msg.contains("Follow project style"));
         assert!(msg.contains("Keep diffs minimal"));
     }
@@ -1902,7 +1902,7 @@ mod tests {
         let task = make_task(11, 0, None);
         // Whitespace-only should be treated as empty — no section header.
         let msg = build_initial_message(&task, "main", "   \n\n  ");
-        assert!(!msg.contains("Project-specific instructions"));
+        assert!(!msg.contains("Project-specific worker instructions"));
     }
 
     #[test]
