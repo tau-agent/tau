@@ -687,35 +687,53 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             spans.push(Span::styled(id_short.to_string(), id_style));
             used += id_len;
 
-            // Right-side info: context%, idle, msgs -- build from right
+            // Right-side info columns: fixed-width, right-aligned, so the
+            // same field always appears in the same column across rows.
+            //
+            // Column widths (chars), tuned for typical values:
+            //   ctx%:  4   (e.g. "100%")
+            //   cost:  6   (e.g. "$12.34")
+            //   idle:  3   (e.g. "59m" / "23h" / "99d")
+            //   msgs:  5   (e.g. "#1234"; "#" disambiguates from idle "m")
+            const CTX_W: usize = 4;
+            const COST_W: usize = 6;
+            const IDLE_W: usize = 3;
+            const MSGS_W: usize = 5;
+            // Two-space gap before the block, plus two spaces between columns.
+            const COL_GAP: usize = 2;
+
             let ctx_str = session
                 .context_pct
                 .map(|p| format!("{:.0}%", p))
                 .unwrap_or_default();
             let idle_str = format_idle_time(session.last_activity);
-            let msg_str = format!("{}m", session.message_count);
-
-            // Cost string
+            // Use "#" prefix for message count to disambiguate from idle
+            // minutes ("m"). Both used to render as "...m" on the same row.
+            let msg_str = format!("#{}", session.message_count);
             let cost_str = if session.stats.cost > 0.0 {
                 format!("${:.2}", session.stats.cost)
             } else {
                 String::new()
             };
 
-            // Compose right part: "  42%  $0.42  3m  12m"
-            let mut right_parts: Vec<String> = Vec::new();
-            if !ctx_str.is_empty() {
-                right_parts.push(ctx_str);
-            }
-            if !cost_str.is_empty() {
-                right_parts.push(cost_str);
-            }
-            if !idle_str.is_empty() {
-                right_parts.push(idle_str);
-            }
-            right_parts.push(msg_str);
-            let right_text = format!("  {}", right_parts.join("  "));
-            let right_len = right_text.len();
+            // Right-align each value within its fixed-width column. Missing
+            // values render as all-spaces of the same width so columns line up.
+            let right_text = format!(
+                "  {:>ctx_w$}  {:>cost_w$}  {:>idle_w$}  {:>msgs_w$}",
+                ctx_str,
+                cost_str,
+                idle_str,
+                msg_str,
+                ctx_w = CTX_W,
+                cost_w = COST_W,
+                idle_w = IDLE_W,
+                msgs_w = MSGS_W,
+            );
+            // Total width is deterministic: leading 2-space gap + 4 columns
+            // separated by 2 spaces each.
+            let right_len =
+                COL_GAP + CTX_W + COL_GAP + COST_W + COL_GAP + IDLE_W + COL_GAP + MSGS_W;
+            debug_assert_eq!(right_text.len(), right_len);
 
             // Tagline fills the middle
             let tagline_space = w.saturating_sub(used + 1 + right_len + 1);
