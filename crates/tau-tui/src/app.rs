@@ -638,15 +638,18 @@ impl App {
         hidden
     }
 
-    /// Reset transient picker state (confirm dialogs, edit, filter, fold).
+    /// Reset transient picker state (confirm dialogs, edit, filter).
     /// Used when closing the picker.
+    ///
+    /// Note: `picker_folded` is intentionally NOT cleared here -- fold state
+    /// persists across picker open/close within the same TUI process and is
+    /// only reset on TUI restart (which clears the in-memory HashSet).
     fn picker_reset_transient(&mut self) {
         self.picker_confirm_delete = None;
         self.picker_confirm_archive = None;
         self.picker_edit_tagline = None;
         self.picker_filter.clear();
         self.picker_filter_mode = false;
-        self.picker_folded.clear();
     }
 
     /// Clamp picker_cursor to remain valid within filtered results.
@@ -1862,7 +1865,15 @@ impl App {
                     self.picker_confirm_delete = None;
                     self.picker_confirm_archive = None;
                     self.picker_edit_tagline = None;
-                    self.picker_folded.clear();
+                    // Garbage-collect fold entries for sessions that no
+                    // longer exist (e.g. archived/deleted between opens).
+                    // Fold state itself persists across picker open/close.
+                    if !self.picker_folded.is_empty() {
+                        let existing: std::collections::HashSet<&str> =
+                            self.picker_sessions.iter().map(|s| s.id.as_str()).collect();
+                        self.picker_folded
+                            .retain(|id| existing.contains(id.as_str()));
+                    }
                     return;
                 }
 
