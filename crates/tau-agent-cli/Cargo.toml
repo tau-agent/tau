@@ -2,9 +2,14 @@
 name = "tau-agent-cli"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "LLM agent CLI"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Command-line interface for the tau LLM agent (binary: tau)"
 
 [[bin]]
 name = "tau"

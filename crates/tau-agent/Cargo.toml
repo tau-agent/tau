@@ -2,9 +2,14 @@
 name = "tau-agent"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "LLM agent library"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Library for building Claude/OpenAI/etc. agents with tools, sessions, and a plugin system"
 
 [dependencies]
 serde.workspace = true

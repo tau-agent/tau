@@ -2,9 +2,14 @@
 name = "tau-agent-tui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Terminal UI for tau"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Ratatui-based terminal UI for the tau LLM agent"
 
 [dependencies]
 tau-agent.workspace = true
