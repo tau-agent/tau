@@ -63,6 +63,18 @@ pub enum Request {
     DeleteSession { session_id: String },
     /// List available models.
     ListModels,
+    /// List configured aliases (global + per-project).
+    ///
+    /// `cwd` is the project directory whose `.tau/models.toml` should be
+    /// inspected for project-level aliases.  Pass `None` to get global
+    /// aliases only.
+    ///
+    /// Added in protocol v0.2: older servers will respond with an error.
+    /// Clients should treat that as "no aliases" and degrade gracefully.
+    ListAliases {
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Change model for a session.
     SetModel {
         session_id: String,
@@ -167,6 +179,16 @@ pub enum Response {
     SessionRestored,
     /// Available models.
     Models { models: Vec<ModelInfo> },
+    /// Configured aliases (global + per-project).
+    ///
+    /// Added in protocol v0.2.  Older clients will not understand this
+    /// variant and will fall through to their default error path.
+    Aliases {
+        #[serde(default)]
+        global: Vec<AliasInfo>,
+        #[serde(default)]
+        project: Vec<AliasInfo>,
+    },
     /// Model changed.
     ModelChanged { model: ModelInfo },
     /// Streaming event from the LLM.
@@ -271,6 +293,19 @@ pub struct ModelInfo {
     pub thinking: crate::types::ThinkingStyle,
     pub context_window: u64,
     pub max_tokens: u64,
+}
+
+/// One configured alias entry: a short name pointing at a target.
+///
+/// Targets are model ids, optionally prefixed with `provider/`.  See
+/// [`crate::model_resolve`] for resolution rules.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AliasInfo {
+    /// The short name users type, e.g. `"smart"`.
+    pub name: String,
+    /// What the alias points at, e.g. `"claude-opus-4-6"` or
+    /// `"openai/gpt-4.1-mini"`.
+    pub target: String,
 }
 
 /// Cumulative session usage statistics.

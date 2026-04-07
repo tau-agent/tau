@@ -1124,7 +1124,8 @@ async fn handle_slash_command(
             if args.is_empty() {
                 // Get current model first, then list
                 let current_info = get_session_info(client, session_id).await.ok();
-                let current_model_id = current_info.map(|i| i.model);
+                let current_model_id = current_info.as_ref().map(|i| i.model.clone());
+                let session_cwd = current_info.and_then(|i| i.cwd);
 
                 client
                     .send(&tau_agent::protocol::Request::ListModels)
@@ -1145,6 +1146,34 @@ async fn handle_slash_command(
                                     m.provider,
                                     m.context_window / 1000,
                                 );
+                            }
+                        }
+                    })
+                    .await?;
+
+                // Best-effort: ask the server for configured aliases. Older
+                // servers will return an Error response which we silently
+                // skip — the protocol comment in tau_agent::protocol::Request
+                // documents this fallback contract.
+                client
+                    .send(&tau_agent::protocol::Request::ListAliases { cwd: session_cwd })
+                    .await?;
+                client
+                    .recv_streaming(|resp| {
+                        if let tau_agent::protocol::Response::Aliases { global, project } = resp {
+                            if !global.is_empty() {
+                                println!();
+                                println!("aliases (global):");
+                                for a in global {
+                                    println!("  {:<16} -> {}", a.name, a.target);
+                                }
+                            }
+                            if !project.is_empty() {
+                                println!();
+                                println!("aliases (project):");
+                                for a in project {
+                                    println!("  {:<16} -> {}", a.name, a.target);
+                                }
                             }
                         }
                     })
@@ -1647,6 +1676,32 @@ fn cmd_models_list() -> tau_agent::Result<()> {
             thinking,
         );
     }
+
+    // Aliases — global from providers.toml + project-local from
+    // ./.tau/models.toml.  Project lookup is non-recursive: it only checks
+    // the current working directory, not parent directories.  Run from the
+    // project root to see project aliases.
+    if !cfg.aliases.is_empty() {
+        println!();
+        println!("aliases (global):");
+        let mut entries: Vec<(&String, &String)> = cfg.aliases.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, target) in entries {
+            println!("  {:<16} -> {}", name, target);
+        }
+    }
+
+    let project_aliases = tau_agent::project_config::load_project_aliases(".");
+    if !project_aliases.is_empty() {
+        println!();
+        println!("aliases (project):");
+        let mut entries: Vec<(&String, &String)> = project_aliases.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, target) in entries {
+            println!("  {:<16} -> {}", name, target);
+        }
+    }
+
     Ok(())
 }
 

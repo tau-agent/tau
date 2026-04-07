@@ -614,6 +614,8 @@ pub struct TestServerConfig {
     pub mock_tools: Vec<Tool>,
     /// Optional: plugins configuration (for testing global plugins).
     pub plugins_config: Option<crate::plugin::PluginsConfig>,
+    /// Optional: global model aliases (mirrors `Config::aliases`).
+    pub aliases: HashMap<String, String>,
 }
 
 /// Run a server with custom config (for testing).
@@ -653,6 +655,9 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
             models: vec![],
         },
     );
+    // Inject any test-supplied aliases into the synthesized config so the
+    // resolver picks them up.
+    cfg.aliases = config.aliases.clone();
     let plugins_config = config
         .plugins_config
         .unwrap_or(crate::plugin::PluginsConfig {
@@ -1799,6 +1804,36 @@ async fn handle_client(
                 };
                 send(&mut writer, &Response::Models { models }).await?;
             }
+            Request::ListAliases { cwd } => {
+                use crate::protocol::AliasInfo;
+                let global: Vec<AliasInfo> = {
+                    let st = lock_state(&state);
+                    let mut entries: Vec<AliasInfo> = st
+                        .config
+                        .aliases
+                        .iter()
+                        .map(|(name, target)| AliasInfo {
+                            name: name.clone(),
+                            target: target.clone(),
+                        })
+                        .collect();
+                    entries.sort_by(|a, b| a.name.cmp(&b.name));
+                    entries
+                };
+                let project: Vec<AliasInfo> = match cwd.as_deref() {
+                    Some(c) => {
+                        let map = crate::project_config::load_project_aliases(c);
+                        let mut entries: Vec<AliasInfo> = map
+                            .into_iter()
+                            .map(|(name, target)| AliasInfo { name, target })
+                            .collect();
+                        entries.sort_by(|a, b| a.name.cmp(&b.name));
+                        entries
+                    }
+                    None => Vec::new(),
+                };
+                send(&mut writer, &Response::Aliases { global, project }).await?;
+            }
             Request::SetCwd { session_id, cwd } => {
                 let result = {
                     let st = lock_state(&state);
@@ -1848,14 +1883,30 @@ async fn handle_client(
             } => {
                 let result = {
                     let st = lock_state(&state);
-                    if let Some(model) = st.all_models.iter().find(|m| m.id == model_id) {
-                        st.db.update_model(&session_id, model)?;
-                        Ok(model_info(model))
-                    } else {
-                        Err(format!(
-                            "unknown model: {}. Use /model to list available models.",
-                            model_id
-                        ))
+                    // Look up the session's cwd so project aliases (loaded
+                    // from `{cwd}/.tau/models.toml`) apply when the user
+                    // switches models mid-session via `/model smart`.
+                    let cwd = st
+                        .db
+                        .get_session(&session_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.cwd);
+                    let project_aliases = cwd
+                        .as_deref()
+                        .map(crate::project_config::load_project_aliases);
+                    match crate::model_resolve::resolve_model(
+                        &model_id,
+                        None,
+                        project_aliases.as_ref(),
+                        &st.config.aliases,
+                        &st.all_models,
+                    ) {
+                        Ok(model) => {
+                            st.db.update_model(&session_id, model)?;
+                            Ok(model_info(model))
+                        }
+                        Err(e) => Err(format!("{}. Use /model to list available models.", e)),
                     }
                 };
                 match result {
@@ -3433,21 +3484,55 @@ fn create_session_impl(
         .as_ref()
         .and_then(|pid| st.db.get_session(pid).ok().flatten());
 
-    let model = match (model_id, provider_name) {
-        (Some(mid), Some(prov)) => st
-            .all_models
-            .iter()
-            .find(|m| m.id == *mid && m.provider == *prov)
-            .cloned(),
-        (Some(mid), None) => st.all_models.iter().find(|m| m.id == *mid).cloned(),
-        _ => None,
-    }
-    .or_else(|| parent.as_ref().map(|p| p.model.clone()))
-    .unwrap_or_else(|| st.default_model.clone());
-
+    // Derive cwd before model resolution: project aliases need it.
     let cwd = cwd
         .clone()
         .or_else(|| parent.as_ref().and_then(|p| p.cwd.clone()));
+
+    // Resolve the model. When the request supplies an explicit model_id we
+    // run it through the alias resolver (project map → global map → literal
+    // id). When no model_id is given we inherit from the parent or fall
+    // back to the server-wide default, preserving the historical behavior
+    // for sessions that don't ask for a specific model.
+    //
+    // NOTE: load_project_aliases performs file I/O while we hold the state
+    // lock. This mirrors how `load_project_instructions` is invoked from
+    // the task scheduler — see project_config.rs for the rationale.
+    let model = if let Some(mid) = model_id {
+        let project_aliases = cwd
+            .as_deref()
+            .map(crate::project_config::load_project_aliases);
+        let resolved = crate::model_resolve::resolve_model(
+            mid,
+            provider_name.as_deref(),
+            project_aliases.as_ref(),
+            &st.config.aliases,
+            &st.all_models,
+        );
+        match resolved {
+            Ok(m) => m.clone(),
+            Err(e @ crate::model_resolve::ResolveError::UnknownAlias { .. }) => {
+                // A configured alias points at a missing model: surface
+                // the error instead of silently using the default.
+                return Response::Error {
+                    message: format!("{}. Use `tau models` to list available models.", e),
+                };
+            }
+            Err(crate::model_resolve::ResolveError::UnknownModel { .. }) => {
+                // Not an alias and not a known model id — preserve the
+                // historical fall-through to parent / default.
+                parent
+                    .as_ref()
+                    .map(|p| p.model.clone())
+                    .unwrap_or_else(|| st.default_model.clone())
+            }
+        }
+    } else {
+        parent
+            .as_ref()
+            .map(|p| p.model.clone())
+            .unwrap_or_else(|| st.default_model.clone())
+    };
 
     let id = match st.db.next_session_id() {
         Ok(id) => id,

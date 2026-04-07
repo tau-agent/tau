@@ -81,6 +81,7 @@ impl Client {
                 | Response::SessionRestored
                 | Response::Sessions { .. }
                 | Response::Models { .. }
+                | Response::Aliases { .. }
                 | Response::ModelChanged { .. }
                 | Response::Messages { .. }
                 | Response::UserMessage { .. }

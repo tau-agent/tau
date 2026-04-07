@@ -18,6 +18,10 @@ use crate::types::{Model, ModelCost, ThinkingStyle};
 pub struct Config {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// Global model aliases: short name → model id (or `provider/model-id`).
+    /// See `crate::model_resolve` for resolution semantics.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub aliases: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,5 +458,34 @@ mod tests {
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert!(parsed.providers.contains_key("local"));
         assert_eq!(parsed.providers["local"].models[0].id, "test-model");
+    }
+
+    #[test]
+    fn aliases_roundtrip() {
+        let mut config = Config::default();
+        config.aliases.insert("smart".into(), "gpt-4.1".into());
+        config
+            .aliases
+            .insert("fast".into(), "openai/gpt-4.1-mini".into());
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.aliases.get("smart"), Some(&"gpt-4.1".to_string()));
+        assert_eq!(
+            parsed.aliases.get("fast"),
+            Some(&"openai/gpt-4.1-mini".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_aliases_section_defaults_to_empty() {
+        // No [aliases] section in TOML — should still parse fine.
+        let toml_str = r#"
+[providers.local]
+api = "openai"
+base_url = "http://localhost"
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(parsed.aliases.is_empty());
+        assert!(parsed.providers.contains_key("local"));
     }
 }

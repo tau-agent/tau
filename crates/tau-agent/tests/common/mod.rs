@@ -88,6 +88,7 @@ impl TestServer {
             tool_executor_factory: None,
             mock_tools: vec![],
             plugins_config: None,
+            aliases: std::collections::HashMap::new(),
         };
 
         std::thread::spawn(move || {
@@ -135,6 +136,7 @@ impl TestServer {
             tool_executor_factory: None,
             mock_tools: vec![],
             plugins_config: None,
+            aliases: std::collections::HashMap::new(),
         };
         let config = configure(base_config);
 

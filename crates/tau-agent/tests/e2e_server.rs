@@ -587,6 +587,7 @@ fn server_session_resume_after_restart() {
         tool_executor_factory: None,
         mock_tools: vec![],
         plugins_config: None,
+        aliases: std::collections::HashMap::new(),
     };
 
     let handle = std::thread::spawn(move || {
@@ -657,6 +658,7 @@ fn server_session_resume_after_restart() {
         tool_executor_factory: None,
         mock_tools: vec![],
         plugins_config: None,
+        aliases: std::collections::HashMap::new(),
     };
 
     let _handle2 = std::thread::spawn(move || {
@@ -940,6 +942,7 @@ fn server_chat_with_mock_tool_success() {
         tool_executor_factory: Some(tool_factory),
         mock_tools: vec![mock_tool("read_file", "Read a file")],
         plugins_config: None,
+        aliases: std::collections::HashMap::new(),
     };
 
     std::thread::spawn(move || {
@@ -1574,6 +1577,7 @@ fn session_dump_and_replay() {
         tool_executor_factory: Some(tool_factory),
         mock_tools: vec![mock_tool("bash", "Run a command")],
         plugins_config: None,
+        aliases: std::collections::HashMap::new(),
     };
 
     std::thread::spawn(move || {
@@ -2530,6 +2534,7 @@ fn server_log_provider_chat_returns_immediately() {
         tool_executor_factory: None,
         mock_tools: vec![],
         plugins_config: None,
+        aliases: std::collections::HashMap::new(),
     };
 
     std::thread::spawn(move || {
@@ -2613,4 +2618,322 @@ fn server_log_provider_chat_returns_immediately() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     send_recv(&conn3, &Request::Shutdown { restart: false });
+}
+
+// ---------------------------------------------------------------------------
+// Model alias resolution (task 419)
+// ---------------------------------------------------------------------------
+
+/// Build a small set of mock models for alias tests: "fast" and "smart"
+/// share the mock provider so a session can pick either via id.
+fn alias_test_models() -> Vec<tau_agent::Model> {
+    let mut a = mock_model();
+    a.id = "fast-model".into();
+    a.name = "Fast".into();
+    let mut b = mock_model();
+    b.id = "smart-model".into();
+    b.name = "Smart".into();
+    vec![a, b]
+}
+
+fn alias_test_server(
+    aliases: std::collections::HashMap<String, String>,
+) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("alias-test.sock");
+    let db_path = dir.path().join("alias-test.db");
+
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![]));
+
+    let config = tau_agent::server::TestServerConfig {
+        registry,
+        models: alias_test_models(),
+        socket_path: sock_path.clone(),
+        db_path,
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases,
+    };
+
+    std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config).await.ok();
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        sock_path.exists(),
+        "alias test server socket did not appear"
+    );
+
+    (dir, sock_path)
+}
+
+fn create_session_with_model(
+    sock_path: &std::path::Path,
+    model: Option<&str>,
+    cwd: Option<&str>,
+) -> Response {
+    let conn = UnixStream::connect(sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: model.map(String::from),
+            provider: None,
+            system_prompt: Some("test".into()),
+            cwd: cwd.map(String::from),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+        },
+    )
+}
+
+fn session_model_id(sock_path: &std::path::Path, session_id: &str) -> String {
+    let conn = UnixStream::connect(sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    match send_recv(
+        &conn,
+        &Request::GetSessionInfo {
+            session_id: session_id.into(),
+        },
+    ) {
+        Response::SessionInfo { info } => info.model,
+        other => panic!("expected SessionInfo, got {:?}", other),
+    }
+}
+
+fn shutdown(sock_path: &std::path::Path) {
+    let conn = UnixStream::connect(sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send_recv(&conn, &Request::Shutdown { restart: false });
+}
+
+#[test]
+fn alias_global_resolves_to_target_model() {
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert("smart".into(), "smart-model".into());
+    aliases.insert("fast".into(), "fast-model".into());
+    let (_dir, sock) = alias_test_server(aliases);
+
+    let resp = create_session_with_model(&sock, Some("smart"), None);
+    let sid = match resp {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+    let model = session_model_id(&sock, &sid);
+    assert_eq!(model, "smart-model", "alias 'smart' should resolve");
+
+    let resp = create_session_with_model(&sock, Some("fast"), None);
+    let sid = match resp {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+    let model = session_model_id(&sock, &sid);
+    assert_eq!(model, "fast-model");
+
+    shutdown(&sock);
+}
+
+#[test]
+fn alias_unknown_target_returns_error() {
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert("ghost".into(), "no-such-model".into());
+    let (_dir, sock) = alias_test_server(aliases);
+
+    let resp = create_session_with_model(&sock, Some("ghost"), None);
+    match resp {
+        Response::Error { message } => {
+            assert!(
+                message.contains("ghost"),
+                "error should mention alias name: {}",
+                message
+            );
+            assert!(
+                message.contains("no-such-model"),
+                "error should mention target: {}",
+                message
+            );
+        }
+        other => panic!("expected Error response, got {:?}", other),
+    }
+
+    shutdown(&sock);
+}
+
+#[test]
+fn alias_empty_maps_match_legacy_behavior() {
+    // Regression: with no aliases configured, behavior must be identical
+    // to before the alias layer existed:
+    //   - explicit known model id → that model
+    //   - explicit unknown model id → fall through to default
+    //   - no model id → default
+    let (_dir, sock) = alias_test_server(std::collections::HashMap::new());
+
+    // Known id.
+    let resp = create_session_with_model(&sock, Some("smart-model"), None);
+    let sid = match resp {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+    assert_eq!(session_model_id(&sock, &sid), "smart-model");
+
+    // Unknown id → default (the FIRST model in the list, "fast-model").
+    let resp = create_session_with_model(&sock, Some("not-a-model"), None);
+    let sid = match resp {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+    assert_eq!(
+        session_model_id(&sock, &sid),
+        "fast-model",
+        "unknown id should fall through to default model"
+    );
+
+    // No id → default.
+    let resp = create_session_with_model(&sock, None, None);
+    let sid = match resp {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+    assert_eq!(session_model_id(&sock, &sid), "fast-model");
+
+    shutdown(&sock);
+}
+
+#[test]
+fn alias_project_overrides_global() {
+    // Set up a project dir with .tau/models.toml that points "smart" at
+    // "fast-model" while the global alias points "smart" at "smart-model".
+    let proj_dir = tempfile::tempdir().unwrap();
+    let tau_dir = proj_dir.path().join(".tau");
+    std::fs::create_dir_all(&tau_dir).unwrap();
+    std::fs::write(
+        tau_dir.join("models.toml"),
+        r#"[aliases]
+smart = "fast-model"
+"#,
+    )
+    .unwrap();
+
+    let mut global = std::collections::HashMap::new();
+    global.insert("smart".into(), "smart-model".into());
+    let (_dir, sock) = alias_test_server(global);
+
+    // Without cwd: global alias wins → smart-model.
+    let resp = create_session_with_model(&sock, Some("smart"), None);
+    let sid = match resp {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+    assert_eq!(session_model_id(&sock, &sid), "smart-model");
+
+    // With cwd inside the project dir: project alias wins → fast-model.
+    let cwd = proj_dir.path().to_str().unwrap();
+    let resp = create_session_with_model(&sock, Some("smart"), Some(cwd));
+    let sid = match resp {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+    assert_eq!(
+        session_model_id(&sock, &sid),
+        "fast-model",
+        "project alias should override global"
+    );
+
+    shutdown(&sock);
+}
+
+#[test]
+fn alias_set_model_routes_through_resolver() {
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert("smart".into(), "smart-model".into());
+    let (_dir, sock) = alias_test_server(aliases);
+
+    // Create a session on the default model (fast-model).
+    let sid = match create_session_with_model(&sock, None, None) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+    assert_eq!(session_model_id(&sock, &sid), "fast-model");
+
+    // /model smart should switch via the alias.
+    let conn = UnixStream::connect(&sock).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(
+        &conn,
+        &Request::SetModel {
+            session_id: sid.clone(),
+            model_id: "smart".into(),
+        },
+    );
+    match resp {
+        Response::ModelChanged { model } => assert_eq!(model.id, "smart-model"),
+        other => panic!("expected ModelChanged, got {:?}", other),
+    }
+    assert_eq!(session_model_id(&sock, &sid), "smart-model");
+
+    shutdown(&sock);
+}
+
+#[test]
+fn alias_list_aliases_request() {
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert("smart".into(), "smart-model".into());
+    aliases.insert("fast".into(), "fast-model".into());
+    let (_dir, sock) = alias_test_server(aliases);
+
+    // No cwd → global only.
+    let conn = UnixStream::connect(&sock).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(&conn, &Request::ListAliases { cwd: None });
+    match resp {
+        Response::Aliases { global, project } => {
+            assert!(project.is_empty());
+            assert_eq!(global.len(), 2);
+            let names: Vec<&str> = global.iter().map(|a| a.name.as_str()).collect();
+            assert!(names.contains(&"smart"));
+            assert!(names.contains(&"fast"));
+        }
+        other => panic!("expected Aliases, got {:?}", other),
+    }
+
+    // With cwd containing .tau/models.toml.
+    let proj_dir = tempfile::tempdir().unwrap();
+    let tau_dir = proj_dir.path().join(".tau");
+    std::fs::create_dir_all(&tau_dir).unwrap();
+    std::fs::write(
+        tau_dir.join("models.toml"),
+        r#"[aliases]
+worker = "fast-model"
+"#,
+    )
+    .unwrap();
+    let cwd = proj_dir.path().to_str().unwrap().to_string();
+
+    let conn = UnixStream::connect(&sock).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(&conn, &Request::ListAliases { cwd: Some(cwd) });
+    match resp {
+        Response::Aliases { global, project } => {
+            assert_eq!(global.len(), 2);
+            assert_eq!(project.len(), 1);
+            assert_eq!(project[0].name, "worker");
+            assert_eq!(project[0].target, "fast-model");
+        }
+        other => panic!("expected Aliases, got {:?}", other),
+    }
+
+    shutdown(&sock);
 }
