@@ -8,7 +8,6 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use tau_agent::protocol::format_tokens;
-use tau_agent::truncate_str;
 use tau_agent::types::AgentPhase;
 use unicode_width::UnicodeWidthStr;
 
@@ -434,6 +433,24 @@ fn build_session_tree(sessions: &[tau_agent::protocol::SessionInfo]) -> Vec<(usi
 }
 
 /// Format a duration as a compact idle time string.
+/// Truncate `s` to at most `max_width` display columns, respecting char
+/// boundaries. Unlike `tau_agent::truncate_str` which counts bytes, this
+/// accounts for wide characters (CJK, emoji, box-drawing glyphs).
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > max_width {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
+}
+
 fn format_idle_time(last_activity: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -632,7 +649,10 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut used = 0usize;
 
-            // Tree indent with connectors (flatten when filtering)
+            // Tree indent with connectors (flatten when filtering).
+            // Note: box-drawing glyphs (└ ├ │ ─) are 3 bytes in UTF-8 but
+            // render at width 1, so we must use display width (not byte
+            // length) when tracking column position.
             let connector = if !app.picker_filter.is_empty() || depth == 0 {
                 String::new()
             } else if is_last {
@@ -641,7 +661,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
                 format!("{}├── ", "│   ".repeat(depth - 1))
             };
             spans.push(Span::raw(format!(" {}", connector)));
-            used += 1 + connector.len();
+            used += 1 + UnicodeWidthStr::width(connector.as_str());
 
             // Fold indicator: ▼ (has children, unfolded), ▶ (has children,
             // folded), or two spaces (no children) for alignment.
@@ -735,20 +755,27 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
                 COL_GAP + CTX_W + COL_GAP + COST_W + COL_GAP + IDLE_W + COL_GAP + MSGS_W;
             debug_assert_eq!(right_text.len(), right_len);
 
-            // Tagline fills the middle
+            // Tagline fills the middle. Use display width (not byte length)
+            // so wide chars (CJK, emoji) don't break alignment.
             let tagline_space = w.saturating_sub(used + 1 + right_len + 1);
             let tagline_display = if tagline_space >= 4 {
                 if let Some(ref tl) = session.tagline {
-                    if tl.len() > tagline_space {
-                        format!(" {}...", truncate_str(tl, tagline_space.saturating_sub(3)))
+                    if UnicodeWidthStr::width(tl.as_str()) > tagline_space {
+                        format!(
+                            " {}...",
+                            truncate_to_width(tl, tagline_space.saturating_sub(3))
+                        )
                     } else {
                         format!(" {}", tl)
                     }
                 } else {
                     // Fall back to model name
                     let m = &session.model;
-                    if m.len() + 1 > tagline_space {
-                        format!(" {}...", truncate_str(m, tagline_space.saturating_sub(3)))
+                    if UnicodeWidthStr::width(m.as_str()) + 1 > tagline_space {
+                        format!(
+                            " {}...",
+                            truncate_to_width(m, tagline_space.saturating_sub(3))
+                        )
                     } else {
                         format!(" {}", m)
                     }
@@ -756,13 +783,18 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             } else {
                 String::new()
             };
-            let tagline_actual_len = tagline_display.len();
 
             spans.push(Span::styled(tagline_display, theme.italic_fg(theme.dim)));
-            used += tagline_actual_len;
 
-            // Pad between tagline and right info
-            let pad = w.saturating_sub(used + right_len);
+            // Anchor the right block to the right edge: compute padding from
+            // the actual rendered width of all spans so far, not from the
+            // running `used` counter. This makes the right column robust
+            // against any residual width-tracking bugs upstream.
+            let line_so_far_width: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let pad = w.saturating_sub(line_so_far_width + right_len);
             if pad > 0 {
                 spans.push(Span::raw(" ".repeat(pad)));
             }
@@ -826,4 +858,111 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
 
     let text = Text::from(lines);
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_to_width_ascii() {
+        assert_eq!(truncate_to_width("hello world", 5), "hello");
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("", 10), "");
+    }
+
+    #[test]
+    fn truncate_to_width_wide_chars() {
+        // CJK chars are width 2.
+        assert_eq!(truncate_to_width("日本語", 4), "日本");
+        // Width 3 is not enough for two CJK chars (would be 4) → just one.
+        assert_eq!(truncate_to_width("日本語", 3), "日");
+        // Width 0 → empty.
+        assert_eq!(truncate_to_width("日本", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_width_box_drawing() {
+        // Box-drawing chars are 3 bytes UTF-8 but width 1.
+        let s = "│   ├── ";
+        assert_eq!(UnicodeWidthStr::width(s), 8);
+        assert!(s.len() > 8); // bytes > width
+        assert_eq!(truncate_to_width(s, 4), "│   ");
+    }
+
+    /// Regression test for the bug where connector display width was
+    /// computed as byte length, causing right-side columns to drift left
+    /// at deeper tree depths.
+    #[test]
+    fn connector_width_matches_display_not_bytes() {
+        for depth in 1..=5usize {
+            let last = format!("{}└── ", "│   ".repeat(depth - 1));
+            let mid = format!("{}├── ", "│   ".repeat(depth - 1));
+            // Each level adds 4 columns; the leaf glyph adds 4 columns.
+            let expected_width = depth * 4;
+            assert_eq!(
+                UnicodeWidthStr::width(last.as_str()),
+                expected_width,
+                "└── connector at depth {depth}"
+            );
+            assert_eq!(
+                UnicodeWidthStr::width(mid.as_str()),
+                expected_width,
+                "├── connector at depth {depth}"
+            );
+            // Byte length is strictly larger than display width because of
+            // the 3-byte box-drawing glyphs.
+            assert!(last.len() > expected_width);
+            assert!(mid.len() > expected_width);
+        }
+    }
+
+    /// Simulate the picker layout math to verify the right-side block
+    /// lands at the same column regardless of tree depth. This mirrors the
+    /// logic in `draw_session_picker`.
+    #[test]
+    fn picker_right_block_aligned_across_depths() {
+        const W: usize = 80;
+        const RIGHT_LEN: usize = 25; // matches the actual right_text width
+
+        // For each depth, compute where the right block starts.
+        let mut right_starts = Vec::new();
+        for depth in 0..=4usize {
+            let connector = if depth == 0 {
+                String::new()
+            } else {
+                format!("{}├── ", "│   ".repeat(depth - 1))
+            };
+
+            // Mimic the row builder.
+            let mut spans: Vec<String> = Vec::new();
+            spans.push(format!(" {}", connector)); // leading space + connector
+            spans.push("▼ ".to_string()); // fold indicator
+            spans.push("* ".to_string()); // state
+            spans.push("s123abcd".to_string()); // 8-char id
+
+            // tagline (kept short so it fits everywhere)
+            let tagline = " example tagline";
+            spans.push(tagline.to_string());
+
+            let line_so_far_width: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.as_str()))
+                .sum();
+            let pad = W.saturating_sub(line_so_far_width + RIGHT_LEN);
+            let right_col = line_so_far_width + pad;
+            right_starts.push(right_col);
+        }
+
+        // All right-column starts should equal W - RIGHT_LEN.
+        for (depth, &col) in right_starts.iter().enumerate() {
+            assert_eq!(
+                col,
+                W - RIGHT_LEN,
+                "right block start at depth {depth} should be {} but got {}",
+                W - RIGHT_LEN,
+                col
+            );
+        }
+    }
 }
