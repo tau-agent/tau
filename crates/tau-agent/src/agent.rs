@@ -599,9 +599,16 @@ async fn stream_with_retry(
         let message = consume_stream(rx, event_tx, should_stop, idle_timeout).await;
 
         // Propagate cancellation immediately — no retry.
-        // Convert idle-timeout errors into an error AssistantMessage so the
-        // retry logic below (which checks stop_reason + error_message) can
-        // handle them uniformly with other timeout/retryable errors.
+        // Convert idle-timeout / transport errors into an error AssistantMessage
+        // so the retry logic below (which checks stop_reason + error_message)
+        // can handle them uniformly with other timeout/retryable errors.
+        //
+        // Track whether the error message was *synthesised* from a transport-
+        // level failure (i.e. `consume_stream` returned Err and never forwarded
+        // a terminating StreamEvent on `event_tx`). In that case we must emit
+        // a `StreamEvent::Error` ourselves before returning, so the TUI / other
+        // subscribers see a terminator for the in-flight streaming item.
+        let mut synthesised_from_transport_error = false;
         let message = match message {
             Err(crate::Error::Cancelled) => return Err(crate::Error::Cancelled),
             Err(crate::Error::Http(ref msg)) if is_timeout(msg) => {
@@ -609,6 +616,7 @@ async fn stream_with_retry(
                 let mut m = AssistantMessage::empty(&model.api, &model.provider, &model.id);
                 m.stop_reason = StopReason::Error;
                 m.error_message = Some(err_msg);
+                synthesised_from_transport_error = true;
                 m
             }
             other => other?,
@@ -708,14 +716,31 @@ async fn stream_with_retry(
                 continue;
             }
             if is_context_overflow(err_msg) {
-                // Return the error — caller (server) handles overflow recovery
+                // Return the error — caller (server) handles overflow recovery.
+                // No need to synthesise a StreamEvent::Error here: the server
+                // recovers from overflow and the TUI never sees this path.
                 return Ok(message);
             }
+        }
+
+        // If we synthesised this error from a transport-level failure (i.e.
+        // `consume_stream` returned Err before any Done/Error event was
+        // forwarded), the channel never received a terminator for the
+        // in-flight streaming item. Emit one now so the TUI can finalise
+        // the placeholder and show the error to the user instead of leaving
+        // a stuck spinner.
+        if synthesised_from_transport_error && message.stop_reason == StopReason::Error {
+            let _ = event_tx.try_send(StreamEvent::Error {
+                reason: StopReason::Error,
+                error: message.clone(),
+            });
         }
 
         return Ok(message);
     }
 
+    // The retry loop always returns from inside its body — this is unreachable
+    // in practice, but if we ever fall through, surface a clear error.
     Err(crate::Error::Http("max retries exceeded".into()))
 }
 
@@ -1872,6 +1897,111 @@ mod tests {
             assert!(matches!(&result.new_messages[0], Message::Assistant(a)
                     if a.stop_reason == StopReason::Error
                     && a.error_message.as_ref().unwrap().contains("idle timeout")));
+        });
+    }
+
+    /// Regression test for the "stuck spinner on transport timeout" bug.
+    ///
+    /// When `consume_stream` returns `Err(Error::Http(...))` due to an idle
+    /// timeout (i.e. the provider stalled mid-stream and never sent a Done /
+    /// Error event), `stream_with_retry` synthesises an error AssistantMessage
+    /// to drive its retry logic. After exhausting `MAX_TIMEOUT_RETRIES`, the
+    /// agent loop persists that synthesised message and returns Ok — but it
+    /// must *also* deliver a `StreamEvent::Error` on the event channel, so
+    /// the TUI can finalise its in-flight streaming placeholder. Without
+    /// the terminator the TUI shows a stuck spinner forever.
+    #[test]
+    fn timeout_exhaustion_emits_stream_event_error() {
+        smol::block_on(async {
+            // 3 hangs = initial attempt + MAX_TIMEOUT_RETRIES (2) retries.
+            let registry = setup_registry(vec![
+                MockResponse::Hang,
+                MockResponse::Hang,
+                MockResponse::Hang,
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let config = AgentConfig {
+                idle_timeout_secs: 0, // fire on next poll
+                ..Default::default()
+            };
+            let mut worker = InProcessWorker::new();
+            let (tx, rx) = smol::channel::unbounded();
+
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .expect("agent run should return Ok with synthesised error message");
+
+            // The errored AssistantMessage was persisted via emit_message and
+            // is also reflected in result.new_messages.
+            assert_eq!(result.new_messages.len(), 1);
+            let persisted_err = match &result.new_messages[0] {
+                Message::Assistant(a) => a,
+                _ => panic!("expected an Assistant message"),
+            };
+            assert_eq!(persisted_err.stop_reason, StopReason::Error);
+            assert!(
+                persisted_err
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|m| m.contains("idle timeout")),
+                "expected an idle-timeout error_message, got {:?}",
+                persisted_err.error_message
+            );
+
+            // The whole point of the fix: a StreamEvent::Error must have been
+            // delivered on the event channel before run returned, carrying the
+            // same error text. Otherwise the TUI's streaming placeholder is
+            // never finalised and the spinner appears stuck.
+            let mut events = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                events.push(e);
+            }
+            let error_events: Vec<&AssistantMessage> = events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::Error { error, .. } => Some(error),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                error_events.len(),
+                1,
+                "expected exactly one StreamEvent::Error after timeout exhaustion, got {}",
+                error_events.len()
+            );
+            let err_msg = error_events[0]
+                .error_message
+                .as_deref()
+                .expect("error event AssistantMessage should carry an error_message");
+            assert!(
+                err_msg.contains("idle timeout"),
+                "StreamEvent::Error should carry the idle-timeout text, got {:?}",
+                err_msg
+            );
+
+            // Sanity: retries should still emit Status events for UX.
+            let status_events: Vec<&String> = events
+                .iter()
+                .filter_map(|e| match e {
+                    StreamEvent::Status { message } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                status_events.iter().any(|m| m.contains("timeout")),
+                "expected at least one Status event mentioning timeout, got {:?}",
+                status_events
+            );
         });
     }
 
