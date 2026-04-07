@@ -25,11 +25,24 @@ max_tokens = 32768
 ## Model aliases
 
 Aliases let you refer to a model by **role** (`smart`, `fast`, `cheap`,
-`worker`, …) instead of by version string. They live in two places:
+`worker`, …) instead of by version string. They live in two places,
+both named `models.toml`:
+
+| Scope   | File                                       |
+|---------|--------------------------------------------|
+| Global  | `~/.config/tau/models.toml`                |
+| Project | `{project}/.tau/models.toml`               |
+
+> **Migration.** Earlier versions of tau kept the global `[aliases]`
+> section in `~/.config/tau/providers.toml`. That location is now
+> deprecated. Tau still reads it as a fallback but prints a warning on
+> startup; move your aliases to `~/.config/tau/models.toml` to silence
+> it.
 
 ### Global aliases
 
-Add an `[aliases]` section to `~/.config/tau/providers.toml`:
+Add an `[aliases]` section to `~/.config/tau/models.toml` (the path
+honours `$XDG_CONFIG_HOME`):
 
 ```toml
 [aliases]
@@ -65,7 +78,8 @@ When you say `tau chat -m smart` or `/model smart`, the resolver:
 
 1. Looks `smart` up in the **project** alias map (loaded from
    `{cwd}/.tau/models.toml`, if `cwd` is set).
-2. Falls back to the **global** alias map (`providers.toml [aliases]`).
+2. Falls back to the **global** alias map
+   (`~/.config/tau/models.toml [aliases]`).
 3. Falls back to treating `smart` as a literal model id.
 
 Only **one alias hop** is performed: alias targets must be model ids,
@@ -103,7 +117,7 @@ tau models
 ```
 
 Lists all known models followed by:
-- `aliases (global):` — entries from `~/.config/tau/providers.toml`
+- `aliases (global):` — entries from `~/.config/tau/models.toml`
 - `aliases (project):` — entries from `./.tau/models.toml` (only when
   run from the project root; the lookup is non-recursive in v1)
 

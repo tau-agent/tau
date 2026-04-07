@@ -212,6 +212,10 @@ struct State {
     registry: ProviderRegistry,
     auth: AuthStorage,
     config: config::Config,
+    /// Global model aliases loaded from `~/.config/tau/models.toml`
+    /// (with a legacy fallback to `providers.toml [aliases]`).  See
+    /// [`crate::models_config::load_global_aliases`].
+    global_aliases: HashMap<String, String>,
     default_model: Model,
     /// All known models (for /model listing).
     all_models: Vec<Model>,
@@ -614,7 +618,9 @@ pub struct TestServerConfig {
     pub mock_tools: Vec<Tool>,
     /// Optional: plugins configuration (for testing global plugins).
     pub plugins_config: Option<crate::plugin::PluginsConfig>,
-    /// Optional: global model aliases (mirrors `Config::aliases`).
+    /// Optional: global model aliases (mirrors what would normally be
+    /// loaded from `~/.config/tau/models.toml` by
+    /// [`crate::models_config::load_global_aliases`]).
     pub aliases: HashMap<String, String>,
 }
 
@@ -655,9 +661,9 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
             models: vec![],
         },
     );
-    // Inject any test-supplied aliases into the synthesized config so the
-    // resolver picks them up.
-    cfg.aliases = config.aliases.clone();
+    // Test-supplied global aliases (mirrors what would normally come
+    // from `~/.config/tau/models.toml`).
+    let global_aliases = config.aliases.clone();
     let plugins_config = config
         .plugins_config
         .unwrap_or(crate::plugin::PluginsConfig {
@@ -676,6 +682,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         registry: config.registry,
         auth: AuthStorage::open_default(),
         config: cfg,
+        global_aliases,
         default_model,
         all_models: config.models,
         usage_cache: None,
@@ -768,6 +775,7 @@ pub async fn run() -> crate::Result<()> {
     let registry = build_registry();
     let cfg = config::load_config()?;
     let all_models = config::resolve_models(&cfg);
+    let global_aliases = crate::models_config::load_global_aliases();
     let default_model = all_models
         .first()
         .cloned()
@@ -803,6 +811,7 @@ pub async fn run() -> crate::Result<()> {
         registry,
         auth: AuthStorage::open_default(),
         config: cfg,
+        global_aliases,
         default_model,
         all_models,
         usage_cache: None,
@@ -1809,8 +1818,7 @@ async fn handle_client(
                 let global: Vec<AliasInfo> = {
                     let st = lock_state(&state);
                     let mut entries: Vec<AliasInfo> = st
-                        .config
-                        .aliases
+                        .global_aliases
                         .iter()
                         .map(|(name, target)| AliasInfo {
                             name: name.clone(),
@@ -1822,7 +1830,7 @@ async fn handle_client(
                 };
                 let project: Vec<AliasInfo> = match cwd.as_deref() {
                     Some(c) => {
-                        let map = crate::project_config::load_project_aliases(c);
+                        let map = crate::models_config::load_project_aliases(c);
                         let mut entries: Vec<AliasInfo> = map
                             .into_iter()
                             .map(|(name, target)| AliasInfo { name, target })
@@ -1894,12 +1902,12 @@ async fn handle_client(
                         .and_then(|s| s.cwd);
                     let project_aliases = cwd
                         .as_deref()
-                        .map(crate::project_config::load_project_aliases);
+                        .map(crate::models_config::load_project_aliases);
                     match crate::model_resolve::resolve_model(
                         &model_id,
                         None,
                         project_aliases.as_ref(),
-                        &st.config.aliases,
+                        &st.global_aliases,
                         &st.all_models,
                     ) {
                         Ok(model) => {
@@ -3497,16 +3505,16 @@ fn create_session_impl(
     //
     // NOTE: load_project_aliases performs file I/O while we hold the state
     // lock. This mirrors how `load_project_instructions` is invoked from
-    // the task scheduler — see project_config.rs for the rationale.
+    // the task scheduler — see models_config.rs for the rationale.
     let model = if let Some(mid) = model_id {
         let project_aliases = cwd
             .as_deref()
-            .map(crate::project_config::load_project_aliases);
+            .map(crate::models_config::load_project_aliases);
         let resolved = crate::model_resolve::resolve_model(
             mid,
             provider_name.as_deref(),
             project_aliases.as_ref(),
-            &st.config.aliases,
+            &st.global_aliases,
             &st.all_models,
         );
         match resolved {

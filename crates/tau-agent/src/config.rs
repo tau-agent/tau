@@ -2,6 +2,12 @@
 //!
 //! Built-in providers (anthropic, openai) provide defaults.
 //! Custom providers and models from TOML are merged on top.
+//!
+//! Note: model aliases used to live in this file under `[aliases]`.
+//! They now live in `~/.config/tau/models.toml`, handled by
+//! [`crate::models_config`].  Legacy `[aliases]` entries in
+//! `providers.toml` are still honoured as a migration fallback — see
+//! [`crate::models_config::load_global_aliases`] for details.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,10 +24,6 @@ use crate::types::{Model, ModelCost, ThinkingStyle};
 pub struct Config {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
-    /// Global model aliases: short name → model id (or `provider/model-id`).
-    /// See `crate::model_resolve` for resolution semantics.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub aliases: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -461,31 +463,21 @@ mod tests {
     }
 
     #[test]
-    fn aliases_roundtrip() {
-        let mut config = Config::default();
-        config.aliases.insert("smart".into(), "gpt-4.1".into());
-        config
-            .aliases
-            .insert("fast".into(), "openai/gpt-4.1-mini".into());
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        let parsed: Config = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.aliases.get("smart"), Some(&"gpt-4.1".to_string()));
-        assert_eq!(
-            parsed.aliases.get("fast"),
-            Some(&"openai/gpt-4.1-mini".to_string())
-        );
-    }
-
-    #[test]
-    fn missing_aliases_section_defaults_to_empty() {
-        // No [aliases] section in TOML — should still parse fine.
+    fn legacy_aliases_section_is_ignored_by_config_parser() {
+        // Back-compat: an old providers.toml with a top-level
+        // [aliases] section should still parse without error.  The
+        // aliases themselves are picked up by `models_config`, not by
+        // this struct, so we only assert the providers section still
+        // round-trips.
         let toml_str = r#"
 [providers.local]
 api = "openai"
 base_url = "http://localhost"
+
+[aliases]
+smart = "gpt-4.1"
 "#;
         let parsed: Config = toml::from_str(toml_str).unwrap();
-        assert!(parsed.aliases.is_empty());
         assert!(parsed.providers.contains_key("local"));
     }
 }

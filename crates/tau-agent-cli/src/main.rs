@@ -1677,21 +1677,22 @@ fn cmd_models_list() -> tau_agent::Result<()> {
         );
     }
 
-    // Aliases — global from providers.toml + project-local from
-    // ./.tau/models.toml.  Project lookup is non-recursive: it only checks
-    // the current working directory, not parent directories.  Run from the
-    // project root to see project aliases.
-    if !cfg.aliases.is_empty() {
+    // Aliases — global from ~/.config/tau/models.toml + project-local
+    // from ./.tau/models.toml.  Project lookup is non-recursive: it only
+    // checks the current working directory, not parent directories.  Run
+    // from the project root to see project aliases.
+    let global_aliases = tau_agent::models_config::load_global_aliases();
+    if !global_aliases.is_empty() {
         println!();
         println!("aliases (global):");
-        let mut entries: Vec<(&String, &String)> = cfg.aliases.iter().collect();
+        let mut entries: Vec<(&String, &String)> = global_aliases.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         for (name, target) in entries {
             println!("  {:<16} -> {}", name, target);
         }
     }
 
-    let project_aliases = tau_agent::project_config::load_project_aliases(".");
+    let project_aliases = tau_agent::models_config::load_project_aliases(".");
     if !project_aliases.is_empty() {
         println!();
         println!("aliases (project):");
