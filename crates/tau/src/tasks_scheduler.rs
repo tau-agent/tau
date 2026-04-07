@@ -406,7 +406,9 @@ pub fn dispatch(
     let merge_target = db
         .get_merge_target(task_id)
         .unwrap_or_else(|_| "main".into());
-    let chat_msg = build_initial_message(&task, &merge_target);
+    let project_instructions =
+        tasks_config::load_project_instructions(&task.project, "worker").unwrap_or_default();
+    let chat_msg = build_initial_message(&task, &merge_target, &project_instructions);
     let chat_req = crate::protocol::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
@@ -1246,7 +1248,13 @@ fn merge_one_task(
 }
 
 /// Build the initial chat message sent to a dispatched task's session.
-fn build_initial_message(task: &Task, merge_target: &str) -> String {
+///
+/// `project_instructions` is the combined text loaded from
+/// `.tau/instructions.toml` (via
+/// [`tasks_config::load_project_instructions`]) for the `"worker"` phase.
+/// When non-empty it is appended as a dedicated section so the worker sees
+/// project-specific guidance in addition to the generic boilerplate.
+fn build_initial_message(task: &Task, merge_target: &str, project_instructions: &str) -> String {
     let review_instruction = if task.skip_review {
         format!(
             "- Call the `task_update` tool with arguments: {{\"id\": {id}, \"state\": \"approved\"}}  (skip_review is true for this task)",
@@ -1259,7 +1267,7 @@ fn build_initial_message(task: &Task, merge_target: &str) -> String {
         )
     };
 
-    format!(
+    let mut msg = format!(
         "You are working on task {id}: {title}\n\
          \n\
          Use the task_get tool (not a bash command) to read the full specification:\n\
@@ -1277,7 +1285,17 @@ fn build_initial_message(task: &Task, merge_target: &str) -> String {
         title = task.title,
         review = review_instruction,
         target = merge_target,
-    )
+    );
+
+    let trimmed = project_instructions.trim();
+    if !trimmed.is_empty() {
+        msg.push_str(&format!(
+            "\n\n## Project-specific instructions\n\n{}\n",
+            trimmed
+        ));
+    }
+
+    msg
 }
 
 // ---------------------------------------------------------------------------
@@ -1821,7 +1839,7 @@ mod tests {
     #[test]
     fn test_build_initial_message_with_review() {
         let task = make_task(5, 0, None);
-        let msg = build_initial_message(&task, "main");
+        let msg = build_initial_message(&task, "main", "");
         assert!(msg.contains("task 5"));
         assert!(msg.contains("task_get"));
         assert!(!msg.contains("task_assign"));
@@ -1832,13 +1850,15 @@ mod tests {
         assert!(msg.contains("not a bash command") || msg.contains("not CLI commands"));
         assert!(msg.contains("do NOT merge into main") || msg.contains("do not merge"));
         assert!(msg.contains("rebase"));
+        // No project instructions supplied — the section header must not appear.
+        assert!(!msg.contains("Project-specific instructions"));
     }
 
     #[test]
     fn test_build_initial_message_skip_review() {
         let mut task = make_task(7, 0, None);
         task.skip_review = true;
-        let msg = build_initial_message(&task, "main");
+        let msg = build_initial_message(&task, "main", "");
         assert!(msg.contains("\"state\": \"approved\""));
         assert!(msg.contains("skip_review is true"));
     }
@@ -1846,7 +1866,7 @@ mod tests {
     #[test]
     fn test_build_initial_message_tool_call_format() {
         let task = make_task(42, 0, None);
-        let msg = build_initial_message(&task, "main");
+        let msg = build_initial_message(&task, "main", "");
         // Should include JSON argument hint so agent knows the invocation format
         assert!(msg.contains(r#"{"id": 42}"#));
         // task_update should also use JSON format, not CLI-style positional args
@@ -1861,10 +1881,28 @@ mod tests {
     #[test]
     fn test_build_initial_message_uses_merge_target() {
         let task = make_task(42, 0, None);
-        let msg = build_initial_message(&task, "task-1-5");
+        let msg = build_initial_message(&task, "task-1-5", "");
         assert!(msg.contains("do NOT merge into task-1-5"));
         assert!(!msg.contains("merge into main"));
         assert!(msg.contains("git rebase task-1-5"));
+    }
+
+    #[test]
+    fn test_build_initial_message_includes_project_instructions() {
+        let task = make_task(9, 0, None);
+        let instructions = "- Follow project style\n- Keep diffs minimal";
+        let msg = build_initial_message(&task, "main", instructions);
+        assert!(msg.contains("Project-specific instructions"));
+        assert!(msg.contains("Follow project style"));
+        assert!(msg.contains("Keep diffs minimal"));
+    }
+
+    #[test]
+    fn test_build_initial_message_blank_instructions_omitted() {
+        let task = make_task(11, 0, None);
+        // Whitespace-only should be treated as empty — no section header.
+        let msg = build_initial_message(&task, "main", "   \n\n  ");
+        assert!(!msg.contains("Project-specific instructions"));
     }
 
     #[test]

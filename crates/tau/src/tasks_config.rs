@@ -1,7 +1,8 @@
 //! Project-specific instruction injection for task lifecycle phases.
 //!
 //! Loads custom instructions from `{project_root}/.tau/instructions.toml`
-//! and injects them into planning, refining, and review session prompts.
+//! and injects them into planning, refining, review, and worker session
+//! prompts.
 //!
 //! ## Config format
 //!
@@ -19,6 +20,11 @@
 //! [review]
 //! instructions = """
 //! - Check for proper error handling
+//! """
+//!
+//! [worker]
+//! instructions = """
+//! - Keep diffs small and focused
 //! """
 //! ```
 
@@ -39,6 +45,8 @@ struct InstructionsConfig {
     refining: Section,
     #[serde(default)]
     review: Section,
+    #[serde(default)]
+    worker: Section,
 }
 
 /// A single section containing optional instructions text.
@@ -59,8 +67,9 @@ struct Section {
 /// `[{phase}].instructions`, separated by a blank line.  Returns `None` if
 /// the file doesn't exist or has no instructions for the requested phase.
 ///
-/// `phase` should be `"planning"`, `"refining"`, or `"review"`.  Any other
-/// value is accepted but will only match the `[common]` section.
+/// `phase` should be `"planning"`, `"refining"`, `"review"`, or
+/// `"worker"`.  Any other value is accepted but will only match the
+/// `[common]` section.
 pub fn load_project_instructions(project: &str, phase: &str) -> Option<String> {
     let path = std::path::Path::new(project)
         .join(".tau")
@@ -81,6 +90,7 @@ pub fn load_project_instructions(project: &str, phase: &str) -> Option<String> {
         "planning" => &config.planning,
         "refining" => &config.refining,
         "review" => &config.review,
+        "worker" => &config.worker,
         _ => &Section::default(),
     };
     let phase_text = phase_section.instructions.as_deref().map(str::trim);
@@ -238,6 +248,70 @@ instructions = "- Check errors"
         let result = load_project_instructions(project, "deploy").unwrap();
         assert!(result.contains("Be careful"));
         assert!(!result.contains("Check errors"));
+    }
+
+    #[test]
+    fn worker_phase_loads_common_and_worker() {
+        let dir = setup(
+            r#"
+[common]
+instructions = """
+- Follow coding style
+"""
+
+[worker]
+instructions = """
+- Keep diffs small
+"""
+
+[review]
+instructions = """
+- Check error handling
+"""
+"#,
+        );
+        let project = dir.path().to_str().unwrap();
+
+        let worker = load_project_instructions(project, "worker").unwrap();
+        assert!(worker.contains("Follow coding style"));
+        assert!(worker.contains("Keep diffs small"));
+        // Should not include the review-only section
+        assert!(!worker.contains("Check error handling"));
+    }
+
+    #[test]
+    fn worker_phase_falls_back_to_common() {
+        // No [worker] section — worker should still receive [common].
+        let dir = setup(
+            r#"
+[common]
+instructions = """
+- Follow coding style
+"""
+"#,
+        );
+        let project = dir.path().to_str().unwrap();
+
+        let worker = load_project_instructions(project, "worker").unwrap();
+        assert!(worker.contains("Follow coding style"));
+    }
+
+    #[test]
+    fn worker_phase_only() {
+        let dir = setup(
+            r#"
+[worker]
+instructions = """
+- Prefer helper functions
+"""
+"#,
+        );
+        let project = dir.path().to_str().unwrap();
+
+        let worker = load_project_instructions(project, "worker").unwrap();
+        assert!(worker.contains("Prefer helper functions"));
+        // refining/review have nothing, not even common
+        assert!(load_project_instructions(project, "refining").is_none());
     }
 
     #[test]
