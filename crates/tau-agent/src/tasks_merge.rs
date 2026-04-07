@@ -2,6 +2,29 @@
 //!
 //! Processes `merging` tasks: rebases onto the merge target, runs the project
 //! checklist, and performs a fast-forward merge.
+//!
+//! # Session roles and post-merge cleanup
+//!
+//! Sessions are tracked against a task in the `task_sessions` table with a
+//! `role` column. The roles currently in use (grep for `record_session(` to
+//! audit) are:
+//!
+//! | Role          | Spawned by task system? | Archive on merge? |
+//! |---------------|-------------------------|-------------------|
+//! | `worker`      | yes (dispatch)          | yes               |
+//! | `planner`     | yes (dispatch_planning) | yes               |
+//! | `reviewer`    | yes (dispatch_review)   | yes               |
+//! | `refiner`     | yes (dispatch_refining) | yes               |
+//! | `log`         | yes (merge itself)      | yes               |
+//! | `interactive` | yes, but user-driven    | no (user may still be using it) |
+//! | `creator`     | no — orchestrator ref   | no                |
+//! | `contributor` | no — orchestrator ref   | no                |
+//!
+//! Only roles listed in [`ARCHIVABLE_ROLES`] are archived when a task merges.
+//! This prevents the long-lived orchestrator/user sessions that merely
+//! *created* or *commented on* a task from being archived as a side-effect
+//! of its merge. See [`sessions_to_archive`] for the filter and the unit
+//! tests below.
 
 use std::io::{BufRead, Write};
 
@@ -10,7 +33,38 @@ use serde_json::json;
 
 use crate::plugin::{PluginMessage, PluginRequest};
 use crate::protocol::{Request, Response};
-use crate::tasks_db::TasksDb;
+use crate::tasks_db::{TaskSession, TasksDb};
+
+/// Session roles that should be archived when a task merges.
+///
+/// Only sessions whose role is in this list are archived by [`merge_task`]'s
+/// cleanup step. Roles outside this list (`creator`, `contributor`,
+/// `interactive`, and anything unknown) are preserved so that orchestrator
+/// and user sessions are not clobbered by a subtask merge.
+///
+/// If a new task-spawned role is introduced, add it to this list explicitly
+/// rather than relying on a deny-list — unknown roles are preserved by
+/// default.
+pub const ARCHIVABLE_ROLES: &[&str] = &["worker", "planner", "reviewer", "refiner", "log"];
+
+/// Partition a list of task sessions into (to-archive, to-skip) based on
+/// [`ARCHIVABLE_ROLES`]. Pure function, trivially testable.
+///
+/// The first tuple element contains sessions whose role is archivable; the
+/// second contains sessions that should be left alone (orchestrator,
+/// interactive, contributor, creator, etc.).
+pub fn sessions_to_archive(sessions: &[TaskSession]) -> (Vec<&TaskSession>, Vec<&TaskSession>) {
+    let mut archive = Vec::new();
+    let mut skip = Vec::new();
+    for ts in sessions {
+        if ARCHIVABLE_ROLES.contains(&ts.role.as_str()) {
+            archive.push(ts);
+        } else {
+            skip.push(ts);
+        }
+    }
+    (archive, skip)
+}
 
 // ---------------------------------------------------------------------------
 // Checklist
@@ -416,21 +470,32 @@ pub fn merge_task(
         );
     }
 
-    // 7c. Archive all task sessions: worker, reviewer, refiner, etc. (best-effort)
-    let mut archived = std::collections::HashSet::new();
+    // 7c. Archive task-spawned sessions (worker, planner, reviewer, refiner,
+    // log). Sessions with roles like `contributor`, `creator`, or
+    // `interactive` are the orchestrator/user sessions that merely referenced
+    // the task — archiving them as a side-effect of a merge would rip them
+    // out from under the user. See `ARCHIVABLE_ROLES` and
+    // `sessions_to_archive` at the top of this module.
+    //
+    // We deliberately do NOT fall back to archiving `task.session_id` when
+    // it isn't present in `task_sessions`: every codepath that sets
+    // `task.session_id` also records an entry in `task_sessions` with an
+    // explicit role (`assign_task` records `worker`, interactive creation
+    // records `interactive`, etc.), so a `task.session_id` missing from
+    // `task_sessions` means we have no role information and cannot safely
+    // decide to archive.
     if let Ok(sessions) = db.get_sessions(task_id) {
-        for ts in &sessions {
+        let (to_archive, to_skip) = sessions_to_archive(&sessions);
+        for ts in to_archive {
             archive_session(writer, reader, &ts.session_id);
             log.push_str(&format!("Archived {} session {}\n", ts.role, ts.session_id));
-            archived.insert(ts.session_id.clone());
         }
-    }
-    // Also archive session_id if it wasn't tracked in task_sessions
-    if let Some(ref sid) = task.session_id
-        && !archived.contains(sid)
-    {
-        archive_session(writer, reader, sid);
-        log.push_str(&format!("Archived task session {}\n", sid));
+        for ts in to_skip {
+            log.push_str(&format!(
+                "Preserved {} session {} (role not in archive list)\n",
+                ts.role, ts.session_id
+            ));
+        }
     }
 
     // 8. Archive the log session
@@ -592,7 +657,118 @@ pub fn notify_session_of_merge_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks_db::{TaskUpdate, TasksDb};
+    use crate::tasks_db::{TaskSession, TaskUpdate, TasksDb};
+
+    // ----- archive role filter -----
+
+    fn ts(session_id: &str, role: &str) -> TaskSession {
+        TaskSession {
+            task_id: 1,
+            session_id: session_id.into(),
+            role: role.into(),
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn test_sessions_to_archive_allows_task_spawned_roles() {
+        let sessions = vec![
+            ts("s-worker", "worker"),
+            ts("s-planner", "planner"),
+            ts("s-reviewer", "reviewer"),
+            ts("s-refiner", "refiner"),
+            ts("s-log", "log"),
+        ];
+        let (to_archive, to_skip) = sessions_to_archive(&sessions);
+        assert_eq!(to_archive.len(), 5);
+        assert!(to_skip.is_empty());
+    }
+
+    #[test]
+    fn test_sessions_to_archive_skips_orchestrator_and_user_roles() {
+        let sessions = vec![
+            ts("s-creator", "creator"),
+            ts("s-contributor", "contributor"),
+            ts("s-interactive", "interactive"),
+        ];
+        let (to_archive, to_skip) = sessions_to_archive(&sessions);
+        assert!(
+            to_archive.is_empty(),
+            "creator/contributor/interactive must never be archived on merge"
+        );
+        assert_eq!(to_skip.len(), 3);
+    }
+
+    #[test]
+    fn test_sessions_to_archive_mixed() {
+        // Reproduces the s560 bug scenario: the orchestrator session is
+        // recorded as `contributor` against the task because it created it,
+        // and must survive the merge. The task's worker session should be
+        // archived as usual.
+        let sessions = vec![
+            ts("s-worker", "worker"),
+            ts("s560", "contributor"),
+            ts("s-reviewer", "reviewer"),
+            ts("s-human", "creator"),
+        ];
+        let (to_archive, to_skip) = sessions_to_archive(&sessions);
+
+        let archived_ids: Vec<&str> = to_archive.iter().map(|t| t.session_id.as_str()).collect();
+        assert_eq!(archived_ids, vec!["s-worker", "s-reviewer"]);
+
+        let skipped_ids: Vec<&str> = to_skip.iter().map(|t| t.session_id.as_str()).collect();
+        assert_eq!(skipped_ids, vec!["s560", "s-human"]);
+    }
+
+    #[test]
+    fn test_sessions_to_archive_unknown_roles_are_preserved() {
+        // New roles default to preserved — forces an explicit ARCHIVABLE_ROLES
+        // update whenever a task-spawned role is introduced.
+        let sessions = vec![ts("s-new", "some-future-role")];
+        let (to_archive, to_skip) = sessions_to_archive(&sessions);
+        assert!(to_archive.is_empty());
+        assert_eq!(to_skip.len(), 1);
+        assert_eq!(to_skip[0].role, "some-future-role");
+    }
+
+    #[test]
+    fn test_archivable_roles_constant() {
+        // Guard against accidental reordering/removal. If this test needs to
+        // change, audit `record_session(` call sites first.
+        assert_eq!(
+            ARCHIVABLE_ROLES,
+            &["worker", "planner", "reviewer", "refiner", "log"]
+        );
+    }
+
+    /// End-to-end DB-level check: record sessions with different roles and
+    /// confirm `sessions_to_archive` keeps the orchestrator sessions.
+    #[test]
+    fn test_sessions_to_archive_via_db() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task("/project", "T", None, None, None, true, false, false)
+            .unwrap();
+        db.record_session(task.id, "s-worker", "worker").unwrap();
+        db.record_session(task.id, "s-reviewer", "reviewer")
+            .unwrap();
+        db.record_session(task.id, "s-orchestrator", "contributor")
+            .unwrap();
+        db.record_session(task.id, "s-human", "creator").unwrap();
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        let (to_archive, to_skip) = sessions_to_archive(&sessions);
+
+        let archived: Vec<&str> = to_archive.iter().map(|t| t.session_id.as_str()).collect();
+        assert!(archived.contains(&"s-worker"));
+        assert!(archived.contains(&"s-reviewer"));
+        assert!(!archived.contains(&"s-orchestrator"));
+        assert!(!archived.contains(&"s-human"));
+
+        let skipped: Vec<&str> = to_skip.iter().map(|t| t.session_id.as_str()).collect();
+        assert!(skipped.contains(&"s-orchestrator"));
+        assert!(skipped.contains(&"s-human"));
+    }
 
     // ----- checklist parsing -----
 
