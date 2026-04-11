@@ -7,16 +7,20 @@ use std::path::Path;
 use std::process::Command;
 
 /// Create a new git branch from a base branch.
-pub fn create_branch(repo_path: &str, branch_name: &str, base_branch: &str) -> crate::Result<()> {
+pub fn create_branch(
+    repo_path: &str,
+    branch_name: &str,
+    base_branch: &str,
+) -> tau_agent_base::Result<()> {
     let output = Command::new("git")
         .args(["branch", branch_name, base_branch])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| crate::Error::Io(format!("git branch: {}", e)))?;
+        .map_err(|e| tau_agent_base::Error::Io(format!("git branch: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_base::Error::Io(format!(
             "git branch {} from {}: {}",
             branch_name,
             base_branch,
@@ -31,16 +35,16 @@ pub fn create_worktree(
     repo_path: &str,
     worktree_path: &str,
     branch_name: &str,
-) -> crate::Result<()> {
+) -> tau_agent_base::Result<()> {
     let output = Command::new("git")
         .args(["worktree", "add", worktree_path, branch_name])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| crate::Error::Io(format!("git worktree add: {}", e)))?;
+        .map_err(|e| tau_agent_base::Error::Io(format!("git worktree add: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_base::Error::Io(format!(
             "git worktree add {} {}: {}",
             worktree_path,
             branch_name,
@@ -54,12 +58,12 @@ pub fn create_worktree(
 ///
 /// Safety: refuses to remove the main worktree (repo root) to prevent
 /// accidental deletion of the primary working tree.
-pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> crate::Result<()> {
+pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> tau_agent_base::Result<()> {
     // Guard: never remove the main worktree.
     let repo_canon = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.into());
     let wt_canon = std::fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.into());
     if repo_canon == wt_canon {
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_base::Error::Io(format!(
             "refusing to remove main worktree: {} is the repo root",
             worktree_path
         )));
@@ -69,11 +73,11 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> crate::Result<()
         .args(["worktree", "remove", "--force", worktree_path])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| crate::Error::Io(format!("git worktree remove: {}", e)))?;
+        .map_err(|e| tau_agent_base::Error::Io(format!("git worktree remove: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_base::Error::Io(format!(
             "git worktree remove {}: {}",
             worktree_path,
             stderr.trim()
@@ -83,16 +87,16 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> crate::Result<()
 }
 
 /// Delete a local git branch. Uses `-D` to force-delete even if not merged.
-pub fn delete_branch(repo_path: &str, branch_name: &str) -> crate::Result<()> {
+pub fn delete_branch(repo_path: &str, branch_name: &str) -> tau_agent_base::Result<()> {
     let output = Command::new("git")
         .args(["branch", "-D", branch_name])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| crate::Error::Io(format!("git branch -D: {}", e)))?;
+        .map_err(|e| tau_agent_base::Error::Io(format!("git branch -D: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_base::Error::Io(format!(
             "git branch -D {}: {}",
             branch_name,
             stderr.trim()
@@ -102,16 +106,16 @@ pub fn delete_branch(repo_path: &str, branch_name: &str) -> crate::Result<()> {
 }
 
 /// Get the repository root directory from a path inside the repo.
-pub fn get_repo_root(cwd: &str) -> crate::Result<String> {
+pub fn get_repo_root(cwd: &str) -> tau_agent_base::Result<String> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()
-        .map_err(|e| crate::Error::Io(format!("git rev-parse --show-toplevel: {}", e)))?;
+        .map_err(|e| tau_agent_base::Error::Io(format!("git rev-parse --show-toplevel: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_base::Error::Io(format!(
             "git rev-parse --show-toplevel in {}: {}",
             cwd,
             stderr.trim()
@@ -123,7 +127,7 @@ pub fn get_repo_root(cwd: &str) -> crate::Result<String> {
 }
 
 /// Check whether a branch exists in the repository.
-pub fn branch_exists(repo_path: &str, branch_name: &str) -> crate::Result<bool> {
+pub fn branch_exists(repo_path: &str, branch_name: &str) -> tau_agent_base::Result<bool> {
     let output = Command::new("git")
         .args([
             "rev-parse",
@@ -132,7 +136,7 @@ pub fn branch_exists(repo_path: &str, branch_name: &str) -> crate::Result<bool> 
         ])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| crate::Error::Io(format!("git rev-parse --verify: {}", e)))?;
+        .map_err(|e| tau_agent_base::Error::Io(format!("git rev-parse --verify: {}", e)))?;
 
     Ok(output.status.success())
 }
@@ -151,13 +155,13 @@ pub fn task_branch_name(task_id: i64, parent_id: Option<i64>) -> String {
 /// Derive the worktree path for a task given the repo root.
 ///
 /// If repo is at `/home/user/src/tau`, returns `/home/user/src/tau-task-{id}`.
-pub fn task_worktree_path(repo_root: &str, task_id: i64) -> crate::Result<String> {
+pub fn task_worktree_path(repo_root: &str, task_id: i64) -> tau_agent_base::Result<String> {
     let root = Path::new(repo_root);
     let repo_name = root.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        crate::Error::Io(format!("cannot derive repo name from path: {}", repo_root))
+        tau_agent_base::Error::Io(format!("cannot derive repo name from path: {}", repo_root))
     })?;
     let parent = root.parent().ok_or_else(|| {
-        crate::Error::Io(format!("repo root has no parent directory: {}", repo_root))
+        tau_agent_base::Error::Io(format!("repo root has no parent directory: {}", repo_root))
     })?;
     let worktree_dir = format!("{}-task-{}", repo_name, task_id);
     Ok(parent.join(worktree_dir).to_string_lossy().into_owned())
@@ -169,16 +173,16 @@ pub fn task_worktree_path(repo_root: &str, task_id: i64) -> crate::Result<String
 /// for worktrees), then checks for `rebase-merge` or `rebase-apply` directories.
 /// If either exists, runs `git rebase --abort`. Always returns `Ok(())` if no
 /// partial rebase is found.
-pub fn abort_partial_rebase(worktree_path: &str) -> crate::Result<()> {
+pub fn abort_partial_rebase(worktree_path: &str) -> tau_agent_base::Result<()> {
     let output = Command::new("git")
         .args(["rev-parse", "--git-dir"])
         .current_dir(worktree_path)
         .output()
-        .map_err(|e| crate::Error::Io(format!("git rev-parse --git-dir: {}", e)))?;
+        .map_err(|e| tau_agent_base::Error::Io(format!("git rev-parse --git-dir: {}", e)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_base::Error::Io(format!(
             "git rev-parse --git-dir in {}: {}",
             worktree_path,
             stderr.trim()
@@ -199,11 +203,11 @@ pub fn abort_partial_rebase(worktree_path: &str) -> crate::Result<()> {
             .args(["rebase", "--abort"])
             .current_dir(worktree_path)
             .output()
-            .map_err(|e| crate::Error::Io(format!("git rebase --abort: {}", e)))?;
+            .map_err(|e| tau_agent_base::Error::Io(format!("git rebase --abort: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_base::Error::Io(format!(
                 "git rebase --abort in {}: {}",
                 worktree_path,
                 stderr.trim()

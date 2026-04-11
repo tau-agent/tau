@@ -2401,6 +2401,7 @@ dependencies = [
  "smol",
  "tau-agent-base",
  "tau-agent-plugin",
+ "tau-agent-plugin-tasks",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -2443,6 +2444,20 @@ dependencies = [
  "serde_json",
  "smol",
  "tau-agent-base",
+]
+
+[[package]]
+name = "tau-agent-plugin-tasks"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tau-agent-base",
+ "tau-agent-plugin",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

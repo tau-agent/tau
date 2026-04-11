@@ -5,33 +5,31 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
-use crate::plugin::{
-    HookResult, PluginMessage, PluginRegistration, PluginRequest, PluginToolDef, PluginToolResult,
-};
 use crate::tasks_db::{TaskUpdate, TasksDb};
 use crate::tasks_merge;
 use crate::tasks_scheduler;
-use crate::types::ToolResultContent;
+use tau_agent_plugin::ToolResultContent;
+use tau_agent_plugin::{
+    HookResult, PluginMessage, PluginRegistration, PluginRequest, PluginToolDef, PluginToolResult,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
-    if let Ok(mut line) = serde_json::to_string(msg) {
-        line.push('\n');
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.flush();
-    }
+    tau_agent_plugin::tunnel::send_message(writer, msg);
 }
 
 fn tool_ok(tool_call_id: &str, text: &str) -> PluginToolResult {
     PluginToolResult {
         tool_call_id: tool_call_id.to_string(),
-        content: vec![ToolResultContent::Text(crate::types::TextContent {
-            text: text.to_string(),
-            text_signature: None,
-        })],
+        content: vec![ToolResultContent::Text(
+            tau_agent_plugin::TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            },
+        )],
         is_error: false,
     }
 }
@@ -39,10 +37,12 @@ fn tool_ok(tool_call_id: &str, text: &str) -> PluginToolResult {
 fn tool_err(tool_call_id: &str, text: &str) -> PluginToolResult {
     PluginToolResult {
         tool_call_id: tool_call_id.to_string(),
-        content: vec![ToolResultContent::Text(crate::types::TextContent {
-            text: text.to_string(),
-            text_signature: None,
-        })],
+        content: vec![ToolResultContent::Text(
+            tau_agent_plugin::TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            },
+        )],
         is_error: true,
     }
 }
@@ -508,7 +508,7 @@ fn create_interactive_session(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> Option<String> {
-    use crate::protocol::{Request, Response};
+    use tau_agent_plugin::{Request, Response};
 
     // Inherit model from the parent session so the interactive task uses
     // the same model as its creator.
@@ -651,7 +651,7 @@ fn handle_task_assign(
                 && old_sid != sid
             {
                 // Reparent direct child sessions from the old session
-                let req = crate::protocol::Request::ReparentChildren {
+                let req = tau_agent_plugin::Request::ReparentChildren {
                     old_parent_id: old_sid.clone(),
                     new_parent_id: sid.to_string(),
                 };
@@ -668,7 +668,7 @@ fn handle_task_assign(
                 let mut reparented = std::collections::HashSet::new();
                 for desc_old_sid in &result.descendant_old_sessions {
                     if reparented.insert(desc_old_sid.clone()) {
-                        let req = crate::protocol::Request::ReparentChildren {
+                        let req = tau_agent_plugin::Request::ReparentChildren {
                             old_parent_id: desc_old_sid.clone(),
                             new_parent_id: sid.to_string(),
                         };
@@ -815,6 +815,66 @@ fn handle_task_update(
     let old_task = db.get_task(id).ok().flatten();
     let old_state = old_task.as_ref().map(|t| t.state.clone());
 
+    // Rebase enforcement: active → review requires branch to be rebased on
+    // merge target. This prevents merges from failing due to conflicts.
+    if let (Some(new_state), Some(old_s)) = (&update.state, &old_state)
+        && new_state == "review"
+        && old_s == "active"
+    {
+        if let Some(ref task) = old_task {
+            if task.branch.is_some() && task.worktree_path.is_some() {
+                match tasks_scheduler::is_rebased_on_target(db, task) {
+                    Ok(true) => {} // good, rebased
+                    Ok(false) => {
+                        let merge_target = db.get_merge_target(id).unwrap_or("main".into());
+
+                        // Clean up any partial rebase state.
+                        if let Some(ref wt_path) = task.worktree_path {
+                            let _ = crate::tasks_git::abort_partial_rebase(wt_path);
+                        }
+
+                        // Notify the worker session.
+                        if let Some(ref sid) = task.session_id {
+                            let branch_name = task.branch.as_deref().unwrap_or("(unknown)");
+                            let msg = format!(
+                                "Task {} transition to review was rejected: branch {} is not rebased on '{}'.\n\
+                                     Please run `git rebase {}` in your worktree, resolve any conflicts, then try again:\n\
+                                     - Call `task_update` with arguments {{\"id\": {}, \"state\": \"review\"}}",
+                                task.id, branch_name, merge_target, merge_target, task.id
+                            );
+                            let _ = crate::tasks_scheduler::server_request(
+                                writer,
+                                reader,
+                                tau_agent_plugin::Request::QueueMessage {
+                                    target_session_id: sid.clone(),
+                                    content: msg,
+                                    sender_info: format!(
+                                        "task-system (rebase check task {})",
+                                        task.id
+                                    ),
+                                    await_reply: false,
+                                    reply_to: None,
+                                },
+                            );
+                        }
+
+                        return tool_err(
+                            tool_call_id,
+                            &format!(
+                                "cannot transition to review: branch is not rebased on '{}'. \
+                                     Please run `git rebase {}` in the worktree first.",
+                                merge_target, merge_target
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        return tool_err(tool_call_id, &format!("rebase check failed: {}", e));
+                    }
+                }
+            }
+        }
+    }
+
     match db.update_task(id, &update, session_id) {
         Ok(task) => {
             // Trigger scheduler events based on the new state.
@@ -844,7 +904,7 @@ fn handle_task_update(
                 let _ = crate::tasks_scheduler::server_request(
                     writer,
                     reader,
-                    crate::protocol::Request::QueueMessage {
+                    tau_agent_plugin::Request::QueueMessage {
                         target_session_id: sid.clone(),
                         content: msg,
                         sender_info: format!("task-system (review task {})", task.id),
@@ -928,7 +988,7 @@ fn handle_task_update(
                 let _ = crate::tasks_scheduler::server_request(
                     writer,
                     reader,
-                    crate::protocol::Request::QueueMessage {
+                    tau_agent_plugin::Request::QueueMessage {
                         target_session_id: sid.clone(),
                         content: msg,
                         sender_info: format!("task-system (refine task {})", task.id),
@@ -948,11 +1008,13 @@ fn handle_task_update(
                     None => true,
                     Some(sid) => {
                         // Check if existing session is still alive
-                        let req = crate::protocol::Request::GetSessionInfo {
+                        let req = tau_agent_plugin::Request::GetSessionInfo {
                             session_id: sid.clone(),
                         };
                         match crate::tasks_scheduler::server_request(writer, reader, req) {
-                            Ok(crate::protocol::Response::SessionInfo { info }) => info.archived,
+                            Ok(tau_agent_plugin::Response::SessionInfo { info }) => {
+                                info.archived
+                            }
                             _ => true, // session not found or error → need a new one
                         }
                     }
@@ -997,7 +1059,7 @@ fn handle_task_update(
                     let _ = crate::tasks_scheduler::server_request(
                         writer,
                         reader,
-                        crate::protocol::Request::QueueMessage {
+                        tau_agent_plugin::Request::QueueMessage {
                             target_session_id: target_sid.clone(),
                             content: msg,
                             sender_info: format!(
@@ -1063,7 +1125,7 @@ fn auto_archive_task_session(
             let _ = crate::tasks_scheduler::server_request(
                 writer,
                 reader,
-                crate::protocol::Request::ArchiveSession {
+                tau_agent_plugin::Request::ArchiveSession {
                     session_id: ts.session_id.clone(),
                     require_ancestor: None,
                 },
@@ -1078,7 +1140,7 @@ fn auto_archive_task_session(
         let _ = crate::tasks_scheduler::server_request(
             writer,
             reader,
-            crate::protocol::Request::ArchiveSession {
+            tau_agent_plugin::Request::ArchiveSession {
                 session_id: sid.clone(),
                 require_ancestor: None,
             },
@@ -1885,7 +1947,7 @@ fn run_schedule_pass(
                         let _ = tasks_scheduler::server_request(
                             writer,
                             reader,
-                            crate::protocol::Request::QueueMessage {
+                            tau_agent_plugin::Request::QueueMessage {
                                 target_session_id: sid.to_string(),
                                 content: warn_msg,
                                 sender_info: "task-scheduler".to_string(),
@@ -2003,22 +2065,22 @@ mod tests {
                 }) = serde_json::from_str::<PluginMessage>(line)
                 {
                     let response = match request {
-                        crate::protocol::Request::CreateSession { .. } => {
+                        tau_agent_plugin::Request::CreateSession { .. } => {
                             if let Some(ref err) = self.create_session_error {
-                                crate::protocol::Response::Error {
+                                tau_agent_plugin::Response::Error {
                                     message: err.clone(),
                                 }
                             } else {
                                 self.session_counter += 1;
-                                crate::protocol::Response::SessionCreated {
+                                tau_agent_plugin::Response::SessionCreated {
                                     session_id: format!("mock-s{}", self.session_counter),
                                 }
                             }
                         }
-                        crate::protocol::Request::GetSessionInfo { session_id } => {
+                        tau_agent_plugin::Request::GetSessionInfo { session_id } => {
                             let is_archived = self.archived_sessions.contains(session_id.as_str());
-                            crate::protocol::Response::SessionInfo {
-                                info: crate::protocol::SessionInfo {
+                            tau_agent_plugin::Response::SessionInfo {
+                                info: tau_agent_plugin::SessionInfo {
                                     id: session_id.clone(),
                                     model: "mock-model".to_string(),
                                     provider: "mock".to_string(),
@@ -2037,13 +2099,13 @@ mod tests {
                                 },
                             }
                         }
-                        crate::protocol::Request::QueueMessage { .. } => {
-                            crate::protocol::Response::Ok
+                        tau_agent_plugin::Request::QueueMessage { .. } => {
+                            tau_agent_plugin::Response::Ok
                         }
-                        crate::protocol::Request::ArchiveSession { .. } => {
-                            crate::protocol::Response::SessionArchived
+                        tau_agent_plugin::Request::ArchiveSession { .. } => {
+                            tau_agent_plugin::Response::SessionArchived
                         }
-                        _ => crate::protocol::Response::Ok,
+                        _ => tau_agent_plugin::Response::Ok,
                     };
                     let resp = PluginRequest::ServerResponse {
                         request_id,

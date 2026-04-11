@@ -12,12 +12,6 @@ pub mod providers;
 pub mod replay;
 pub mod server;
 pub mod system_prompt;
-pub mod tasks;
-pub mod tasks_config;
-pub mod tasks_db;
-pub mod tasks_git;
-pub mod tasks_merge;
-pub mod tasks_scheduler;
 pub mod throttle;
 pub mod tools;
 pub mod worker;
@@ -38,3 +32,11 @@ pub use tau_agent_base::{
 
 pub use provider::{Provider, ProviderRegistry};
 pub use types::*;
+
+// Re-export from tau-agent-plugin-tasks for backward compatibility
+pub use tau_agent_plugin_tasks::tasks;
+pub use tau_agent_plugin_tasks::tasks_config;
+pub use tau_agent_plugin_tasks::tasks_db;
+pub use tau_agent_plugin_tasks::tasks_git;
+pub use tau_agent_plugin_tasks::tasks_merge;
+pub use tau_agent_plugin_tasks::tasks_scheduler;

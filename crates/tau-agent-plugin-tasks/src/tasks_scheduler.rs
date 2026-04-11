@@ -12,10 +12,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 
-use crate::plugin::{PluginMessage, PluginRequest};
 use crate::tasks_config;
 use crate::tasks_db::{Task, TaskUpdate, TasksDb};
 use crate::tasks_git;
+use tau_agent_plugin::PluginMessage;
 
 // ---------------------------------------------------------------------------
 // Batch selection
@@ -131,7 +131,7 @@ pub(crate) const MAX_CONCURRENT_TASKS: usize = 8;
 /// remaining capacity allows.
 ///
 /// Returns the list of tasks that were prepared for dispatch.
-pub fn schedule(db: &TasksDb, project: &str) -> crate::Result<Vec<ScheduledTask>> {
+pub fn schedule(db: &TasksDb, project: &str) -> tau_agent_plugin::Result<Vec<ScheduledTask>> {
     // Check how many tasks are already in-flight.
     let inflight = db.count_inflight_tasks(project)?;
     if inflight >= MAX_CONCURRENT_TASKS {
@@ -207,15 +207,19 @@ pub fn schedule(db: &TasksDb, project: &str) -> crate::Result<Vec<ScheduledTask>
 }
 
 /// Prepare a single task for dispatch: create branch, worktree, update DB.
-fn prepare_task(db: &TasksDb, task: &Task, repo_root: &str) -> crate::Result<ScheduledTask> {
+fn prepare_task(
+    db: &TasksDb,
+    task: &Task,
+    repo_root: &str,
+) -> tau_agent_plugin::Result<ScheduledTask> {
     let branch = tasks_git::task_branch_name(task.id, task.parent_id);
 
     // Determine the base branch: parent's branch, or "main".
     let base_branch = match task.parent_id {
         Some(pid) => {
-            let parent = db
-                .get_task(pid)?
-                .ok_or_else(|| crate::Error::Io(format!("parent task {} not found", pid)))?;
+            let parent = db.get_task(pid)?.ok_or_else(|| {
+                tau_agent_plugin::Error::Io(format!("parent task {} not found", pid))
+            })?;
             parent.branch.as_deref().unwrap_or("main").to_string()
         }
         None => "main".to_string(),
@@ -308,11 +312,11 @@ pub fn get_session_model(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> Option<String> {
-    let req = crate::protocol::Request::GetSessionInfo {
+    let req = tau_agent_plugin::Request::GetSessionInfo {
         session_id: session_id.to_string(),
     };
     match server_request(writer, reader, req) {
-        Ok(crate::protocol::Response::SessionInfo { info }) => Some(info.model),
+        Ok(tau_agent_plugin::Response::SessionInfo { info }) => Some(info.model),
         _ => None,
     }
 }
@@ -338,10 +342,10 @@ pub fn dispatch(
     parent_session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> crate::Result<String> {
+) -> tau_agent_plugin::Result<String> {
     let task = db
         .get_task(task_id)?
-        .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
+        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
     // Handle planning-state dispatch (no worktree, read-only session)
     if task.state == "planning" {
@@ -355,16 +359,16 @@ pub fn dispatch(
         prepare_task(db, &task, &repo_root)?;
         // Re-read after prepare.
     } else if task.state != "active" {
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_plugin::Error::Io(format!(
             "task {} is in state '{}', must be 'ready', 'active', or 'planning' to dispatch",
             task_id, task.state
         )));
     }
 
     // Re-read the task to get updated fields after potential prepare.
-    let task = db
-        .get_task(task_id)?
-        .ok_or_else(|| crate::Error::Io(format!("task {} not found after prepare", task_id)))?;
+    let task = db.get_task(task_id)?.ok_or_else(|| {
+        tau_agent_plugin::Error::Io(format!("task {} not found after prepare", task_id))
+    })?;
 
     // If there is already a live worker session for this task, reuse it
     // instead of creating a duplicate.  This makes dispatch idempotent:
@@ -404,7 +408,7 @@ pub fn dispatch(
     let hierarchy_parent = resolve_hierarchy_parent(db, &task);
 
     // Create session via ServerRequest.
-    let create_req = crate::protocol::Request::CreateSession {
+    let create_req = tau_agent_plugin::Request::CreateSession {
         model,
         provider: None,
         system_prompt: None,
@@ -417,15 +421,15 @@ pub fn dispatch(
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
-        crate::protocol::Response::SessionCreated { session_id } => session_id,
-        crate::protocol::Response::Error { message } => {
-            return Err(crate::Error::Io(format!(
+        tau_agent_plugin::Response::SessionCreated { session_id } => session_id,
+        tau_agent_plugin::Response::Error { message } => {
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "create session for task {}: {}",
                 task_id, message
             )));
         }
         other => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "unexpected response creating session for task {}: {:?}",
                 task_id, other
             )));
@@ -439,27 +443,27 @@ pub fn dispatch(
     let project_instructions =
         tasks_config::load_project_instructions(&task.project, "worker").unwrap_or_default();
     let chat_msg = build_initial_message(&task, &merge_target, &project_instructions);
-    let chat_req = crate::protocol::Request::Chat {
+    let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
     };
 
     match server_request(writer, reader, chat_req) {
-        Ok(crate::protocol::Response::Ok) => {}
-        Ok(crate::protocol::Response::Error { message }) => {
-            return Err(crate::Error::Io(format!(
+        Ok(tau_agent_plugin::Response::Ok) => {}
+        Ok(tau_agent_plugin::Response::Error { message }) => {
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "session {} created but chat failed: {}",
                 session_id, message
             )));
         }
         Ok(other) => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "session {} created but unexpected chat response: {:?}",
                 session_id, other
             )));
         }
         Err(e) => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "session {} created but chat failed: {}",
                 session_id, e
             )));
@@ -485,7 +489,7 @@ fn dispatch_planning(
     parent_session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> crate::Result<String> {
+) -> tau_agent_plugin::Result<String> {
     let task_id = task.id;
 
     // If there is already a live planner session for this task, reuse it
@@ -521,7 +525,7 @@ fn dispatch_planning(
         .or_else(|| resolve_parent_session(db, task));
 
     // Planning sessions use the project directory as cwd (no worktree).
-    let create_req = crate::protocol::Request::CreateSession {
+    let create_req = tau_agent_plugin::Request::CreateSession {
         model,
         provider: None,
         system_prompt: None,
@@ -534,15 +538,15 @@ fn dispatch_planning(
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
-        crate::protocol::Response::SessionCreated { session_id } => session_id,
-        crate::protocol::Response::Error { message } => {
-            return Err(crate::Error::Io(format!(
+        tau_agent_plugin::Response::SessionCreated { session_id } => session_id,
+        tau_agent_plugin::Response::Error { message } => {
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "create planning session for task {}: {}",
                 task_id, message
             )));
         }
         other => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "unexpected response creating planning session for task {}: {:?}",
                 task_id, other
             )));
@@ -555,27 +559,27 @@ fn dispatch_planning(
 
     // Send planning-specific initial message.
     let chat_msg = build_planning_message(task, &project_instructions);
-    let chat_req = crate::protocol::Request::Chat {
+    let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
     };
 
     match server_request(writer, reader, chat_req) {
-        Ok(crate::protocol::Response::Ok) => {}
-        Ok(crate::protocol::Response::Error { message }) => {
-            return Err(crate::Error::Io(format!(
+        Ok(tau_agent_plugin::Response::Ok) => {}
+        Ok(tau_agent_plugin::Response::Error { message }) => {
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "planning session {} created but chat failed: {}",
                 session_id, message
             )));
         }
         Ok(other) => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "planning session {} created but unexpected chat response: {:?}",
                 session_id, other
             )));
         }
         Err(e) => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "planning session {} created but chat failed: {}",
                 session_id, e
             )));
@@ -641,11 +645,11 @@ fn find_reusable_session(
     let session_id = db.find_latest_session_by_role(task_id, role).ok()??;
 
     // Ask the server whether the session is still alive.
-    let req = crate::protocol::Request::GetSessionInfo {
+    let req = tau_agent_plugin::Request::GetSessionInfo {
         session_id: session_id.clone(),
     };
     match server_request(writer, reader, req) {
-        Ok(crate::protocol::Response::SessionInfo { info }) => {
+        Ok(tau_agent_plugin::Response::SessionInfo { info }) => {
             if info.archived {
                 return None;
             }
@@ -662,8 +666,8 @@ fn resume_session(
     message: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> crate::Result<()> {
-    let req = crate::protocol::Request::QueueMessage {
+) -> tau_agent_plugin::Result<()> {
+    let req = tau_agent_plugin::Request::QueueMessage {
         target_session_id: session_id.to_string(),
         content: message.to_string(),
         sender_info: format!("task-system (task {})", task_id),
@@ -671,16 +675,18 @@ fn resume_session(
         reply_to: None,
     };
     match server_request(writer, reader, req) {
-        Ok(crate::protocol::Response::Ok) => Ok(()),
-        Ok(crate::protocol::Response::Error { message }) => Err(crate::Error::Io(format!(
-            "failed to resume session {}: {}",
-            session_id, message
-        ))),
-        Ok(other) => Err(crate::Error::Io(format!(
+        Ok(tau_agent_plugin::Response::Ok) => Ok(()),
+        Ok(tau_agent_plugin::Response::Error { message }) => {
+            Err(tau_agent_plugin::Error::Io(format!(
+                "failed to resume session {}: {}",
+                session_id, message
+            )))
+        }
+        Ok(other) => Err(tau_agent_plugin::Error::Io(format!(
             "unexpected response resuming session {}: {:?}",
             session_id, other
         ))),
-        Err(e) => Err(crate::Error::Io(format!(
+        Err(e) => Err(tau_agent_plugin::Error::Io(format!(
             "failed to resume session {}: {}",
             session_id, e
         ))),
@@ -703,7 +709,7 @@ pub fn dispatch_review(
     parent_session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> crate::Result<String> {
+) -> tau_agent_plugin::Result<String> {
     let task_id = task.id;
 
     // Try to reuse an existing reviewer session.
@@ -739,7 +745,7 @@ pub fn dispatch_review(
     // Review sessions use the task's worktree as cwd.
     let cwd = task.worktree_path.clone().or(Some(task.project.clone()));
 
-    let create_req = crate::protocol::Request::CreateSession {
+    let create_req = tau_agent_plugin::Request::CreateSession {
         model,
         provider: None,
         system_prompt: None,
@@ -752,15 +758,15 @@ pub fn dispatch_review(
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
-        crate::protocol::Response::SessionCreated { session_id } => session_id,
-        crate::protocol::Response::Error { message } => {
-            return Err(crate::Error::Io(format!(
+        tau_agent_plugin::Response::SessionCreated { session_id } => session_id,
+        tau_agent_plugin::Response::Error { message } => {
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "create review session for task {}: {}",
                 task_id, message
             )));
         }
         other => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "unexpected response creating review session for task {}: {:?}",
                 task_id, other
             )));
@@ -775,27 +781,27 @@ pub fn dispatch_review(
         .get_merge_target(task.id)
         .unwrap_or_else(|_| "main".into());
     let chat_msg = build_review_message(task, &project_instructions, &merge_target);
-    let chat_req = crate::protocol::Request::Chat {
+    let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
     };
 
     match server_request(writer, reader, chat_req) {
-        Ok(crate::protocol::Response::Ok) => {}
-        Ok(crate::protocol::Response::Error { message }) => {
-            return Err(crate::Error::Io(format!(
+        Ok(tau_agent_plugin::Response::Ok) => {}
+        Ok(tau_agent_plugin::Response::Error { message }) => {
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "review session {} created but chat failed: {}",
                 session_id, message
             )));
         }
         Ok(other) => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "review session {} created but unexpected chat response: {:?}",
                 session_id, other
             )));
         }
         Err(e) => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "review session {} created but chat failed: {}",
                 session_id, e
             )));
@@ -863,7 +869,7 @@ pub fn dispatch_refining(
     parent_session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> crate::Result<String> {
+) -> tau_agent_plugin::Result<String> {
     let task_id = task.id;
 
     // Try to reuse an existing refiner session.
@@ -896,7 +902,7 @@ pub fn dispatch_refining(
     // session triggered the refining state change.
     let hierarchy_parent = resolve_hierarchy_parent(db, task);
 
-    let create_req = crate::protocol::Request::CreateSession {
+    let create_req = tau_agent_plugin::Request::CreateSession {
         model,
         provider: None,
         system_prompt: None,
@@ -909,15 +915,15 @@ pub fn dispatch_refining(
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
-        crate::protocol::Response::SessionCreated { session_id } => session_id,
-        crate::protocol::Response::Error { message } => {
-            return Err(crate::Error::Io(format!(
+        tau_agent_plugin::Response::SessionCreated { session_id } => session_id,
+        tau_agent_plugin::Response::Error { message } => {
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "create refining session for task {}: {}",
                 task_id, message
             )));
         }
         other => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "unexpected response creating refining session for task {}: {:?}",
                 task_id, other
             )));
@@ -929,27 +935,27 @@ pub fn dispatch_refining(
         tasks_config::load_project_instructions(&task.project, "refining").unwrap_or_default();
 
     let chat_msg = build_refining_message(task, &project_instructions);
-    let chat_req = crate::protocol::Request::Chat {
+    let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
     };
 
     match server_request(writer, reader, chat_req) {
-        Ok(crate::protocol::Response::Ok) => {}
-        Ok(crate::protocol::Response::Error { message }) => {
-            return Err(crate::Error::Io(format!(
+        Ok(tau_agent_plugin::Response::Ok) => {}
+        Ok(tau_agent_plugin::Response::Error { message }) => {
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "refining session {} created but chat failed: {}",
                 session_id, message
             )));
         }
         Ok(other) => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "refining session {} created but unexpected chat response: {:?}",
                 session_id, other
             )));
         }
         Err(e) => {
-            return Err(crate::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "refining session {} created but chat failed: {}",
                 session_id, e
             )));
@@ -1021,6 +1027,39 @@ fn build_refining_message(task: &Task, project_instructions: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Rebase check
+// ---------------------------------------------------------------------------
+
+/// Check whether a task's branch is rebased on its merge target.
+///
+/// Returns `Ok(true)` if the branch is up-to-date (merge target is an
+/// ancestor of the branch HEAD). Returns `Ok(false)` if the branch needs
+/// rebasing. Returns `Err` if the check cannot be performed.
+pub fn is_rebased_on_target(db: &TasksDb, task: &Task) -> tau_agent_plugin::Result<bool> {
+    let branch = task
+        .branch
+        .as_ref()
+        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} has no branch set", task.id)))?;
+
+    let worktree = task
+        .worktree_path
+        .as_ref()
+        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} has no worktree", task.id)))?;
+
+    let merge_target = db.get_merge_target(task.id)?;
+
+    // Use git merge-base --is-ancestor to check if merge_target is an
+    // ancestor of the task's branch.
+    let output = std::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", &merge_target, branch])
+        .current_dir(worktree)
+        .output()
+        .map_err(|e| tau_agent_plugin::Error::Io(format!("git merge-base: {}", e)))?;
+
+    Ok(output.status.success())
+}
+
+// ---------------------------------------------------------------------------
 // Auto-merge approved tasks
 // ---------------------------------------------------------------------------
 
@@ -1041,7 +1080,7 @@ pub fn merge_approved(
     db: &TasksDb,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> crate::Result<Vec<MergeAttempt>> {
+) -> tau_agent_plugin::Result<Vec<MergeAttempt>> {
     let approved = db.get_approved_tasks(None)?;
     if approved.is_empty() {
         return Ok(Vec::new());
@@ -1293,95 +1332,20 @@ fn build_initial_message(task: &Task, merge_target: &str, project_instructions: 
 }
 
 // ---------------------------------------------------------------------------
-// ServerRequest tunnel (same pattern as worker.rs)
+// ServerRequest tunnel (delegates to shared tau_agent_plugin::tunnel)
 // ---------------------------------------------------------------------------
 
-fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
-    if let Ok(mut line) = serde_json::to_string(msg) {
-        line.push('\n');
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.flush();
-    }
+#[allow(dead_code)] // Used in tests
+pub(crate) fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
+    tau_agent_plugin::tunnel::send_message(writer, msg);
 }
 
-/// Send a ServerRequest via plugin protocol and wait for the ServerResponse.
-///
-/// While waiting, any `ToolCall` messages that arrive on stdin are
-/// **immediately answered with an error** so that the calling session does
-/// not hang.  This situation arises when the tasks plugin is executing a
-/// background merge/schedule pass (triggered by a state transition) and the
-/// server delivers a concurrent tool call before the pass completes.  Rather
-/// than silently dropping the concurrent call — which would leave the
-/// session stuck forever in "running tools" — we send a descriptive error
-/// that the LLM can react to.
 pub fn server_request(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-    request: crate::protocol::Request,
-) -> crate::Result<crate::protocol::Response> {
-    let request_id = format!("task-sr-{}", crate::types::timestamp_ms());
-    send_message(
-        writer,
-        &PluginMessage::ServerRequest {
-            request_id: request_id.clone(),
-            request,
-        },
-    );
-
-    // Read lines until we get our ServerResponse.
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                return Err(crate::Error::Io(
-                    "stdin closed while waiting for server response".into(),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Err(crate::Error::Io(format!("read error: {}", e)));
-            }
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req: PluginRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        match req {
-            PluginRequest::ServerResponse {
-                request_id: rid,
-                response,
-            } if rid == request_id => {
-                return Ok(response);
-            }
-            // A ToolCall arrived while we are mid-ServerRequest (e.g. during a
-            // background merge pass).  Answer it immediately with an error so
-            // the calling session is not left hanging in "running tools".
-            PluginRequest::ToolCall { tool_call_id, .. } => {
-                send_message(
-                    writer,
-                    &PluginMessage::ToolResult(crate::plugin::PluginToolResult {
-                        tool_call_id,
-                        content: vec![crate::types::ToolResultContent::Text(
-                            crate::types::TextContent {
-                                text: "tasks plugin is busy with a background merge/schedule \
-                                       pass — please retry in a moment"
-                                    .into(),
-                                text_signature: None,
-                            },
-                        )],
-                        is_error: true,
-                    }),
-                );
-                // Continue waiting for our ServerResponse.
-            }
-            // Ignore other message types (ServerResponse with wrong ID, etc.)
-            _ => {}
-        }
-    }
+    request: tau_agent_plugin::Request,
+) -> tau_agent_plugin::Result<tau_agent_plugin::Response> {
+    tau_agent_plugin::tunnel::server_request(writer, reader, request, "task-sr")
 }
 
 // ---------------------------------------------------------------------------
@@ -1428,7 +1392,7 @@ pub struct SchedulerStatus {
 }
 
 /// Compute the current scheduler status: active, queued, and blocked tasks.
-pub fn get_status(db: &TasksDb, project: &str) -> crate::Result<SchedulerStatus> {
+pub fn get_status(db: &TasksDb, project: &str) -> tau_agent_plugin::Result<SchedulerStatus> {
     let inflight_count = db.count_inflight_tasks(project)?;
     let max_concurrent = MAX_CONCURRENT_TASKS;
 
@@ -2657,8 +2621,8 @@ mod tests {
     /// immediately, then keep waiting for the `ServerResponse`.
     #[test]
     fn test_server_request_handles_concurrent_tool_call() {
-        use crate::plugin::{PluginMessage, PluginRequest};
-        use crate::protocol::Response;
+        use tau_agent_plugin::Response;
+        use tau_agent_plugin::{PluginMessage, PluginRequest};
 
         // Build a reader that contains:
         //   1. A ToolCall (concurrent, arrives while we wait for the response)
@@ -2722,10 +2686,10 @@ mod tests {
                     // The fix: answer with an error ToolResult
                     send_message(
                         &mut writer,
-                        &PluginMessage::ToolResult(crate::plugin::PluginToolResult {
+                        &PluginMessage::ToolResult(tau_agent_plugin::PluginToolResult {
                             tool_call_id,
-                            content: vec![crate::types::ToolResultContent::Text(
-                                crate::types::TextContent {
+                            content: vec![tau_agent_plugin::ToolResultContent::Text(
+                                tau_agent_plugin::TextContent {
                                     text: "tasks plugin is busy".into(),
                                     text_signature: None,
                                 },

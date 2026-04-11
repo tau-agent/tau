@@ -31,9 +31,8 @@ use std::io::{BufRead, Write};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::plugin::{PluginMessage, PluginRequest};
-use crate::protocol::{Request, Response};
 use crate::tasks_db::{TaskSession, TasksDb};
+use tau_agent_base::protocol::{Request, Response};
 
 /// Session roles that should be archived when a task merges.
 ///
@@ -112,88 +111,15 @@ pub struct MergeResult {
 }
 
 // ---------------------------------------------------------------------------
-// ServerRequest tunnel helpers (same pattern as tasks_scheduler)
+// ServerRequest tunnel (delegates to shared tau_agent_plugin::tunnel)
 // ---------------------------------------------------------------------------
 
-fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
-    if let Ok(mut line) = serde_json::to_string(msg) {
-        line.push('\n');
-        let _ = writer.write_all(line.as_bytes());
-        let _ = writer.flush();
-    }
-}
-
-/// Send a ServerRequest via plugin protocol and wait for the ServerResponse.
-///
-/// While waiting, any `ToolCall` messages that arrive on stdin are
-/// **immediately answered with an error** so that the calling session does
-/// not hang.  See the identical comment in `tasks_scheduler::server_request`
-/// for the full rationale.
 fn server_request(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     request: Request,
-) -> crate::Result<Response> {
-    let request_id = format!("merge-sr-{}", crate::types::timestamp_ms());
-    send_message(
-        writer,
-        &PluginMessage::ServerRequest {
-            request_id: request_id.clone(),
-            request,
-        },
-    );
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                return Err(crate::Error::Io(
-                    "stdin closed while waiting for server response".into(),
-                ));
-            }
-            Ok(_) => {}
-            Err(e) => {
-                return Err(crate::Error::Io(format!("read error: {}", e)));
-            }
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req: PluginRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        match req {
-            PluginRequest::ServerResponse {
-                request_id: rid,
-                response,
-            } if rid == request_id => {
-                return Ok(response);
-            }
-            // A concurrent ToolCall arrived while we are mid-ServerRequest.
-            // Answer immediately with an error so the session is not left
-            // hanging in "running tools".
-            PluginRequest::ToolCall { tool_call_id, .. } => {
-                send_message(
-                    writer,
-                    &PluginMessage::ToolResult(crate::plugin::PluginToolResult {
-                        tool_call_id,
-                        content: vec![crate::types::ToolResultContent::Text(
-                            crate::types::TextContent {
-                                text: "tasks plugin is busy with a background merge pass \
-                                       — please retry in a moment"
-                                    .into(),
-                                text_signature: None,
-                            },
-                        )],
-                        is_error: true,
-                    }),
-                );
-            }
-            _ => {}
-        }
-    }
+) -> tau_agent_base::Result<Response> {
+    tau_agent_plugin::tunnel::server_request(writer, reader, request, "merge-sr")
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +133,7 @@ fn execute_bash(
     reader: &mut impl BufRead,
     session_id: &str,
     command: &str,
-) -> crate::Result<(String, bool)> {
+) -> tau_agent_base::Result<(String, bool)> {
     let resp = server_request(
         writer,
         reader,
@@ -220,10 +146,11 @@ fn execute_bash(
 
     match resp {
         Response::ToolExecuted { content, is_error } => Ok((content, is_error)),
-        Response::Error { message } => {
-            Err(crate::Error::Io(format!("ExecuteTool error: {}", message)))
-        }
-        other => Err(crate::Error::Io(format!(
+        Response::Error { message } => Err(tau_agent_base::Error::Io(format!(
+            "ExecuteTool error: {}",
+            message
+        ))),
+        other => Err(tau_agent_base::Error::Io(format!(
             "unexpected ExecuteTool response: {:?}",
             other
         ))),
@@ -245,14 +172,14 @@ pub fn merge_task(
     project_dir: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> crate::Result<MergeResult> {
+) -> tau_agent_base::Result<MergeResult> {
     // 1. Get task, branch, merge target
     let task = db
         .get_task(task_id)?
-        .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
+        .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} not found", task_id)))?;
 
     if task.state != "merging" {
-        return Err(crate::Error::Io(format!(
+        return Err(tau_agent_base::Error::Io(format!(
             "task {} is in state '{}', must be 'merging'",
             task_id, task.state
         )));
@@ -261,12 +188,12 @@ pub fn merge_task(
     let branch = task
         .branch
         .as_ref()
-        .ok_or_else(|| crate::Error::Io(format!("task {} has no branch set", task_id)))?;
+        .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} has no branch set", task_id)))?;
 
     let worktree_path = task
         .worktree_path
         .as_ref()
-        .ok_or_else(|| crate::Error::Io(format!("task {} has no worktree", task_id)))?;
+        .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} has no worktree", task_id)))?;
 
     let merge_target = db.get_merge_target(task_id)?;
 
@@ -533,10 +460,10 @@ pub fn notify_parent_if_all_done(
     task_id: i64,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> crate::Result<()> {
+) -> tau_agent_base::Result<()> {
     let task = db
         .get_task(task_id)?
-        .ok_or_else(|| crate::Error::Io(format!("task {} not found", task_id)))?;
+        .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} not found", task_id)))?;
 
     let parent_id = match task.parent_id {
         Some(pid) => pid,
@@ -661,6 +588,7 @@ pub fn notify_session_of_merge_failure(
 mod tests {
     use super::*;
     use crate::tasks_db::{TaskSession, TaskUpdate, TasksDb};
+    use tau_agent_plugin::PluginRequest;
 
     // ----- archive role filter -----
 
