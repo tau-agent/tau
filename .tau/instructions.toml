@@ -1,7 +1,7 @@
 [common]
 instructions = """
  - No unwrap() in non-test code (use expect() instead)
- - When spawning child sessions for information gathering (reading files, summarizing code, searching the codebase), pass `model: "light"` to session_spawn. Reserve the full model for sessions that need reasoning, planning, or code generation.
+ - When spawning child sessions purely for file reading or code summarization (no reasoning or decision-making required), pass `model: "light"` to session_spawn. Do NOT use "light" for sessions that need to review code, make judgments, write code, plan, or reason — those need the full model.
 """
 
 [worker]
@@ -15,7 +15,7 @@ instruction = """
 
 [planning]
 instructions = """
- - When spawning sub-sessions to read or summarize source files, pass `model: "light"` to session_spawn
+ - When spawning sub-sessions purely to read or summarize source files, pass `model: "light"` to session_spawn. Do NOT use "light" for review or analysis sessions that need to make judgments.
 """
 
 [refining]

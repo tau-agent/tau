@@ -57,7 +57,7 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                 "Spawn children for parallelizable work (e.g., reviewing multiple files)".into(),
                 "Children can spawn grandchildren by default (child_budget=4). Set child_budget=0 to make a leaf.".into(),
                 "The task should be self-contained -- the child has no access to the parent's conversation.".into(),
-                "When spawning children for information gathering (reading files, summarizing code, searching the codebase), pass model: \"light\" to use a cheaper model. Reserve the default model for sessions that need reasoning, planning, or code generation.".into(),
+                "When spawning children purely for file reading or code summarization (no reasoning needed), pass model: \"light\" to use a cheaper model. Do NOT use \"light\" for sessions that review, analyse, plan, or generate code — those need the full model.".into(),
             ],
         },
         PluginToolDef {
