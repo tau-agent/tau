@@ -1102,6 +1102,35 @@ impl TasksDb {
         Ok(count as usize)
     }
 
+    /// Get all tasks in in-flight states (active, review, merging, refining).
+    /// Used by the scheduler to check affected_files conflicts against
+    /// already-active tasks before dispatching new ones.
+    pub fn get_inflight_tasks(&self, project: &str) -> crate::Result<Vec<Task>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
+                        branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
+                        created_at, updated_at
+                 FROM tasks
+                 WHERE project = ?1
+                   AND state IN ('active', 'review', 'merging', 'refining')
+                 ORDER BY priority DESC, created_at ASC",
+            )
+            .map_err(|e| crate::Error::Io(format!("prepare get_inflight_tasks: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![project], row_to_task)
+            .map_err(|e| crate::Error::Io(format!("get_inflight_tasks: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks
+                .push(row.map_err(|e| crate::Error::Io(format!("read inflight task row: {}", e)))?);
+        }
+        Ok(tasks)
+    }
+
     /// Check if `from` transitively depends on `to` via `depends_on` relations.
     /// Uses BFS from `from` following depends_on edges. Returns true if `to` is
     /// reachable.

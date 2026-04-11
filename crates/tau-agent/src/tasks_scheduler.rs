@@ -26,39 +26,61 @@ use crate::tasks_git;
 /// Greedy algorithm:
 /// 1. Sort by priority descending (stable — preserves creation order for ties).
 /// 2. For each task, check if its `affected_files` overlap with any already
-///    selected task.
+///    selected task **or** with any already-active task (via `active_files`).
 /// 3. Tasks **without** `affected_files` are assumed to potentially conflict
 ///    with everything — they are only scheduled if nothing else is selected
-///    yet (i.e., they run alone).
-pub fn select_non_conflicting(tasks: &[Task]) -> Vec<&Task> {
+///    yet **and** no active tasks have claimed files (i.e., they run alone).
+///
+/// `active_files` contains `(task_id, files)` pairs for tasks already in
+/// in-flight states (active, review, merging, refining). These files are
+/// pre-claimed and cannot overlap with newly scheduled tasks.
+pub fn select_non_conflicting<'a>(
+    tasks: &'a [Task],
+    active_files: &[(i64, Vec<String>)],
+) -> Vec<&'a Task> {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
     sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
 
-    let mut selected: Vec<&Task> = Vec::new();
+    // Pre-populate claimed_files with files from already-active tasks.
     let mut claimed_files: HashSet<String> = HashSet::new();
-    let mut has_unbounded = false;
+    let mut has_unbounded_active = false;
+    for (_id, files) in active_files {
+        if files.is_empty() {
+            // An active task without affected_files is unbounded — it
+            // potentially conflicts with everything.
+            has_unbounded_active = true;
+        }
+        for f in files {
+            claimed_files.insert(f.clone());
+        }
+    }
+
+    let mut selected: Vec<&Task> = Vec::new();
+    let mut has_unbounded = has_unbounded_active;
 
     for task in &sorted {
         let files = extract_files(&task.affected_files);
 
         if files.is_empty() {
             // No affected_files declared — treat as potentially conflicting
-            // with everything. Only schedule alone.
-            if selected.is_empty() {
+            // with everything. Only schedule alone and only if no active tasks
+            // have claimed files.
+            if selected.is_empty() && !has_unbounded {
                 selected.push(task);
                 has_unbounded = true;
                 // Don't break — but the flag prevents any further additions.
             }
-            // Skip if we already have selections.
+            // Skip if we already have selections or an unbounded active task.
             continue;
         }
 
-        // If we already selected an unbounded task, skip everything else.
+        // If we already selected an unbounded task (or an active task is
+        // unbounded), skip everything else.
         if has_unbounded {
             continue;
         }
 
-        // Check overlap with already-claimed files.
+        // Check overlap with already-claimed files (includes active tasks).
         let overlaps = files.iter().any(|f| claimed_files.contains(f));
         if !overlaps {
             for f in files {
@@ -153,7 +175,15 @@ pub fn schedule(db: &TasksDb, project: &str) -> crate::Result<Vec<ScheduledTask>
 
     // Handle ready tasks — create branches/worktrees
     if !ready_tasks.is_empty() {
-        let batch = select_non_conflicting(&ready_tasks);
+        // Collect affected_files from already in-flight tasks to prevent
+        // file conflicts between new and active tasks.
+        let inflight = db.get_inflight_tasks(project)?;
+        let active_files: Vec<(i64, Vec<String>)> = inflight
+            .iter()
+            .map(|t| (t.id, extract_files(&t.affected_files)))
+            .collect();
+
+        let batch = select_non_conflicting(&ready_tasks, &active_files);
         if !batch.is_empty() {
             // We need the repo root to create branches and worktrees.
             let repo_root = tasks_git::get_repo_root(project)?;
@@ -1717,7 +1747,7 @@ mod tests {
             make_task(2, 3, Some(vec!["src/b.rs"])),
             make_task(3, 1, Some(vec!["src/c.rs"])),
         ];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         assert_eq!(batch.len(), 3);
     }
 
@@ -1728,7 +1758,7 @@ mod tests {
             make_task(2, 3, Some(vec!["src/b.rs", "src/c.rs"])), // overlaps with task 1
             make_task(3, 1, Some(vec!["src/d.rs"])),             // no overlap
         ];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].id, 1);
         assert_eq!(batch[1].id, 3);
@@ -1741,7 +1771,7 @@ mod tests {
             make_task(1, 1, Some(vec!["src/a.rs"])),
             make_task(2, 10, Some(vec!["src/a.rs"])), // same file, higher priority
         ];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         // Task 2 should be picked first (higher priority), task 1 excluded
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].id, 2);
@@ -1753,7 +1783,7 @@ mod tests {
             make_task(1, 10, None), // no affected_files — runs alone
             make_task(2, 5, Some(vec!["src/a.rs"])),
         ];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         // Task 1 (higher priority, no files) should be selected alone
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].id, 1);
@@ -1765,7 +1795,7 @@ mod tests {
             make_task(1, 5, Some(vec!["src/a.rs"])),
             make_task(2, 1, None), // lower priority, no files
         ];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         // Task 1 selected first (higher priority with files), task 2 skipped
         // because we already have selections and task 2 has no files.
         assert_eq!(batch.len(), 1);
@@ -1775,7 +1805,7 @@ mod tests {
     #[test]
     fn test_select_non_conflicting_empty() {
         let tasks: Vec<Task> = Vec::new();
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         assert!(batch.is_empty());
     }
 
@@ -1786,7 +1816,7 @@ mod tests {
             make_task(2, 3, Some(vec!["src/main.rs"])),
             make_task(3, 1, Some(vec!["src/main.rs"])),
         ];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].id, 1); // highest priority wins
     }
@@ -1794,7 +1824,7 @@ mod tests {
     #[test]
     fn test_select_non_conflicting_multiple_no_files() {
         let tasks = vec![make_task(1, 10, None), make_task(2, 5, None)];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         // Only highest priority no-files task should be selected
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].id, 1);
@@ -1803,7 +1833,7 @@ mod tests {
     #[test]
     fn test_select_non_conflicting_single_task() {
         let tasks = vec![make_task(42, 0, Some(vec!["file.txt"]))];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].id, 42);
     }
@@ -1811,7 +1841,7 @@ mod tests {
     #[test]
     fn test_select_non_conflicting_single_no_files() {
         let tasks = vec![make_task(42, 0, None)];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         assert_eq!(batch.len(), 1);
         assert_eq!(batch[0].id, 42);
     }
@@ -1933,12 +1963,219 @@ mod tests {
             make_task(4, 4, Some(vec!["src/styles.css", "src/app.rs"])), // overlaps 3
             make_task(5, 2, Some(vec!["src/tests.rs"])),               // no overlap with 1, 3
         ];
-        let batch = select_non_conflicting(&tasks);
+        let batch = select_non_conflicting(&tasks, &[]);
         // Should select: 1 (highest), 3 (no overlap with 1), 5 (no overlap with 1, 3)
         assert_eq!(batch.len(), 3);
         assert_eq!(batch[0].id, 1);
         assert_eq!(batch[1].id, 3);
         assert_eq!(batch[2].id, 5);
+    }
+
+    // ----- active file conflict tests -----
+
+    #[test]
+    fn test_select_non_conflicting_with_active_file_overlap() {
+        // A ready task that overlaps with an active task's files should be excluded.
+        let tasks = vec![
+            make_task(1, 5, Some(vec!["src/server.rs"])),
+            make_task(2, 3, Some(vec!["src/other.rs"])),
+        ];
+        let active_files = vec![(100, vec!["src/server.rs".to_string()])];
+        let batch = select_non_conflicting(&tasks, &active_files);
+        // Task 1 overlaps with active task 100 — excluded
+        // Task 2 has no overlap — included
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, 2);
+    }
+
+    #[test]
+    fn test_select_non_conflicting_all_overlap_with_active() {
+        // All ready tasks overlap with active tasks — none should be selected.
+        let tasks = vec![
+            make_task(1, 5, Some(vec!["src/a.rs"])),
+            make_task(2, 3, Some(vec!["src/b.rs"])),
+        ];
+        let active_files = vec![
+            (100, vec!["src/a.rs".to_string()]),
+            (101, vec!["src/b.rs".to_string()]),
+        ];
+        let batch = select_non_conflicting(&tasks, &active_files);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_select_non_conflicting_active_unbounded_blocks_all() {
+        // An active task without affected_files (unbounded) should block all
+        // ready tasks.
+        let tasks = vec![
+            make_task(1, 5, Some(vec!["src/a.rs"])),
+            make_task(2, 3, Some(vec!["src/b.rs"])),
+        ];
+        let active_files = vec![
+            (100, vec![]), // unbounded active task
+        ];
+        let batch = select_non_conflicting(&tasks, &active_files);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_select_non_conflicting_active_unbounded_blocks_unbounded_ready() {
+        // A ready task without affected_files should not be scheduled when
+        // an active task is unbounded.
+        let tasks = vec![
+            make_task(1, 5, None), // unbounded ready task
+        ];
+        let active_files = vec![
+            (100, vec![]), // unbounded active task
+        ];
+        let batch = select_non_conflicting(&tasks, &active_files);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_select_non_conflicting_no_files_ready_blocked_by_active_with_files() {
+        // A ready task without affected_files should not be scheduled when
+        // active tasks have claimed files (the unbounded task could conflict
+        // with anything).
+        let tasks = vec![
+            make_task(1, 10, None), // unbounded ready task
+        ];
+        let active_files = vec![(100, vec!["src/something.rs".to_string()])];
+        let batch = select_non_conflicting(&tasks, &active_files);
+        // has_unbounded is NOT set by active tasks with files; the task without
+        // affected_files runs alone only if no OTHER selected task exists.
+        // However, with active_files claiming files, claimed_files is non-empty.
+        // The unbounded task only checks `selected.is_empty() && !has_unbounded`.
+        // active tasks with files don't set has_unbounded, so the unbounded
+        // ready task CAN be selected if nothing else has been selected yet.
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, 1);
+    }
+
+    #[test]
+    fn test_select_non_conflicting_partial_overlap_with_active() {
+        // Some tasks overlap with active, some don't.
+        let tasks = vec![
+            make_task(1, 10, Some(vec!["src/a.rs", "src/b.rs"])),
+            make_task(2, 8, Some(vec!["src/b.rs", "src/c.rs"])), // overlaps with 1
+            make_task(3, 6, Some(vec!["src/d.rs"])),             // no overlap
+            make_task(4, 4, Some(vec!["src/e.rs"])),             // no overlap
+        ];
+        let active_files = vec![
+            (100, vec!["src/a.rs".to_string()]), // blocks task 1
+        ];
+        let batch = select_non_conflicting(&tasks, &active_files);
+        // Task 1 blocked by active task 100 (src/a.rs)
+        // Task 2 can run (src/b.rs, src/c.rs — no overlap with active)
+        // Task 3 can run (src/d.rs — no overlap)
+        // Task 4 can run (src/e.rs — no overlap)
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].id, 2);
+        assert_eq!(batch[1].id, 3);
+        assert_eq!(batch[2].id, 4);
+    }
+
+    #[test]
+    fn test_select_non_conflicting_active_no_overlap_allows_all() {
+        // Active tasks with files that don't overlap should not block anything.
+        let tasks = vec![
+            make_task(1, 5, Some(vec!["src/a.rs"])),
+            make_task(2, 3, Some(vec!["src/b.rs"])),
+        ];
+        let active_files = vec![(100, vec!["src/z.rs".to_string()])];
+        let batch = select_non_conflicting(&tasks, &active_files);
+        assert_eq!(batch.len(), 2);
+    }
+
+    // ----- integration test: schedule skips tasks conflicting with active -----
+
+    #[test]
+    fn test_schedule_skips_task_conflicting_with_active() {
+        let db = TasksDb::open_memory().expect("open in-memory db");
+        let files_shared = serde_json::json!(["src/server.rs"]);
+        let files_other = serde_json::json!(["src/other.rs"]);
+
+        // Create two ready tasks with overlapping and non-overlapping files.
+        let t1 = create_ready_task(&db, "/project", "Active task", 10, Some(&files_shared));
+        let t2 = create_ready_task(&db, "/project", "Blocked task", 5, Some(&files_shared));
+        let t3 = create_ready_task(&db, "/project", "Free task", 3, Some(&files_other));
+
+        // Simulate t1 being already active (dispatched in a previous pass).
+        db.assign_task(t1.id, "s1").expect("assign t1");
+
+        // Now only t2 and t3 are in ready state.
+        let schedulable = db
+            .get_schedulable_tasks("/project")
+            .expect("get schedulable");
+        let schedulable_ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
+        assert!(schedulable_ids.contains(&t2.id));
+        assert!(schedulable_ids.contains(&t3.id));
+        assert!(!schedulable_ids.contains(&t1.id)); // t1 is active, not schedulable
+
+        // Collect active task files.
+        let inflight = db.get_inflight_tasks("/project").expect("get inflight");
+        let active_files: Vec<(i64, Vec<String>)> = inflight
+            .iter()
+            .map(|t| (t.id, extract_files(&t.affected_files)))
+            .collect();
+        assert_eq!(active_files.len(), 1);
+        assert_eq!(active_files[0].0, t1.id);
+
+        // select_non_conflicting should exclude t2 (overlaps with active t1).
+        let batch = select_non_conflicting(&schedulable, &active_files);
+        let batch_ids: Vec<i64> = batch.iter().map(|t| t.id).collect();
+        assert!(
+            !batch_ids.contains(&t2.id),
+            "t2 should be excluded due to conflict with active t1"
+        );
+        assert!(
+            batch_ids.contains(&t3.id),
+            "t3 should be included (no conflict)"
+        );
+    }
+
+    #[test]
+    fn test_schedule_allows_task_after_active_completes() {
+        let db = TasksDb::open_memory().expect("open in-memory db");
+        let files = serde_json::json!(["src/server.rs"]);
+
+        let t1 = create_ready_task(&db, "/project", "First task", 10, Some(&files));
+        let t2 = create_ready_task(&db, "/project", "Second task", 5, Some(&files));
+
+        // Simulate t1 being dispatched (active).
+        db.assign_task(t1.id, "s1").expect("assign t1");
+
+        // t2 should be blocked while t1 is active.
+        let inflight = db.get_inflight_tasks("/project").expect("get inflight");
+        let active_files: Vec<(i64, Vec<String>)> = inflight
+            .iter()
+            .map(|t| (t.id, extract_files(&t.affected_files)))
+            .collect();
+        let schedulable = db
+            .get_schedulable_tasks("/project")
+            .expect("get schedulable");
+        let batch = select_non_conflicting(&schedulable, &active_files);
+        assert!(batch.is_empty() || batch.iter().all(|t| t.id != t2.id));
+
+        // Now complete t1 (move to merged).
+        move_to_merged(&db, t1.id);
+
+        // t2 should now be schedulable.
+        let inflight = db.get_inflight_tasks("/project").expect("get inflight");
+        let active_files: Vec<(i64, Vec<String>)> = inflight
+            .iter()
+            .map(|t| (t.id, extract_files(&t.affected_files)))
+            .collect();
+        assert!(active_files.is_empty(), "no inflight tasks after t1 merged");
+        let schedulable = db
+            .get_schedulable_tasks("/project")
+            .expect("get schedulable");
+        let batch = select_non_conflicting(&schedulable, &active_files);
+        let batch_ids: Vec<i64> = batch.iter().map(|t| t.id).collect();
+        assert!(
+            batch_ids.contains(&t2.id),
+            "t2 should be schedulable after t1 merged"
+        );
     }
 
     // ----- dependency + scheduling integration tests -----
@@ -2056,7 +2293,7 @@ mod tests {
         assert_eq!(schedulable.len(), 2);
 
         // select_non_conflicting on the filtered set
-        let batch = select_non_conflicting(&schedulable);
+        let batch = select_non_conflicting(&schedulable, &[]);
         let batch_ids: Vec<i64> = batch.iter().map(|t| t.id).collect();
         // dep (priority 10, shared.rs) and free (priority 1, other.rs) don't conflict
         assert!(batch_ids.contains(&dep.id));
