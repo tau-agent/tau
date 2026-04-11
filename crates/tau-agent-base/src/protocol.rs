@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::subscription_usage::{SubscriptionUsage, UsageBucket};
 use crate::types::StreamEvent;
 
 // ---------------------------------------------------------------------------
@@ -254,9 +255,7 @@ pub enum Response {
     /// Authentication status.
     AuthStatus { providers: Vec<String> },
     /// Subscription usage data.
-    SubscriptionUsage {
-        usage: crate::auth::SubscriptionUsage,
-    },
+    SubscriptionUsage { usage: SubscriptionUsage },
     /// Server is shutting down. Clients should reconnect if restart=true.
     ServerShutdown { restart: bool },
     /// Sessions completed (response to WaitSessions).
@@ -581,7 +580,7 @@ pub fn format_utilization(utilization: Option<f64>) -> String {
 }
 
 /// Format a single usage bucket as `"LABEL PCT RESET"`.
-fn format_usage_bucket(label: &str, bucket: &crate::auth::UsageBucket) -> Option<String> {
+fn format_usage_bucket(label: &str, bucket: &UsageBucket) -> Option<String> {
     let pct = format_utilization(bucket.utilization);
     if pct == "?" {
         return None;
@@ -599,7 +598,7 @@ fn format_usage_bucket(label: &str, bucket: &crate::auth::UsageBucket) -> Option
 /// Example: `(5h 50% 16h | 7d 12% 2d | sonnet 6% 1d)`
 ///
 /// Returns `None` if there's no usage data to display.
-pub fn format_subscription_usage(usage: &crate::auth::SubscriptionUsage) -> Option<String> {
+pub fn format_subscription_usage(usage: &SubscriptionUsage) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(ref b) = usage.five_hour
         && let Some(s) = format_usage_bucket("5h", b)
@@ -703,7 +702,7 @@ mod tests {
 
     #[test]
     fn format_subscription_usage_basic() {
-        use crate::auth::{SubscriptionUsage, UsageBucket};
+        use crate::subscription_usage::{SubscriptionUsage, UsageBucket};
         let usage = SubscriptionUsage {
             five_hour: Some(UsageBucket {
                 utilization: Some(50.0),
@@ -731,14 +730,14 @@ mod tests {
 
     #[test]
     fn format_subscription_usage_empty() {
-        use crate::auth::SubscriptionUsage;
+        use crate::subscription_usage::SubscriptionUsage;
         let usage = SubscriptionUsage::default();
         assert!(format_subscription_usage(&usage).is_none());
     }
 
     #[test]
     fn format_subscription_usage_no_utilization() {
-        use crate::auth::{SubscriptionUsage, UsageBucket};
+        use crate::subscription_usage::{SubscriptionUsage, UsageBucket};
         let usage = SubscriptionUsage {
             five_hour: Some(UsageBucket {
                 utilization: None,

@@ -12,6 +12,7 @@ categories.workspace = true
 description = "Library for building Claude/OpenAI/etc. agents with tools, sessions, and a plugin system"
 
 [dependencies]
+tau-agent-base.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true

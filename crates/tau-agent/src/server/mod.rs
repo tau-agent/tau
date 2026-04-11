@@ -125,19 +125,17 @@ pub struct TestServerConfig {
 
 /// Returns the default socket path.
 pub fn socket_path() -> PathBuf {
-    crate::paths::runtime_dir().join("tau.sock")
+    crate::paths::socket_path()
 }
 
 /// Returns the PID file path next to the socket.
 pub fn pid_path() -> PathBuf {
-    let mut p = socket_path();
-    p.set_file_name("tau.pid");
-    p
+    crate::paths::pid_path()
 }
 
 /// Check if a server is already running by trying to connect.
 pub fn is_running() -> bool {
-    std::os::unix::net::UnixStream::connect(socket_path()).is_ok()
+    crate::paths::is_running()
 }
 
 fn prepare_socket_dir(sock: &Path) -> crate::Result<()> {

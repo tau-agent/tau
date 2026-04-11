@@ -524,30 +524,14 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
-/// Check if an API key is an OAuth token (starts with `sk-ant-oat`).
-pub fn is_oauth_token(key: &str) -> bool {
-    key.starts_with("sk-ant-oat")
-}
+// Re-export types from tau-agent-base for backward compatibility
+pub use crate::subscription_usage::{ExtraUsage, SubscriptionUsage, UsageBucket, is_oauth_token};
 
 // ---------------------------------------------------------------------------
 // Subscription usage
 // ---------------------------------------------------------------------------
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct UsageBucket {
-    pub utilization: Option<f64>,
-    pub resets_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ExtraUsage {
-    #[serde(default)]
-    pub is_enabled: bool,
-    pub monthly_limit: Option<f64>,
-    pub used_credits: Option<f64>,
-}
 
 /// Raw API response from the usage endpoint.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -557,15 +541,6 @@ struct UsageApiResponse {
     seven_day_sonnet: Option<UsageBucket>,
     seven_day_opus: Option<UsageBucket>,
     extra_usage: Option<ExtraUsage>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SubscriptionUsage {
-    pub five_hour: Option<UsageBucket>,
-    pub seven_day: Option<UsageBucket>,
-    pub seven_day_sonnet: Option<UsageBucket>,
-    pub seven_day_opus: Option<UsageBucket>,
-    pub extra_usage: Option<ExtraUsage>,
 }
 
 /// Fetch subscription usage from the Anthropic API.

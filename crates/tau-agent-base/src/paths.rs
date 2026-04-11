@@ -54,3 +54,20 @@ pub fn runtime_dir() -> PathBuf {
         PathBuf::from("/tmp").join(format!("tau-{}", std::process::id()))
     }
 }
+
+/// Returns the default socket path for the tau server.
+pub fn socket_path() -> PathBuf {
+    runtime_dir().join("tau.sock")
+}
+
+/// Returns the PID file path next to the socket.
+pub fn pid_path() -> PathBuf {
+    let mut p = socket_path();
+    p.set_file_name("tau.pid");
+    p
+}
+
+/// Check if a server is already running by trying to connect.
+pub fn is_running() -> bool {
+    std::os::unix::net::UnixStream::connect(socket_path()).is_ok()
+}

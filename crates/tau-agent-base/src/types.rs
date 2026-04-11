@@ -262,6 +262,17 @@ pub struct ModelCost {
     pub cache_write: f64,
 }
 
+impl Default for ModelCost {
+    fn default() -> Self {
+        Self {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        }
+    }
+}
+
 /// How the model supports extended thinking/reasoning.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -61,17 +61,6 @@ fn default_max_tokens() -> u64 {
     16_384
 }
 
-impl Default for ModelCost {
-    fn default() -> Self {
-        Self {
-            input: 0.0,
-            output: 0.0,
-            cache_read: 0.0,
-            cache_write: 0.0,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Loading & saving
 // ---------------------------------------------------------------------------

@@ -2399,10 +2399,21 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "smol",
+ "tau-agent-base",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
  "ureq",
+]
+
+[[package]]
+name = "tau-agent-base"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
