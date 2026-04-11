@@ -1021,15 +1021,6 @@ fn build_refining_message(task: &Task, project_instructions: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Rebase check
-// ---------------------------------------------------------------------------
-
-/// Check whether a task's branch is rebased on its merge target.
-///
-/// Returns `Ok(true)` if the branch is up-to-date (merge target is an
-/// ancestor of the branch HEAD). Returns `Ok(false)` if the branch needs
-/// rebasing. Returns `Err` if the check cannot be performed.
-// ---------------------------------------------------------------------------
 // Auto-merge approved tasks
 // ---------------------------------------------------------------------------
 
