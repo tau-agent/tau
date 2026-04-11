@@ -65,7 +65,7 @@ pub fn select_non_conflicting<'a>(
             // No affected_files declared — treat as potentially conflicting
             // with everything. Only schedule alone and only if no active tasks
             // have claimed files.
-            if selected.is_empty() && !has_unbounded {
+            if selected.is_empty() && !has_unbounded && claimed_files.is_empty() {
                 selected.push(task);
                 has_unbounded = true;
                 // Don't break — but the flag prevents any further additions.
@@ -2042,14 +2042,10 @@ mod tests {
         ];
         let active_files = vec![(100, vec!["src/something.rs".to_string()])];
         let batch = select_non_conflicting(&tasks, &active_files);
-        // has_unbounded is NOT set by active tasks with files; the task without
-        // affected_files runs alone only if no OTHER selected task exists.
-        // However, with active_files claiming files, claimed_files is non-empty.
-        // The unbounded task only checks `selected.is_empty() && !has_unbounded`.
-        // active tasks with files don't set has_unbounded, so the unbounded
-        // ready task CAN be selected if nothing else has been selected yet.
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].id, 1);
+        // An unbounded ready task (no affected_files) is assumed to potentially
+        // conflict with everything. Since active tasks have claimed files
+        // (claimed_files is non-empty), the unbounded task must not be scheduled.
+        assert!(batch.is_empty());
     }
 
     #[test]
