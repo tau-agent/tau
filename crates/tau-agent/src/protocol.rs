@@ -294,6 +294,8 @@ pub enum Response {
     TaskStatus { text: String },
     /// Task list with tree depth info (response to TaskList).
     TaskTree { tasks: Vec<(usize, TaskInfo)> },
+    /// Merge queue (approved + merging tasks, response to TaskMergeQueue).
+    TaskMergeQueue { tasks: Vec<TaskInfo> },
     /// Error.
     Error { message: String },
 }
@@ -860,8 +862,9 @@ mod tests {
                 text: "status text".into(),
             },
             Response::TaskTree {
-                tasks: vec![(0, task)],
+                tasks: vec![(0, task.clone())],
             },
+            Response::TaskMergeQueue { tasks: vec![task] },
         ];
         for resp in &responses {
             let json = serde_json::to_string(resp).expect("serialize response");

@@ -91,9 +91,30 @@ pub fn handle_task_get(id: i64) -> Response {
             };
         }
     };
-    let messages = db.get_messages(id).unwrap_or_default();
-    let relations = db.get_relations(id).unwrap_or_default();
-    let subtasks = db.get_subtasks(id).unwrap_or_default();
+    let messages = match db.get_messages(id) {
+        Ok(m) => m,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to get messages for task {}: {}", id, e),
+            };
+        }
+    };
+    let relations = match db.get_relations(id) {
+        Ok(r) => r,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to get relations for task {}: {}", id, e),
+            };
+        }
+    };
+    let subtasks = match db.get_subtasks(id) {
+        Ok(s) => s,
+        Err(e) => {
+            return Response::Error {
+                message: format!("failed to get subtasks for task {}: {}", id, e),
+            };
+        }
+    };
     Response::TaskDetail {
         task: task_to_info(task),
         messages: messages.into_iter().map(msg_to_info).collect(),
@@ -228,16 +249,26 @@ pub fn handle_task_merge_queue(project: &str) -> Response {
         Ok(db) => db,
         Err(resp) => return resp,
     };
-    let approved = db
-        .list_tasks(project, Some("approved"), None, None, None)
-        .unwrap_or_default();
-    let merging = db
-        .list_tasks(project, Some("merging"), None, None, None)
-        .unwrap_or_default();
+    let approved = match db.list_tasks(project, Some("approved"), None, None, None) {
+        Ok(t) => t,
+        Err(e) => {
+            return Response::Error {
+                message: e.to_string(),
+            };
+        }
+    };
+    let merging = match db.list_tasks(project, Some("merging"), None, None, None) {
+        Ok(t) => t,
+        Err(e) => {
+            return Response::Error {
+                message: e.to_string(),
+            };
+        }
+    };
     let tasks: Vec<TaskInfo> = approved
         .into_iter()
         .chain(merging)
         .map(task_to_info)
         .collect();
-    Response::TaskList { tasks }
+    Response::TaskMergeQueue { tasks }
 }

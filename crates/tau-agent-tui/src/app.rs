@@ -1533,6 +1533,31 @@ impl App {
         }
     }
 
+    /// Render a merge queue (approved + merging tasks).
+    fn render_merge_queue(&mut self, tasks: &[TaskInfo]) {
+        if tasks.is_empty() {
+            self.messages.push(MessageItem::Status {
+                text: "merge queue is empty".into(),
+            });
+            return;
+        }
+        self.messages.push(MessageItem::Status {
+            text: "  MERGE QUEUE".into(),
+        });
+        self.messages.push(MessageItem::Status {
+            text: format!("  {:>4}  {:<12}  {:<14}  TITLE", "ID", "STATE", "BRANCH"),
+        });
+        for t in tasks {
+            let branch = t.branch.as_deref().unwrap_or("-");
+            self.messages.push(MessageItem::Status {
+                text: format!(
+                    "  {:>4}  {:<12}  {:<14}  {}",
+                    t.id, t.state, branch, t.title
+                ),
+            });
+        }
+    }
+
     /// Remove empty AssistantStreaming placeholder if present.
     fn cleanup_empty_streaming(&mut self) {
         if let Some(MessageItem::AssistantStreaming { text }) = self.messages.last()
@@ -1838,6 +1863,9 @@ impl App {
             }
             Response::TaskList { tasks } => {
                 self.render_task_list_flat(&tasks);
+            }
+            Response::TaskMergeQueue { tasks } => {
+                self.render_merge_queue(&tasks);
             }
             _ => {}
         }

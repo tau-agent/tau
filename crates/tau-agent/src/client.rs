@@ -97,6 +97,7 @@ impl Client {
                 | Response::TaskUpdated { .. }
                 | Response::TaskStatus { .. }
                 | Response::TaskTree { .. }
+                | Response::TaskMergeQueue { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);
