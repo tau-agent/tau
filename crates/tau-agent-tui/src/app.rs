@@ -1104,6 +1104,17 @@ impl App {
         }
     }
 
+    /// Transition mode safely: if the session picker is open, update
+    /// `picker_previous_mode` instead so the picker stays visible and the
+    /// correct mode is restored when the picker closes.
+    fn set_mode(&mut self, target: AppMode) {
+        if self.mode == AppMode::SessionPicker {
+            self.picker_previous_mode = target;
+        } else {
+            self.mode = target;
+        }
+    }
+
     /// Save current session state to navigation stack.
     pub fn save_nav_state(&mut self) {
         self.nav_stack.push(NavEntry {
@@ -1768,24 +1779,34 @@ impl App {
                     phase: AgentPhase::Idle,
                 } = *event
                 {
-                    if self.mode == AppMode::Streaming {
+                    let effective = if self.mode == AppMode::SessionPicker {
+                        self.picker_previous_mode
+                    } else {
+                        self.mode
+                    };
+                    if effective == AppMode::Streaming {
                         self.finalize_in_flight();
-                        self.mode = AppMode::Input;
+                        self.set_mode(AppMode::Input);
                     }
                     self.phase = AgentPhase::Idle;
                     return;
                 }
                 // If we receive stream events while in Input mode,
                 // another client is chatting — switch to streaming view.
-                if self.mode == AppMode::Input {
-                    self.mode = AppMode::Streaming;
+                let effective = if self.mode == AppMode::SessionPicker {
+                    self.picker_previous_mode
+                } else {
+                    self.mode
+                };
+                if effective == AppMode::Input {
+                    self.set_mode(AppMode::Streaming);
                 }
                 self.handle_stream_event(*event);
             }
             Response::AgentDone => {
                 self.finalize_in_flight();
                 self.phase = AgentPhase::Idle;
-                self.mode = AppMode::Input;
+                self.set_mode(AppMode::Input);
             }
             Response::Cancelled => {
                 self.finalize_in_flight();
@@ -1802,7 +1823,7 @@ impl App {
                     });
                 }
                 self.phase = AgentPhase::Idle;
-                self.mode = AppMode::Input;
+                self.set_mode(AppMode::Input);
             }
             Response::ServerShutdown { restart } => {
                 if restart {
@@ -1820,7 +1841,7 @@ impl App {
                 self.finalize_in_flight();
                 self.messages.push(MessageItem::Error { text: message });
                 self.phase = AgentPhase::Idle;
-                self.mode = AppMode::Input;
+                self.set_mode(AppMode::Input);
             }
             Response::UserMessage { text } => {
                 // Another client sent a message — display it
@@ -2124,7 +2145,7 @@ impl App {
                 // so the TUI is robust to event-ordering quirks or a
                 // dropped Idle event.
                 self.phase = AgentPhase::Idle;
-                self.mode = AppMode::Input;
+                self.set_mode(AppMode::Input);
             }
             StreamEvent::Error { error, .. } => {
                 let msg = error
@@ -2153,7 +2174,7 @@ impl App {
                 self.finalize_in_flight();
                 self.messages.push(MessageItem::Error { text: msg });
                 self.phase = AgentPhase::Idle;
-                self.mode = AppMode::Input;
+                self.set_mode(AppMode::Input);
                 // Reset the per-turn finalization flag so the next turn
                 // starts clean.
                 self.turn_text_finalized = false;
@@ -2696,6 +2717,147 @@ mod tests {
             assistant_texts,
             vec!["first reply", "second reply"],
             "each turn should produce exactly one Assistant message in order"
+        );
+    }
+
+    // ---- Session picker stability tests ----
+
+    /// Helper: put the app into SessionPicker mode with a given previous mode.
+    fn open_picker(app: &mut App, previous: AppMode) {
+        app.mode = previous;
+        app.picker_previous_mode = previous;
+        app.mode = AppMode::SessionPicker;
+    }
+
+    /// AgentDone while picker is open should NOT close the picker.
+    #[test]
+    fn picker_stays_open_on_agent_done() {
+        let mut app = make_app();
+        open_picker(&mut app, AppMode::Streaming);
+
+        app.handle_server_response(Response::AgentDone);
+
+        assert_eq!(app.mode, AppMode::SessionPicker, "picker must stay open");
+        assert_eq!(
+            app.picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
+        );
+    }
+
+    /// Stream events arriving while picker is open (previous mode = Input)
+    /// should update picker_previous_mode to Streaming, not close the picker.
+    #[test]
+    fn picker_stays_open_on_stream_text_delta() {
+        let mut app = make_app();
+        open_picker(&mut app, AppMode::Input);
+
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "hello".to_string(),
+                partial: assistant_message("hello", StopReason::Stop, None),
+            }),
+        });
+
+        assert_eq!(app.mode, AppMode::SessionPicker, "picker must stay open");
+        assert_eq!(
+            app.picker_previous_mode,
+            AppMode::Streaming,
+            "underlying mode should switch to Streaming"
+        );
+    }
+
+    /// Phase::Idle while picker is open and underlying mode is Streaming
+    /// should update picker_previous_mode to Input, not close the picker.
+    #[test]
+    fn picker_stays_open_on_phase_idle() {
+        let mut app = make_app();
+        open_picker(&mut app, AppMode::Streaming);
+
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Idle,
+            }),
+        });
+
+        assert_eq!(app.mode, AppMode::SessionPicker, "picker must stay open");
+        assert_eq!(
+            app.picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
+        );
+    }
+
+    /// Cancelled response while picker is open should NOT close the picker.
+    #[test]
+    fn picker_stays_open_on_cancelled() {
+        let mut app = make_app();
+        open_picker(&mut app, AppMode::Streaming);
+
+        app.handle_server_response(Response::Cancelled);
+
+        assert_eq!(app.mode, AppMode::SessionPicker, "picker must stay open");
+        assert_eq!(
+            app.picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
+        );
+    }
+
+    /// Error response while picker is open should NOT close the picker.
+    #[test]
+    fn picker_stays_open_on_error() {
+        let mut app = make_app();
+        open_picker(&mut app, AppMode::Input);
+
+        app.handle_server_response(Response::Error {
+            message: "something broke".to_string(),
+        });
+
+        assert_eq!(app.mode, AppMode::SessionPicker, "picker must stay open");
+        assert_eq!(
+            app.picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should stay Input"
+        );
+    }
+
+    /// StreamEvent::Done while picker is open should NOT close the picker.
+    #[test]
+    fn picker_stays_open_on_stream_done() {
+        let mut app = make_app();
+        open_picker(&mut app, AppMode::Streaming);
+
+        app.handle_stream_event(StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: assistant_message("done", StopReason::Stop, None),
+        });
+
+        assert_eq!(app.mode, AppMode::SessionPicker, "picker must stay open");
+        assert_eq!(
+            app.picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
+        );
+    }
+
+    /// StreamEvent::Error while picker is open should NOT close the picker.
+    #[test]
+    fn picker_stays_open_on_stream_error() {
+        let mut app = make_app();
+        open_picker(&mut app, AppMode::Streaming);
+
+        app.handle_stream_event(StreamEvent::Error {
+            reason: StopReason::Error,
+            error: assistant_message("err", StopReason::Error, Some("fail")),
+        });
+
+        assert_eq!(app.mode, AppMode::SessionPicker, "picker must stay open");
+        assert_eq!(
+            app.picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
         );
     }
 }
