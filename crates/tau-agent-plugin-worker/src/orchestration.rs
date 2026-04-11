@@ -5,8 +5,8 @@
 //! session_read, session_cancel, session_archive, session_id). These tools communicate with the server
 //! via the plugin protocol's ServerRequest/ServerResponse tunnel.
 
-use crate::plugin::{PluginRegistration, PluginToolDef};
-use crate::system_prompt::ToolPrompt;
+use tau_agent_plugin::ToolPrompt;
+use tau_agent_plugin::{PluginRegistration, PluginToolDef};
 
 /// Tool definitions for session orchestration.
 pub fn orchestration_tools() -> Vec<PluginToolDef> {

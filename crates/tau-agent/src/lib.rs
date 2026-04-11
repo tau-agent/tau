@@ -1,11 +1,9 @@
 pub mod agent;
 pub mod auth;
-pub mod client;
 pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod models_config;
-pub mod orchestration;
 pub mod plugin;
 pub mod provider;
 pub mod providers;
@@ -13,7 +11,6 @@ pub mod replay;
 pub mod server;
 pub mod system_prompt;
 pub mod throttle;
-pub mod tools;
 pub mod worker;
 
 // Re-export from tau-agent-base for backward compatibility
@@ -40,3 +37,10 @@ pub use tau_agent_plugin_tasks::tasks_db;
 pub use tau_agent_plugin_tasks::tasks_git;
 pub use tau_agent_plugin_tasks::tasks_merge;
 pub use tau_agent_plugin_tasks::tasks_scheduler;
+
+// Re-export from tau-agent-client for backward compatibility
+pub use tau_agent_client as client;
+
+// Re-export from tau-agent-plugin-worker for backward compatibility
+pub use tau_agent_plugin_worker::orchestration;
+pub use tau_agent_plugin_worker::tools;

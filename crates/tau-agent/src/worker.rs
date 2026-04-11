@@ -21,8 +21,6 @@ use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use async_trait::async_trait;
-
 use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use smol::channel::{Receiver, Sender};
 use smol::lock::Mutex;
@@ -35,36 +33,8 @@ use crate::types::*;
 // Re-export ToolExecutor from the plugin SDK for backward compatibility
 pub use tau_agent_plugin::ToolExecutor;
 
-/// In-process worker for testing (no subprocess).
-pub struct InProcessWorker {
-    tools: Vec<crate::tools::ToolDef>,
-}
-
-impl Default for InProcessWorker {
-    fn default() -> Self {
-        Self {
-            tools: crate::tools::default_tools(),
-        }
-    }
-}
-
-impl InProcessWorker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-#[async_trait]
-impl ToolExecutor for InProcessWorker {
-    async fn execute(
-        &mut self,
-        tool_call: &ToolCall,
-        _output_tx: &smol::channel::Sender<String>,
-    ) -> crate::Result<ToolResultMessage> {
-        let result = crate::tools::execute_tool(&self.tools, tool_call, "/tmp");
-        Ok(result)
-    }
-}
+// Re-export InProcessWorker from the worker crate for backward compatibility
+pub use tau_agent_plugin_worker::InProcessWorker;
 
 // ---------------------------------------------------------------------------
 // Request ID generation (safe for concurrent use)

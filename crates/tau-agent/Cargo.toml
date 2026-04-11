@@ -13,8 +13,10 @@ description = "Library for building Claude/OpenAI/etc. agents with tools, sessio
 
 [dependencies]
 tau-agent-base.workspace = true
+tau-agent-client.workspace = true
 tau-agent-plugin.workspace = true
 tau-agent-plugin-tasks.workspace = true
+tau-agent-plugin-worker.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 smol.workspace = true

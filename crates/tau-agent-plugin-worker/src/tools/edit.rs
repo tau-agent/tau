@@ -3,7 +3,7 @@
 //! Supports single edit (old_text/new_text) and multi-edit (edits array).
 
 use super::{ToolDef, ToolOutput};
-use crate::types::Tool;
+use tau_agent_base::types::Tool;
 
 pub fn tool_def() -> ToolDef {
     ToolDef {
