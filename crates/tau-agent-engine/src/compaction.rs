@@ -4,7 +4,7 @@
 //! are summarized by the LLM and replaced with a compact summary message.
 
 use crate::provider::EventReceiver;
-use crate::types::*;
+use tau_agent_base::types::*;
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -225,9 +225,9 @@ fn serialize_messages(messages: &[Message]) -> String {
                     if let ToolResultContent::Text(t) = c {
                         // Truncate very long tool results
                         if t.text.len() > 2000 {
-                            out.push_str(crate::truncate_str(&t.text, 1000));
+                            out.push_str(tau_agent_base::truncate_str(&t.text, 1000));
                             out.push_str("\n... [truncated] ...\n");
-                            out.push_str(crate::truncate_str_end(&t.text, 1000));
+                            out.push_str(tau_agent_base::truncate_str_end(&t.text, 1000));
                         } else {
                             out.push_str(&t.text);
                         }
@@ -266,7 +266,7 @@ pub fn build_summarization_context(messages_to_summarize: &[Message]) -> Context
 }
 
 /// Extract the summary text from a completed summarization response.
-pub fn extract_summary(rx: &EventReceiver) -> crate::Result<String> {
+pub fn extract_summary(rx: &EventReceiver) -> tau_agent_base::Result<String> {
     // This is called synchronously — drain the receiver
     loop {
         match rx.recv_blocking() {
@@ -274,14 +274,14 @@ pub fn extract_summary(rx: &EventReceiver) -> crate::Result<String> {
                 return Ok(message.text());
             }
             Ok(StreamEvent::Error { error, .. }) => {
-                return Err(crate::Error::Http(
+                return Err(tau_agent_base::Error::Http(
                     error
                         .error_message
                         .unwrap_or_else(|| "summarization failed".into()),
                 ));
             }
             Ok(_) => continue, // skip deltas
-            Err(_) => return Err(crate::Error::ChannelClosed),
+            Err(_) => return Err(tau_agent_base::Error::ChannelClosed),
         }
     }
 }
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn estimate_tokens_info() {
         // "hello" = 5 chars → ceil(5/4) = 2 tokens
-        let msg = Message::Info(crate::types::InfoMessage {
+        let msg = Message::Info(tau_agent_base::types::InfoMessage {
             text: "hello".into(),
             timestamp: 0,
         });
@@ -509,7 +509,7 @@ mod tests {
         let messages = vec![
             user(&big),
             assistant(&big, 500),
-            Message::Info(crate::types::InfoMessage {
+            Message::Info(tau_agent_base::types::InfoMessage {
                 text: "notification".into(),
                 timestamp: 0,
             }),

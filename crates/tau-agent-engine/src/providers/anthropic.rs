@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use super::anthropic_types::*;
 use super::common::{self, StreamCtx, send_event};
 use crate::provider::{EventReceiver, EventSender, Provider};
-use crate::types::*;
+use tau_agent_base::types::*;
 
 const API_ID: &str = "anthropic-messages";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -24,7 +24,7 @@ impl Provider for Anthropic {
         model: &Model,
         context: &Context,
         options: &StreamOptions,
-    ) -> crate::Result<EventReceiver> {
+    ) -> tau_agent_base::Result<EventReceiver> {
         let (tx, rx) = smol::channel::unbounded();
 
         let body = build_request_body(model, context, options)?;
@@ -33,7 +33,7 @@ impl Provider for Anthropic {
             .api_key
             .clone()
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-            .ok_or_else(|| crate::Error::NoApiKey("anthropic".into()))?;
+            .ok_or_else(|| tau_agent_base::Error::NoApiKey("anthropic".into()))?;
         let api_id = model.api.clone();
         let provider_name = model.provider.clone();
         let model_id = model.id.clone();
@@ -52,7 +52,7 @@ impl Provider for Anthropic {
             if let Err(e) = result {
                 // For HTTP status errors, include the structured info in the error message
                 let error_message = match &e {
-                    crate::Error::HttpStatus {
+                    tau_agent_base::Error::HttpStatus {
                         status,
                         message,
                         retry_after,
@@ -84,10 +84,14 @@ impl Provider for Anthropic {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> crate::Result<()> {
+fn run_stream(
+    ctx: &StreamCtx<'_>,
+    body: &MessagesRequest,
+    tx: &EventSender,
+) -> tau_agent_base::Result<()> {
     let url = format!("{}/v1/messages", ctx.base_url.trim_end_matches('/'));
 
-    let is_oauth = crate::auth::is_oauth_token(ctx.api_key);
+    let is_oauth = tau_agent_base::subscription_usage::is_oauth_token(ctx.api_key);
     let mut req = ureq::post(&url)
         .header("content-type", "application/json")
         .header("anthropic-version", "2023-06-01")
@@ -118,7 +122,7 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
         .http_status_as_error(false)
         .build()
         .send_json(body)
-        .map_err(|e| crate::Error::Http(e.to_string()))?;
+        .map_err(|e| tau_agent_base::Error::Http(e.to_string()))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -130,7 +134,7 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
         use std::io::Read;
         let mut body_text = String::new();
         let _ = resp.body_mut().as_reader().read_to_string(&mut body_text);
-        return Err(crate::Error::HttpStatus {
+        return Err(tau_agent_base::Error::HttpStatus {
             status,
             message: body_text,
             retry_after,
@@ -153,7 +157,7 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
         std::collections::HashMap::new();
 
     for line in reader.lines() {
-        let line = line.map_err(|e: std::io::Error| crate::Error::Http(e.to_string()))?;
+        let line = line.map_err(|e: std::io::Error| tau_agent_base::Error::Http(e.to_string()))?;
 
         if let Some(event_type) = line.strip_prefix("event: ") {
             current_event_type = event_type.to_string();
@@ -168,8 +172,8 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
 
         match current_event_type.as_str() {
             "message_start" => {
-                let ev: MessageStartEvent =
-                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
+                let ev: MessageStartEvent = serde_json::from_str(data)
+                    .map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
                 output.response_id = Some(ev.message.id);
                 if let Some(usage) = ev.message.usage {
                     usage.apply_to(&mut output.usage);
@@ -177,8 +181,8 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                 }
             }
             "content_block_start" => {
-                let ev: ContentBlockStartEvent =
-                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
+                let ev: ContentBlockStartEvent = serde_json::from_str(data)
+                    .map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
 
                 match ev.content_block {
                     ContentBlock::Text { .. } => {
@@ -251,8 +255,8 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                 }
             }
             "content_block_delta" => {
-                let ev: ContentBlockDeltaEvent =
-                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
+                let ev: ContentBlockDeltaEvent = serde_json::from_str(data)
+                    .map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
                 let ci = block_index_map
                     .iter()
                     .find(|(bi, _)| *bi == ev.index)
@@ -309,8 +313,8 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                 }
             }
             "content_block_stop" => {
-                let ev: ContentBlockStopEvent =
-                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
+                let ev: ContentBlockStopEvent = serde_json::from_str(data)
+                    .map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
                 let ci = block_index_map
                     .iter()
                     .find(|(bi, _)| *bi == ev.index)
@@ -363,8 +367,8 @@ fn run_stream(ctx: &StreamCtx<'_>, body: &MessagesRequest, tx: &EventSender) -> 
                 }
             }
             "message_delta" => {
-                let ev: MessageDeltaEvent =
-                    serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
+                let ev: MessageDeltaEvent = serde_json::from_str(data)
+                    .map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
                 if let Some(delta) = ev.delta
                     && let Some(reason) = delta.stop_reason
                 {
@@ -431,7 +435,7 @@ fn build_request_body(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
-) -> crate::Result<MessagesRequest> {
+) -> tau_agent_base::Result<MessagesRequest> {
     let mut messages = Vec::new();
 
     for msg in &context.messages {
@@ -489,7 +493,7 @@ fn build_request_body(
     let is_oauth = options
         .api_key
         .as_deref()
-        .map(crate::auth::is_oauth_token)
+        .map(tau_agent_base::subscription_usage::is_oauth_token)
         .unwrap_or(false);
 
     let cc = Some(CacheControl::ephemeral());

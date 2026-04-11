@@ -3,7 +3,7 @@
 //! Dynamic: tools contribute their own snippets and guidelines.
 
 // Re-export ToolPrompt from tau-agent-base for backward compatibility
-pub use crate::tool_prompt::ToolPrompt;
+pub use tau_agent_base::tool_prompt::ToolPrompt;
 
 /// Options for building the system prompt.
 #[derive(Debug, Default)]
@@ -88,8 +88,36 @@ Current date: {date}"#
 }
 
 /// Built-in tool prompts for the default tools.
+/// This is provided as a convenience; the canonical source is
+/// `tau_agent_plugin_worker::default_tool_prompts()`.
 pub fn default_tool_prompts() -> Vec<ToolPrompt> {
-    tau_agent_plugin_worker::default_tool_prompts()
+    vec![
+        ToolPrompt {
+            name: "bash".into(),
+            snippet: "Execute bash commands (ls, grep, find, etc.)".into(),
+            guidelines: vec!["Use bash for file operations like ls, rg, find".into()],
+        },
+        ToolPrompt {
+            name: "read".into(),
+            snippet: "Read file contents".into(),
+            guidelines: vec!["Use read to examine files instead of cat or sed.".into()],
+        },
+        ToolPrompt {
+            name: "edit".into(),
+            snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call".into(),
+            guidelines: vec![
+                "Use edit for precise changes (old text must match exactly)".into(),
+                "When changing multiple separate locations in one file, use one edit call with edits[] instead of multiple edit calls".into(),
+                "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.".into(),
+                "Keep oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.".into(),
+            ],
+        },
+        ToolPrompt {
+            name: "write".into(),
+            snippet: "Create or overwrite files".into(),
+            guidelines: vec!["Use write only for new files or complete rewrites.".into()],
+        },
+    ]
 }
 
 /// Build a system prompt with the default tools (convenience for server).

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::types::{Context, Model, StreamEvent, StreamOptions};
+use tau_agent_base::types::{Context, Model, StreamEvent, StreamOptions};
 
 /// Receiver end of a stream of events from an LLM provider.
 pub type EventReceiver = smol::channel::Receiver<StreamEvent>;
@@ -23,7 +23,7 @@ pub trait Provider: Send + Sync {
         model: &Model,
         context: &Context,
         options: &StreamOptions,
-    ) -> crate::Result<EventReceiver>;
+    ) -> tau_agent_base::Result<EventReceiver>;
 }
 
 /// Simple registry mapping API id → provider.
@@ -52,10 +52,10 @@ impl ProviderRegistry {
         model: &Model,
         context: &Context,
         options: &StreamOptions,
-    ) -> crate::Result<EventReceiver> {
+    ) -> tau_agent_base::Result<EventReceiver> {
         let provider = self
             .get(&model.api)
-            .ok_or_else(|| crate::Error::NoProvider(model.api.clone()))?;
+            .ok_or_else(|| tau_agent_base::Error::NoProvider(model.api.clone()))?;
         provider.stream(model, context, options)
     }
 }

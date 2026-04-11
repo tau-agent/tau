@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 
 use crate::provider::{EventReceiver, Provider};
-use crate::types::*;
+use tau_agent_base::types::*;
 
 const API_ID: &str = "log";
 
@@ -26,7 +26,7 @@ impl Provider for LogProvider {
         _model: &Model,
         _context: &Context,
         _options: &StreamOptions,
-    ) -> crate::Result<EventReceiver> {
+    ) -> tau_agent_base::Result<EventReceiver> {
         let (tx, rx) = smol::channel::unbounded();
 
         let output = AssistantMessage::empty(API_ID, "log", "log");

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use super::common::{self, StreamCtx, send_event};
 use super::openai_types;
 use crate::provider::{EventReceiver, EventSender, Provider};
-use crate::types::*;
+use tau_agent_base::types::*;
 
 const API_ID: &str = "openai-completions";
 
@@ -28,7 +28,7 @@ impl Provider for OpenAi {
         model: &Model,
         context: &Context,
         options: &StreamOptions,
-    ) -> crate::Result<EventReceiver> {
+    ) -> tau_agent_base::Result<EventReceiver> {
         let (tx, rx) = smol::channel::unbounded();
 
         let body = build_request_body(model, context, options)?;
@@ -55,7 +55,7 @@ impl Provider for OpenAi {
             let result = run_stream(&ctx, &body, &tx);
             if let Err(e) = result {
                 let error_message = match &e {
-                    crate::Error::HttpStatus {
+                    tau_agent_base::Error::HttpStatus {
                         status,
                         message,
                         retry_after,
@@ -91,7 +91,7 @@ fn run_stream(
     ctx: &StreamCtx<'_>,
     body: &openai_types::ChatCompletionRequest,
     tx: &EventSender,
-) -> crate::Result<()> {
+) -> tau_agent_base::Result<()> {
     let url = format!("{}/chat/completions", ctx.base_url.trim_end_matches('/'));
 
     let mut req = ureq::post(&url)
@@ -111,7 +111,7 @@ fn run_stream(
         .http_status_as_error(false)
         .build()
         .send_json(body)
-        .map_err(|e| crate::Error::Http(e.to_string()))?;
+        .map_err(|e| tau_agent_base::Error::Http(e.to_string()))?;
 
     let status = resp.status().as_u16();
     if status >= 400 {
@@ -123,7 +123,7 @@ fn run_stream(
         use std::io::Read;
         let mut body_text = String::new();
         let _ = resp.body_mut().as_reader().read_to_string(&mut body_text);
-        return Err(crate::Error::HttpStatus {
+        return Err(tau_agent_base::Error::HttpStatus {
             status,
             message: body_text,
             retry_after,
@@ -152,7 +152,7 @@ fn run_stream(
     let mut thinking_started = false;
 
     for line in reader.lines() {
-        let line = line.map_err(|e: std::io::Error| crate::Error::Http(e.to_string()))?;
+        let line = line.map_err(|e: std::io::Error| tau_agent_base::Error::Http(e.to_string()))?;
 
         if line.trim().is_empty() {
             continue;
@@ -167,7 +167,7 @@ fn run_stream(
         }
 
         let chunk: openai_types::ChatCompletionChunk =
-            serde_json::from_str(data).map_err(|e| crate::Error::Parse(e.to_string()))?;
+            serde_json::from_str(data).map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
 
         if output.response_id.is_none()
             && let Some(id) = chunk.id
@@ -409,7 +409,7 @@ fn build_request_body(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
-) -> crate::Result<openai_types::ChatCompletionRequest> {
+) -> tau_agent_base::Result<openai_types::ChatCompletionRequest> {
     let mut messages = Vec::new();
 
     // System prompt as system message

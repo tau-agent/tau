@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::provider::{EventReceiver, EventSender, Provider};
-use crate::types::*;
-use crate::worker::ToolExecutor;
+use tau_agent_base::types::*;
+use tau_agent_plugin::ToolExecutor;
 
 const API_ID: &str = "mock";
 
@@ -121,7 +121,7 @@ impl Provider for MockProvider {
         _model: &Model,
         _context: &Context,
         _options: &StreamOptions,
-    ) -> crate::Result<EventReceiver> {
+    ) -> tau_agent_base::Result<EventReceiver> {
         // Capture context before popping the response.
         {
             let mut caps = self.inner.captures.lock().expect("captures mutex poisoned");
@@ -393,7 +393,7 @@ fn execute_mock_tool_response(
     tool_call: &ToolCall,
     resp: MockToolResponse,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = crate::Result<ToolResultMessage>> + Send + '_>,
+    Box<dyn std::future::Future<Output = tau_agent_base::Result<ToolResultMessage>> + Send + '_>,
 > {
     Box::pin(async move {
         match resp {
@@ -421,7 +421,7 @@ fn execute_mock_tool_response(
                 timestamp: timestamp_ms(),
                 duration_ms: None,
             }),
-            MockToolResponse::ExecutorError(msg) => Err(crate::Error::Http(msg)),
+            MockToolResponse::ExecutorError(msg) => Err(tau_agent_base::Error::Http(msg)),
             MockToolResponse::Delayed { delay_ms, response } => {
                 smol::Timer::after(std::time::Duration::from_millis(delay_ms)).await;
                 execute_mock_tool_response(tool_call, *response).await
@@ -436,7 +436,7 @@ impl ToolExecutor for MockToolExecutor {
         &mut self,
         tool_call: &ToolCall,
         _output_tx: &smol::channel::Sender<String>,
-    ) -> crate::Result<ToolResultMessage> {
+    ) -> tau_agent_base::Result<ToolResultMessage> {
         // Capture.
         self.inner
             .captures

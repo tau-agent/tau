@@ -85,7 +85,7 @@ pub struct ApiUsage {
 }
 
 impl ApiUsage {
-    pub fn apply_to(&self, usage: &mut crate::types::Usage) {
+    pub fn apply_to(&self, usage: &mut tau_agent_base::types::Usage) {
         if let Some(n) = self.input_tokens {
             usage.input = n;
         }

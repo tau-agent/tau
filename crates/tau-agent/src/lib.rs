@@ -1,16 +1,11 @@
-pub mod agent;
+// Server-side modules (still live here until full server extraction)
 pub mod auth;
-pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod models_config;
 pub mod plugin;
-pub mod provider;
-pub mod providers;
 pub mod replay;
 pub mod server;
-pub mod system_prompt;
-pub mod throttle;
 pub mod worker;
 
 // Re-export from tau-agent-base for backward compatibility
@@ -27,8 +22,16 @@ pub use tau_agent_base::{
     write_json_line, write_json_line_async,
 };
 
-pub use provider::{Provider, ProviderRegistry};
 pub use types::*;
+
+// Re-export from tau-agent-engine for backward compatibility
+pub use tau_agent_engine::agent;
+pub use tau_agent_engine::compaction;
+pub use tau_agent_engine::provider;
+pub use tau_agent_engine::providers;
+pub use tau_agent_engine::system_prompt;
+pub use tau_agent_engine::throttle;
+pub use tau_agent_engine::{Provider, ProviderRegistry};
 
 // Re-export from tau-agent-plugin-tasks for backward compatibility
 pub use tau_agent_plugin_tasks::tasks;

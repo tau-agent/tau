@@ -7,8 +7,8 @@
 
 use crate::provider::{EventReceiver, EventSender, ProviderRegistry};
 
-use crate::types::*;
-use crate::worker::ToolExecutor;
+use tau_agent_base::types::*;
+use tau_agent_plugin::ToolExecutor;
 
 /// Configuration for the agent loop.
 pub struct AgentConfig {
@@ -157,11 +157,11 @@ pub fn repair_messages(messages: &[Message]) -> Vec<Message> {
 async fn cancellable_sleep(
     delay: std::time::Duration,
     should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
-) -> crate::Result<()> {
+) -> tau_agent_base::Result<()> {
     let deadline = std::time::Instant::now() + delay;
     loop {
         if should_stop.is_some_and(|f| f()) {
-            return Err(crate::Error::Cancelled);
+            return Err(tau_agent_base::Error::Cancelled);
         }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -194,7 +194,7 @@ pub async fn run(
     config: &AgentConfig,
     extra_tools: &[Tool],
     event_tx: EventSender,
-) -> crate::Result<AgentResult> {
+) -> tau_agent_base::Result<AgentResult> {
     let mut new_messages = Vec::new();
 
     // All tools come from plugins (session + global)
@@ -222,13 +222,13 @@ pub async fn run(
 
         // Signal that we're about to call the LLM (so the UI can update the phase).
         let _ = event_tx.try_send(StreamEvent::Phase {
-            phase: crate::types::AgentPhase::Connecting,
+            phase: tau_agent_base::types::AgentPhase::Connecting,
         });
 
         // Stream LLM response (with retry)
         let message =
             match stream_with_retry(registry, model, context, options, config, &event_tx).await {
-                Err(crate::Error::Cancelled) => {
+                Err(tau_agent_base::Error::Cancelled) => {
                     return Ok(AgentResult {
                         new_messages,
                         max_turns_reached: false,
@@ -283,7 +283,7 @@ pub async fn run(
             // so the message history stays valid (every tool_use needs a tool_result).
             if config.should_stop.as_ref().is_some_and(|f| f()) {
                 for remaining_tc in &tool_calls[tc_idx..] {
-                    let stub = crate::types::ToolResultMessage::error(
+                    let stub = tau_agent_base::types::ToolResultMessage::error(
                         remaining_tc.id.clone(),
                         remaining_tc.name.clone(),
                         "error: cancelled before execution",
@@ -332,7 +332,7 @@ pub async fn run(
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
             let mut result = match result {
                 Ok(r) => r,
-                Err(e) => crate::types::ToolResultMessage::error(
+                Err(e) => tau_agent_base::types::ToolResultMessage::error(
                     tc.id.clone(),
                     tc.name.clone(),
                     format!("error: {}", e),
@@ -345,7 +345,7 @@ pub async fn run(
                 .content
                 .iter()
                 .filter_map(|c| match c {
-                    crate::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                    tau_agent_base::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -396,7 +396,7 @@ pub async fn run(
                             .into(),
                         text_signature: None,
                     })],
-                    timestamp: crate::types::timestamp_ms(),
+                    timestamp: tau_agent_base::types::timestamp_ms(),
                 });
                 emit_message(config, &nudge);
                 let _ = event_tx.try_send(StreamEvent::Status {
@@ -443,7 +443,7 @@ async fn run_loop_review(
     event_tx: &EventSender,
 ) -> bool {
     let _ = event_tx.try_send(StreamEvent::Phase {
-        phase: crate::types::AgentPhase::Compacting,
+        phase: tau_agent_base::types::AgentPhase::Compacting,
     });
 
     // Extract the last N messages for review.
@@ -520,7 +520,7 @@ async fn run_loop_review(
                 text: review_text,
                 text_signature: None,
             })],
-            timestamp: crate::types::timestamp_ms(),
+            timestamp: tau_agent_base::types::timestamp_ms(),
         })],
         tools: vec![],
     };
@@ -586,7 +586,7 @@ async fn stream_with_retry(
     options: &StreamOptions,
     config: &AgentConfig,
     event_tx: &EventSender,
-) -> crate::Result<AssistantMessage> {
+) -> tau_agent_base::Result<AssistantMessage> {
     let max_attempts = config.max_retries + 1;
     /// Maximum number of auth-refresh retries before giving up.
     const MAX_AUTH_RETRIES: usize = 3;
@@ -613,8 +613,8 @@ async fn stream_with_retry(
         // subscribers see a terminator for the in-flight streaming item.
         let mut synthesised_from_transport_error = false;
         let message = match message {
-            Err(crate::Error::Cancelled) => return Err(crate::Error::Cancelled),
-            Err(crate::Error::Http(ref msg)) if is_timeout(msg) => {
+            Err(tau_agent_base::Error::Cancelled) => return Err(tau_agent_base::Error::Cancelled),
+            Err(tau_agent_base::Error::Http(ref msg)) if is_timeout(msg) => {
                 let err_msg = msg.clone();
                 let mut m = AssistantMessage::empty(&model.api, &model.provider, &model.id);
                 m.stop_reason = StopReason::Error;
@@ -707,7 +707,7 @@ async fn stream_with_retry(
                     message: status_msg,
                 });
                 let _ = event_tx.try_send(StreamEvent::Phase {
-                    phase: crate::types::AgentPhase::RateLimited,
+                    phase: tau_agent_base::types::AgentPhase::RateLimited,
                 });
                 if delay_ms > 0 {
                     cancellable_sleep(
@@ -744,7 +744,7 @@ async fn stream_with_retry(
 
     // The retry loop always returns from inside its body — this is unreachable
     // in practice, but if we ever fall through, surface a clear error.
-    Err(crate::Error::Http("max retries exceeded".into()))
+    Err(tau_agent_base::Error::Http("max retries exceeded".into()))
 }
 
 /// Extract retry-after seconds from an error message containing "[retry-after: Ns]".
@@ -789,7 +789,7 @@ async fn consume_stream(
     event_tx: &EventSender,
     should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
     idle_timeout: std::time::Duration,
-) -> crate::Result<AssistantMessage> {
+) -> tau_agent_base::Result<AssistantMessage> {
     loop {
         // Check cancellation between events.
         if should_stop.is_some_and(|f| f()) {
@@ -800,7 +800,7 @@ async fn consume_stream(
                     break;
                 }
             }
-            return Err(crate::Error::Cancelled);
+            return Err(tau_agent_base::Error::Cancelled);
         }
 
         // Race recv() against an idle timer so we detect stalled streams.
@@ -813,7 +813,7 @@ async fn consume_stream(
         match recv_or_timeout {
             None => {
                 // Idle timeout — no SSE event arrived in time.
-                return Err(crate::Error::Http(format!(
+                return Err(tau_agent_base::Error::Http(format!(
                     "idle timeout: no SSE event received within {}s",
                     idle_timeout.as_secs()
                 )));
@@ -828,10 +828,10 @@ async fn consume_stream(
                 };
                 let _ = event_tx.try_send(event);
                 if is_done {
-                    return final_msg.ok_or(crate::Error::ChannelClosed);
+                    return final_msg.ok_or(tau_agent_base::Error::ChannelClosed);
                 }
             }
-            Some(Err(_)) => return Err(crate::Error::ChannelClosed),
+            Some(Err(_)) => return Err(tau_agent_base::Error::ChannelClosed),
         }
     }
 }
@@ -894,7 +894,7 @@ pub fn is_context_overflow(err_msg: &str) -> bool {
 mod tests {
     use super::*;
     use crate::providers::mock::*;
-    use crate::worker::InProcessWorker;
+    use tau_agent_plugin_worker::InProcessWorker;
 
     fn setup_registry(responses: Vec<MockResponse>) -> ProviderRegistry {
         let mut registry = ProviderRegistry::new();
@@ -2064,7 +2064,7 @@ mod tests {
         let messages = vec![
             Message::User(UserMessage::text("hi")),
             Message::Assistant(AssistantMessage::empty("mock", "mock", "mock-model")),
-            Message::Info(crate::types::InfoMessage {
+            Message::Info(tau_agent_base::types::InfoMessage {
                 text: "task state changed".into(),
                 timestamp: 0,
             }),
@@ -2078,7 +2078,7 @@ mod tests {
         let messages = vec![
             Message::User(UserMessage::text("hi")),
             Message::Assistant(AssistantMessage::empty("mock", "mock", "mock-model")),
-            Message::Info(crate::types::InfoMessage {
+            Message::Info(tau_agent_base::types::InfoMessage {
                 text: "some notification".into(),
                 timestamp: 0,
             }),

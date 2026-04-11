@@ -137,7 +137,7 @@ pub struct ChunkUsage {
 }
 
 impl ChunkUsage {
-    pub fn apply_to(&self, usage: &mut crate::types::Usage) {
+    pub fn apply_to(&self, usage: &mut tau_agent_base::types::Usage) {
         if let Some(n) = self.prompt_tokens {
             usage.input = n;
         }

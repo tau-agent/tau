@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use crate::provider::EventSender;
-use crate::types::*;
+use tau_agent_base::types::*;
 
 /// Timeout for TCP + TLS connection establishment.
 pub const TIMEOUT_CONNECT: Duration = Duration::from_secs(30);
@@ -25,8 +25,8 @@ pub(crate) struct StreamCtx<'a> {
 }
 
 /// Send a [`StreamEvent`] over the channel, mapping send errors to
-/// [`crate::Error::ChannelClosed`].
-pub(crate) fn send_event(tx: &EventSender, event: StreamEvent) -> crate::Result<()> {
+/// [`tau_agent_base::Error::ChannelClosed`].
+pub(crate) fn send_event(tx: &EventSender, event: StreamEvent) -> tau_agent_base::Result<()> {
     tx.send_blocking(event)
-        .map_err(|_| crate::Error::ChannelClosed)
+        .map_err(|_| tau_agent_base::Error::ChannelClosed)
 }

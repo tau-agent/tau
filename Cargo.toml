@@ -17,6 +17,7 @@ categories = ["command-line-utilities", "development-tools"]
 tau-agent = { path = "crates/tau-agent", version = "0.1.0" }
 tau-agent-base = { path = "crates/tau-agent-base", version = "0.1.0" }
 tau-agent-client = { path = "crates/tau-agent-client", version = "0.1.0" }
+tau-agent-engine = { path = "crates/tau-agent-engine", version = "0.1.0" }
 tau-agent-plugin = { path = "crates/tau-agent-plugin", version = "0.1.0" }
 tau-agent-plugin-tasks = { path = "crates/tau-agent-plugin-tasks", version = "0.1.0" }
 tau-agent-plugin-worker = { path = "crates/tau-agent-plugin-worker", version = "0.1.0" }
