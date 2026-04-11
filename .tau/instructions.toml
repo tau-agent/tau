@@ -1,6 +1,7 @@
 [common]
 instructions = """
  - No unwrap() in non-test code (use expect() instead)
+ - When spawning child sessions for information gathering (reading files, summarizing code, searching the codebase), pass `model: "light"` to session_spawn. Reserve the full model for sessions that need reasoning, planning, or code generation.
 """
 
 [worker]
@@ -11,6 +12,11 @@ instruction = """
   - Run the project checklist (`just`) ONCE before marking for review — capture output to a file if you need both exit code and tail
  - If you discover a separate bug, cleanup or optimization opportunity while working, file a new task instead of expanding scope
  """
+[planning]
+instructions = """
+ - When spawning sub-sessions to read or summarize source files, pass `model: "light"` to session_spawn
+"""
+
 [refining]
 instructions = """
  - Watch out for race conditions with DB accesses - use transactions if they help
