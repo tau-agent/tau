@@ -925,9 +925,10 @@ fn refining_to_interactive_escalation() {
     server.shutdown();
 }
 
-/// Test that active→review is rejected when branch is not rebased on main.
+/// Test that active→review succeeds even when branch is not rebased on main.
+/// The merge queue handles rebasing, so the pre-review rebase check is removed.
 #[test]
-fn rebase_enforcement_on_review_transition() {
+fn review_transition_without_rebase() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = init_git_repo(tmp.path());
     let repo_str = repo.to_string_lossy().to_string();
@@ -961,10 +962,10 @@ fn rebase_enforcement_on_review_transition() {
         &sid,
         "task_create",
         serde_json::json!({
-            "title": "Rebase enforcement test",
+            "title": "No rebase needed for review",
             "parent_id": parent_id,
             "skip_planning": true,
-            "message": "Test rebase check",
+            "message": "Test that review works without rebase",
         }),
     );
     let task_id = subtask["id"].as_i64().unwrap();
@@ -976,32 +977,17 @@ fn rebase_enforcement_on_review_transition() {
 
     // Make a commit on main AFTER the branch was created.
     // This makes the branch NOT rebased on main.
-    std::fs::write(repo.join("extra.txt"), "extra content\n").unwrap();
+    std::fs::write(repo.join("extra.txt"), "extra content\n").expect("write extra.txt");
     git(&repo, &["add", "extra.txt"]);
     git(&repo, &["commit", "-m", "Add extra.txt on main"]);
 
     // Make a commit on the worktree branch
-    std::fs::write(wt_path.join("feature.txt"), "feature\n").unwrap();
+    std::fs::write(wt_path.join("feature.txt"), "feature\n").expect("write feature.txt");
     git(wt_path, &["add", "feature.txt"]);
     git(wt_path, &["commit", "-m", "Add feature.txt"]);
 
-    // active → review should fail because branch is not rebased
-    let err = exec_tool_err(
-        &server,
-        &sid,
-        "task_update",
-        serde_json::json!({"id": task_id, "state": "review"}),
-    );
-    assert!(
-        err.contains("rebased") || err.contains("rebase"),
-        "should mention rebase requirement: {}",
-        err
-    );
-
-    // Now rebase on main
-    git(wt_path, &["rebase", "main"]);
-
-    // active → review should now succeed
+    // active → review should succeed even though branch is not rebased
+    // (merge queue will handle the rebase later)
     let task = exec_tool_ok(
         &server,
         &sid,

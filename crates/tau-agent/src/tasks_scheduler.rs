@@ -1029,30 +1029,6 @@ fn build_refining_message(task: &Task, project_instructions: &str) -> String {
 /// Returns `Ok(true)` if the branch is up-to-date (merge target is an
 /// ancestor of the branch HEAD). Returns `Ok(false)` if the branch needs
 /// rebasing. Returns `Err` if the check cannot be performed.
-pub fn is_rebased_on_target(db: &TasksDb, task: &Task) -> crate::Result<bool> {
-    let branch = task
-        .branch
-        .as_ref()
-        .ok_or_else(|| crate::Error::Io(format!("task {} has no branch set", task.id)))?;
-
-    let worktree = task
-        .worktree_path
-        .as_ref()
-        .ok_or_else(|| crate::Error::Io(format!("task {} has no worktree", task.id)))?;
-
-    let merge_target = db.get_merge_target(task.id)?;
-
-    // Use git merge-base --is-ancestor to check if merge_target is an
-    // ancestor of the task's branch.
-    let output = std::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", &merge_target, branch])
-        .current_dir(worktree)
-        .output()
-        .map_err(|e| crate::Error::Io(format!("git merge-base: {}", e)))?;
-
-    Ok(output.status.success())
-}
-
 // ---------------------------------------------------------------------------
 // Auto-merge approved tasks
 // ---------------------------------------------------------------------------
