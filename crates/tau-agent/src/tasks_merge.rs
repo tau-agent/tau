@@ -328,13 +328,16 @@ pub fn merge_task(
     }
 
     // 4. Rebase onto merge target
+    //
+    // Set GIT_EDITOR and GIT_SEQUENCE_EDITOR to `true` so git never opens an
+    // interactive editor (which would hang indefinitely in this headless context).
     log.push_str(&format!("=== Rebase onto {} ===\n", merge_target));
-    let (output, is_error) = execute_bash(
-        writer,
-        reader,
-        &log_session,
-        &format!("git rebase {}", merge_target),
-    )?;
+    let rebase_cmd = format!(
+        "GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+         git -c advice.resolveConflict=false rebase {}",
+        merge_target,
+    );
+    let (output, is_error) = execute_bash(writer, reader, &log_session, &rebase_cmd)?;
     log.push_str(&output);
     log.push('\n');
 
