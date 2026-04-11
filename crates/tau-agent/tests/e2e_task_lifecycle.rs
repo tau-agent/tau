@@ -986,8 +986,24 @@ fn review_transition_without_rebase() {
     git(wt_path, &["add", "feature.txt"]);
     git(wt_path, &["commit", "-m", "Add feature.txt"]);
 
-    // active → review should succeed even though branch is not rebased
-    // (merge queue will handle the rebase later)
+    // active → review should be rejected because branch is not rebased
+    // (the rebase enforcement feature added in the tasks plugin requires
+    // the branch to be rebased on the merge target before entering review)
+    let (content, is_error) = exec_tool(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": task_id, "state": "review"}),
+    );
+    assert!(is_error, "expected error but got success: {}", content);
+    assert!(
+        content.contains("not rebased"),
+        "expected rebase error, got: {}",
+        content
+    );
+
+    // Now actually rebase and try again — should succeed
+    git(wt_path, &["rebase", "main"]);
     let task = exec_tool_ok(
         &server,
         &sid,
