@@ -92,6 +92,11 @@ impl Client {
                 | Response::MessageReply { .. }
                 | Response::GcComplete { .. }
                 | Response::ToolExecuted { .. }
+                | Response::TaskList { .. }
+                | Response::TaskDetail { .. }
+                | Response::TaskUpdated { .. }
+                | Response::TaskStatus { .. }
+                | Response::TaskTree { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);

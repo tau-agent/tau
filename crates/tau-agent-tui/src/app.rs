@@ -4,7 +4,7 @@ use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyMod
 use ratatui_textarea::TextArea;
 
 use tau_agent::auth::SubscriptionUsage;
-use tau_agent::protocol::{Response, SessionInfo};
+use tau_agent::protocol::{Response, SessionInfo, TaskInfo, TaskMessageInfo};
 use tau_agent::types::{
     AgentPhase, AssistantContent, Message, StopReason, StreamEvent, ToolResultMessage, UserContent,
 };
@@ -357,7 +357,10 @@ impl App {
         match event {
             Event::Terminal(ct_event) => self.handle_terminal_event(ct_event),
             Event::Server(response) => {
-                self.handle_server_response(*response);
+                let action = self.handle_server_response(*response);
+                if action.is_some() {
+                    return action;
+                }
                 // Fetch subscription usage if requested
                 if self.pending_subscription_usage {
                     self.pending_subscription_usage = false;
@@ -1312,18 +1315,14 @@ impl App {
         match subcmd {
             "" | "list" => {
                 let state_filter = if parts.len() > 1 {
-                    Some(parts[1])
+                    Some(parts[1].to_string())
                 } else {
                     None
                 };
-                match self.run_task_list(state_filter) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.messages.push(MessageItem::Error {
-                            text: format!("task list: {}", e),
-                        });
-                    }
-                }
+                Some(Action::TaskList {
+                    project: self.task_project(),
+                    state: state_filter,
+                })
             }
             "get" => {
                 let Some(id_str) = parts.get(1) else {
@@ -1338,14 +1337,7 @@ impl App {
                     });
                     return None;
                 };
-                match self.run_task_get(id) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.messages.push(MessageItem::Error {
-                            text: format!("task get: {}", e),
-                        });
-                    }
-                }
+                Some(Action::TaskGet { id })
             }
             "approve" => {
                 let Some(id_str) = parts.get(1) else {
@@ -1360,19 +1352,10 @@ impl App {
                     });
                     return None;
                 };
-                match self.run_task_state_change(id, "approved") {
-                    Ok(()) => {
-                        return Some(Action::FireHook {
-                            name: "task_state_changed".into(),
-                            data: serde_json::json!({"task_id": id, "new_state": "approved"}),
-                        });
-                    }
-                    Err(e) => {
-                        self.messages.push(MessageItem::Error {
-                            text: format!("task approve: {}", e),
-                        });
-                    }
-                }
+                Some(Action::TaskUpdate {
+                    id,
+                    state: "approved".into(),
+                })
             }
             "ready" => {
                 let Some(id_str) = parts.get(1) else {
@@ -1387,19 +1370,10 @@ impl App {
                     });
                     return None;
                 };
-                match self.run_task_state_change(id, "ready") {
-                    Ok(()) => {
-                        return Some(Action::FireHook {
-                            name: "task_state_changed".into(),
-                            data: serde_json::json!({"task_id": id, "new_state": "ready"}),
-                        });
-                    }
-                    Err(e) => {
-                        self.messages.push(MessageItem::Error {
-                            text: format!("task ready: {}", e),
-                        });
-                    }
-                }
+                Some(Action::TaskUpdate {
+                    id,
+                    state: "ready".into(),
+                })
             }
             "create" => {
                 let title = args.strip_prefix("create").unwrap_or("").trim();
@@ -1409,14 +1383,10 @@ impl App {
                     });
                     return None;
                 }
-                match self.run_task_create(title) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.messages.push(MessageItem::Error {
-                            text: format!("task create: {}", e),
-                        });
-                    }
-                }
+                Some(Action::TaskCreate {
+                    project: self.task_project(),
+                    title: title.to_string(),
+                })
             }
             "search" => {
                 let query = args.strip_prefix("search").unwrap_or("").trim();
@@ -1426,14 +1396,10 @@ impl App {
                     });
                     return None;
                 }
-                match self.run_task_search(query) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.messages.push(MessageItem::Error {
-                            text: format!("task search: {}", e),
-                        });
-                    }
-                }
+                Some(Action::TaskSearch {
+                    project: self.task_project(),
+                    query: query.to_string(),
+                })
             }
             "claim" => {
                 let Some(id_str) = parts.get(1) else {
@@ -1448,31 +1414,17 @@ impl App {
                     });
                     return None;
                 };
-                match self.run_task_claim(id) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.messages.push(MessageItem::Error {
-                            text: format!("task claim: {}", e),
-                        });
-                    }
-                }
+                Some(Action::TaskAssign {
+                    id,
+                    session_id: self.session_id.clone(),
+                })
             }
-            "status" | "queue" => match self.run_task_status() {
-                Ok(()) => {}
-                Err(e) => {
-                    self.messages.push(MessageItem::Error {
-                        text: format!("task status: {}", e),
-                    });
-                }
-            },
-            "mq" => match self.run_task_merge_queue() {
-                Ok(()) => {}
-                Err(e) => {
-                    self.messages.push(MessageItem::Error {
-                        text: format!("task mq: {}", e),
-                    });
-                }
-            },
+            "status" | "queue" => Some(Action::TaskStatus {
+                project: self.task_project(),
+            }),
+            "mq" => Some(Action::TaskMergeQueue {
+                project: self.task_project(),
+            }),
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!(
@@ -1480,9 +1432,9 @@ impl App {
                         subcmd
                     ),
                 });
+                None
             }
         }
-        None
     }
 
     /// Get the project path for task DB queries.
@@ -1497,67 +1449,25 @@ impl App {
             .to_string()
     }
 
-    fn run_task_status(&mut self) -> tau_agent::Result<()> {
-        let db = tau_agent::tasks_db::TasksDb::open_default()?;
-        let project = self.task_project();
-        let status = tau_agent::tasks_scheduler::get_status(&db, &project)?;
-        let output = tau_agent::tasks_scheduler::format_status(&status);
-        self.messages.push(MessageItem::Status { text: output });
-        Ok(())
-    }
-
-    fn run_task_merge_queue(&mut self) -> tau_agent::Result<()> {
-        let db = tau_agent::tasks_db::TasksDb::open_default()?;
-        let project = self.task_project();
-        let approved = db.list_tasks(&project, Some("approved"), None, None, None)?;
-        let merging = db.list_tasks(&project, Some("merging"), None, None, None)?;
-        if approved.is_empty() && merging.is_empty() {
-            self.messages.push(MessageItem::Status {
-                text: "merge queue is empty".into(),
-            });
-            return Ok(());
-        }
-        self.messages.push(MessageItem::Status {
-            text: "  MERGE QUEUE".into(),
-        });
-        self.messages.push(MessageItem::Status {
-            text: format!("  {:>4}  {:<12}  {:<14}  TITLE", "ID", "STATE", "BRANCH"),
-        });
-        for t in approved.iter().chain(merging.iter()) {
-            let branch = t.branch.as_deref().unwrap_or("-");
-            self.messages.push(MessageItem::Status {
-                text: format!(
-                    "  {:>4}  {:<12}  {:<14}  {}",
-                    t.id, t.state, branch, t.title
-                ),
-            });
-        }
-        Ok(())
-    }
-
-    fn run_task_list(&mut self, state_filter: Option<&str>) -> tau_agent::Result<()> {
-        let db = tau_agent::tasks_db::TasksDb::open_default()?;
-        let project = self.task_project();
-        let tasks = db.list_tasks(&project, state_filter, None, None, None)?;
+    /// Render a flat task list (search results, merge queue).
+    fn render_task_list_flat(&mut self, tasks: &[TaskInfo]) {
         if tasks.is_empty() {
             self.messages.push(MessageItem::Status {
-                text: "no tasks".into(),
+                text: "no matching tasks".into(),
             });
-            return Ok(());
+            return;
         }
-        let tree = tau_agent::tasks_db::tree_order(tasks);
         self.messages.push(MessageItem::Status {
             text: format!(
                 "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
                 "ID", "STATE", "PRIORITY", "SESSION"
             ),
         });
-        for (depth, t) in &tree {
+        for t in tasks {
             let session = t.session_id.as_deref().unwrap_or("-");
-            let indent = "  ".repeat(*depth);
             let text = format!(
-                "  {:>4}  {:<12}  {:>8}  {:<8}  {}{}",
-                t.id, t.state, t.priority, session, indent, t.title
+                "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
+                t.id, t.state, t.priority, session, t.title
             );
             if t.state == "failed" {
                 self.messages.push(MessageItem::Error { text });
@@ -1565,15 +1475,15 @@ impl App {
                 self.messages.push(MessageItem::Status { text });
             }
         }
-        Ok(())
     }
 
-    fn run_task_get(&mut self, id: i64) -> tau_agent::Result<()> {
-        let db = tau_agent::tasks_db::TasksDb::open_default()?;
-        let task = db
-            .get_task(id)?
-            .ok_or_else(|| tau_agent::Error::Io(format!("task {} not found", id)))?;
-
+    /// Render task detail (task get response).
+    fn render_task_detail(
+        &mut self,
+        task: &TaskInfo,
+        messages: &[TaskMessageInfo],
+        subtasks: &[TaskInfo],
+    ) {
         let skip = if task.skip_review { "yes" } else { "no" };
         let branch = task.branch.as_deref().unwrap_or("none");
         let parent = task
@@ -1594,13 +1504,11 @@ impl App {
             text: format!("Branch: {} | Parent: {}", branch, parent),
         });
 
-        // Messages
-        let messages = db.get_messages(id)?;
         if !messages.is_empty() {
             self.messages.push(MessageItem::Status {
                 text: format!("Messages: {}", messages.len()),
             });
-            for msg in &messages {
+            for msg in messages {
                 let author = msg.author.as_deref().unwrap_or("unknown");
                 let preview: String = msg.content.chars().take(80).collect();
                 let ellipsis = if msg.content.len() > 80 { "..." } else { "" };
@@ -1610,13 +1518,11 @@ impl App {
             }
         }
 
-        // Subtasks
-        let subtasks = db.get_subtasks(id)?;
         if !subtasks.is_empty() {
             self.messages.push(MessageItem::Status {
                 text: "Subtasks:".into(),
             });
-            for st in &subtasks {
+            for st in subtasks {
                 let text = format!("  #{:<4} {:<8} {}", st.id, st.state, st.title);
                 if st.state == "failed" {
                     self.messages.push(MessageItem::Error { text });
@@ -1625,71 +1531,6 @@ impl App {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn run_task_create(&mut self, title: &str) -> tau_agent::Result<()> {
-        let db = tau_agent::tasks_db::TasksDb::open_default()?;
-        let project = self.task_project();
-        let task = db.create_task(&project, title, None, None, None, false, false, false)?;
-        self.messages.push(MessageItem::Status {
-            text: format!("Created task #{}: {}", task.id, task.title),
-        });
-        Ok(())
-    }
-
-    fn run_task_search(&mut self, query: &str) -> tau_agent::Result<()> {
-        let db = tau_agent::tasks_db::TasksDb::open_default()?;
-        let project = self.task_project();
-        let tasks = db.search_tasks(&project, query, None)?;
-        if tasks.is_empty() {
-            self.messages.push(MessageItem::Status {
-                text: "no matching tasks".into(),
-            });
-            return Ok(());
-        }
-        self.messages.push(MessageItem::Status {
-            text: format!(
-                "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
-                "ID", "STATE", "PRIORITY", "SESSION"
-            ),
-        });
-        for t in &tasks {
-            let session = t.session_id.as_deref().unwrap_or("-");
-            let text = format!(
-                "  {:>4}  {:<12}  {:>8}  {:<8}  {}",
-                t.id, t.state, t.priority, session, t.title
-            );
-            if t.state == "failed" {
-                self.messages.push(MessageItem::Error { text });
-            } else {
-                self.messages.push(MessageItem::Status { text });
-            }
-        }
-        Ok(())
-    }
-
-    fn run_task_state_change(&mut self, id: i64, new_state: &str) -> tau_agent::Result<()> {
-        let db = tau_agent::tasks_db::TasksDb::open_default()?;
-        let update = tau_agent::tasks_db::TaskUpdate {
-            state: Some(new_state.to_string()),
-            ..Default::default()
-        };
-        let task = db.update_task(id, &update, None)?;
-        self.messages.push(MessageItem::Status {
-            text: format!("task #{} → {} : {}", task.id, task.state, task.title),
-        });
-        Ok(())
-    }
-
-    fn run_task_claim(&mut self, id: i64) -> tau_agent::Result<()> {
-        let db = tau_agent::tasks_db::TasksDb::open_default()?;
-        let result = db.assign_task(id, &self.session_id)?;
-        self.messages.push(MessageItem::Status {
-            text: format!("Claimed task #{}: {}", result.task.id, result.task.title),
-        });
-        Ok(())
     }
 
     /// Remove empty AssistantStreaming placeholder if present.
@@ -1769,7 +1610,7 @@ impl App {
         }
     }
 
-    fn handle_server_response(&mut self, response: Response) {
+    fn handle_server_response(&mut self, response: Response) -> Option<Action> {
         match response {
             Response::Stream { event } => {
                 // Phase(Idle) means no active agent — if we're in Streaming
@@ -1789,7 +1630,7 @@ impl App {
                         self.set_mode(AppMode::Input);
                     }
                     self.phase = AgentPhase::Idle;
-                    return;
+                    return None;
                 }
                 // If we receive stream events while in Input mode,
                 // another client is chatting — switch to streaming view.
@@ -1909,7 +1750,7 @@ impl App {
                         self.picker_folded
                             .retain(|id| existing.contains(id.as_str()));
                     }
-                    return;
+                    return None;
                 }
 
                 // Display child sessions of the current session
@@ -1943,8 +1784,64 @@ impl App {
                 // Update child count from fresh data
                 self.child_count = children.len();
             }
+            Response::TaskTree { tasks } => {
+                if tasks.is_empty() {
+                    self.messages.push(MessageItem::Status {
+                        text: "no tasks".into(),
+                    });
+                    return None;
+                }
+                self.messages.push(MessageItem::Status {
+                    text: format!(
+                        "  {:>4}  {:<12}  {:>8}  {:<8}  TITLE",
+                        "ID", "STATE", "PRIORITY", "SESSION"
+                    ),
+                });
+                for (depth, t) in &tasks {
+                    let session = t.session_id.as_deref().unwrap_or("-");
+                    let indent = "  ".repeat(*depth);
+                    let text = format!(
+                        "  {:>4}  {:<12}  {:>8}  {:<8}  {}{}",
+                        t.id, t.state, t.priority, session, indent, t.title
+                    );
+                    if t.state == "failed" {
+                        self.messages.push(MessageItem::Error { text });
+                    } else {
+                        self.messages.push(MessageItem::Status { text });
+                    }
+                }
+            }
+            Response::TaskDetail {
+                task,
+                messages,
+                subtasks,
+                ..
+            } => {
+                self.render_task_detail(&task, &messages, &subtasks);
+            }
+            Response::TaskUpdated { task } => {
+                let state = task.state.clone();
+                let id = task.id;
+                self.messages.push(MessageItem::Status {
+                    text: format!("task #{} → {} : {}", task.id, task.state, task.title),
+                });
+                // Fire hook for state changes that need scheduler notification
+                if state == "approved" || state == "ready" {
+                    return Some(Action::FireHook {
+                        name: "task_state_changed".into(),
+                        data: serde_json::json!({"task_id": id, "new_state": state}),
+                    });
+                }
+            }
+            Response::TaskStatus { text } => {
+                self.messages.push(MessageItem::Status { text });
+            }
+            Response::TaskList { tasks } => {
+                self.render_task_list_flat(&tasks);
+            }
             _ => {}
         }
+        None
     }
 
     fn handle_stream_event(&mut self, event: StreamEvent) {
@@ -2241,6 +2138,36 @@ pub enum Action {
     FireHook {
         name: String,
         data: serde_json::Value,
+    },
+    /// Task-related actions that go through the protocol.
+    TaskList {
+        project: String,
+        state: Option<String>,
+    },
+    TaskGet {
+        id: i64,
+    },
+    TaskCreate {
+        project: String,
+        title: String,
+    },
+    TaskSearch {
+        project: String,
+        query: String,
+    },
+    TaskUpdate {
+        id: i64,
+        state: String,
+    },
+    TaskAssign {
+        id: i64,
+        session_id: String,
+    },
+    TaskStatus {
+        project: String,
+    },
+    TaskMergeQueue {
+        project: String,
     },
 }
 

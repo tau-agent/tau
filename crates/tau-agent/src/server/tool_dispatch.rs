@@ -608,6 +608,65 @@ pub(super) async fn handle_server_request(
             )
             .await
         }
+        Request::SetTagline {
+            session_id: target_session_id,
+            tagline,
+        } => {
+            let st = lock_state(state);
+            match st.db.update_tagline(target_session_id, tagline) {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        Request::TaskList {
+            project,
+            state: state_filter,
+            parent_id,
+        } => super::task_handlers::handle_task_list(project, state_filter.as_deref(), *parent_id),
+        Request::TaskGet { id } => super::task_handlers::handle_task_get(*id),
+        Request::TaskCreate {
+            project,
+            title,
+            parent_id,
+            priority,
+            tags,
+        } => super::task_handlers::handle_task_create(project, title, *parent_id, *priority, tags),
+        Request::TaskUpdate {
+            id,
+            state: new_state,
+            title,
+            priority,
+            tags,
+            affected_files,
+            skip_review,
+            skip_planning,
+            require_approval,
+        } => super::task_handlers::handle_task_update(
+            *id,
+            new_state.clone(),
+            title.clone(),
+            *priority,
+            tags.clone(),
+            affected_files.clone(),
+            *skip_review,
+            *skip_planning,
+            *require_approval,
+        ),
+        Request::TaskSearch {
+            project,
+            query,
+            state: state_filter,
+        } => super::task_handlers::handle_task_search(project, query, state_filter.as_deref()),
+        Request::TaskAssign {
+            id,
+            session_id: assign_session_id,
+        } => super::task_handlers::handle_task_assign(*id, assign_session_id),
+        Request::TaskStatus { project } => super::task_handlers::handle_task_status(project),
+        Request::TaskMergeQueue { project } => {
+            super::task_handlers::handle_task_merge_queue(project)
+        }
         _ => Response::Error {
             message: "request not supported in plugin context".into(),
         },

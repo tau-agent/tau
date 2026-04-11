@@ -150,6 +150,62 @@ pub enum Request {
         tool_name: String,
         arguments: serde_json::Value,
     },
+    /// Set the tagline for a session.
+    SetTagline { session_id: String, tagline: String },
+    /// List tasks for a project.
+    TaskList {
+        project: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_id: Option<i64>,
+    },
+    /// Get full details of a task.
+    TaskGet { id: i64 },
+    /// Create a new task.
+    TaskCreate {
+        project: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        priority: Option<i32>,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    /// Update a task (state, title, priority, etc.).
+    TaskUpdate {
+        id: i64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        priority: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tags: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        affected_files: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skip_review: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        skip_planning: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        require_approval: Option<bool>,
+    },
+    /// Search tasks by query.
+    TaskSearch {
+        project: String,
+        query: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+    },
+    /// Assign a task to a session.
+    TaskAssign { id: i64, session_id: String },
+    /// Get scheduler status.
+    TaskStatus { project: String },
+    /// Get merge queue (approved + merging tasks).
+    TaskMergeQueue { project: String },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -223,6 +279,21 @@ pub enum Response {
     GcComplete { deleted: usize },
     /// Tool execution result (response to ExecuteTool).
     ToolExecuted { content: String, is_error: bool },
+    /// List of tasks (flat, for search/merge queue results).
+    TaskList { tasks: Vec<TaskInfo> },
+    /// Full task details (response to TaskGet).
+    TaskDetail {
+        task: TaskInfo,
+        messages: Vec<TaskMessageInfo>,
+        relations: Vec<TaskRelationInfo>,
+        subtasks: Vec<TaskInfo>,
+    },
+    /// Task created or updated (response to TaskCreate, TaskUpdate, TaskAssign).
+    TaskUpdated { task: TaskInfo },
+    /// Scheduler status text (response to TaskStatus).
+    TaskStatus { text: String },
+    /// Task list with tree depth info (response to TaskList).
+    TaskTree { tasks: Vec<(usize, TaskInfo)> },
     /// Error.
     Error { message: String },
 }
@@ -306,6 +377,46 @@ pub struct AliasInfo {
     /// What the alias points at, e.g. `"claude-opus-4-6"` or
     /// `"openai/gpt-4.1-mini"`.
     pub target: String,
+}
+
+/// Task info for wire protocol (mirrors tasks_db::Task but protocol-owned).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub id: i64,
+    pub project: String,
+    pub title: String,
+    pub state: String,
+    pub priority: i64,
+    pub parent_id: Option<i64>,
+    pub tags: Option<serde_json::Value>,
+    pub affected_files: Option<serde_json::Value>,
+    pub branch: Option<String>,
+    pub worktree_path: Option<String>,
+    pub session_id: Option<String>,
+    pub skip_review: bool,
+    pub skip_planning: bool,
+    pub require_approval: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Task message info for wire protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskMessageInfo {
+    pub id: i64,
+    pub task_id: i64,
+    pub content: String,
+    pub author: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Task relation info for wire protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRelationInfo {
+    pub from_task: i64,
+    pub to_task: i64,
+    pub relation: String,
 }
 
 /// Cumulative session usage statistics.
@@ -645,5 +756,116 @@ mod tests {
         assert_eq!(format_duration_compact(7200), "2h");
         assert_eq!(format_duration_compact(86400), "1d");
         assert_eq!(format_duration_compact(172800), "2d");
+    }
+
+    /// Verify that all new task-related protocol variants round-trip through serde.
+    #[test]
+    fn task_protocol_serde_roundtrip() {
+        let task = TaskInfo {
+            id: 42,
+            project: "/tmp/test".into(),
+            title: "test task".into(),
+            state: "active".into(),
+            priority: 5,
+            parent_id: Some(1),
+            tags: Some(serde_json::json!(["foo", "bar"])),
+            affected_files: None,
+            branch: Some("task-42".into()),
+            worktree_path: None,
+            session_id: Some("s123".into()),
+            skip_review: false,
+            skip_planning: true,
+            require_approval: false,
+            created_at: 1000,
+            updated_at: 2000,
+        };
+        let msg = TaskMessageInfo {
+            id: 1,
+            task_id: 42,
+            content: "hello".into(),
+            author: Some("test".into()),
+            created_at: 1000,
+            updated_at: 2000,
+        };
+        let rel = TaskRelationInfo {
+            from_task: 42,
+            to_task: 43,
+            relation: "depends_on".into(),
+        };
+
+        // Request variants
+        let requests: Vec<Request> = vec![
+            Request::SetTagline {
+                session_id: "s1".into(),
+                tagline: "hi".into(),
+            },
+            Request::TaskList {
+                project: "/tmp".into(),
+                state: Some("active".into()),
+                parent_id: None,
+            },
+            Request::TaskGet { id: 42 },
+            Request::TaskCreate {
+                project: "/tmp".into(),
+                title: "new".into(),
+                parent_id: None,
+                priority: Some(3),
+                tags: vec!["a".into()],
+            },
+            Request::TaskUpdate {
+                id: 42,
+                state: Some("approved".into()),
+                title: None,
+                priority: None,
+                tags: None,
+                affected_files: None,
+                skip_review: None,
+                skip_planning: None,
+                require_approval: None,
+            },
+            Request::TaskSearch {
+                project: "/tmp".into(),
+                query: "test".into(),
+                state: None,
+            },
+            Request::TaskAssign {
+                id: 42,
+                session_id: "s1".into(),
+            },
+            Request::TaskStatus {
+                project: "/tmp".into(),
+            },
+            Request::TaskMergeQueue {
+                project: "/tmp".into(),
+            },
+        ];
+        for req in &requests {
+            let json = serde_json::to_string(req).expect("serialize request");
+            let _: Request = serde_json::from_str(&json).expect("deserialize request");
+        }
+
+        // Response variants
+        let responses: Vec<Response> = vec![
+            Response::TaskList {
+                tasks: vec![task.clone()],
+            },
+            Response::TaskDetail {
+                task: task.clone(),
+                messages: vec![msg],
+                relations: vec![rel],
+                subtasks: vec![task.clone()],
+            },
+            Response::TaskUpdated { task: task.clone() },
+            Response::TaskStatus {
+                text: "status text".into(),
+            },
+            Response::TaskTree {
+                tasks: vec![(0, task)],
+            },
+        ];
+        for resp in &responses {
+            let json = serde_json::to_string(resp).expect("serialize response");
+            let _: Response = serde_json::from_str(&json).expect("deserialize response");
+        }
     }
 }

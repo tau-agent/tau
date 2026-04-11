@@ -1564,6 +1564,97 @@ pub(super) async fn handle_client(
                 send(&mut writer, &Response::Ok).await?;
                 return Ok(());
             }
+            crate::protocol::Request::SetTagline {
+                session_id,
+                tagline,
+            } => {
+                let resp = {
+                    let st = lock_state(&state);
+                    match st.db.update_tagline(&session_id, &tagline) {
+                        Ok(()) => Response::Ok,
+                        Err(e) => Response::Error {
+                            message: e.to_string(),
+                        },
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::TaskList {
+                project,
+                state: state_filter,
+                parent_id,
+            } => {
+                let resp = super::task_handlers::handle_task_list(
+                    &project,
+                    state_filter.as_deref(),
+                    parent_id,
+                );
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::TaskGet { id } => {
+                let resp = super::task_handlers::handle_task_get(id);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::TaskCreate {
+                project,
+                title,
+                parent_id,
+                priority,
+                tags,
+            } => {
+                let resp = super::task_handlers::handle_task_create(
+                    &project, &title, parent_id, priority, &tags,
+                );
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::TaskUpdate {
+                id,
+                state: new_state,
+                title,
+                priority,
+                tags,
+                affected_files,
+                skip_review,
+                skip_planning,
+                require_approval,
+            } => {
+                let resp = super::task_handlers::handle_task_update(
+                    id,
+                    new_state,
+                    title,
+                    priority,
+                    tags,
+                    affected_files,
+                    skip_review,
+                    skip_planning,
+                    require_approval,
+                );
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::TaskSearch {
+                project,
+                query,
+                state: state_filter,
+            } => {
+                let resp = super::task_handlers::handle_task_search(
+                    &project,
+                    &query,
+                    state_filter.as_deref(),
+                );
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::TaskAssign { id, session_id } => {
+                let resp = super::task_handlers::handle_task_assign(id, &session_id);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::TaskStatus { project } => {
+                let resp = super::task_handlers::handle_task_status(&project);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::TaskMergeQueue { project } => {
+                let resp = super::task_handlers::handle_task_merge_queue(&project);
+                send(&mut writer, &resp).await?;
+            }
         }
     }
 

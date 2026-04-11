@@ -1,0 +1,243 @@
+//! Task protocol handlers — used by both client dispatch and plugin dispatch.
+
+use crate::protocol::{Response, TaskInfo, TaskMessageInfo, TaskRelationInfo};
+
+fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
+    TaskInfo {
+        id: t.id,
+        project: t.project,
+        title: t.title,
+        state: t.state,
+        priority: t.priority,
+        parent_id: t.parent_id,
+        tags: t.tags,
+        affected_files: t.affected_files,
+        branch: t.branch,
+        worktree_path: t.worktree_path,
+        session_id: t.session_id,
+        skip_review: t.skip_review,
+        skip_planning: t.skip_planning,
+        require_approval: t.require_approval,
+        created_at: t.created_at,
+        updated_at: t.updated_at,
+    }
+}
+
+fn msg_to_info(m: crate::tasks_db::TaskMessage) -> TaskMessageInfo {
+    TaskMessageInfo {
+        id: m.id,
+        task_id: m.task_id,
+        content: m.content,
+        author: m.author,
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+    }
+}
+
+fn rel_to_info(r: crate::tasks_db::TaskRelation) -> TaskRelationInfo {
+    TaskRelationInfo {
+        from_task: r.from_task,
+        to_task: r.to_task,
+        relation: r.relation,
+    }
+}
+
+fn open_tasks_db() -> Result<crate::tasks_db::TasksDb, Response> {
+    crate::tasks_db::TasksDb::open_default().map_err(|e| Response::Error {
+        message: e.to_string(),
+    })
+}
+
+pub fn handle_task_list(
+    project: &str,
+    state_filter: Option<&str>,
+    parent_id: Option<i64>,
+) -> Response {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    match db.list_tasks(project, state_filter, parent_id, None, None) {
+        Ok(tasks) => {
+            let tree = crate::tasks_db::tree_order(tasks);
+            Response::TaskTree {
+                tasks: tree
+                    .into_iter()
+                    .map(|(d, t)| (d, task_to_info(t)))
+                    .collect(),
+            }
+        }
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+pub fn handle_task_get(id: i64) -> Response {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    let task = match db.get_task(id) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return Response::Error {
+                message: format!("task {} not found", id),
+            };
+        }
+        Err(e) => {
+            return Response::Error {
+                message: e.to_string(),
+            };
+        }
+    };
+    let messages = db.get_messages(id).unwrap_or_default();
+    let relations = db.get_relations(id).unwrap_or_default();
+    let subtasks = db.get_subtasks(id).unwrap_or_default();
+    Response::TaskDetail {
+        task: task_to_info(task),
+        messages: messages.into_iter().map(msg_to_info).collect(),
+        relations: relations.into_iter().map(rel_to_info).collect(),
+        subtasks: subtasks.into_iter().map(task_to_info).collect(),
+    }
+}
+
+pub fn handle_task_create(
+    project: &str,
+    title: &str,
+    parent_id: Option<i64>,
+    priority: Option<i32>,
+    tags: &[String],
+) -> Response {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    let tags_val = if tags.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Array(
+            tags.iter()
+                .map(|t| serde_json::Value::String(t.clone()))
+                .collect(),
+        ))
+    };
+    match db.create_task(
+        project,
+        title,
+        priority.map(|p| p as i64),
+        parent_id,
+        tags_val.as_ref(),
+        false,
+        false,
+        false,
+    ) {
+        Ok(task) => Response::TaskUpdated {
+            task: task_to_info(task),
+        },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn handle_task_update(
+    id: i64,
+    new_state: Option<String>,
+    title: Option<String>,
+    priority: Option<i64>,
+    tags: Option<serde_json::Value>,
+    affected_files: Option<serde_json::Value>,
+    skip_review: Option<bool>,
+    skip_planning: Option<bool>,
+    require_approval: Option<bool>,
+) -> Response {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    let update = crate::tasks_db::TaskUpdate {
+        state: new_state,
+        title,
+        priority,
+        tags,
+        affected_files,
+        skip_review,
+        skip_planning,
+        require_approval,
+    };
+    match db.update_task(id, &update, None) {
+        Ok(task) => Response::TaskUpdated {
+            task: task_to_info(task),
+        },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+pub fn handle_task_search(project: &str, query: &str, state_filter: Option<&str>) -> Response {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    match db.search_tasks(project, query, state_filter) {
+        Ok(tasks) => Response::TaskList {
+            tasks: tasks.into_iter().map(task_to_info).collect(),
+        },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+pub fn handle_task_assign(id: i64, session_id: &str) -> Response {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    match db.assign_task(id, session_id) {
+        Ok(result) => Response::TaskUpdated {
+            task: task_to_info(result.task),
+        },
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+pub fn handle_task_status(project: &str) -> Response {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    match crate::tasks_scheduler::get_status(&db, project) {
+        Ok(status) => {
+            let text = crate::tasks_scheduler::format_status(&status);
+            Response::TaskStatus { text }
+        }
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+pub fn handle_task_merge_queue(project: &str) -> Response {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(resp) => return resp,
+    };
+    let approved = db
+        .list_tasks(project, Some("approved"), None, None, None)
+        .unwrap_or_default();
+    let merging = db
+        .list_tasks(project, Some("merging"), None, None, None)
+        .unwrap_or_default();
+    let tasks: Vec<TaskInfo> = approved
+        .into_iter()
+        .chain(merging)
+        .map(task_to_info)
+        .collect();
+    Response::TaskList { tasks }
+}

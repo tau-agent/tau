@@ -319,20 +319,16 @@ async fn run_inner(
                 Action::SetTagline {
                     session_id,
                     tagline,
-                } => match tau_agent::db::Db::open_default() {
-                    Ok(db) => {
-                        if let Err(e) = db.update_tagline(&session_id, &tagline) {
-                            app.messages.push(crate::message::MessageItem::Error {
-                                text: format!("set tagline: {}", e),
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        app.messages.push(crate::message::MessageItem::Error {
-                            text: format!("set tagline: {}", e),
-                        });
-                    }
-                },
+                } => {
+                    send_request_and_recv(
+                        Request::SetTagline {
+                            session_id,
+                            tagline,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
                 Action::DeleteSession(session_id) => {
                     send_request_and_recv(
                         Request::DeleteSession {
@@ -506,6 +502,76 @@ async fn run_inner(
                             text: format!("hook: {}", e),
                         });
                     }
+                }
+                Action::TaskList { project, state } => {
+                    send_request_and_recv(
+                        Request::TaskList {
+                            project,
+                            state,
+                            parent_id: None,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
+                Action::TaskGet { id } => {
+                    send_request_and_recv(Request::TaskGet { id }, server_tx.clone()).await?;
+                }
+                Action::TaskCreate { project, title } => {
+                    send_request_and_recv(
+                        Request::TaskCreate {
+                            project,
+                            title,
+                            parent_id: None,
+                            priority: None,
+                            tags: vec![],
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
+                Action::TaskSearch { project, query } => {
+                    send_request_and_recv(
+                        Request::TaskSearch {
+                            project,
+                            query,
+                            state: None,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
+                Action::TaskUpdate { id, state } => {
+                    send_request_and_recv(
+                        Request::TaskUpdate {
+                            id,
+                            state: Some(state),
+                            title: None,
+                            priority: None,
+                            tags: None,
+                            affected_files: None,
+                            skip_review: None,
+                            skip_planning: None,
+                            require_approval: None,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
+                Action::TaskAssign { id, session_id } => {
+                    send_request_and_recv(
+                        Request::TaskAssign { id, session_id },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
+                Action::TaskStatus { project } => {
+                    send_request_and_recv(Request::TaskStatus { project }, server_tx.clone())
+                        .await?;
+                }
+                Action::TaskMergeQueue { project } => {
+                    send_request_and_recv(Request::TaskMergeQueue { project }, server_tx.clone())
+                        .await?;
                 }
             }
         }

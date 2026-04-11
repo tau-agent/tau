@@ -5,6 +5,7 @@ mod dispatch;
 mod notifications;
 mod registry;
 mod state;
+pub(crate) mod task_handlers;
 mod tool_dispatch;
 
 use std::collections::{HashMap, HashSet};
