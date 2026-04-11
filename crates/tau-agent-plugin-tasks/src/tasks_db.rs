@@ -302,27 +302,27 @@ pub struct TasksDb {
 
 impl TasksDb {
     /// Open (or create) the database at the default path.
-    pub fn open_default() -> tau_agent_base::Result<Self> {
+    pub fn open_default() -> tau_agent_plugin::Result<Self> {
         let path = default_db_path();
         Self::open(&path)
     }
 
     /// Open (or create) the database at the given path.
-    pub fn open(path: &PathBuf) -> tau_agent_base::Result<Self> {
+    pub fn open(path: &PathBuf) -> tau_agent_plugin::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                tau_agent_base::Error::Io(format!("mkdir {}: {}", parent.display(), e))
+                tau_agent_plugin::Error::Io(format!("mkdir {}: {}", parent.display(), e))
             })?;
         }
         let conn = Connection::open(path).map_err(|e| {
-            tau_agent_base::Error::Io(format!("open tasks db {}: {}", path.display(), e))
+            tau_agent_plugin::Error::Io(format!("open tasks db {}: {}", path.display(), e))
         })?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| tau_agent_base::Error::Io(format!("pragma: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("pragma: {}", e)))?;
 
         conn.execute_batch(SCHEMA)
-            .map_err(|e| tau_agent_base::Error::Io(format!("create tables: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("create tables: {}", e)))?;
 
         Self::migrate(&conn)?;
 
@@ -331,15 +331,15 @@ impl TasksDb {
 
     /// Open an in-memory database (for tests).
     #[cfg(test)]
-    pub fn open_memory() -> tau_agent_base::Result<Self> {
+    pub fn open_memory() -> tau_agent_plugin::Result<Self> {
         let conn = Connection::open_in_memory()
-            .map_err(|e| tau_agent_base::Error::Io(format!("open in-memory tasks db: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("open in-memory tasks db: {}", e)))?;
 
         conn.execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(|e| tau_agent_base::Error::Io(format!("pragma: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("pragma: {}", e)))?;
 
         conn.execute_batch(SCHEMA)
-            .map_err(|e| tau_agent_base::Error::Io(format!("create tables: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("create tables: {}", e)))?;
 
         Self::migrate(&conn)?;
 
@@ -349,7 +349,7 @@ impl TasksDb {
     /// Run schema migrations. Currently handles:
     /// - Dropping the `assigned_session` column (consolidated into `session_id`).
     /// - Adding the `skip_planning` column.
-    fn migrate(conn: &Connection) -> tau_agent_base::Result<()> {
+    fn migrate(conn: &Connection) -> tau_agent_plugin::Result<()> {
         // Check if assigned_session column still exists.
         let has_assigned_session: bool = conn
             .prepare(
@@ -367,7 +367,7 @@ impl TasksDb {
                  WHERE assigned_session IS NOT NULL AND (session_id IS NULL OR session_id != assigned_session); \
                  ALTER TABLE tasks DROP COLUMN assigned_session;"
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("migrate assigned_session: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate assigned_session: {}", e)))?;
         }
 
         // Add skip_planning column if it doesn't exist.
@@ -381,7 +381,7 @@ impl TasksDb {
             conn.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN skip_planning INTEGER NOT NULL DEFAULT 0;",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("migrate skip_planning: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate skip_planning: {}", e)))?;
         }
 
         // Add require_approval column if it doesn't exist.
@@ -397,7 +397,7 @@ impl TasksDb {
             conn.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN require_approval INTEGER NOT NULL DEFAULT 0;",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("migrate require_approval: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate require_approval: {}", e)))?;
         }
 
         // Migrate done -> merged/closed terminal states.
@@ -414,7 +414,7 @@ impl TasksDb {
                 );
                 UPDATE tasks SET state = 'closed' WHERE state = 'done';",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("migrate done to merged/closed: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate done to merged/closed: {}", e)))?;
         }
 
         Ok(())
@@ -439,13 +439,13 @@ impl TasksDb {
         skip_review: bool,
         skip_planning: bool,
         require_approval: bool,
-    ) -> tau_agent_base::Result<Task> {
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+    ) -> tau_agent_plugin::Result<Task> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         let priority = priority.unwrap_or(0);
         let tags_str = tags
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
+            .map_err(|e| tau_agent_plugin::Error::Parse(e.to_string()))?;
 
         // Subtasks default to 'planning' state (or 'ready' if skip_planning).
         // skip_review is always forced to false for subtasks.
@@ -474,15 +474,15 @@ impl TasksDb {
                     now,
                 ],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("insert task: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert task: {}", e)))?;
 
         let id = self.conn.last_insert_rowid();
         self.get_task(id)?
-            .ok_or_else(|| tau_agent_base::Error::Io("task not found after insert".into()))
+            .ok_or_else(|| tau_agent_plugin::Error::Io("task not found after insert".into()))
     }
 
     /// Get a task by ID.
-    pub fn get_task(&self, id: i64) -> tau_agent_base::Result<Option<Task>> {
+    pub fn get_task(&self, id: i64) -> tau_agent_plugin::Result<Option<Task>> {
         self.conn
             .query_row(
                 "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
@@ -493,7 +493,7 @@ impl TasksDb {
                 row_to_task,
             )
             .optional()
-            .map_err(|e| tau_agent_base::Error::Io(format!("get task: {}", e)))
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get task: {}", e)))
     }
 
     /// List tasks with optional filters.
@@ -504,7 +504,7 @@ impl TasksDb {
         parent_id_filter: Option<i64>,
         tag_filter: Option<&str>,
         limit: Option<i64>,
-    ) -> tau_agent_base::Result<Vec<Task>> {
+    ) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut sql = String::from(
             "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
                     branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
@@ -554,16 +554,17 @@ impl TasksDb {
         let mut stmt = self
             .conn
             .prepare(&sql)
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare list tasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare list tasks: {}", e)))?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_task)
-            .map_err(|e| tau_agent_base::Error::Io(format!("list tasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("list tasks: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks
-                .push(row.map_err(|e| tau_agent_base::Error::Io(format!("read task row: {}", e)))?);
+            tasks.push(
+                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read task row: {}", e)))?,
+            );
         }
         Ok(tasks)
     }
@@ -575,28 +576,28 @@ impl TasksDb {
         id: i64,
         update: &TaskUpdate,
         session_id: Option<&str>,
-    ) -> tau_agent_base::Result<Task> {
+    ) -> tau_agent_plugin::Result<Task> {
         let task = self
             .get_task(id)?
-            .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} not found", id)))?;
+            .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", id)))?;
 
         // Validate state transition
         if let Some(ref new_state) = update.state {
             if !VALID_STATES.contains(&new_state.as_str()) {
-                return Err(tau_agent_base::Error::Io(format!(
+                return Err(tau_agent_plugin::Error::Io(format!(
                     "invalid state: {}",
                     new_state
                 )));
             }
             if !validate_state_transition(&task.state, new_state) {
-                return Err(tau_agent_base::Error::Io(format!(
+                return Err(tau_agent_plugin::Error::Io(format!(
                     "invalid state transition: {} -> {}",
                     task.state, new_state
                 )));
             }
             // active -> approved requires skip_review=true
             if task.state == "active" && new_state == "approved" && !task.skip_review {
-                return Err(tau_agent_base::Error::Io(
+                return Err(tau_agent_plugin::Error::Io(
                     "cannot transition active -> approved: skip_review is false, \
                      must go through review first"
                         .into(),
@@ -614,7 +615,7 @@ impl TasksDb {
                     _ => false,
                 };
                 if !has_files && !update_has_files {
-                    return Err(tau_agent_base::Error::Io(
+                    return Err(tau_agent_plugin::Error::Io(
                         "cannot transition refining -> ready: affected_files must be \
                          set and non-empty before a task can proceed to ready"
                             .into(),
@@ -623,12 +624,12 @@ impl TasksDb {
             }
         }
 
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+        let now = tau_agent_plugin::timestamp_ms() as i64;
 
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| tau_agent_base::Error::Io(format!("update_task begin: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("update_task begin: {}", e)))?;
 
         // Build SET clauses and record history
         let mut sets = vec!["updated_at = ?".to_string()];
@@ -646,7 +647,7 @@ impl TasksDb {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         params![id, $col, old_str, new_str, session_id, now],
                     )
-                    .map_err(|e| tau_agent_base::Error::Io(format!("insert history: {}", e)))?;
+                    .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
                 }
             };
         }
@@ -659,7 +660,7 @@ impl TasksDb {
             let old_str = task.tags.as_ref().map(|v| v.to_string());
             let new_str = val.to_string();
             let json_str = serde_json::to_string(val)
-                .map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
+                .map_err(|e| tau_agent_plugin::Error::Parse(e.to_string()))?;
             params_vec.push(Box::new(json_str));
             sets.push("tags = ?".to_string());
             tx.execute(
@@ -667,14 +668,14 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "tags", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
         }
 
         if let Some(ref val) = update.affected_files {
             let old_str = task.affected_files.as_ref().map(|v| v.to_string());
             let new_str = val.to_string();
             let json_str = serde_json::to_string(val)
-                .map_err(|e| tau_agent_base::Error::Parse(e.to_string()))?;
+                .map_err(|e| tau_agent_plugin::Error::Parse(e.to_string()))?;
             params_vec.push(Box::new(json_str));
             sets.push("affected_files = ?".to_string());
             tx.execute(
@@ -682,7 +683,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "affected_files", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
         }
 
         if let Some(val) = update.skip_review {
@@ -695,7 +696,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "skip_review", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
         }
 
         if let Some(val) = update.skip_planning {
@@ -708,7 +709,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "skip_planning", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
         }
 
         if let Some(val) = update.require_approval {
@@ -721,16 +722,16 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "require_approval", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
         }
 
         if sets.len() == 1 {
             // Only updated_at, nothing else to update
             tx.commit()
-                .map_err(|e| tau_agent_base::Error::Io(format!("update_task commit: {}", e)))?;
+                .map_err(|e| tau_agent_plugin::Error::Io(format!("update_task commit: {}", e)))?;
             return self
                 .get_task(id)?
-                .ok_or_else(|| tau_agent_base::Error::Io("task not found after update".into()));
+                .ok_or_else(|| tau_agent_plugin::Error::Io("task not found after update".into()));
         }
 
         // Build positional param placeholders
@@ -750,13 +751,13 @@ impl TasksDb {
             params_vec.iter().map(|p| p.as_ref()).collect();
 
         tx.execute(&sql, params_refs.as_slice())
-            .map_err(|e| tau_agent_base::Error::Io(format!("update task: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("update task: {}", e)))?;
 
         tx.commit()
-            .map_err(|e| tau_agent_base::Error::Io(format!("update_task commit: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("update_task commit: {}", e)))?;
 
         self.get_task(id)?
-            .ok_or_else(|| tau_agent_base::Error::Io("task not found after update".into()))
+            .ok_or_else(|| tau_agent_plugin::Error::Io("task not found after update".into()))
     }
 
     // ----- messages -----
@@ -767,19 +768,19 @@ impl TasksDb {
         task_id: i64,
         content: &str,
         author: Option<&str>,
-    ) -> tau_agent_base::Result<TaskMessage> {
+    ) -> tau_agent_plugin::Result<TaskMessage> {
         // Verify task exists
         self.get_task(task_id)?
-            .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} not found", task_id)))?;
+            .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         self.conn
             .execute(
                 "INSERT INTO task_messages (task_id, content, author, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![task_id, content, author, now, now],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("insert message: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert message: {}", e)))?;
 
         let id = self.conn.last_insert_rowid();
         Ok(TaskMessage {
@@ -797,8 +798,8 @@ impl TasksDb {
         &self,
         message_id: i64,
         content: &str,
-    ) -> tau_agent_base::Result<TaskMessage> {
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+    ) -> tau_agent_plugin::Result<TaskMessage> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
 
         let updated = self
             .conn
@@ -806,10 +807,10 @@ impl TasksDb {
                 "UPDATE task_messages SET content = ?1, updated_at = ?2 WHERE id = ?3",
                 params![content, now, message_id],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("edit message: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("edit message: {}", e)))?;
 
         if updated == 0 {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "message {} not found",
                 message_id
             )));
@@ -822,27 +823,27 @@ impl TasksDb {
                 params![message_id],
                 row_to_message,
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("get edited message: {}", e)))
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get edited message: {}", e)))
     }
 
     /// Get all messages for a task.
-    pub fn get_messages(&self, task_id: i64) -> tau_agent_base::Result<Vec<TaskMessage>> {
+    pub fn get_messages(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<TaskMessage>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT id, task_id, content, author, created_at, updated_at
                  FROM task_messages WHERE task_id = ?1 ORDER BY id",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare get messages: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get messages: {}", e)))?;
 
         let rows = stmt
             .query_map(params![task_id], row_to_message)
-            .map_err(|e| tau_agent_base::Error::Io(format!("get messages: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get messages: {}", e)))?;
 
         let mut messages = Vec::new();
         for row in rows {
             messages.push(
-                row.map_err(|e| tau_agent_base::Error::Io(format!("read message row: {}", e)))?,
+                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read message row: {}", e)))?,
             );
         }
         Ok(messages)
@@ -858,10 +859,10 @@ impl TasksDb {
         from_task: i64,
         to_task: i64,
         relation: &str,
-    ) -> tau_agent_base::Result<()> {
+    ) -> tau_agent_plugin::Result<()> {
         // Validate relation type
         if !matches!(relation, "depends_on" | "blocks" | "related") {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "invalid relation type: {}. Must be depends_on, blocks, or related",
                 relation
             )));
@@ -869,7 +870,7 @@ impl TasksDb {
 
         // Prevent self-referential relations
         if from_task == to_task {
-            return Err(tau_agent_base::Error::Io(
+            return Err(tau_agent_plugin::Error::Io(
                 "cannot create a relation from a task to itself".into(),
             ));
         }
@@ -880,7 +881,7 @@ impl TasksDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| tau_agent_base::Error::Io(format!("add_relation begin: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("add_relation begin: {}", e)))?;
 
         // Validate both tasks exist
         let from = tx
@@ -890,9 +891,9 @@ impl TasksDb {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|e| tau_agent_base::Error::Io(format!("check from_task: {}", e)))?
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("check from_task: {}", e)))?
             .ok_or_else(|| {
-                tau_agent_base::Error::Io(format!("from_task {} not found", from_task))
+                tau_agent_plugin::Error::Io(format!("from_task {} not found", from_task))
             })?;
 
         let to = tx
@@ -902,12 +903,12 @@ impl TasksDb {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|e| tau_agent_base::Error::Io(format!("check to_task: {}", e)))?
-            .ok_or_else(|| tau_agent_base::Error::Io(format!("to_task {} not found", to_task)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("check to_task: {}", e)))?
+            .ok_or_else(|| tau_agent_plugin::Error::Io(format!("to_task {} not found", to_task)))?;
 
         // Both tasks must be in the same project
         if from != to {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "cannot relate tasks across projects: '{}' and '{}'",
                 from, to
             )));
@@ -931,20 +932,20 @@ impl TasksDb {
                          WHERE from_task = ?1 AND relation = 'depends_on'",
                     )
                     .map_err(|e| {
-                        tau_agent_base::Error::Io(format!("prepare cycle check: {}", e))
+                        tau_agent_plugin::Error::Io(format!("prepare cycle check: {}", e))
                     })?;
 
                 let deps: Vec<i64> = stmt
                     .query_map(params![current], |row| row.get(0))
-                    .map_err(|e| tau_agent_base::Error::Io(format!("cycle check: {}", e)))?
+                    .map_err(|e| tau_agent_plugin::Error::Io(format!("cycle check: {}", e)))?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| {
-                        tau_agent_base::Error::Io(format!("read cycle check row: {}", e))
+                        tau_agent_plugin::Error::Io(format!("read cycle check row: {}", e))
                     })?;
 
                 for dep in deps {
                     if dep == from_task {
-                        return Err(tau_agent_base::Error::Io(format!(
+                        return Err(tau_agent_plugin::Error::Io(format!(
                             "circular dependency: task {} transitively depends on task {}",
                             to_task, from_task
                         )));
@@ -961,23 +962,23 @@ impl TasksDb {
              VALUES (?1, ?2, ?3)",
             params![from_task, to_task, relation],
         )
-        .map_err(|e| tau_agent_base::Error::Io(format!("insert relation: {}", e)))?;
+        .map_err(|e| tau_agent_plugin::Error::Io(format!("insert relation: {}", e)))?;
 
         tx.commit()
-            .map_err(|e| tau_agent_base::Error::Io(format!("add_relation commit: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("add_relation commit: {}", e)))?;
 
         Ok(())
     }
 
     /// Get all relations involving a task (from or to).
-    pub fn get_relations(&self, task_id: i64) -> tau_agent_base::Result<Vec<TaskRelation>> {
+    pub fn get_relations(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<TaskRelation>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT from_task, to_task, relation FROM task_relations
                  WHERE from_task = ?1 OR to_task = ?1",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare get relations: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get relations: {}", e)))?;
 
         let rows = stmt
             .query_map(params![task_id], |row| {
@@ -987,12 +988,12 @@ impl TasksDb {
                     relation: row.get(2)?,
                 })
             })
-            .map_err(|e| tau_agent_base::Error::Io(format!("get relations: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get relations: {}", e)))?;
 
         let mut relations = Vec::new();
         for row in rows {
             relations.push(
-                row.map_err(|e| tau_agent_base::Error::Io(format!("read relation row: {}", e)))?,
+                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read relation row: {}", e)))?,
             );
         }
         Ok(relations)
@@ -1000,7 +1001,7 @@ impl TasksDb {
 
     /// Get tasks that this task depends on that are NOT yet in a terminal state.
     /// Returns tasks where: relation(this_task, dep, 'depends_on') AND dep.state NOT IN ('merged', 'closed')
-    pub fn get_blocking_dependencies(&self, task_id: i64) -> tau_agent_base::Result<Vec<Task>> {
+    pub fn get_blocking_dependencies(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1012,16 +1013,16 @@ impl TasksDb {
                  JOIN tasks t ON t.id = r.to_task
                  WHERE r.from_task = ?1 AND r.relation = 'depends_on' AND t.state NOT IN ('merged', 'closed')",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare get_blocking_dependencies: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get_blocking_dependencies: {}", e)))?;
 
-        let rows = stmt
-            .query_map(params![task_id], row_to_task)
-            .map_err(|e| tau_agent_base::Error::Io(format!("get_blocking_dependencies: {}", e)))?;
+        let rows = stmt.query_map(params![task_id], row_to_task).map_err(|e| {
+            tau_agent_plugin::Error::Io(format!("get_blocking_dependencies: {}", e))
+        })?;
 
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(row.map_err(|e| {
-                tau_agent_base::Error::Io(format!("read blocking dependency row: {}", e))
+                tau_agent_plugin::Error::Io(format!("read blocking dependency row: {}", e))
             })?);
         }
         Ok(tasks)
@@ -1032,7 +1033,7 @@ impl TasksDb {
     ///
     /// Planning-state tasks are included so the scheduler can dispatch
     /// planning sessions for them (without creating worktrees).
-    pub fn get_schedulable_tasks(&self, project: &str) -> tau_agent_base::Result<Vec<Task>> {
+    pub fn get_schedulable_tasks(&self, project: &str) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1051,16 +1052,16 @@ impl TasksDb {
                    )
                  ORDER BY t.priority DESC, t.created_at ASC",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare get_schedulable_tasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get_schedulable_tasks: {}", e)))?;
 
         let rows = stmt
             .query_map(params![project], row_to_task)
-            .map_err(|e| tau_agent_base::Error::Io(format!("get_schedulable_tasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get_schedulable_tasks: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(row.map_err(|e| {
-                tau_agent_base::Error::Io(format!("read schedulable task row: {}", e))
+                tau_agent_plugin::Error::Io(format!("read schedulable task row: {}", e))
             })?);
         }
         Ok(tasks)
@@ -1068,7 +1069,7 @@ impl TasksDb {
 
     /// Get all tasks in `approved` state, optionally filtered by project.
     /// Used by the scheduler to find tasks ready for auto-merge.
-    pub fn get_approved_tasks(&self, project: Option<&str>) -> tau_agent_base::Result<Vec<Task>> {
+    pub fn get_approved_tasks(&self, project: Option<&str>) -> tau_agent_plugin::Result<Vec<Task>> {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project {
             Some(p) => (
                 "SELECT id, project, title, state, priority, parent_id, tags, affected_files,
@@ -1094,19 +1095,18 @@ impl TasksDb {
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare get_approved_tasks: {}", e)))?;
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
+            tau_agent_plugin::Error::Io(format!("prepare get_approved_tasks: {}", e))
+        })?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_task)
-            .map_err(|e| tau_agent_base::Error::Io(format!("get_approved_tasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get_approved_tasks: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(row.map_err(|e| {
-                tau_agent_base::Error::Io(format!("read approved task row: {}", e))
+                tau_agent_plugin::Error::Io(format!("read approved task row: {}", e))
             })?);
         }
         Ok(tasks)
@@ -1114,7 +1114,7 @@ impl TasksDb {
 
     /// Count tasks in in-flight states (planning, refining, active, review, merging).
     /// Used by the scheduler to enforce the max concurrent tasks limit.
-    pub fn count_inflight_tasks(&self, project: &str) -> tau_agent_base::Result<usize> {
+    pub fn count_inflight_tasks(&self, project: &str) -> tau_agent_plugin::Result<usize> {
         let count: i64 = self
             .conn
             .query_row(
@@ -1124,14 +1124,14 @@ impl TasksDb {
                 params![project],
                 |row| row.get(0),
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("count_inflight_tasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("count_inflight_tasks: {}", e)))?;
         Ok(count as usize)
     }
 
     /// Get all tasks in in-flight states (active, review, merging, refining).
     /// Used by the scheduler to check affected_files conflicts against
     /// already-active tasks before dispatching new ones.
-    pub fn get_inflight_tasks(&self, project: &str) -> tau_agent_base::Result<Vec<Task>> {
+    pub fn get_inflight_tasks(&self, project: &str) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1143,16 +1143,16 @@ impl TasksDb {
                    AND state IN ('active', 'review', 'merging', 'refining')
                  ORDER BY priority DESC, created_at ASC",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare get_inflight_tasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get_inflight_tasks: {}", e)))?;
 
         let rows = stmt
             .query_map(params![project], row_to_task)
-            .map_err(|e| tau_agent_base::Error::Io(format!("get_inflight_tasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get_inflight_tasks: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(row.map_err(|e| {
-                tau_agent_base::Error::Io(format!("read inflight task row: {}", e))
+                tau_agent_plugin::Error::Io(format!("read inflight task row: {}", e))
             })?);
         }
         Ok(tasks)
@@ -1161,7 +1161,7 @@ impl TasksDb {
     /// Check if `from` transitively depends on `to` via `depends_on` relations.
     /// Uses BFS from `from` following depends_on edges. Returns true if `to` is
     /// reachable.
-    pub fn has_transitive_dependency(&self, from: i64, to: i64) -> tau_agent_base::Result<bool> {
+    pub fn has_transitive_dependency(&self, from: i64, to: i64) -> tau_agent_plugin::Result<bool> {
         use std::collections::{HashSet, VecDeque};
 
         let mut visited = HashSet::new();
@@ -1177,17 +1177,17 @@ impl TasksDb {
                      WHERE from_task = ?1 AND relation = 'depends_on'",
                 )
                 .map_err(|e| {
-                    tau_agent_base::Error::Io(format!("prepare has_transitive_dependency: {}", e))
+                    tau_agent_plugin::Error::Io(format!("prepare has_transitive_dependency: {}", e))
                 })?;
 
             let deps: Vec<i64> = stmt
                 .query_map(params![current], |row| row.get(0))
                 .map_err(|e| {
-                    tau_agent_base::Error::Io(format!("has_transitive_dependency: {}", e))
+                    tau_agent_plugin::Error::Io(format!("has_transitive_dependency: {}", e))
                 })?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
-                    tau_agent_base::Error::Io(format!("read transitive dependency row: {}", e))
+                    tau_agent_plugin::Error::Io(format!("read transitive dependency row: {}", e))
                 })?;
 
             for dep in deps {
@@ -1206,7 +1206,7 @@ impl TasksDb {
     // ----- subtasks -----
 
     /// Get direct subtasks of a task.
-    pub fn get_subtasks(&self, parent_id: i64) -> tau_agent_base::Result<Vec<Task>> {
+    pub fn get_subtasks(&self, parent_id: i64) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1215,16 +1215,16 @@ impl TasksDb {
                         created_at, updated_at
                  FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare get subtasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get subtasks: {}", e)))?;
 
         let rows = stmt
             .query_map(params![parent_id], row_to_task)
-            .map_err(|e| tau_agent_base::Error::Io(format!("get subtasks: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get subtasks: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(
-                row.map_err(|e| tau_agent_base::Error::Io(format!("read subtask row: {}", e)))?,
+                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read subtask row: {}", e)))?,
             );
         }
         Ok(tasks)
@@ -1234,7 +1234,7 @@ impl TasksDb {
     ///
     /// Uses iterative BFS to collect all tasks whose parent chain leads back
     /// to `root_id`. Does NOT include the root task itself.
-    pub fn get_descendant_tasks(&self, root_id: i64) -> tau_agent_base::Result<Vec<Task>> {
+    pub fn get_descendant_tasks(&self, root_id: i64) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut descendants = Vec::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(root_id);
@@ -1264,19 +1264,19 @@ impl TasksDb {
         &self,
         task_id: i64,
         session_id: &str,
-    ) -> tau_agent_base::Result<AssignResult> {
+    ) -> tau_agent_plugin::Result<AssignResult> {
         let task = self
             .get_task(task_id)?
-            .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} not found", task_id)))?;
+            .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
         if task.state != "ready" && task.state != "interactive" {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "cannot assign task {}: state is '{}', must be 'ready' or 'interactive'",
                 task_id, task.state
             )));
         }
 
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         // Interactive tasks stay interactive; ready tasks transition to active
         let new_state = if task.state == "interactive" {
             "interactive"
@@ -1290,14 +1290,14 @@ impl TasksDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| tau_agent_base::Error::Io(format!("assign_task begin: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("assign_task begin: {}", e)))?;
 
         tx.execute(
             "UPDATE tasks SET state = ?1, session_id = ?2, updated_at = ?3 \
              WHERE id = ?4",
             params![new_state, session_id, now, task_id],
         )
-        .map_err(|e| tau_agent_base::Error::Io(format!("assign task update: {}", e)))?;
+        .map_err(|e| tau_agent_plugin::Error::Io(format!("assign task update: {}", e)))?;
 
         // Record state change in history (only if state actually changed)
         if new_state != task.state {
@@ -1306,7 +1306,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![task_id, "state", task.state, new_state, session_id, now],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("assign task history (state): {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("assign task history (state): {}", e)))?;
         }
 
         // Record session_id change in history
@@ -1322,7 +1322,7 @@ impl TasksDb {
                 now
             ],
         )
-        .map_err(|e| tau_agent_base::Error::Io(format!("assign task history (assigned): {}", e)))?;
+        .map_err(|e| tau_agent_plugin::Error::Io(format!("assign task history (assigned): {}", e)))?;
 
         // Record in task_sessions
         tx.execute(
@@ -1330,7 +1330,7 @@ impl TasksDb {
              VALUES (?1, ?2, 'worker', ?3)",
             params![task_id, session_id, now],
         )
-        .map_err(|e| tau_agent_base::Error::Io(format!("assign task session: {}", e)))?;
+        .map_err(|e| tau_agent_plugin::Error::Io(format!("assign task session: {}", e)))?;
 
         // For interactive tasks with a changed session, update all descendant
         // tasks' session_id within this same transaction (atomic).
@@ -1349,16 +1349,16 @@ impl TasksDb {
                     let mut stmt = tx
                         .prepare("SELECT id, session_id FROM tasks WHERE parent_id = ?1")
                         .map_err(|e| {
-                            tau_agent_base::Error::Io(format!("prepare descendant query: {}", e))
+                            tau_agent_plugin::Error::Io(format!("prepare descendant query: {}", e))
                         })?;
                     let rows: Vec<(i64, Option<String>)> = stmt
                         .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))
                         .map_err(|e| {
-                            tau_agent_base::Error::Io(format!("query descendants: {}", e))
+                            tau_agent_plugin::Error::Io(format!("query descendants: {}", e))
                         })?
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|e| {
-                            tau_agent_base::Error::Io(format!("read descendant row: {}", e))
+                            tau_agent_plugin::Error::Io(format!("read descendant row: {}", e))
                         })?;
                     for (child_id, child_session) in rows {
                         // Track old sessions that were parented under
@@ -1391,7 +1391,7 @@ impl TasksDb {
                     params![session_id, now, desc_id],
                 )
                 .map_err(|e| {
-                    tau_agent_base::Error::Io(format!(
+                    tau_agent_plugin::Error::Io(format!(
                         "update descendant {} session: {}",
                         desc_id, e
                     ))
@@ -1403,7 +1403,7 @@ impl TasksDb {
                     params![desc_id, session_id, now],
                 )
                 .map_err(|e| {
-                    tau_agent_base::Error::Io(format!(
+                    tau_agent_plugin::Error::Io(format!(
                         "record descendant {} session: {}",
                         desc_id, e
                     ))
@@ -1412,11 +1412,11 @@ impl TasksDb {
         }
 
         tx.commit()
-            .map_err(|e| tau_agent_base::Error::Io(format!("assign_task commit: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("assign_task commit: {}", e)))?;
 
         let updated_task = self
             .get_task(task_id)?
-            .ok_or_else(|| tau_agent_base::Error::Io("task not found after assign".into()))?;
+            .ok_or_else(|| tau_agent_plugin::Error::Io("task not found after assign".into()))?;
 
         Ok(AssignResult {
             task: updated_task,
@@ -1433,27 +1433,27 @@ impl TasksDb {
         task_id: i64,
         session_id: &str,
         role: &str,
-    ) -> tau_agent_base::Result<()> {
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+    ) -> tau_agent_plugin::Result<()> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         self.conn
             .execute(
                 "INSERT OR IGNORE INTO task_sessions (task_id, session_id, role, created_at) \
                  VALUES (?1, ?2, ?3, ?4)",
                 params![task_id, session_id, role, now],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("record session: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("record session: {}", e)))?;
         Ok(())
     }
 
     /// Get all sessions for a task.
-    pub fn get_sessions(&self, task_id: i64) -> tau_agent_base::Result<Vec<TaskSession>> {
+    pub fn get_sessions(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<TaskSession>> {
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT task_id, session_id, role, created_at \
                  FROM task_sessions WHERE task_id = ?1 ORDER BY created_at",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare get sessions: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get sessions: {}", e)))?;
 
         let rows = stmt
             .query_map(params![task_id], |row| {
@@ -1464,12 +1464,12 @@ impl TasksDb {
                     created_at: row.get(3)?,
                 })
             })
-            .map_err(|e| tau_agent_base::Error::Io(format!("get sessions: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get sessions: {}", e)))?;
 
         let mut sessions = Vec::new();
         for row in rows {
             sessions.push(
-                row.map_err(|e| tau_agent_base::Error::Io(format!("read session row: {}", e)))?,
+                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read session row: {}", e)))?,
             );
         }
         Ok(sessions)
@@ -1483,7 +1483,7 @@ impl TasksDb {
         &self,
         task_id: i64,
         role: &str,
-    ) -> tau_agent_base::Result<Option<String>> {
+    ) -> tau_agent_plugin::Result<Option<String>> {
         let result = self
             .conn
             .query_row(
@@ -1495,7 +1495,7 @@ impl TasksDb {
             )
             .optional()
             .map_err(|e| {
-                tau_agent_base::Error::Io(format!("find latest session by role: {}", e))
+                tau_agent_plugin::Error::Io(format!("find latest session by role: {}", e))
             })?;
         Ok(result)
     }
@@ -1508,7 +1508,7 @@ impl TasksDb {
         project: &str,
         query: &str,
         state_filter: Option<&str>,
-    ) -> tau_agent_base::Result<Vec<Task>> {
+    ) -> tau_agent_plugin::Result<Vec<Task>> {
         let like_query = format!("%{}%", query);
         let mut tasks = Vec::new();
 
@@ -1524,13 +1524,15 @@ impl TasksDb {
             let mut stmt = self
                 .conn
                 .prepare(sql)
-                .map_err(|e| tau_agent_base::Error::Io(format!("prepare search: {}", e)))?;
+                .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare search: {}", e)))?;
             let rows = stmt
                 .query_map(params![project, state, like_query], row_to_task)
-                .map_err(|e| tau_agent_base::Error::Io(format!("search tasks: {}", e)))?;
+                .map_err(|e| tau_agent_plugin::Error::Io(format!("search tasks: {}", e)))?;
             for row in rows {
                 tasks.push(
-                    row.map_err(|e| tau_agent_base::Error::Io(format!("read search row: {}", e)))?,
+                    row.map_err(|e| {
+                        tau_agent_plugin::Error::Io(format!("read search row: {}", e))
+                    })?,
                 );
             }
         } else {
@@ -1545,13 +1547,15 @@ impl TasksDb {
             let mut stmt = self
                 .conn
                 .prepare(sql)
-                .map_err(|e| tau_agent_base::Error::Io(format!("prepare search: {}", e)))?;
+                .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare search: {}", e)))?;
             let rows = stmt
                 .query_map(params![project, like_query], row_to_task)
-                .map_err(|e| tau_agent_base::Error::Io(format!("search tasks: {}", e)))?;
+                .map_err(|e| tau_agent_plugin::Error::Io(format!("search tasks: {}", e)))?;
             for row in rows {
                 tasks.push(
-                    row.map_err(|e| tau_agent_base::Error::Io(format!("read search row: {}", e)))?,
+                    row.map_err(|e| {
+                        tau_agent_plugin::Error::Io(format!("read search row: {}", e))
+                    })?,
                 );
             }
         }
@@ -1562,18 +1566,18 @@ impl TasksDb {
     // ----- git integration -----
 
     /// Set the branch name for a task.
-    pub fn set_branch(&self, task_id: i64, branch: &str) -> tau_agent_base::Result<()> {
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+    pub fn set_branch(&self, task_id: i64, branch: &str) -> tau_agent_plugin::Result<()> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         let updated = self
             .conn
             .execute(
                 "UPDATE tasks SET branch = ?1, updated_at = ?2 WHERE id = ?3",
                 params![branch, now, task_id],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("set_branch: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("set_branch: {}", e)))?;
 
         if updated == 0 {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "task {} not found",
                 task_id
             )));
@@ -1582,18 +1586,18 @@ impl TasksDb {
     }
 
     /// Set the worktree path for a task.
-    pub fn set_worktree_path(&self, task_id: i64, path: &str) -> tau_agent_base::Result<()> {
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+    pub fn set_worktree_path(&self, task_id: i64, path: &str) -> tau_agent_plugin::Result<()> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         let updated = self
             .conn
             .execute(
                 "UPDATE tasks SET worktree_path = ?1, updated_at = ?2 WHERE id = ?3",
                 params![path, now, task_id],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("set_worktree_path: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("set_worktree_path: {}", e)))?;
 
         if updated == 0 {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "task {} not found",
                 task_id
             )));
@@ -1606,16 +1610,16 @@ impl TasksDb {
     /// Returns the parent task's branch name if the task has a parent,
     /// or `"main"` if it is a root task. Falls back to `"main"` if the
     /// parent has no branch set (e.g. interactive tasks).
-    pub fn get_merge_target(&self, task_id: i64) -> tau_agent_base::Result<String> {
+    pub fn get_merge_target(&self, task_id: i64) -> tau_agent_plugin::Result<String> {
         let task = self
             .get_task(task_id)?
-            .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} not found", task_id)))?;
+            .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
         match task.parent_id {
             None => Ok("main".to_string()),
             Some(pid) => {
                 let parent = self.get_task(pid)?.ok_or_else(|| {
-                    tau_agent_base::Error::Io(format!("parent task {} not found", pid))
+                    tau_agent_plugin::Error::Io(format!("parent task {} not found", pid))
                 })?;
                 Ok(parent.branch.as_deref().unwrap_or("main").to_string())
             }
@@ -1623,18 +1627,18 @@ impl TasksDb {
     }
 
     /// Set the session_id for a task (the session working on it).
-    pub fn set_session_id(&self, task_id: i64, session_id: &str) -> tau_agent_base::Result<()> {
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+    pub fn set_session_id(&self, task_id: i64, session_id: &str) -> tau_agent_plugin::Result<()> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         let updated = self
             .conn
             .execute(
                 "UPDATE tasks SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
                 params![session_id, now, task_id],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("set_session_id: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("set_session_id: {}", e)))?;
 
         if updated == 0 {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "task {} not found",
                 task_id
             )));
@@ -1643,18 +1647,18 @@ impl TasksDb {
     }
 
     /// Clear the session_id for a task (set to NULL).
-    pub fn clear_session_id(&self, task_id: i64) -> tau_agent_base::Result<()> {
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+    pub fn clear_session_id(&self, task_id: i64) -> tau_agent_plugin::Result<()> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         let updated = self
             .conn
             .execute(
                 "UPDATE tasks SET session_id = NULL, updated_at = ?1 WHERE id = ?2",
                 params![now, task_id],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("clear_session_id: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("clear_session_id: {}", e)))?;
 
         if updated == 0 {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "task {} not found",
                 task_id
             )));
@@ -1664,7 +1668,7 @@ impl TasksDb {
 
     /// Find tasks in terminal states (merged/closed/failed) that still have a worktree_path set.
     /// Used for startup cleanup of stale worktrees.
-    pub fn get_stale_worktree_tasks(&self) -> tau_agent_base::Result<Vec<Task>> {
+    pub fn get_stale_worktree_tasks(&self) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
             .prepare(
@@ -1674,34 +1678,34 @@ impl TasksDb {
                  FROM tasks
                  WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("prepare stale worktree query: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare stale worktree query: {}", e)))?;
 
         let rows = stmt
             .query_map([], row_to_task)
-            .map_err(|e| tau_agent_base::Error::Io(format!("query stale worktrees: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("query stale worktrees: {}", e)))?;
 
         let mut tasks = Vec::new();
         for row in rows {
             tasks.push(
-                row.map_err(|e| tau_agent_base::Error::Io(format!("read stale task: {}", e)))?,
+                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read stale task: {}", e)))?,
             );
         }
         Ok(tasks)
     }
 
     /// Clear the worktree path for a task (set to NULL).
-    pub fn clear_worktree(&self, task_id: i64) -> tau_agent_base::Result<()> {
-        let now = tau_agent_base::types::timestamp_ms() as i64;
+    pub fn clear_worktree(&self, task_id: i64) -> tau_agent_plugin::Result<()> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
         let updated = self
             .conn
             .execute(
                 "UPDATE tasks SET worktree_path = NULL, updated_at = ?1 WHERE id = ?2",
                 params![now, task_id],
             )
-            .map_err(|e| tau_agent_base::Error::Io(format!("clear_worktree: {}", e)))?;
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("clear_worktree: {}", e)))?;
 
         if updated == 0 {
-            return Err(tau_agent_base::Error::Io(format!(
+            return Err(tau_agent_plugin::Error::Io(format!(
                 "task {} not found",
                 task_id
             )));
@@ -1753,7 +1757,7 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskMessage> {
 }
 
 fn default_db_path() -> PathBuf {
-    tau_agent_base::paths::data_dir().join("tasks.db")
+    tau_agent_plugin::data_dir().join("tasks.db")
 }
 
 // ---------------------------------------------------------------------------

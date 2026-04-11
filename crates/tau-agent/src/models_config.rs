@@ -135,7 +135,7 @@ pub fn load_global_aliases() -> HashMap<String, String> {
 ///   - the file is unreadable
 ///   - the TOML is malformed (a warning is printed to stderr)
 ///
-/// This mirrors [`crate::tasks_config::load_project_instructions`]:
+/// This mirrors `tau_agent_plugin_tasks::tasks_config::load_project_instructions`:
 /// failures are non-fatal so that a broken file in one project doesn't
 /// break unrelated commands in others.
 pub fn load_project_aliases(project: &str) -> HashMap<String, String> {

@@ -1,7 +1,7 @@
 //! Read tool — read file contents.
 
 use super::{ToolDef, ToolOutput};
-use tau_agent_base::types::Tool;
+use tau_agent_plugin::Tool;
 
 pub fn tool_def() -> ToolDef {
     ToolDef {

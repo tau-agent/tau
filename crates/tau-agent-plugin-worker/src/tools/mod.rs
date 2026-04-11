@@ -7,7 +7,7 @@ pub mod write;
 
 use std::path::{Path, PathBuf};
 
-use tau_agent_base::types::*;
+use tau_agent_plugin::*;
 
 /// Resolve a potentially relative path against the working directory.
 pub(crate) fn resolve_path(cwd: &str, path: &str) -> PathBuf {

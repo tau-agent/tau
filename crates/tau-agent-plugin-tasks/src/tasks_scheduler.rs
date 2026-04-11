@@ -676,12 +676,9 @@ fn resume_session(
     };
     match server_request(writer, reader, req) {
         Ok(tau_agent_plugin::Response::Ok) => Ok(()),
-        Ok(tau_agent_plugin::Response::Error { message }) => {
-            Err(tau_agent_plugin::Error::Io(format!(
-                "failed to resume session {}: {}",
-                session_id, message
-            )))
-        }
+        Ok(tau_agent_plugin::Response::Error { message }) => Err(tau_agent_plugin::Error::Io(
+            format!("failed to resume session {}: {}", session_id, message),
+        )),
         Ok(other) => Err(tau_agent_plugin::Error::Io(format!(
             "unexpected response resuming session {}: {:?}",
             session_id, other
@@ -1036,10 +1033,9 @@ fn build_refining_message(task: &Task, project_instructions: &str) -> String {
 /// ancestor of the branch HEAD). Returns `Ok(false)` if the branch needs
 /// rebasing. Returns `Err` if the check cannot be performed.
 pub fn is_rebased_on_target(db: &TasksDb, task: &Task) -> tau_agent_plugin::Result<bool> {
-    let branch = task
-        .branch
-        .as_ref()
-        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} has no branch set", task.id)))?;
+    let branch = task.branch.as_ref().ok_or_else(|| {
+        tau_agent_plugin::Error::Io(format!("task {} has no branch set", task.id))
+    })?;
 
     let worktree = task
         .worktree_path

@@ -1,7 +1,8 @@
 //! Shared types, wire protocol, and utilities for the tau agent workspace.
 //!
 //! This is the leaf crate that every other tau workspace crate depends on.
-//! It has no async runtime deps — only serde, serde_json, and thiserror.
+//! Dependencies are kept minimal: serde, serde_json, thiserror, and futures
+//! (for async JSON-line I/O helpers used by the client and plugin crates).
 
 pub mod model_resolve;
 pub mod paths;

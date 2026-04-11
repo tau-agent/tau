@@ -233,7 +233,7 @@ Set `is_error: true` — the LLM sees the error and can retry or report it:
 ### Tool result content types
 
 The `content` array supports two variants (matching `ToolResultContent`
-in `crates/tau-agent/src/types.rs`):
+in `crates/tau-agent-base/src/types.rs`):
 
 ```json
 {"type": "text",  "text": "plain text content"}
@@ -436,7 +436,7 @@ is active.
 ### Available request types
 
 The `request` field accepts the same `Request` enum used by clients
-(see `crates/tau-agent/src/protocol.rs`). The variants currently
+(see `crates/tau-agent-base/src/protocol.rs`). The variants currently
 supported in plugin context include:
 
 | Variant | Purpose |
@@ -507,8 +507,9 @@ def server_request(req):
 ```
 
 For Rust reference implementations, see
-`crates/tau-agent/src/tasks_scheduler.rs::server_request` and
-`crates/tau-agent/src/tasks_merge.rs::server_request`.
+`crates/tau-agent-plugin-tasks/src/tasks_scheduler.rs` and
+`crates/tau-agent-plugin-tasks/src/tasks_merge.rs` (both delegate to
+`tau_agent_plugin::tunnel::server_request`).
 
 ## Commands
 
@@ -651,17 +652,18 @@ tau server start --foreground
 
 ## Reference
 
-- `crates/tau-agent/src/plugin.rs` — Rust implementation of `PluginRequest`,
-  `PluginMessage`, `PluginRegistration`, etc.
-- `crates/tau-agent/src/protocol.rs` — `Request` / `Response` enums used
-  inside `ServerRequest`.
-- `crates/tau-agent/src/system_prompt.rs` — `ToolPrompt`,
+- `crates/tau-agent-base/src/plugin_protocol.rs` — wire types
+  (`PluginRequest`, `PluginMessage`, `PluginRegistration`, etc.).
+- `crates/tau-agent/src/plugin.rs` — server-side plugin management.
+- `crates/tau-agent-base/src/protocol.rs` — `Request` / `Response` enums
+  used inside `ServerRequest`.
+- `crates/tau-agent-engine/src/system_prompt.rs` — `ToolPrompt`,
   `prompt_snippet`, `prompt_guidelines` weaving.
-- `crates/tau-agent/src/server.rs` — global plugin background tasks,
+- `crates/tau-agent/src/server/` — global plugin background tasks,
   hook firing, tool dispatch.
-- `crates/tau-agent/src/tasks_scheduler.rs` — reference implementation
-  of a Rust plugin that uses the `ServerRequest` tunnel and handles
-  concurrent `ToolCall` messages mid-request.
+- `crates/tau-agent-plugin-tasks/src/tasks_scheduler.rs` — reference
+  implementation of a Rust plugin that uses the `ServerRequest` tunnel
+  and handles concurrent `ToolCall` messages mid-request.
 - `tests/test_plugin.py` — minimal Python plugin exercising tools,
   streaming, hooks, and errors.
 - `tau-remini` (sibling project) — a real-world Rust plugin; its

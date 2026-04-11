@@ -9,8 +9,8 @@ pub mod orchestration;
 pub mod tools;
 
 use async_trait::async_trait;
-use tau_agent_base::types::{ToolCall, ToolResultMessage};
 use tau_agent_plugin::ToolExecutor;
+use tau_agent_plugin::{ToolCall, ToolResultMessage};
 
 /// In-process worker for testing (no subprocess).
 pub struct InProcessWorker {
@@ -37,41 +37,17 @@ impl ToolExecutor for InProcessWorker {
         &mut self,
         tool_call: &ToolCall,
         _output_tx: &smol::channel::Sender<String>,
-    ) -> tau_agent_base::Result<ToolResultMessage> {
+    ) -> tau_agent_plugin::Result<ToolResultMessage> {
         let result = tools::execute_tool(&self.tools, tool_call, "/tmp");
         Ok(result)
     }
 }
 
 /// Built-in tool prompts for the default tools.
+///
+/// Delegates to the canonical source in `tau_agent_plugin::default_tool_prompts()`.
 pub fn default_tool_prompts() -> Vec<tau_agent_plugin::ToolPrompt> {
-    vec![
-        tau_agent_plugin::ToolPrompt {
-            name: "bash".into(),
-            snippet: "Execute bash commands (ls, grep, find, etc.)".into(),
-            guidelines: vec!["Use bash for file operations like ls, rg, find".into()],
-        },
-        tau_agent_plugin::ToolPrompt {
-            name: "read".into(),
-            snippet: "Read file contents".into(),
-            guidelines: vec!["Use read to examine files instead of cat or sed.".into()],
-        },
-        tau_agent_plugin::ToolPrompt {
-            name: "edit".into(),
-            snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call".into(),
-            guidelines: vec![
-                "Use edit for precise changes (old text must match exactly)".into(),
-                "When changing multiple separate locations in one file, use one edit call with edits[] instead of multiple edit calls".into(),
-                "Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.".into(),
-                "Keep oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.".into(),
-            ],
-        },
-        tau_agent_plugin::ToolPrompt {
-            name: "write".into(),
-            snippet: "Create or overwrite files".into(),
-            guidelines: vec!["Use write only for new files or complete rewrites.".into()],
-        },
-    ]
+    tau_agent_plugin::default_tool_prompts()
 }
 
 /// Build a system prompt with the default tools (convenience for server).

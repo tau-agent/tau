@@ -128,4 +128,4 @@ same information.
 
 Unrelated but adjacent: `{project}/.tau/instructions.toml` lets you
 inject prompt fragments into task lifecycle phases. See
-`crates/tau-agent/src/tasks_config.rs` for the format.
+`crates/tau-agent-plugin-tasks/src/tasks_config.rs` for the format.

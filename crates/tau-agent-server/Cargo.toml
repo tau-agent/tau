@@ -11,25 +11,6 @@ keywords.workspace = true
 categories.workspace = true
 description = "Unix-socket daemon, session storage, plugin host, and authentication for the tau agent"
 
+# Placeholder crate — dependencies will be added as server modules move here.
+# See task #423 follow-up work.
 [dependencies]
-tau-agent-base.workspace = true
-tau-agent-engine.workspace = true
-tau-agent-plugin.workspace = true
-tau-agent-plugin-worker.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-smol.workspace = true
-async-trait.workspace = true
-futures.workspace = true
-ureq.workspace = true
-rusqlite.workspace = true
-toml.workspace = true
-sha2.workspace = true
-base64.workspace = true
-rand.workspace = true
-fs2.workspace = true
-chrono.workspace = true
-nix.workspace = true
-
-[dev-dependencies]
-tempfile = "3"

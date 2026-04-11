@@ -12,7 +12,6 @@ categories.workspace = true
 description = "Default worker plugin for the tau agent — provides bash/edit/read/write tools"
 
 [dependencies]
-tau-agent-base.workspace = true
 tau-agent-plugin.workspace = true
 async-trait.workspace = true
 smol.workspace = true

@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tasks_db::{TaskSession, TasksDb};
-use tau_agent_base::protocol::{Request, Response};
+use tau_agent_plugin::{Request, Response};
 
 /// Session roles that should be archived when a task merges.
 ///
@@ -118,7 +118,7 @@ fn server_request(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     request: Request,
-) -> tau_agent_base::Result<Response> {
+) -> tau_agent_plugin::Result<Response> {
     tau_agent_plugin::tunnel::server_request(writer, reader, request, "merge-sr")
 }
 
@@ -133,7 +133,7 @@ fn execute_bash(
     reader: &mut impl BufRead,
     session_id: &str,
     command: &str,
-) -> tau_agent_base::Result<(String, bool)> {
+) -> tau_agent_plugin::Result<(String, bool)> {
     let resp = server_request(
         writer,
         reader,
@@ -146,11 +146,11 @@ fn execute_bash(
 
     match resp {
         Response::ToolExecuted { content, is_error } => Ok((content, is_error)),
-        Response::Error { message } => Err(tau_agent_base::Error::Io(format!(
+        Response::Error { message } => Err(tau_agent_plugin::Error::Io(format!(
             "ExecuteTool error: {}",
             message
         ))),
-        other => Err(tau_agent_base::Error::Io(format!(
+        other => Err(tau_agent_plugin::Error::Io(format!(
             "unexpected ExecuteTool response: {:?}",
             other
         ))),
@@ -172,28 +172,27 @@ pub fn merge_task(
     project_dir: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> tau_agent_base::Result<MergeResult> {
+) -> tau_agent_plugin::Result<MergeResult> {
     // 1. Get task, branch, merge target
     let task = db
         .get_task(task_id)?
-        .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} not found", task_id)))?;
+        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
     if task.state != "merging" {
-        return Err(tau_agent_base::Error::Io(format!(
+        return Err(tau_agent_plugin::Error::Io(format!(
             "task {} is in state '{}', must be 'merging'",
             task_id, task.state
         )));
     }
 
-    let branch = task
-        .branch
-        .as_ref()
-        .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} has no branch set", task_id)))?;
+    let branch = task.branch.as_ref().ok_or_else(|| {
+        tau_agent_plugin::Error::Io(format!("task {} has no branch set", task_id))
+    })?;
 
     let worktree_path = task
         .worktree_path
         .as_ref()
-        .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} has no worktree", task_id)))?;
+        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} has no worktree", task_id)))?;
 
     let merge_target = db.get_merge_target(task_id)?;
 
@@ -460,10 +459,10 @@ pub fn notify_parent_if_all_done(
     task_id: i64,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) -> tau_agent_base::Result<()> {
+) -> tau_agent_plugin::Result<()> {
     let task = db
         .get_task(task_id)?
-        .ok_or_else(|| tau_agent_base::Error::Io(format!("task {} not found", task_id)))?;
+        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
     let parent_id = match task.parent_id {
         Some(pid) => pid,

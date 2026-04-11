@@ -12,7 +12,6 @@ categories.workspace = true
 description = "Task system plugin for the tau agent — manages tasks, scheduling, and merge queue"
 
 [dependencies]
-tau-agent-base.workspace = true
 tau-agent-plugin.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

@@ -24,12 +24,10 @@ fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
 fn tool_ok(tool_call_id: &str, text: &str) -> PluginToolResult {
     PluginToolResult {
         tool_call_id: tool_call_id.to_string(),
-        content: vec![ToolResultContent::Text(
-            tau_agent_plugin::TextContent {
-                text: text.to_string(),
-                text_signature: None,
-            },
-        )],
+        content: vec![ToolResultContent::Text(tau_agent_plugin::TextContent {
+            text: text.to_string(),
+            text_signature: None,
+        })],
         is_error: false,
     }
 }
@@ -37,12 +35,10 @@ fn tool_ok(tool_call_id: &str, text: &str) -> PluginToolResult {
 fn tool_err(tool_call_id: &str, text: &str) -> PluginToolResult {
     PluginToolResult {
         tool_call_id: tool_call_id.to_string(),
-        content: vec![ToolResultContent::Text(
-            tau_agent_plugin::TextContent {
-                text: text.to_string(),
-                text_signature: None,
-            },
-        )],
+        content: vec![ToolResultContent::Text(tau_agent_plugin::TextContent {
+            text: text.to_string(),
+            text_signature: None,
+        })],
         is_error: true,
     }
 }
@@ -1012,9 +1008,7 @@ fn handle_task_update(
                             session_id: sid.clone(),
                         };
                         match crate::tasks_scheduler::server_request(writer, reader, req) {
-                            Ok(tau_agent_plugin::Response::SessionInfo { info }) => {
-                                info.archived
-                            }
+                            Ok(tau_agent_plugin::Response::SessionInfo { info }) => info.archived,
                             _ => true, // session not found or error → need a new one
                         }
                     }
