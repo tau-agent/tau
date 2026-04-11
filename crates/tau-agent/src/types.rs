@@ -177,6 +177,8 @@ pub struct ToolResultMessage {
     pub details: Option<serde_json::Value>,
     pub is_error: bool,
     pub timestamp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 impl ToolResultMessage {
@@ -195,6 +197,7 @@ impl ToolResultMessage {
             details: None,
             is_error: false,
             timestamp: timestamp_ms(),
+            duration_ms: None,
         }
     }
 
@@ -209,6 +212,7 @@ impl ToolResultMessage {
             details: None,
             is_error: true,
             timestamp: timestamp_ms(),
+            duration_ms: None,
         }
     }
 }
@@ -514,6 +518,44 @@ mod tests {
         let deserialized: Message = serde_json::from_str(&json).unwrap();
         assert!(
             matches!(deserialized, Message::Info(i) if i.text == "task state changed" && i.timestamp == 12345)
+        );
+    }
+
+    #[test]
+    fn tool_result_message_duration_ms_roundtrip() {
+        let msg = ToolResultMessage {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            content: vec![ToolResultContent::Text(TextContent {
+                text: "ok".into(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: false,
+            timestamp: 1000,
+            duration_ms: Some(1234),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"duration_ms\":1234"));
+        let deserialized: ToolResultMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.duration_ms, Some(1234));
+    }
+
+    #[test]
+    fn tool_result_message_duration_ms_backward_compat() {
+        // Old messages without duration_ms should deserialize to None
+        let json = r#"{"tool_call_id":"tc1","tool_name":"bash","content":[{"type":"text","text":"ok"}],"is_error":false,"timestamp":1000}"#;
+        let msg: ToolResultMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(msg.duration_ms, None);
+    }
+
+    #[test]
+    fn tool_result_message_duration_ms_none_not_serialized() {
+        let msg = ToolResultMessage::success("tc1", "bash", "ok");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            !json.contains("duration_ms"),
+            "duration_ms: None should not appear in JSON"
         );
     }
 }

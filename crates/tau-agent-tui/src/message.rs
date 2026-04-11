@@ -90,7 +90,7 @@ pub enum MessageItem {
         args: serde_json::Value,
         output: String,
         is_error: bool,
-        duration: std::time::Duration,
+        duration: Option<std::time::Duration>,
     },
     /// Status line (e.g. "[cancelled]", "[Working...]").
     Status { text: String },

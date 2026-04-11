@@ -2503,6 +2503,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                         details: None,
                         is_error: result.is_error,
                         timestamp: crate::types::timestamp_ms(),
+                        duration_ms: None,
                     });
                 }
                 crate::plugin::PluginMessage::ServerRequest {
@@ -3760,6 +3761,7 @@ async fn execute_tool_impl(
             details: None,
             is_error: true,
             timestamp: timestamp_ms(),
+            duration_ms: None,
         },
     };
 

@@ -918,6 +918,7 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 0,
+                    duration_ms: None,
                 }),
             ],
             tools: Vec::new(),

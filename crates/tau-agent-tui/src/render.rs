@@ -68,7 +68,7 @@ pub trait ToolRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
-        duration: Duration,
+        duration: Option<Duration>,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>>;
@@ -234,7 +234,7 @@ impl ToolRenderer for DefaultRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
-        _duration: Duration,
+        _duration: Option<Duration>,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -306,7 +306,7 @@ impl ToolRenderer for BashRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
-        duration: Duration,
+        duration: Option<Duration>,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -355,7 +355,10 @@ impl ToolRenderer for BashRenderer {
             )));
         }
         lines.push(Line::from(Span::styled(
-            format!("  Took {}", format_duration(duration)),
+            format!(
+                "  Took {}",
+                duration.map(format_duration).unwrap_or_else(|| "—".into())
+            ),
             meta_style,
         )));
 
@@ -402,7 +405,7 @@ impl ToolRenderer for EditRenderer {
         args: &Value,
         _output: &str,
         is_error: bool,
-        _duration: Duration,
+        _duration: Option<Duration>,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -496,7 +499,7 @@ impl ToolRenderer for ReadRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
-        _duration: Duration,
+        _duration: Option<Duration>,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -545,7 +548,7 @@ impl ToolRenderer for WriteRenderer {
         args: &Value,
         output: &str,
         is_error: bool,
-        _duration: Duration,
+        _duration: Option<Duration>,
         theme: &Theme,
         width: u16,
     ) -> Vec<Line<'static>> {
@@ -583,5 +586,151 @@ fn truncate_str(s: &str, max: usize) -> String {
         format!("{}...", tau_agent::truncate_str(s, max))
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme;
+    use std::time::Duration;
+
+    fn test_theme() -> Theme {
+        theme::dark()
+    }
+
+    // -- format_duration unit tests --
+
+    #[test]
+    fn format_duration_milliseconds() {
+        assert_eq!(format_duration(Duration::from_millis(42)), "42ms");
+    }
+
+    #[test]
+    fn format_duration_seconds() {
+        assert_eq!(format_duration(Duration::from_millis(1200)), "1.2s");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        assert_eq!(format_duration(Duration::from_secs(125)), "2m 5s");
+    }
+
+    #[test]
+    fn format_duration_hours() {
+        assert_eq!(format_duration(Duration::from_secs(3661)), "1h 1m");
+    }
+
+    // -- BashRenderer::render_complete tests --
+
+    #[test]
+    fn bash_render_complete_shows_duration() {
+        let renderer = BashRenderer;
+        let theme = test_theme();
+        let lines = renderer.render_complete(
+            "bash",
+            &serde_json::json!({"command": "ls"}),
+            "file1\nfile2",
+            false,
+            Some(Duration::from_millis(1200)),
+            &theme,
+            80,
+        );
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Took 1.2s"),
+            "Expected 'Took 1.2s' in: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn bash_render_complete_shows_dash_for_unknown_duration() {
+        let renderer = BashRenderer;
+        let theme = test_theme();
+        let lines = renderer.render_complete(
+            "bash",
+            &serde_json::json!({"command": "ls"}),
+            "file1\nfile2",
+            false,
+            None,
+            &theme,
+            80,
+        );
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Took —"), "Expected 'Took —' in: {}", text);
+        assert!(
+            !text.contains("Took 0ms"),
+            "Should not show 'Took 0ms' in: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn bash_render_complete_error_shows_exit_code() {
+        let renderer = BashRenderer;
+        let theme = test_theme();
+        let lines = renderer.render_complete(
+            "bash",
+            &serde_json::json!({"command": "false"}),
+            "something failed\n(exit code: 1)",
+            true,
+            Some(Duration::from_millis(50)),
+            &theme,
+            80,
+        );
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("exited with code 1"),
+            "Expected exit code info in: {}",
+            text
+        );
+        assert!(
+            text.contains("Took 50ms"),
+            "Expected 'Took 50ms' in: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn bash_render_complete_no_output() {
+        let renderer = BashRenderer;
+        let theme = test_theme();
+        let lines = renderer.render_complete(
+            "bash",
+            &serde_json::json!({"command": "true"}),
+            "",
+            false,
+            Some(Duration::from_millis(5)),
+            &theme,
+            80,
+        );
+        let text: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("(no output)"),
+            "Expected '(no output)' in: {}",
+            text
+        );
+        assert!(
+            text.contains("Took 5ms"),
+            "Expected 'Took 5ms' in: {}",
+            text
+        );
     }
 }

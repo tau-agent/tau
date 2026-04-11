@@ -312,6 +312,7 @@ pub async fn run(
             // Spawn tool execution and output forwarding concurrently.
             // The execute future must drop tool_output_tx when done so the
             // forward loop sees channel-closed and terminates.
+            let started_at = std::time::Instant::now();
             let tool_future = async {
                 let res = worker.execute(tc, &tool_output_tx).await;
                 drop(tool_output_tx);
@@ -328,7 +329,8 @@ pub async fn run(
                 }
             };
             let (result, _) = futures::future::join(tool_future, forward_future).await;
-            let result = match result {
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            let mut result = match result {
                 Ok(r) => r,
                 Err(e) => crate::types::ToolResultMessage::error(
                     tc.id.clone(),
@@ -336,6 +338,7 @@ pub async fn run(
                     format!("error: {}", e),
                 ),
             };
+            result.duration_ms = Some(elapsed_ms);
 
             // Emit full tool result
             let content = result

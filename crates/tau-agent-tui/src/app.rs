@@ -264,6 +264,7 @@ impl App {
                     tool_name,
                     is_error,
                     content,
+                    duration_ms,
                     ..
                 }) => {
                     let output = content
@@ -284,7 +285,7 @@ impl App {
                         args,
                         output,
                         is_error: *is_error,
-                        duration: std::time::Duration::ZERO,
+                        duration: duration_ms.map(std::time::Duration::from_millis),
                     });
                 }
                 Message::CompactionSummary(_) => {
@@ -1719,7 +1720,7 @@ impl App {
                         args: std::mem::take(args),
                         output: "[interrupted]".into(),
                         is_error: true,
-                        duration: started_at.elapsed(),
+                        duration: Some(started_at.elapsed()),
                     };
                 }
                 _ => {}
@@ -2045,7 +2046,7 @@ impl App {
                         args,
                         output: content,
                         is_error,
-                        duration: started_at.elapsed(),
+                        duration: Some(started_at.elapsed()),
                     };
                 } else {
                     self.messages.push(MessageItem::ToolComplete {
@@ -2053,7 +2054,7 @@ impl App {
                         args: serde_json::Value::Null,
                         output: content,
                         is_error,
-                        duration: std::time::Duration::ZERO,
+                        duration: None,
                     });
                 }
             }

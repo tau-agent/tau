@@ -70,6 +70,7 @@ pub fn execute_tool(tools: &[ToolDef], tool_call: &ToolCall, cwd: &str) -> ToolR
         details: None,
         is_error: result.is_error,
         timestamp: timestamp_ms(),
+        duration_ms: None,
     }
 }
 

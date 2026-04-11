@@ -421,6 +421,7 @@ mod tests {
                 details: None,
                 is_error: false,
                 timestamp: 0,
+                duration_ms: None,
             }),
             Message::Assistant({
                 let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
@@ -559,6 +560,7 @@ mod tests {
                             details: None,
                             is_error: false,
                             timestamp: 0,
+                            duration_ms: None,
                         }],
                     },
                     RecordedTurn {
