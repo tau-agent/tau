@@ -32,19 +32,8 @@ use crate::plugin::{
 };
 use crate::types::*;
 
-// ---------------------------------------------------------------------------
-// ToolExecutor trait and InProcessWorker (for testing / in-process use)
-// ---------------------------------------------------------------------------
-
-/// Trait for tool execution (allows plugin-based or in-process).
-#[async_trait]
-pub trait ToolExecutor: Send {
-    async fn execute(
-        &mut self,
-        tool_call: &ToolCall,
-        output_tx: &smol::channel::Sender<String>,
-    ) -> crate::Result<ToolResultMessage>;
-}
+// Re-export ToolExecutor from the plugin SDK for backward compatibility
+pub use tau_agent_plugin::ToolExecutor;
 
 /// In-process worker for testing (no subprocess).
 pub struct InProcessWorker {

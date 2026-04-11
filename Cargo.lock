@@ -2400,6 +2400,7 @@ dependencies = [
  "sha2 0.11.0",
  "smol",
  "tau-agent-base",
+ "tau-agent-plugin",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -2428,7 +2429,20 @@ dependencies = [
  "serde_json",
  "smol",
  "tau-agent",
+ "tau-agent-base",
  "tau-agent-tui",
+]
+
+[[package]]
+name = "tau-agent-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "smol",
+ "tau-agent-base",
 ]
 
 [[package]]
@@ -2444,6 +2458,7 @@ dependencies = [
  "serde_json",
  "smol",
  "tau-agent",
+ "tau-agent-base",
  "toml",
  "unicode-width",
 ]

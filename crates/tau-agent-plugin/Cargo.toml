@@ -1,5 +1,5 @@
 [package]
-name = "tau-agent-tui"
+name = "tau-agent-plugin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,20 +9,12 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Ratatui-based terminal UI for the tau LLM agent"
+description = "Plugin SDK for the tau agent — everything a plugin author needs in one crate"
 
 [dependencies]
-tau-agent.workspace = true
 tau-agent-base.workspace = true
+async-trait.workspace = true
 smol.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
-futures.workspace = true
-ratatui = "0.30"
-crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
-ratatui-textarea = "0.8"
-unicode-width = "0.2"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

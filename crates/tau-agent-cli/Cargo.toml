@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 tau-agent.workspace = true
+tau-agent-base.workspace = true
 tau-agent-tui.workspace = true
 smol.workspace = true
 chrono.workspace = true
