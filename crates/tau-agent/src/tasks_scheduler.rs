@@ -1307,9 +1307,6 @@ fn build_initial_message(task: &Task, merge_target: &str, project_instructions: 
          When done, run the project checklist, then mark the task:\n\
          {review}\n\
          \n\
-         Before marking the task for review, ensure your branch is rebased on the target branch.\n\
-         Run `git rebase {target}` in your worktree and resolve any conflicts.\n\
-         \n\
          Note: task_get and task_update are agent tools (like bash or edit), not CLI commands.",
         id = task.id,
         title = task.title,
@@ -1879,7 +1876,8 @@ mod tests {
         // Must clarify these are tool calls, not CLI commands
         assert!(msg.contains("not a bash command") || msg.contains("not CLI commands"));
         assert!(msg.contains("do NOT merge into main") || msg.contains("do not merge"));
-        assert!(msg.contains("rebase"));
+        // Rebase instruction removed — merge queue handles it.
+        assert!(!msg.contains("rebase"));
         // No project instructions supplied — the section header must not appear.
         assert!(!msg.contains("Project-specific worker instructions"));
     }
@@ -1914,7 +1912,8 @@ mod tests {
         let msg = build_initial_message(&task, "task-1-5", "");
         assert!(msg.contains("do NOT merge into task-1-5"));
         assert!(!msg.contains("merge into main"));
-        assert!(msg.contains("git rebase task-1-5"));
+        // Rebase instruction removed — merge queue handles it.
+        assert!(!msg.contains("git rebase"));
     }
 
     #[test]
