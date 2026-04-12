@@ -4,7 +4,7 @@ use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyMod
 use ratatui_textarea::TextArea;
 
 use tau_agent::auth::SubscriptionUsage;
-use tau_agent::protocol::{Response, SessionInfo, TaskInfo, TaskMessageInfo};
+use tau_agent::protocol::{Response, SessionInfo, TaskInfo, TaskMessageInfo, TaskRelationInfo};
 use tau_agent::types::{
     AgentPhase, AssistantContent, Message, StopReason, StreamEvent, ToolResultMessage, UserContent,
 };
@@ -47,6 +47,8 @@ pub enum AppMode {
     Streaming,
     /// Session picker overlay is open.
     SessionPicker,
+    /// Task picker overlay is open.
+    TaskPicker,
 }
 
 /// A steering message is sent as the next turn right after the current one.
@@ -55,6 +57,24 @@ pub enum AppMode {
 pub struct QueuedMessage {
     pub text: String,
     pub is_steering: bool,
+}
+
+/// Which task-picker action is waiting for y/n confirmation.
+#[derive(Debug, Clone, Copy)]
+pub enum TaskPickerConfirmAction {
+    Approve,
+    Ready,
+    Dispatch,
+    Merge,
+}
+
+/// Detailed view of a single task in the task picker.
+pub struct TaskPickerDetail {
+    pub task: TaskInfo,
+    pub messages: Vec<TaskMessageInfo>,
+    pub relations: Vec<TaskRelationInfo>,
+    pub subtasks: Vec<TaskInfo>,
+    pub scroll: usize,
 }
 
 /// Application state.
@@ -134,6 +154,22 @@ pub struct App {
     pub picker_edit_tagline: Option<(usize, String, usize)>,
     /// Set of session IDs whose subtrees are folded (children hidden).
     pub picker_folded: std::collections::HashSet<String>,
+    /// Task list for the picker overlay (tree-ordered with depth).
+    pub picker_tasks: Vec<(usize, TaskInfo)>,
+    /// Cursor position in the task picker (into filtered indices).
+    pub task_picker_cursor: usize,
+    /// Mode to restore when the task picker is closed.
+    pub task_picker_previous_mode: AppMode,
+    /// Search filter text for the task picker.
+    pub task_picker_filter: String,
+    /// Whether the task picker is in filter-input mode (`/` was pressed).
+    pub task_picker_filter_mode: bool,
+    /// Whether the filter bar is in "create" mode (`c` was pressed; Enter creates task).
+    pub task_picker_create_mode: bool,
+    /// Pending confirmation: (cursor_pos, label, which_action) for y/n prompt.
+    pub task_picker_confirm: Option<(usize, String, TaskPickerConfirmAction)>,
+    /// Task detail view data (when Enter is pressed on a task).
+    pub task_picker_detail: Option<Box<TaskPickerDetail>>,
     /// Whether a text block in the current turn has already been
     /// finalized by a `StreamEvent::TextEnd`.  Used by `StreamEvent::Done`
     /// to suppress its fallback append branch when `TextEnd` has already
@@ -206,6 +242,14 @@ impl App {
             picker_filter_mode: false,
             picker_edit_tagline: None,
             picker_folded: std::collections::HashSet::new(),
+            picker_tasks: Vec::new(),
+            task_picker_cursor: 0,
+            task_picker_previous_mode: AppMode::Input,
+            task_picker_filter: String::new(),
+            task_picker_filter_mode: false,
+            task_picker_create_mode: false,
+            task_picker_confirm: None,
+            task_picker_detail: None,
             turn_text_finalized: false,
         }
     }
@@ -434,6 +478,7 @@ impl App {
             AppMode::Input => self.handle_input_key(key),
             AppMode::Streaming => self.handle_streaming_key(key),
             AppMode::SessionPicker => self.handle_picker_key(key),
+            AppMode::TaskPicker => self.handle_task_picker_key(key),
         }
     }
 
@@ -575,6 +620,8 @@ impl App {
             }
             // TAB: open session picker
             (KeyCode::Tab, _) => Some(Action::OpenSessionPicker),
+            // F2: open task picker
+            (KeyCode::F(2), _) => Some(Action::OpenTaskPicker),
             // Everything else goes to textarea
             _ => {
                 // Reset history browsing on any other key
@@ -1005,6 +1052,420 @@ impl App {
         }
     }
 
+    // ---- Task picker helpers ----
+
+    /// Return indices into `picker_tasks` that match the current task picker filter.
+    /// If the filter is empty, all indices are returned.
+    pub fn task_picker_filtered_indices(&self) -> Vec<usize> {
+        let needle = self.task_picker_filter.to_lowercase();
+        let filter_empty = self.task_picker_filter.is_empty();
+
+        self.picker_tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, t))| {
+                if filter_empty {
+                    return true;
+                }
+                // Match against task title
+                if t.title.to_lowercase().contains(&needle) {
+                    return true;
+                }
+                // Match against task ID (prefix match)
+                if t.id.to_string().starts_with(&needle) {
+                    return true;
+                }
+                // Match against state name
+                if t.state.to_lowercase().contains(&needle) {
+                    return true;
+                }
+                // Match against session_id
+                if let Some(ref sid) = t.session_id {
+                    if sid.to_lowercase().contains(&needle) {
+                        return true;
+                    }
+                }
+                // Match against tags
+                if let Some(ref tags) = t.tags {
+                    if let Some(arr) = tags.as_array() {
+                        for tag in arr {
+                            if let Some(s) = tag.as_str() {
+                                if s.to_lowercase().contains(&needle) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Resolve the task picker cursor to an index in `picker_tasks`.
+    /// Returns `None` if no matching tasks or cursor is out of range.
+    pub fn task_picker_selected_task_idx(&self) -> Option<usize> {
+        let filtered = self.task_picker_filtered_indices();
+        filtered.get(self.task_picker_cursor).copied()
+    }
+
+    /// Reset transient task picker state (confirm, filter, detail, create mode).
+    fn task_picker_reset_transient(&mut self) {
+        self.task_picker_confirm = None;
+        self.task_picker_filter.clear();
+        self.task_picker_filter_mode = false;
+        self.task_picker_create_mode = false;
+        self.task_picker_detail = None;
+    }
+
+    /// Clamp task picker cursor to valid range within filtered results.
+    fn task_picker_clamp_cursor(&mut self) {
+        let filtered = self.task_picker_filtered_indices();
+        if filtered.is_empty() {
+            self.task_picker_cursor = 0;
+        } else if self.task_picker_cursor >= filtered.len() {
+            self.task_picker_cursor = filtered.len() - 1;
+        }
+    }
+
+    fn handle_task_picker_key(&mut self, key: &KeyEvent) -> Option<Action> {
+        // Priority 1: Task detail view
+        if let Some(ref mut detail) = self.task_picker_detail {
+            // If there's a pending confirmation while in detail mode, handle it first
+            if let Some((_, _, action_kind)) = self.task_picker_confirm.take() {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        let task_id = detail.task.id;
+                        return self.execute_task_picker_confirm(task_id, action_kind);
+                    }
+                    _ => {
+                        // Cancelled
+                        return None;
+                    }
+                }
+            }
+
+            match key.code {
+                KeyCode::Esc | KeyCode::Backspace => {
+                    self.task_picker_detail = None;
+                    return None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    // re-borrow after the outer match
+                    if let Some(ref mut d) = self.task_picker_detail {
+                        d.scroll = d.scroll.saturating_add(1);
+                    }
+                    return None;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(ref mut d) = self.task_picker_detail {
+                        d.scroll = d.scroll.saturating_sub(1);
+                    }
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    if let Some(ref mut d) = self.task_picker_detail {
+                        d.scroll = d.scroll.saturating_add(10);
+                    }
+                    return None;
+                }
+                KeyCode::PageUp => {
+                    if let Some(ref mut d) = self.task_picker_detail {
+                        d.scroll = d.scroll.saturating_sub(10);
+                    }
+                    return None;
+                }
+                KeyCode::Char('a') => {
+                    let task_id = self
+                        .task_picker_detail
+                        .as_ref()
+                        .expect("detail should be Some in detail mode")
+                        .task
+                        .id;
+                    self.task_picker_confirm = Some((
+                        self.task_picker_cursor,
+                        format!("Approve #{}?", task_id),
+                        TaskPickerConfirmAction::Approve,
+                    ));
+                    return None;
+                }
+                KeyCode::Char('r') => {
+                    let task_id = self
+                        .task_picker_detail
+                        .as_ref()
+                        .expect("detail should be Some in detail mode")
+                        .task
+                        .id;
+                    self.task_picker_confirm = Some((
+                        self.task_picker_cursor,
+                        format!("Ready #{}?", task_id),
+                        TaskPickerConfirmAction::Ready,
+                    ));
+                    return None;
+                }
+                KeyCode::Char('d') => {
+                    let task_id = self
+                        .task_picker_detail
+                        .as_ref()
+                        .expect("detail should be Some in detail mode")
+                        .task
+                        .id;
+                    self.task_picker_confirm = Some((
+                        self.task_picker_cursor,
+                        format!("Dispatch #{}?", task_id),
+                        TaskPickerConfirmAction::Dispatch,
+                    ));
+                    return None;
+                }
+                KeyCode::Char('g') => {
+                    if let Some(ref session_id) = self
+                        .task_picker_detail
+                        .as_ref()
+                        .expect("detail should be Some in detail mode")
+                        .task
+                        .session_id
+                    {
+                        let session_id = session_id.clone();
+                        self.mode = self.task_picker_previous_mode;
+                        self.task_picker_reset_transient();
+                        return Some(Action::SwitchSession(session_id));
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
+
+        // Priority 2: Confirmation mode
+        if let Some((cursor_pos, _, action_kind)) = self.task_picker_confirm.take() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let filtered = self.task_picker_filtered_indices();
+                    if let Some(&real_idx) = filtered.get(cursor_pos) {
+                        if let Some((_, task)) = self.picker_tasks.get(real_idx) {
+                            let task_id = task.id;
+                            return self.execute_task_picker_confirm(task_id, action_kind);
+                        }
+                    }
+                    None
+                }
+                _ => {
+                    // Cancelled
+                    None
+                }
+            }
+        }
+        // Priority 3: Filter input mode
+        else if self.task_picker_filter_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    self.task_picker_filter.clear();
+                    self.task_picker_filter_mode = false;
+                    self.task_picker_create_mode = false;
+                    self.task_picker_cursor = 0;
+                    None
+                }
+                KeyCode::Enter => {
+                    if self.task_picker_create_mode && !self.task_picker_filter.is_empty() {
+                        let title = self.task_picker_filter.clone();
+                        let project = self.session_cwd.clone().unwrap_or_default();
+                        self.task_picker_filter.clear();
+                        self.task_picker_filter_mode = false;
+                        self.task_picker_create_mode = false;
+                        Some(Action::TaskCreate { project, title })
+                    } else {
+                        self.task_picker_filter_mode = false;
+                        self.task_picker_create_mode = false;
+                        self.task_picker_clamp_cursor();
+                        None
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.task_picker_filter.pop();
+                    self.task_picker_cursor = 0;
+                    None
+                }
+                KeyCode::Char(c) => {
+                    self.task_picker_filter.push(c);
+                    self.task_picker_cursor = 0;
+                    None
+                }
+                _ => None,
+            }
+        }
+        // Priority 4: Normal navigation
+        else {
+            let filtered_len = self.task_picker_filtered_indices().len();
+            match (key.code, key.modifiers) {
+                // / enters filter mode
+                (KeyCode::Char('/'), _) => {
+                    self.task_picker_filter_mode = true;
+                    None
+                }
+                // c enters create mode (filter + create)
+                (KeyCode::Char('c'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                    self.task_picker_filter_mode = true;
+                    self.task_picker_create_mode = true;
+                    None
+                }
+                // Navigate up
+                (KeyCode::Up | KeyCode::Char('k'), _) => {
+                    if self.task_picker_cursor > 0 {
+                        self.task_picker_cursor -= 1;
+                    }
+                    None
+                }
+                // Navigate down
+                (KeyCode::Down | KeyCode::Char('j'), _) => {
+                    if filtered_len > 0 && self.task_picker_cursor < filtered_len - 1 {
+                        self.task_picker_cursor += 1;
+                    }
+                    None
+                }
+                // Page up
+                (KeyCode::PageUp, _) => {
+                    const PAGE_SIZE: usize = 10;
+                    self.task_picker_cursor = self.task_picker_cursor.saturating_sub(PAGE_SIZE);
+                    None
+                }
+                // Page down
+                (KeyCode::PageDown, _) => {
+                    if filtered_len > 0 {
+                        const PAGE_SIZE: usize = 10;
+                        self.task_picker_cursor =
+                            (self.task_picker_cursor + PAGE_SIZE).min(filtered_len - 1);
+                    }
+                    None
+                }
+                // Home: jump to first
+                (KeyCode::Home, _) => {
+                    self.task_picker_cursor = 0;
+                    None
+                }
+                // End: jump to last
+                (KeyCode::End, _) => {
+                    if filtered_len > 0 {
+                        self.task_picker_cursor = filtered_len - 1;
+                    }
+                    None
+                }
+                // Enter: fetch task detail
+                (KeyCode::Enter, _) => {
+                    if let Some(idx) = self.task_picker_selected_task_idx()
+                        && let Some((_, task)) = self.picker_tasks.get(idx)
+                    {
+                        return Some(Action::TaskGet { id: task.id });
+                    }
+                    None
+                }
+                // a: approve selected task (with confirmation)
+                (KeyCode::Char('a'), _) => {
+                    if let Some(idx) = self.task_picker_selected_task_idx()
+                        && let Some((_, task)) = self.picker_tasks.get(idx)
+                    {
+                        self.task_picker_confirm = Some((
+                            self.task_picker_cursor,
+                            format!("Approve #{}?", task.id),
+                            TaskPickerConfirmAction::Approve,
+                        ));
+                    }
+                    None
+                }
+                // r: ready selected task (with confirmation)
+                (KeyCode::Char('r'), _) => {
+                    if let Some(idx) = self.task_picker_selected_task_idx()
+                        && let Some((_, task)) = self.picker_tasks.get(idx)
+                    {
+                        self.task_picker_confirm = Some((
+                            self.task_picker_cursor,
+                            format!("Ready #{}?", task.id),
+                            TaskPickerConfirmAction::Ready,
+                        ));
+                    }
+                    None
+                }
+                // d: dispatch selected task (with confirmation)
+                (KeyCode::Char('d'), _) => {
+                    if let Some(idx) = self.task_picker_selected_task_idx()
+                        && let Some((_, task)) = self.picker_tasks.get(idx)
+                    {
+                        self.task_picker_confirm = Some((
+                            self.task_picker_cursor,
+                            format!("Dispatch #{}?", task.id),
+                            TaskPickerConfirmAction::Dispatch,
+                        ));
+                    }
+                    None
+                }
+                // s: schedule
+                (KeyCode::Char('s'), _) => {
+                    let project = self.session_cwd.clone().unwrap_or_default();
+                    Some(Action::TaskSchedule { project })
+                }
+                // m: merge selected task (with confirmation)
+                (KeyCode::Char('m'), _) => {
+                    if let Some(idx) = self.task_picker_selected_task_idx()
+                        && let Some((_, task)) = self.picker_tasks.get(idx)
+                    {
+                        self.task_picker_confirm = Some((
+                            self.task_picker_cursor,
+                            format!("Merge #{}?", task.id),
+                            TaskPickerConfirmAction::Merge,
+                        ));
+                    }
+                    None
+                }
+                // g: go to session
+                (KeyCode::Char('g'), _) => {
+                    if let Some(idx) = self.task_picker_selected_task_idx()
+                        && let Some((_, task)) = self.picker_tasks.get(idx)
+                        && let Some(ref session_id) = task.session_id
+                    {
+                        let session_id = session_id.clone();
+                        self.mode = self.task_picker_previous_mode;
+                        self.task_picker_reset_transient();
+                        return Some(Action::SwitchSession(session_id));
+                    }
+                    None
+                }
+                // F2/Esc: close picker, restore previous mode
+                (KeyCode::F(2) | KeyCode::Esc, _) => {
+                    self.mode = self.task_picker_previous_mode;
+                    self.task_picker_reset_transient();
+                    None
+                }
+                // Ctrl+C: close picker
+                (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
+                    self.mode = self.task_picker_previous_mode;
+                    self.task_picker_reset_transient();
+                    None
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Execute a confirmed task picker action.
+    fn execute_task_picker_confirm(
+        &self,
+        task_id: i64,
+        action: TaskPickerConfirmAction,
+    ) -> Option<Action> {
+        match action {
+            TaskPickerConfirmAction::Approve => Some(Action::TaskUpdate {
+                id: task_id,
+                state: "approved".into(),
+            }),
+            TaskPickerConfirmAction::Ready => Some(Action::TaskUpdate {
+                id: task_id,
+                state: "ready".into(),
+            }),
+            TaskPickerConfirmAction::Dispatch => Some(Action::TaskDispatch { id: task_id }),
+            TaskPickerConfirmAction::Merge => Some(Action::TaskMerge { id: task_id }),
+        }
+    }
+
     fn handle_streaming_key(&mut self, key: &KeyEvent) -> Option<Action> {
         match (key.code, key.modifiers) {
             // Enter during streaming: inject steering message into agent loop
@@ -1099,6 +1560,8 @@ impl App {
             }
             // TAB: open session picker
             (KeyCode::Tab, _) => Some(Action::OpenSessionPicker),
+            // F2: open task picker
+            (KeyCode::F(2), _) => Some(Action::OpenTaskPicker),
             // All other keys go to textarea (compose steering message while streaming)
             _ => {
                 self.textarea.input(event_to_tui_textarea(key));
@@ -1113,6 +1576,8 @@ impl App {
     fn set_mode(&mut self, target: AppMode) {
         if self.mode == AppMode::SessionPicker {
             self.picker_previous_mode = target;
+        } else if self.mode == AppMode::TaskPicker {
+            self.task_picker_previous_mode = target;
         } else {
             self.mode = target;
         }
@@ -1647,6 +2112,8 @@ impl App {
                 {
                     let effective = if self.mode == AppMode::SessionPicker {
                         self.picker_previous_mode
+                    } else if self.mode == AppMode::TaskPicker {
+                        self.task_picker_previous_mode
                     } else {
                         self.mode
                     };
@@ -1661,6 +2128,8 @@ impl App {
                 // another client is chatting — switch to streaming view.
                 let effective = if self.mode == AppMode::SessionPicker {
                     self.picker_previous_mode
+                } else if self.mode == AppMode::TaskPicker {
+                    self.task_picker_previous_mode
                 } else {
                     self.mode
                 };
@@ -1810,6 +2279,13 @@ impl App {
                 self.child_count = children.len();
             }
             Response::TaskTree { tasks } => {
+                // If in task picker mode, populate picker state
+                if self.mode == AppMode::TaskPicker {
+                    self.picker_tasks = tasks;
+                    self.task_picker_cursor = 0;
+                    self.task_picker_confirm = None;
+                    return None;
+                }
                 if tasks.is_empty() {
                     self.messages.push(MessageItem::Status {
                         text: "no tasks".into(),
@@ -1839,9 +2315,20 @@ impl App {
             Response::TaskDetail {
                 task,
                 messages,
+                relations,
                 subtasks,
-                ..
             } => {
+                // If in task picker mode, populate detail view
+                if self.mode == AppMode::TaskPicker {
+                    self.task_picker_detail = Some(Box::new(TaskPickerDetail {
+                        task,
+                        messages,
+                        relations,
+                        subtasks,
+                        scroll: 0,
+                    }));
+                    return None;
+                }
                 self.render_task_detail(&task, &messages, &subtasks);
             }
             Response::TaskUpdated { task } => {
@@ -1850,6 +2337,15 @@ impl App {
                 self.messages.push(MessageItem::Status {
                     text: format!("task #{} → {} : {}", task.id, task.state, task.title),
                 });
+                // If in task picker mode, re-fetch task list to refresh
+                if self.mode == AppMode::TaskPicker {
+                    if let Some(ref cwd) = self.session_cwd {
+                        return Some(Action::TaskList {
+                            project: cwd.clone(),
+                            state: None,
+                        });
+                    }
+                }
                 // Fire hook for state changes that need scheduler notification
                 if state == "approved" || state == "ready" {
                     return Some(Action::FireHook {
@@ -2196,6 +2692,20 @@ pub enum Action {
     },
     TaskMergeQueue {
         project: String,
+    },
+    /// Open the task picker overlay.
+    OpenTaskPicker,
+    /// Dispatch a task (schedule if needed + create session).
+    TaskDispatch {
+        id: i64,
+    },
+    /// Run scheduling pass.
+    TaskSchedule {
+        project: String,
+    },
+    /// Merge approved task.
+    TaskMerge {
+        id: i64,
     },
 }
 
@@ -2814,5 +3324,414 @@ mod tests {
             AppMode::Input,
             "underlying mode should transition to Input"
         );
+    }
+
+    // ---- Task picker tests ----
+
+    /// Helper: create a test TaskInfo.
+    fn make_task_info(id: i64, title: &str, state: &str) -> TaskInfo {
+        TaskInfo {
+            id,
+            project: "/test".into(),
+            title: title.into(),
+            state: state.into(),
+            priority: 0,
+            parent_id: None,
+            tags: Some(serde_json::json!(["tui", "test"])),
+            affected_files: None,
+            branch: None,
+            worktree_path: None,
+            session_id: Some("s100".into()),
+            skip_review: false,
+            skip_planning: false,
+            require_approval: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    /// Helper: put the app into TaskPicker mode with a given previous mode.
+    fn open_task_picker(app: &mut App, previous: AppMode) {
+        app.mode = previous;
+        app.task_picker_previous_mode = previous;
+        app.mode = AppMode::TaskPicker;
+    }
+
+    /// Helper: populate picker_tasks with test data.
+    fn populate_picker_tasks(app: &mut App) {
+        app.picker_tasks = vec![
+            (0, make_task_info(1, "First task", "active")),
+            (1, make_task_info(2, "Second task", "review")),
+            (0, make_task_info(3, "Third task", "approved")),
+        ];
+    }
+
+    /// AgentDone while task picker is open should NOT close the picker.
+    #[test]
+    fn task_picker_stays_open_on_agent_done() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Streaming);
+
+        app.handle_server_response(Response::AgentDone);
+
+        assert_eq!(app.mode, AppMode::TaskPicker, "task picker must stay open");
+        assert_eq!(
+            app.task_picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
+        );
+    }
+
+    /// Stream events arriving while task picker is open should NOT close it.
+    #[test]
+    fn task_picker_stays_open_on_stream_text_delta() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "hello".to_string(),
+                partial: assistant_message("hello", StopReason::Stop, None),
+            }),
+        });
+
+        assert_eq!(app.mode, AppMode::TaskPicker, "task picker must stay open");
+        assert_eq!(
+            app.task_picker_previous_mode,
+            AppMode::Streaming,
+            "underlying mode should switch to Streaming"
+        );
+    }
+
+    /// Phase::Idle while task picker is open should NOT close it.
+    #[test]
+    fn task_picker_stays_open_on_phase_idle() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Streaming);
+
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Idle,
+            }),
+        });
+
+        assert_eq!(app.mode, AppMode::TaskPicker, "task picker must stay open");
+        assert_eq!(
+            app.task_picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
+        );
+    }
+
+    /// Cancelled response while task picker is open should NOT close it.
+    #[test]
+    fn task_picker_stays_open_on_cancelled() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Streaming);
+
+        app.handle_server_response(Response::Cancelled);
+
+        assert_eq!(app.mode, AppMode::TaskPicker, "task picker must stay open");
+        assert_eq!(
+            app.task_picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
+        );
+    }
+
+    /// Error response while task picker is open should NOT close it.
+    #[test]
+    fn task_picker_stays_open_on_error() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+
+        app.handle_server_response(Response::Error {
+            message: "something broke".to_string(),
+        });
+
+        assert_eq!(app.mode, AppMode::TaskPicker, "task picker must stay open");
+        assert_eq!(
+            app.task_picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should stay Input"
+        );
+    }
+
+    /// StreamEvent::Done while task picker is open should NOT close it.
+    #[test]
+    fn task_picker_stays_open_on_stream_done() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Streaming);
+
+        app.handle_stream_event(StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: assistant_message("done", StopReason::Stop, None),
+        });
+
+        assert_eq!(app.mode, AppMode::TaskPicker, "task picker must stay open");
+        assert_eq!(
+            app.task_picker_previous_mode,
+            AppMode::Input,
+            "underlying mode should transition to Input"
+        );
+    }
+
+    /// F2 closes task picker and restores previous mode.
+    #[test]
+    fn task_picker_close_restores_mode() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+
+        let key = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+        app.handle_task_picker_key(&key);
+
+        assert_eq!(app.mode, AppMode::Input, "should restore previous mode");
+    }
+
+    /// Esc closes task picker and restores previous mode.
+    #[test]
+    fn task_picker_esc_closes() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Streaming);
+        populate_picker_tasks(&mut app);
+
+        let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_task_picker_key(&key);
+
+        assert_eq!(app.mode, AppMode::Streaming, "should restore previous mode");
+    }
+
+    /// Filter matches title, id, state, and tags.
+    #[test]
+    fn task_picker_filter_matches() {
+        let mut app = make_app();
+        populate_picker_tasks(&mut app);
+
+        // Match by title
+        app.task_picker_filter = "First".into();
+        let indices = app.task_picker_filtered_indices();
+        assert_eq!(indices, vec![0]);
+
+        // Match by ID prefix
+        app.task_picker_filter = "2".into();
+        let indices = app.task_picker_filtered_indices();
+        assert_eq!(indices, vec![1]);
+
+        // Match by state
+        app.task_picker_filter = "approved".into();
+        let indices = app.task_picker_filtered_indices();
+        assert_eq!(indices, vec![2]);
+
+        // Match by tag
+        app.task_picker_filter = "tui".into();
+        let indices = app.task_picker_filtered_indices();
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        // Empty filter matches all
+        app.task_picker_filter = String::new();
+        let indices = app.task_picker_filtered_indices();
+        assert_eq!(indices, vec![0, 1, 2]);
+
+        // No match
+        app.task_picker_filter = "nonexistent".into();
+        let indices = app.task_picker_filtered_indices();
+        assert!(indices.is_empty());
+    }
+
+    /// Confirm approve flow: 'a' sets confirm, 'y' executes.
+    #[test]
+    fn task_picker_confirm_approve_flow() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+
+        // Press 'a' to set confirmation
+        let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key_a);
+        assert!(action.is_none());
+        assert!(app.task_picker_confirm.is_some());
+
+        // Press 'y' to confirm
+        let key_y = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key_y);
+        assert!(action.is_some());
+        match action {
+            Some(Action::TaskUpdate { id, state }) => {
+                assert_eq!(id, 1); // first task
+                assert_eq!(state, "approved");
+            }
+            other => panic!("expected TaskUpdate, got {other:?}"),
+        }
+        assert!(app.task_picker_confirm.is_none());
+    }
+
+    /// Confirm cancel: any non-y/Enter key cancels the confirmation.
+    #[test]
+    fn task_picker_confirm_cancel() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+
+        // Press 'a' to set confirmation
+        let key_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        app.handle_task_picker_key(&key_a);
+        assert!(app.task_picker_confirm.is_some());
+
+        // Press 'n' to cancel
+        let key_n = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key_n);
+        assert!(action.is_none());
+        assert!(app.task_picker_confirm.is_none());
+    }
+
+    /// Create mode flow: 'c' enters filter+create mode, Enter creates task.
+    #[test]
+    fn task_picker_create_mode_flow() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.session_cwd = Some("/test-project".into());
+
+        // Press 'c' to enter create mode
+        let key_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
+        app.handle_task_picker_key(&key_c);
+        assert!(app.task_picker_filter_mode);
+        assert!(app.task_picker_create_mode);
+
+        // Type "New task"
+        for ch in "New task".chars() {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            app.handle_task_picker_key(&key);
+        }
+        assert_eq!(app.task_picker_filter, "New task");
+
+        // Press Enter to create
+        let key_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key_enter);
+        assert!(!app.task_picker_filter_mode);
+        assert!(!app.task_picker_create_mode);
+        match action {
+            Some(Action::TaskCreate { project, title }) => {
+                assert_eq!(project, "/test-project");
+                assert_eq!(title, "New task");
+            }
+            other => panic!("expected TaskCreate, got {other:?}"),
+        }
+    }
+
+    /// Detail view opens (via response) and Esc closes it.
+    #[test]
+    fn task_picker_detail_open_close() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+
+        // Simulate detail response
+        app.task_picker_detail = Some(Box::new(TaskPickerDetail {
+            task: make_task_info(1, "First task", "active"),
+            messages: vec![],
+            relations: vec![],
+            subtasks: vec![],
+            scroll: 0,
+        }));
+        assert!(app.task_picker_detail.is_some());
+
+        // Press Esc to close detail
+        let key_esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_task_picker_key(&key_esc);
+        assert!(app.task_picker_detail.is_none());
+    }
+
+    /// Enter on a task returns TaskGet action to fetch detail.
+    #[test]
+    fn task_picker_enter_fetches_detail() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+
+        let key_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key_enter);
+        match action {
+            Some(Action::TaskGet { id }) => assert_eq!(id, 1),
+            other => panic!("expected TaskGet, got {other:?}"),
+        }
+    }
+
+    /// 'g' from normal mode goes to session.
+    #[test]
+    fn task_picker_go_to_session() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+
+        let key_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key_g);
+        match action {
+            Some(Action::SwitchSession(sid)) => assert_eq!(sid, "s100"),
+            other => panic!("expected SwitchSession, got {other:?}"),
+        }
+        // Picker should be closed
+        assert_eq!(app.mode, AppMode::Input);
+    }
+
+    /// TaskTree response in TaskPicker mode populates picker_tasks.
+    #[test]
+    fn task_picker_response_task_tree() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+
+        let tasks = vec![
+            (0, make_task_info(10, "Root task", "active")),
+            (1, make_task_info(11, "Child task", "planning")),
+        ];
+        let action = app.handle_server_response(Response::TaskTree { tasks });
+        assert!(action.is_none());
+        assert_eq!(app.picker_tasks.len(), 2);
+        assert_eq!(app.task_picker_cursor, 0);
+    }
+
+    /// TaskDetail response in TaskPicker mode populates task_picker_detail.
+    #[test]
+    fn task_picker_response_task_detail() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+
+        let action = app.handle_server_response(Response::TaskDetail {
+            task: make_task_info(10, "Test task", "active"),
+            messages: vec![],
+            relations: vec![],
+            subtasks: vec![],
+        });
+        assert!(action.is_none());
+        assert!(app.task_picker_detail.is_some());
+        assert_eq!(
+            app.task_picker_detail
+                .as_ref()
+                .expect("should be Some")
+                .task
+                .id,
+            10
+        );
+    }
+
+    /// TaskUpdated response in TaskPicker mode triggers a refresh.
+    #[test]
+    fn task_picker_response_task_updated_refreshes() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.session_cwd = Some("/test-project".into());
+
+        let action = app.handle_server_response(Response::TaskUpdated {
+            task: make_task_info(10, "Test task", "approved"),
+        });
+        // Should return a TaskList action to refresh
+        match action {
+            Some(Action::TaskList { project, state }) => {
+                assert_eq!(project, "/test-project");
+                assert!(state.is_none());
+            }
+            other => panic!("expected TaskList for refresh, got {other:?}"),
+        }
     }
 }

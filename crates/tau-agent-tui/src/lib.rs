@@ -573,6 +573,43 @@ async fn run_inner(
                     send_request_and_recv(Request::TaskMergeQueue { project }, server_tx.clone())
                         .await?;
                 }
+                Action::OpenTaskPicker => {
+                    app.task_picker_previous_mode = app.mode;
+                    app.mode = AppMode::TaskPicker;
+                    app.picker_tasks.clear();
+                    app.task_picker_confirm = None;
+                    app.task_picker_detail = None;
+                    app.task_picker_filter.clear();
+                    app.task_picker_filter_mode = false;
+                    app.task_picker_create_mode = false;
+                    if let Some(ref cwd) = app.session_cwd {
+                        send_request_and_recv(
+                            Request::TaskList {
+                                project: cwd.clone(),
+                                state: None,
+                                parent_id: None,
+                            },
+                            server_tx.clone(),
+                        )
+                        .await?;
+                    }
+                }
+                Action::TaskDispatch { id } => {
+                    // Dispatch is schedule + assign; for now just show status
+                    app.messages.push(crate::message::MessageItem::Status {
+                        text: format!("dispatch task #{} (not yet wired)", id),
+                    });
+                }
+                Action::TaskSchedule { project } => {
+                    app.messages.push(crate::message::MessageItem::Status {
+                        text: format!("schedule tasks in {} (not yet wired)", project),
+                    });
+                }
+                Action::TaskMerge { id } => {
+                    app.messages.push(crate::message::MessageItem::Status {
+                        text: format!("merge task #{} (not yet wired)", id),
+                    });
+                }
             }
         }
 
