@@ -1112,15 +1112,19 @@ impl TasksDb {
         Ok(tasks)
     }
 
-    /// Count tasks in in-flight states (planning, refining, active, review, merging).
-    /// Used by the scheduler to enforce the max concurrent tasks limit.
+    /// Count tasks in in-flight states that are actually consuming resources.
+    /// Tasks in active, review, merging, or refining always count. Planning
+    /// tasks only count if they have an assigned session (i.e. a planner is
+    /// actively running). Idle planning tasks without sessions are just
+    /// queued and should not block the budget.
     pub fn count_inflight_tasks(&self, project: &str) -> tau_agent_plugin::Result<usize> {
         let count: i64 = self
             .conn
             .query_row(
                 "SELECT COUNT(*) FROM tasks
                  WHERE project = ?1
-                   AND state IN ('planning', 'refining', 'active', 'review', 'merging')",
+                   AND (state IN ('refining', 'active', 'review', 'merging')
+                        OR (state = 'planning' AND session_id IS NOT NULL))",
                 params![project],
                 |row| row.get(0),
             )
@@ -4676,5 +4680,143 @@ mod tests {
             .unwrap();
             assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "failed");
         }
+    }
+
+    #[test]
+    fn test_count_inflight_planning_without_session() {
+        // Planning tasks without a session should NOT count as inflight
+        let db = TasksDb::open_memory().unwrap();
+        let project = "/test/project";
+
+        // Create a task and move it to planning state (interactive -> planning)
+        let task = db
+            .create_task(
+                project,
+                "Plan something",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        // Planning without session -> should NOT count
+        assert_eq!(db.count_inflight_tasks(project).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_count_inflight_planning_with_session() {
+        // Planning tasks WITH a session should count as inflight
+        let db = TasksDb::open_memory().unwrap();
+        let project = "/test/project";
+
+        let task = db
+            .create_task(
+                project,
+                "Plan something",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.set_session_id(task.id, "s123").unwrap();
+
+        // Planning with session -> should count
+        assert_eq!(db.count_inflight_tasks(project).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_inflight_active_always_counts() {
+        // Active tasks always count regardless of session
+        let db = TasksDb::open_memory().unwrap();
+        let project = "/test/project";
+
+        let task = db
+            .create_task(project, "Do work", None, None, None, false, true, false)
+            .unwrap();
+        // interactive -> ready (skip_planning)
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        // Assign to move to active
+        db.assign_task(task.id, "s456").unwrap();
+
+        assert_eq!(db.count_inflight_tasks(project).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_count_inflight_cross_project_isolation() {
+        // Inflight tasks in one project should not affect another
+        let db = TasksDb::open_memory().unwrap();
+
+        let task_a = db
+            .create_task("/project/a", "Task A", None, None, None, false, true, false)
+            .unwrap();
+        db.update_task(
+            task_a.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task_a.id, "s100").unwrap();
+
+        let task_b = db
+            .create_task(
+                "/project/b",
+                "Task B",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task_b.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.set_session_id(task_b.id, "s200").unwrap();
+
+        assert_eq!(db.count_inflight_tasks("/project/a").unwrap(), 1);
+        assert_eq!(db.count_inflight_tasks("/project/b").unwrap(), 1);
+        assert_eq!(db.count_inflight_tasks("/project/c").unwrap(), 0);
     }
 }

@@ -117,8 +117,9 @@ pub struct ScheduledTask {
     pub worktree_path: String,
 }
 
-/// Maximum number of tasks that can be in-flight (planning, refining, active,
-/// review, merging) simultaneously per project.
+/// Maximum number of tasks that can be in-flight simultaneously per project.
+/// Counted states: active, review, merging, refining (always), and planning
+/// (only when a session is assigned, i.e. a planner is actively running).
 pub(crate) const MAX_CONCURRENT_TASKS: usize = 8;
 
 /// Run a scheduling pass: find ready/planning tasks, pick a non-conflicting
