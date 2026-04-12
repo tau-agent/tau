@@ -353,6 +353,9 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if app.child_count > 0 {
         left_parts.push(Span::styled(format!(" [{}]", app.child_count), dim));
     }
+    if let Some((task_id, _title)) = &app.current_task_id {
+        left_parts.push(Span::styled(format!(" T#{}", task_id), dim));
+    }
 
     // Build right side: model name + connection status
     let right_text = if app.server_done {

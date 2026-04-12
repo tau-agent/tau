@@ -170,6 +170,8 @@ pub struct App {
     pub task_picker_confirm: Option<(usize, String, TaskPickerConfirmAction)>,
     /// Task detail view data (when Enter is pressed on a task).
     pub task_picker_detail: Option<Box<TaskPickerDetail>>,
+    /// Task ID and title assigned to the current session (if any), for footer display.
+    pub current_task_id: Option<(i64, String)>,
     /// Whether a text block in the current turn has already been
     /// finalized by a `StreamEvent::TextEnd`.  Used by `StreamEvent::Done`
     /// to suppress its fallback append branch when `TextEnd` has already
@@ -250,6 +252,7 @@ impl App {
             task_picker_create_mode: false,
             task_picker_confirm: None,
             task_picker_detail: None,
+            current_task_id: None,
             turn_text_finalized: false,
         }
     }
@@ -1612,6 +1615,7 @@ impl App {
         self.parent_id = info.parent_id.clone();
         self.child_count = info.child_count;
         self.session_cwd = info.cwd.clone();
+        self.current_task_id = None;
         self.totals = UsageTotals::default();
         self.totals.context_window = info.stats.context_window;
         self.totals.is_subscription = info.stats.is_subscription;
@@ -1634,6 +1638,7 @@ impl App {
             self.subscription_usage = entry.subscription_usage;
             self.last_usage_fetch = entry.last_usage_fetch;
             self.session_cwd = entry.session_cwd;
+            self.current_task_id = None;
             self.scroll_to_bottom();
             self.mode = AppMode::Input;
             true
@@ -2279,6 +2284,13 @@ impl App {
                 self.child_count = children.len();
             }
             Response::TaskTree { tasks } => {
+                // Scan for a task assigned to the current session (piggyback discovery)
+                for (_depth, t) in &tasks {
+                    if t.session_id.as_deref() == Some(&self.session_id) {
+                        self.current_task_id = Some((t.id, t.title.clone()));
+                        break;
+                    }
+                }
                 // If in task picker mode, populate picker state
                 if self.mode == AppMode::TaskPicker {
                     self.picker_tasks = tasks;
@@ -2337,6 +2349,10 @@ impl App {
                 self.messages.push(MessageItem::Status {
                     text: format!("task #{} → {} : {}", task.id, task.state, task.title),
                 });
+                // Track current_task_id for footer indicator
+                if task.session_id.as_deref() == Some(&self.session_id) {
+                    self.current_task_id = Some((task.id, task.title.clone()));
+                }
                 // If in task picker mode, re-fetch task list to refresh
                 if self.mode == AppMode::TaskPicker {
                     if let Some(ref cwd) = self.session_cwd {
@@ -2352,6 +2368,22 @@ impl App {
                         name: "task_state_changed".into(),
                         data: serde_json::json!({"task_id": id, "new_state": state}),
                     });
+                }
+            }
+            Response::ToolExecuted { content, is_error } => {
+                if is_error {
+                    self.messages.push(MessageItem::Error { text: content });
+                } else {
+                    self.messages.push(MessageItem::Status { text: content });
+                }
+                // If in task picker mode, re-fetch task list after tool execution
+                if self.mode == AppMode::TaskPicker {
+                    if let Some(ref cwd) = self.session_cwd {
+                        return Some(Action::TaskList {
+                            project: cwd.clone(),
+                            state: None,
+                        });
+                    }
                 }
             }
             Response::TaskStatus { text } => {

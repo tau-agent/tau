@@ -595,20 +595,37 @@ async fn run_inner(
                     }
                 }
                 Action::TaskDispatch { id } => {
-                    // Dispatch is schedule + assign; for now just show status
-                    app.messages.push(crate::message::MessageItem::Status {
-                        text: format!("dispatch task #{} (not yet wired)", id),
-                    });
+                    send_request_and_recv(
+                        Request::ExecuteTool {
+                            session_id: sid.clone(),
+                            tool_name: "task_dispatch".into(),
+                            arguments: serde_json::json!({"id": id}),
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
                 }
                 Action::TaskSchedule { project } => {
-                    app.messages.push(crate::message::MessageItem::Status {
-                        text: format!("schedule tasks in {} (not yet wired)", project),
-                    });
+                    send_request_and_recv(
+                        Request::ExecuteTool {
+                            session_id: sid.clone(),
+                            tool_name: "task_schedule".into(),
+                            arguments: serde_json::json!({"project": project}),
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
                 }
                 Action::TaskMerge { id } => {
-                    app.messages.push(crate::message::MessageItem::Status {
-                        text: format!("merge task #{} (not yet wired)", id),
-                    });
+                    send_request_and_recv(
+                        Request::ExecuteTool {
+                            session_id: sid.clone(),
+                            tool_name: "task_merge".into(),
+                            arguments: serde_json::json!({"id": id}),
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
                 }
             }
         }
