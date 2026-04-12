@@ -37,6 +37,15 @@ pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     if app.mode == AppMode::SessionPicker {
         draw_session_picker(frame, app, theme, area);
     }
+
+    // Task picker overlay
+    if app.mode == AppMode::TaskPicker {
+        if app.task_picker_detail.is_some() {
+            draw_task_detail(frame, app, theme, area);
+        } else {
+            draw_task_picker(frame, app, theme, area);
+        }
+    }
 }
 
 /// Height of the input area: visual lines (accounting for wrap) + 2 borders.
@@ -860,9 +869,526 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     frame.render_widget(Paragraph::new(text), inner);
 }
 
+// ---------------------------------------------------------------------------
+// Task Picker overlay -- tree view with state, priority, session
+// ---------------------------------------------------------------------------
+
+/// Return the display icon and style for a task state string.
+fn task_state_style(state: &str, theme: &Theme) -> (&'static str, Style) {
+    match state {
+        "interactive" => ("◆", theme.fg(theme.accent)),
+        "planning" | "refining" => ("○", theme.fg(theme.dim)),
+        "ready" => ("●", theme.fg(theme.muted)),
+        "active" => ("▶", theme.fg(theme.success)),
+        "review" => ("◎", theme.fg(theme.warning)),
+        "approved" => ("✓", theme.bold_fg(theme.success)),
+        "merging" => ("⟳", theme.fg(theme.accent)),
+        "merged" => ("✔", theme.fg(theme.dim)),
+        "failed" => ("✗", theme.fg(theme.error)),
+        "closed" => ("✕", theme.fg(theme.dim)),
+        _ => ("?", theme.fg(theme.dim)),
+    }
+}
+
+/// Determine `is_last` sibling for each item in a pre-ordered depth list.
+///
+/// A task at depth D is the last sibling if no later filtered task shares
+/// the same depth without an intervening task at a shallower depth.
+fn compute_is_last_flags(
+    tasks: &[(usize, tau_agent::protocol::TaskInfo)],
+    filtered: &[usize],
+) -> Vec<bool> {
+    filtered
+        .iter()
+        .enumerate()
+        .map(|(pos, &idx)| {
+            let (depth, _) = &tasks[idx];
+            for &next_idx in &filtered[pos + 1..] {
+                let (next_depth, _) = &tasks[next_idx];
+                if *next_depth <= *depth {
+                    // Same or shallower depth → this is last only if shallower
+                    return *next_depth < *depth;
+                }
+            }
+            // No sibling found → this is the last
+            true
+        })
+        .collect()
+}
+
+fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    let filtered = app.task_picker_filtered_indices();
+
+    // Use most of the screen width
+    let picker_width: u16 = (area.width * 3 / 4)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    // Height: tasks + footer(1) + borders(2), clamped to area
+    let content_lines = filtered.len().max(1) as u16;
+    let picker_height = (content_lines + 3).min(area.height.saturating_sub(2));
+
+    // Position: centered
+    let x = (area.width.saturating_sub(picker_width)) / 2;
+    let y = (area.height.saturating_sub(picker_height)) / 2;
+    let picker_area = Rect::new(x, y, picker_width, picker_height);
+
+    // Clear the area behind the overlay
+    frame.render_widget(Clear, picker_area);
+
+    // Title includes filter/create mode when active
+    let title = if app.task_picker_create_mode && !app.task_picker_filter.is_empty() {
+        format!(" Tasks [+{}] ", app.task_picker_filter)
+    } else if app.task_picker_create_mode {
+        " Tasks [+] ".to_string()
+    } else if !app.task_picker_filter.is_empty() {
+        format!(" Tasks [/{}] ", app.task_picker_filter)
+    } else if app.task_picker_filter_mode {
+        " Tasks [/] ".to_string()
+    } else {
+        " Tasks ".to_string()
+    };
+
+    // Border
+    let border_style = Style::default().fg(theme.accent.to_ratatui());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(border_style)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent.to_ratatui())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let w = inner.width as usize;
+
+    // Right-side column widths
+    const PRI_W: usize = 3; // "p0" .. "p9"
+    const SES_W: usize = 8; // session id
+    const COL_GAP: usize = 2;
+    let right_len = COL_GAP + PRI_W + COL_GAP + SES_W;
+
+    if app.picker_tasks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (loading...)",
+            theme.fg(theme.muted),
+        )));
+    } else if filtered.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no matches)",
+            theme.fg(theme.muted),
+        )));
+    } else {
+        // Compute is_last flags for tree connectors
+        let is_last_flags = compute_is_last_flags(&app.picker_tasks, &filtered);
+
+        for (filter_pos, &task_idx) in filtered.iter().enumerate() {
+            let (depth, ref task) = app.picker_tasks[task_idx];
+            let is_selected = filter_pos == app.task_picker_cursor;
+            let is_last = is_last_flags[filter_pos];
+
+            // Confirmation prompt replaces the selected row
+            if is_selected {
+                if let Some((confirm_cursor, ref confirm_label, _)) = app.task_picker_confirm {
+                    if confirm_cursor == app.task_picker_cursor {
+                        let confirm_text = format!(" {} y/n", confirm_label);
+                        let confirm_padded = if confirm_text.len() < w {
+                            format!("{}{}", confirm_text, " ".repeat(w - confirm_text.len()))
+                        } else {
+                            confirm_text[..w].to_string()
+                        };
+                        let style = Style::default()
+                            .fg(theme.accent.to_ratatui())
+                            .bg(theme.selected_bg.to_ratatui());
+                        lines.push(Line::from(Span::styled(confirm_padded, style)));
+                        continue;
+                    }
+                }
+            }
+
+            // Build spans for this row
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut used = 0usize;
+
+            // Tree indent with connectors (flatten when filtering)
+            let connector = if !app.task_picker_filter.is_empty() || depth == 0 {
+                String::new()
+            } else if is_last {
+                format!("{}└── ", "│   ".repeat(depth - 1))
+            } else {
+                format!("{}├── ", "│   ".repeat(depth - 1))
+            };
+            spans.push(Span::styled(format!(" {}", connector), theme.fg(theme.dim)));
+            used += 1 + UnicodeWidthStr::width(connector.as_str());
+
+            // State icon
+            let (icon, icon_style) = task_state_style(&task.state, theme);
+            spans.push(Span::styled(format!("{} ", icon), icon_style));
+            // State icons are typically width 1 + 1 space = 2
+            used += UnicodeWidthStr::width(icon).max(1) + 1;
+
+            // Task ID (right-aligned, 4 chars + 1 space)
+            let id_style = if is_selected {
+                theme.fg(theme.text)
+            } else {
+                theme.fg(theme.muted)
+            };
+            spans.push(Span::styled(format!("{:>4} ", task.id), id_style));
+            used += 5;
+
+            // Right-side info: priority + session
+            let pri_str = format!("p{}", task.priority);
+            let session_str: String = task
+                .session_id
+                .as_deref()
+                .unwrap_or("-")
+                .chars()
+                .take(SES_W)
+                .collect();
+
+            let right_text = format!(
+                "  {:>pri_w$}  {:>ses_w$}",
+                pri_str,
+                session_str,
+                pri_w = PRI_W,
+                ses_w = SES_W,
+            );
+
+            // Title fills the middle
+            let title_space = w.saturating_sub(used + right_len + 1);
+            let title_style = if task.state == "merged" || task.state == "closed" {
+                theme.italic_fg(theme.dim)
+            } else if is_selected {
+                theme.fg(theme.text)
+            } else {
+                Style::default()
+            };
+
+            let title_display = if title_space >= 4 {
+                if UnicodeWidthStr::width(task.title.as_str()) > title_space {
+                    format!(
+                        " {}...",
+                        truncate_to_width(&task.title, title_space.saturating_sub(4))
+                    )
+                } else {
+                    format!(" {}", task.title)
+                }
+            } else {
+                String::new()
+            };
+
+            spans.push(Span::styled(title_display, title_style));
+
+            // Pad to push right-side block to the right edge
+            let line_so_far_width: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let pad = w.saturating_sub(line_so_far_width + right_len);
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+
+            spans.push(Span::styled(right_text, theme.fg(theme.dim)));
+
+            // Row style (selection background)
+            let row_style = if is_selected {
+                Style::default().bg(theme.selected_bg.to_ratatui())
+            } else {
+                Style::default()
+            };
+
+            let mut line = Line::from(spans);
+            // Pad the entire line to full width for selection highlight
+            let line_w = line.width();
+            if line_w < w {
+                line.spans
+                    .push(Span::styled(" ".repeat(w - line_w), row_style));
+            }
+            line = line.style(row_style);
+
+            lines.push(line);
+        }
+    }
+
+    // Footer hint
+    let hint = if app.task_picker_confirm.is_some() {
+        " y/enter confirm  any key cancel"
+    } else if app.task_picker_create_mode {
+        " type title  enter create  esc cancel"
+    } else if app.task_picker_filter_mode {
+        " type to filter  enter accept  esc clear"
+    } else {
+        " /search  c new  j/k nav  enter view  a approve  r ready  d dispatch  g goto  F2/esc close"
+    };
+    let hint_display: String = if hint.len() > w {
+        hint[..w].to_string()
+    } else {
+        hint.to_string()
+    };
+    lines.push(Line::from(Span::styled(hint_display, theme.fg(theme.dim))));
+
+    // Scroll the task list if needed
+    let available_lines = inner.height as usize;
+    let task_lines = available_lines.saturating_sub(1); // reserve 1 for hint
+
+    if lines.len() > available_lines {
+        let num_tasks = lines.len() - 1; // exclude hint
+        let hint_line = lines.pop().expect("lines not empty: hint was just pushed");
+
+        let scroll_start = if app.task_picker_cursor >= task_lines {
+            app.task_picker_cursor - task_lines + 1
+        } else {
+            0
+        };
+        let scroll_end = (scroll_start + task_lines).min(num_tasks);
+
+        let mut visible: Vec<Line<'static>> = lines[scroll_start..scroll_end].to_vec();
+        visible.push(hint_line);
+        lines = visible;
+    }
+
+    let text = Text::from(lines);
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    use ratatui::widgets::Clear;
+
+    let detail = match app.task_picker_detail {
+        Some(ref d) => d,
+        None => return,
+    };
+
+    let task = &detail.task;
+
+    // Use most of the screen width
+    let picker_width: u16 = (area.width * 3 / 4)
+        .max(50)
+        .min(area.width.saturating_sub(2));
+    let picker_height = area.height.saturating_sub(4).max(10);
+
+    // Position: centered
+    let x = (area.width.saturating_sub(picker_width)) / 2;
+    let y = (area.height.saturating_sub(picker_height)) / 2;
+    let picker_area = Rect::new(x, y, picker_width, picker_height);
+
+    // Clear the area behind the overlay
+    frame.render_widget(Clear, picker_area);
+
+    // Title
+    let title_text = format!(" Task #{}: {} ", task.id, task.title);
+    let title_truncated = if UnicodeWidthStr::width(title_text.as_str()) > picker_width as usize - 2
+    {
+        format!(
+            "{}... ",
+            truncate_to_width(&title_text, (picker_width as usize).saturating_sub(6))
+        )
+    } else {
+        title_text
+    };
+
+    let border_style = Style::default().fg(theme.accent.to_ratatui());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(border_style)
+        .title(Span::styled(
+            title_truncated,
+            Style::default()
+                .fg(theme.accent.to_ratatui())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ));
+    let inner = block.inner(picker_area);
+    frame.render_widget(block, picker_area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let w = inner.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // State / priority / skip review
+    let (icon, icon_style) = task_state_style(&task.state, theme);
+    let skip = if task.skip_review { "yes" } else { "no" };
+    lines.push(Line::from(vec![
+        Span::styled("  State: ", theme.bold_fg(theme.text)),
+        Span::styled(format!("{} ", icon), icon_style),
+        Span::styled(format!("{}  ", task.state), theme.fg(theme.text)),
+        Span::styled("Priority: ", theme.bold_fg(theme.text)),
+        Span::styled(format!("{}  ", task.priority), theme.fg(theme.text)),
+        Span::styled("Skip review: ", theme.bold_fg(theme.text)),
+        Span::styled(skip.to_string(), theme.fg(theme.text)),
+    ]));
+
+    // Branch / session / parent
+    let branch = task.branch.as_deref().unwrap_or("none");
+    let session = task.session_id.as_deref().unwrap_or("none");
+    let parent = task
+        .parent_id
+        .map(|p| format!("#{}", p))
+        .unwrap_or_else(|| "none".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("  Branch: ", theme.bold_fg(theme.text)),
+        Span::styled(format!("{}  ", branch), theme.fg(theme.text)),
+        Span::styled("Session: ", theme.bold_fg(theme.text)),
+        Span::styled(format!("{}  ", session), theme.fg(theme.text)),
+        Span::styled("Parent: ", theme.bold_fg(theme.text)),
+        Span::styled(parent, theme.fg(theme.text)),
+    ]));
+
+    // Tags
+    let tags_str = task
+        .tags
+        .as_ref()
+        .and_then(|v| {
+            v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        })
+        .unwrap_or_else(|| "-".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("  Tags: ", theme.bold_fg(theme.text)),
+        Span::styled(tags_str, theme.fg(theme.text)),
+    ]));
+
+    // Blank separator
+    lines.push(Line::from(""));
+
+    // Confirmation prompt (if any)
+    if let Some((_, ref confirm_label, _)) = app.task_picker_confirm {
+        lines.push(Line::from(Span::styled(
+            format!("  {} y/n", confirm_label),
+            Style::default()
+                .fg(theme.accent.to_ratatui())
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+    }
+
+    // Messages
+    if !detail.messages.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  Messages ({})", detail.messages.len()),
+            theme.bold_fg(theme.text),
+        )));
+        for msg in &detail.messages {
+            let author = msg.author.as_deref().unwrap_or("unknown");
+            let max_preview = w.saturating_sub(20);
+            let preview: String = msg
+                .content
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(max_preview)
+                .collect();
+            let ellipsis = if msg.content.len() > preview.len() {
+                "..."
+            } else {
+                ""
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("    #{} ", msg.id), theme.fg(theme.muted)),
+                Span::styled(format!("[{}] ", author), theme.fg(theme.dim)),
+                Span::styled(format!("{}{}", preview, ellipsis), theme.fg(theme.text)),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Messages: (none)",
+            theme.fg(theme.muted),
+        )));
+    }
+
+    lines.push(Line::from(""));
+
+    // Subtasks
+    if !detail.subtasks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("  Subtasks ({})", detail.subtasks.len()),
+            theme.bold_fg(theme.text),
+        )));
+        for st in &detail.subtasks {
+            let (st_icon, st_style) = task_state_style(&st.state, theme);
+            lines.push(Line::from(vec![
+                Span::styled(format!("    #{:<4} ", st.id), theme.fg(theme.muted)),
+                Span::styled(format!("{} ", st_icon), st_style),
+                Span::styled(st.title.clone(), theme.fg(theme.text)),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Subtasks: (none)",
+            theme.fg(theme.muted),
+        )));
+    }
+
+    // Relations
+    if !detail.relations.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  Relations ({})", detail.relations.len()),
+            theme.bold_fg(theme.text),
+        )));
+        for rel in &detail.relations {
+            lines.push(Line::from(Span::styled(
+                format!("    #{} {} #{}", rel.from_task, rel.relation, rel.to_task),
+                theme.fg(theme.text),
+            )));
+        }
+    }
+
+    // Footer hint
+    let hint = if app.task_picker_confirm.is_some() {
+        " y/enter confirm  any key cancel"
+    } else {
+        " a approve  r ready  d dispatch  g goto session  j/k scroll  esc back"
+    };
+    let hint_display: String = if hint.len() > w {
+        hint[..w].to_string()
+    } else {
+        hint.to_string()
+    };
+
+    // Scroll handling
+    let available_lines = inner.height as usize;
+    let content_lines = available_lines.saturating_sub(1); // reserve 1 for hint
+
+    let hint_line = Line::from(Span::styled(hint_display, theme.fg(theme.dim)));
+
+    if lines.len() > content_lines {
+        let scroll = detail.scroll.min(lines.len().saturating_sub(content_lines));
+        let end = (scroll + content_lines).min(lines.len());
+        let mut visible: Vec<Line<'static>> = lines[scroll..end].to_vec();
+        visible.push(hint_line);
+        lines = visible;
+    } else {
+        lines.push(hint_line);
+    }
+
+    let text = Text::from(lines);
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::dark;
 
     #[test]
     fn truncate_to_width_ascii() {
@@ -964,5 +1490,126 @@ mod tests {
                 col
             );
         }
+    }
+
+    #[test]
+    fn task_state_icons_cover_all_states() {
+        let theme = dark();
+        let states = [
+            "interactive",
+            "planning",
+            "refining",
+            "ready",
+            "active",
+            "review",
+            "approved",
+            "merging",
+            "merged",
+            "failed",
+            "closed",
+        ];
+        for state in states {
+            let (icon, _style) = task_state_style(state, &theme);
+            assert_ne!(icon, "?", "state '{}' should have a specific icon", state);
+            assert!(
+                UnicodeWidthStr::width(icon) >= 1,
+                "icon for '{}' should have positive width",
+                state
+            );
+        }
+        // Unknown states get "?"
+        let (icon, _) = task_state_style("unknown_state", &theme);
+        assert_eq!(icon, "?");
+    }
+
+    #[test]
+    fn task_picker_right_block_aligned_across_depths() {
+        // Mirrors the session picker alignment test but for task picker layout.
+        const W: usize = 80;
+        const PRI_W: usize = 3;
+        const SES_W: usize = 8;
+        const COL_GAP: usize = 2;
+        const RIGHT_LEN: usize = COL_GAP + PRI_W + COL_GAP + SES_W;
+
+        let mut right_starts = Vec::new();
+        for depth in 0..=4usize {
+            let connector = if depth == 0 {
+                String::new()
+            } else {
+                format!("{}├── ", "│   ".repeat(depth - 1))
+            };
+
+            let mut spans: Vec<String> = Vec::new();
+            spans.push(format!(" {}", connector)); // leading space + connector
+            spans.push("◆ ".to_string()); // state icon
+            spans.push(format!("{:>4} ", 14)); // task ID
+
+            let title = " Example task title";
+            spans.push(title.to_string());
+
+            let line_so_far_width: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.as_str()))
+                .sum();
+            let pad = W.saturating_sub(line_so_far_width + RIGHT_LEN);
+            let right_col = line_so_far_width + pad;
+            right_starts.push(right_col);
+        }
+
+        for (depth, &col) in right_starts.iter().enumerate() {
+            assert_eq!(
+                col,
+                W - RIGHT_LEN,
+                "task picker right block start at depth {depth} should be {} but got {}",
+                W - RIGHT_LEN,
+                col
+            );
+        }
+    }
+
+    #[test]
+    fn compute_is_last_flags_simple_tree() {
+        use tau_agent::protocol::TaskInfo;
+
+        let make_task = |id: i64| TaskInfo {
+            id,
+            project: String::new(),
+            title: format!("Task {}", id),
+            state: "active".to_string(),
+            priority: 0,
+            parent_id: None,
+            tags: None,
+            affected_files: None,
+            branch: None,
+            worktree_path: None,
+            session_id: None,
+            skip_review: false,
+            skip_planning: false,
+            require_approval: false,
+            created_at: 0,
+            updated_at: 0,
+        };
+
+        // Tree structure:
+        // depth 0: task 1
+        //   depth 1: task 2
+        //   depth 1: task 3
+        // depth 0: task 4
+        let tasks: Vec<(usize, TaskInfo)> = vec![
+            (0, make_task(1)),
+            (1, make_task(2)),
+            (1, make_task(3)),
+            (0, make_task(4)),
+        ];
+        let filtered: Vec<usize> = vec![0, 1, 2, 3];
+        let flags = compute_is_last_flags(&tasks, &filtered);
+        // task 1 (depth 0): not last (task 4 follows at depth 0)
+        assert!(!flags[0], "task 1 should not be last sibling");
+        // task 2 (depth 1): not last (task 3 follows at depth 1)
+        assert!(!flags[1], "task 2 should not be last sibling");
+        // task 3 (depth 1): last (task 4 follows at depth 0 < 1)
+        assert!(flags[2], "task 3 should be last sibling");
+        // task 4 (depth 0): last (no more tasks)
+        assert!(flags[3], "task 4 should be last sibling");
     }
 }
