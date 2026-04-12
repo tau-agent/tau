@@ -332,6 +332,8 @@ enum ProjectAction {
         /// New project name
         new_name: String,
     },
+    /// Run one-time project migration (converts path-based projects to name-based)
+    Migrate,
 }
 
 fn main() {
@@ -1863,6 +1865,7 @@ fn cmd_project(action: ProjectAction) -> tau_agent::Result<()> {
         ProjectAction::List => cmd_project_list(),
         ProjectAction::Info => cmd_project_info(),
         ProjectAction::Rename { new_name } => cmd_project_rename(&new_name),
+        ProjectAction::Migrate => cmd_project_migrate(),
     }
 }
 
@@ -1984,6 +1987,15 @@ fn cmd_project_info() -> tau_agent::Result<()> {
         println!("registered: no (run `tau project init` to register)");
     }
 
+    Ok(())
+}
+
+fn cmd_project_migrate() -> tau_agent::Result<()> {
+    let tau_db_path = tau_agent::paths::data_dir().join("tau.db");
+    let tasks_db_path = tau_agent::paths::data_dir().join("tasks.db");
+    let db = tau_agent::db::Db::open(&tau_db_path)?;
+    tau_agent::migration::run_project_migration(&db, &tasks_db_path)?;
+    eprintln!("Migration complete.");
     Ok(())
 }
 

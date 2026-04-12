@@ -150,6 +150,10 @@ impl Db {
                 path        TEXT NOT NULL UNIQUE,
                 last_seen   INTEGER NOT NULL,
                 created_at  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS migrations (
+                name       TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
             );",
         )
         .map_err(db_err("create tables"))?;
@@ -218,7 +222,7 @@ impl Db {
                 last_phase     TEXT,
                 auto_archive   INTEGER NOT NULL DEFAULT 0,
                 notify_parent  INTEGER NOT NULL DEFAULT 1,
-                project_name TEXT
+                project_name   TEXT
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,
@@ -241,6 +245,10 @@ impl Db {
                 path        TEXT NOT NULL UNIQUE,
                 last_seen   INTEGER NOT NULL,
                 created_at  INTEGER NOT NULL
+            );
+            CREATE TABLE migrations (
+                name       TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
             );",
         )
         .map_err(db_err("create tables"))?;
@@ -1082,6 +1090,69 @@ impl Db {
             .execute("DELETE FROM projects WHERE name = ?1", params![name])
             .map_err(db_err("delete project"))?;
         Ok(())
+    }
+
+    // ----- migrations -----
+
+    /// Ensure the migrations table exists (for CLI usage outside of Db::open).
+    pub fn ensure_migrations_table(&self) -> crate::Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS migrations (
+                    name       TEXT PRIMARY KEY,
+                    applied_at INTEGER NOT NULL
+                );",
+            )
+            .map_err(db_err("create migrations table"))?;
+        Ok(())
+    }
+
+    /// Check if a named migration has been applied.
+    pub fn has_migration(&self, name: &str) -> crate::Result<bool> {
+        let exists: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM migrations WHERE name = ?1)",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(db_err("has_migration"))?;
+        Ok(exists)
+    }
+
+    /// Record a migration as having been applied.
+    pub fn record_migration(&self, name: &str) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO migrations (name, applied_at) VALUES (?1, ?2)",
+                params![name, now],
+            )
+            .map_err(db_err("record_migration"))?;
+        Ok(())
+    }
+
+    // ----- migration helpers -----
+
+    /// Get all sessions with their `cwd` (including archived sessions).
+    pub fn get_all_session_cwds(&self) -> crate::Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, cwd FROM sessions")
+            .map_err(db_err("prepare get_all_session_cwds"))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(db_err("query get_all_session_cwds"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(db_err("read session cwd row"))?);
+        }
+        Ok(result)
+    }
+
+    /// Set the `project_name` for a session.
+    pub fn set_session_project_name(&self, id: &str, name: &str) -> crate::Result<()> {
+        self.update_session_field(id, "project_name", &name)
     }
 }
 

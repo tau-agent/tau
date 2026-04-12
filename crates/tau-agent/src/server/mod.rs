@@ -331,6 +331,14 @@ pub async fn run() -> crate::Result<()> {
         .map_err(|e| crate::Error::Io(format!("write pidfile: {}", e)))?;
 
     let db = Db::open_default()?;
+
+    // Run one-time project migration if needed
+    let tasks_db_path = crate::paths::data_dir().join("tasks.db");
+    if let Err(e) = crate::migration::run_project_migration(&db, &tasks_db_path) {
+        eprintln!("WARNING: project migration failed: {}", e);
+        eprintln!("Run `tau project migrate` to retry manually.");
+    }
+
     eprintln!("tau server listening on {}", sock.display());
 
     // Load plugins
