@@ -142,8 +142,16 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
             let n_edits = edits.len();
             let (added, removed): (usize, usize) = edits.iter().fold((0, 0), |(a, r), edit| {
                 (
-                    a + edit.new_text.lines().count().max(1),
-                    r + edit.old_text.lines().count().max(1),
+                    a + if edit.new_text.is_empty() {
+                        0
+                    } else {
+                        edit.new_text.lines().count().max(1)
+                    },
+                    r + if edit.old_text.is_empty() {
+                        0
+                    } else {
+                        edit.old_text.lines().count().max(1)
+                    },
                 )
             });
             let summary = if n_edits == 1 {

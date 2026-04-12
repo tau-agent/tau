@@ -121,8 +121,9 @@ fn maybe_add_summary(output: &mut ToolOutput, command: &str, exit_code: i32) {
     let text_content = output.content.first().map(|c| c.text()).unwrap_or("");
     let line_count = text_content.lines().count();
     if line_count > 20 {
-        let cmd_preview = if command.len() > 60 {
-            format!("{}...", &command[..57])
+        let cmd_preview = if command.chars().count() > 60 {
+            let truncated: String = command.chars().take(57).collect();
+            format!("{}...", truncated)
         } else {
             command.to_string()
         };
