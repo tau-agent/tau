@@ -24,6 +24,7 @@ pub(crate) fn resolve_path(cwd: &str, path: &str) -> PathBuf {
 pub struct ToolOutput {
     pub content: Vec<ToolResultContent>,
     pub is_error: bool,
+    pub summary: Option<String>,
 }
 
 impl ToolOutput {
@@ -34,6 +35,7 @@ impl ToolOutput {
                 text_signature: None,
             })],
             is_error: false,
+            summary: None,
         }
     }
 
@@ -44,7 +46,13 @@ impl ToolOutput {
                 text_signature: None,
             })],
             is_error: true,
+            summary: None,
         }
+    }
+
+    pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
     }
 }
 
@@ -71,6 +79,7 @@ pub fn execute_tool(tools: &[ToolDef], tool_call: &ToolCall, cwd: &str) -> ToolR
         is_error: result.is_error,
         timestamp: timestamp_ms(),
         duration_ms: None,
+        summary: result.summary,
     }
 }
 

@@ -139,14 +139,31 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
 
     match std::fs::write(&path, &content) {
         Ok(()) => {
+            let n_edits = edits.len();
+            let (added, removed): (usize, usize) = edits.iter().fold((0, 0), |(a, r), edit| {
+                (
+                    a + edit.new_text.lines().count().max(1),
+                    r + edit.old_text.lines().count().max(1),
+                )
+            });
+            let summary = if n_edits == 1 {
+                format!("edit: {} (+{} -{} lines)", path_str, added, removed)
+            } else {
+                format!(
+                    "edit: {} (+{} -{} lines, {} edits)",
+                    path_str, added, removed, n_edits
+                )
+            };
             if edits.len() == 1 {
                 ToolOutput::text(format!("Successfully edited {}", path.display()))
+                    .with_summary(summary)
             } else {
                 ToolOutput::text(format!(
                     "Successfully applied {} edits to {}",
                     edits.len(),
                     path.display()
                 ))
+                .with_summary(summary)
             }
         }
         Err(e) => ToolOutput::error(format!("failed to write {}: {}", path.display(), e)),

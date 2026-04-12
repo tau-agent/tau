@@ -91,6 +91,8 @@ pub enum MessageItem {
         output: String,
         is_error: bool,
         duration: Option<std::time::Duration>,
+        summary: Option<String>,
+        expanded: bool,
     },
     /// Status line (e.g. "[cancelled]", "[Working...]").
     Status { text: String },
@@ -188,11 +190,22 @@ impl MessageItem {
                 output,
                 is_error,
                 duration,
+                summary,
+                expanded,
                 ..
             } => {
                 let renderer = renderers.get(name);
-                let lines = renderer
-                    .render_complete(name, args, output, *is_error, *duration, theme, width);
+                let lines = renderer.render_complete(
+                    name,
+                    args,
+                    output,
+                    *is_error,
+                    *duration,
+                    theme,
+                    width,
+                    summary.as_deref(),
+                    *expanded,
+                );
                 Text::from(lines)
             }
             MessageItem::Status { text } => {

@@ -424,6 +424,7 @@ impl PluginHandle {
                         is_error: result.is_error,
                         timestamp: crate::types::timestamp_ms(),
                         duration_ms: None,
+                        summary: result.summary,
                     });
                 }
                 PluginMessage::ServerRequest {

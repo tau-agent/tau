@@ -71,6 +71,8 @@ pub trait ToolRenderer {
         duration: Option<Duration>,
         theme: &Theme,
         width: u16,
+        summary: Option<&str>,
+        expanded: bool,
     ) -> Vec<Line<'static>>;
 }
 
@@ -179,6 +181,35 @@ fn header_lines(
     lines
 }
 
+/// If a summary is available and the block is not expanded, render just the
+/// summary as a collapsed one-liner.  Returns `Some(lines)` if collapsed,
+/// `None` if the caller should fall through to full rendering.
+fn collapsed_summary(
+    summary: Option<&str>,
+    expanded: bool,
+    is_error: bool,
+    theme: &Theme,
+    width: u16,
+) -> Option<Vec<Line<'static>>> {
+    let summary = summary?;
+    if expanded {
+        return None;
+    }
+    let bg = if is_error {
+        theme.tool_error_style()
+    } else {
+        theme.tool_success_style()
+    };
+    let title_style = bg
+        .fg(theme.tool_title.to_ratatui())
+        .add_modifier(Modifier::BOLD);
+    let lines = vec![Line::from(Span::styled(
+        format!(" {}", summary),
+        title_style,
+    ))];
+    Some(wrap_tool_block(lines, bg, width))
+}
+
 /// Render output lines with clamping and indentation.
 fn output_lines(lines: &[String], theme: &Theme, bg: Style, max: usize) -> Vec<Line<'static>> {
     let styled: Vec<Line<'static>> = lines
@@ -237,7 +268,12 @@ impl ToolRenderer for DefaultRenderer {
         _duration: Option<Duration>,
         theme: &Theme,
         width: u16,
+        summary: Option<&str>,
+        expanded: bool,
     ) -> Vec<Line<'static>> {
+        if let Some(lines) = collapsed_summary(summary, expanded, is_error, theme, width) {
+            return lines;
+        }
         let bg = if is_error {
             theme.tool_error_style()
         } else {
@@ -309,7 +345,12 @@ impl ToolRenderer for BashRenderer {
         duration: Option<Duration>,
         theme: &Theme,
         width: u16,
+        summary: Option<&str>,
+        expanded: bool,
     ) -> Vec<Line<'static>> {
+        if let Some(lines) = collapsed_summary(summary, expanded, is_error, theme, width) {
+            return lines;
+        }
         let bg = if is_error {
             theme.tool_error_style()
         } else {
@@ -408,7 +449,12 @@ impl ToolRenderer for EditRenderer {
         _duration: Option<Duration>,
         theme: &Theme,
         width: u16,
+        summary: Option<&str>,
+        expanded: bool,
     ) -> Vec<Line<'static>> {
+        if let Some(lines) = collapsed_summary(summary, expanded, is_error, theme, width) {
+            return lines;
+        }
         let bg = if is_error {
             theme.tool_error_style()
         } else {
@@ -502,7 +548,12 @@ impl ToolRenderer for ReadRenderer {
         _duration: Option<Duration>,
         theme: &Theme,
         width: u16,
+        summary: Option<&str>,
+        expanded: bool,
     ) -> Vec<Line<'static>> {
+        if let Some(lines) = collapsed_summary(summary, expanded, is_error, theme, width) {
+            return lines;
+        }
         let bg = if is_error {
             theme.tool_error_style()
         } else {
@@ -551,7 +602,12 @@ impl ToolRenderer for WriteRenderer {
         _duration: Option<Duration>,
         theme: &Theme,
         width: u16,
+        summary: Option<&str>,
+        expanded: bool,
     ) -> Vec<Line<'static>> {
+        if let Some(lines) = collapsed_summary(summary, expanded, is_error, theme, width) {
+            return lines;
+        }
         let bg = if is_error {
             theme.tool_error_style()
         } else {
@@ -635,6 +691,8 @@ mod tests {
             Some(Duration::from_millis(1200)),
             &theme,
             80,
+            None,
+            true,
         );
         let text: String = lines
             .iter()
@@ -660,6 +718,8 @@ mod tests {
             None,
             &theme,
             80,
+            None,
+            true,
         );
         let text: String = lines
             .iter()
@@ -686,6 +746,8 @@ mod tests {
             Some(Duration::from_millis(50)),
             &theme,
             80,
+            None,
+            true,
         );
         let text: String = lines
             .iter()
@@ -716,6 +778,8 @@ mod tests {
             Some(Duration::from_millis(5)),
             &theme,
             80,
+            None,
+            true,
         );
         let text: String = lines
             .iter()

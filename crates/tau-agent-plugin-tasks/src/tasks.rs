@@ -29,6 +29,7 @@ fn tool_ok(tool_call_id: &str, text: &str) -> PluginToolResult {
             text_signature: None,
         })],
         is_error: false,
+        summary: None,
     }
 }
 
@@ -40,6 +41,19 @@ fn tool_err(tool_call_id: &str, text: &str) -> PluginToolResult {
             text_signature: None,
         })],
         is_error: true,
+        summary: None,
+    }
+}
+
+fn tool_ok_summary(tool_call_id: &str, text: &str, summary: impl Into<String>) -> PluginToolResult {
+    PluginToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        content: vec![ToolResultContent::Text(tau_agent_plugin::TextContent {
+            text: text.to_string(),
+            text_signature: None,
+        })],
+        is_error: false,
+        summary: Some(summary.into()),
     }
 }
 
@@ -481,7 +495,13 @@ fn handle_task_create(
             // Re-fetch to include the session_id updates
             match db.get_task(task.id) {
                 Ok(Some(updated_task)) => match serde_json::to_string_pretty(&updated_task) {
-                    Ok(json) => tool_ok(tool_call_id, &json),
+                    Ok(json) => {
+                        let summary = format!(
+                            "task_create: #{} \"{}\"",
+                            updated_task.id, updated_task.title
+                        );
+                        tool_ok_summary(tool_call_id, &json, summary)
+                    }
                     Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
                 },
                 Ok(None) => tool_err(tool_call_id, "task not found after create"),
@@ -679,7 +699,10 @@ fn handle_task_assign(
                 }
             }
             match serde_json::to_string_pretty(&result.task) {
-                Ok(json) => tool_ok(tool_call_id, &json),
+                Ok(json) => {
+                    let summary = format!("task_assign: #{}", id);
+                    tool_ok_summary(tool_call_id, &json, summary)
+                }
                 Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
             }
         }
@@ -749,7 +772,16 @@ fn handle_task_get(db: &TasksDb, args: &serde_json::Value, tool_call_id: &str) -
     });
 
     match serde_json::to_string_pretty(&result) {
-        Ok(json) => tool_ok(tool_call_id, &json),
+        Ok(json) => {
+            let summary = format!(
+                "task_get: #{} \"{}\" ({} messages, {} subtasks)",
+                task.id,
+                task.title,
+                messages.len(),
+                subtasks.len()
+            );
+            tool_ok_summary(tool_call_id, &json, summary)
+        }
         Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
     }
 }
@@ -767,7 +799,10 @@ fn handle_task_list(
 
     match db.list_tasks(project, state, parent_id, tag, limit) {
         Ok(tasks) => match serde_json::to_string_pretty(&tasks) {
-            Ok(json) => tool_ok(tool_call_id, &json),
+            Ok(json) => {
+                let summary = format!("task_list: {} tasks", tasks.len());
+                tool_ok_summary(tool_call_id, &json, summary)
+            }
             Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
         },
         Err(e) => tool_err(tool_call_id, &format!("list tasks: {}", e)),
@@ -1094,8 +1129,30 @@ fn handle_task_update(
                     task
                 };
 
+            let mut changes = Vec::new();
+            if let Some(state) = args.get("state").and_then(|v| v.as_str()) {
+                changes.push(format!("state → {}", state));
+            }
+            if args.get("title").and_then(|v| v.as_str()).is_some() {
+                changes.push("title".to_string());
+            }
+            if args.get("priority").is_some() {
+                changes.push("priority".to_string());
+            }
+            if args.get("tags").is_some() {
+                changes.push("tags".to_string());
+            }
+            if args.get("affected_files").is_some() {
+                changes.push("affected_files".to_string());
+            }
+            let summary = if changes.is_empty() {
+                format!("task_update: #{}", id)
+            } else {
+                format!("task_update: #{} ({})", id, changes.join(", "))
+            };
+
             match serde_json::to_string_pretty(&final_task) {
-                Ok(json) => tool_ok(tool_call_id, &json),
+                Ok(json) => tool_ok_summary(tool_call_id, &json, summary),
                 Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
             }
         }
@@ -1180,7 +1237,10 @@ fn handle_task_message(
     let author = session_id.unwrap_or("user");
     match db.add_message(id, content, Some(author)) {
         Ok(msg) => match serde_json::to_string_pretty(&msg) {
-            Ok(json) => tool_ok(tool_call_id, &json),
+            Ok(json) => {
+                let summary = format!("task_message: #{} (message added)", id);
+                tool_ok_summary(tool_call_id, &json, summary)
+            }
             Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
         },
         Err(e) => tool_err(tool_call_id, &format!("add message: {}", e)),
@@ -1192,7 +1252,7 @@ fn handle_task_message_edit(
     args: &serde_json::Value,
     tool_call_id: &str,
 ) -> PluginToolResult {
-    let _task_id = match args.get("task_id").and_then(|v| v.as_i64()) {
+    let task_id = match args.get("task_id").and_then(|v| v.as_i64()) {
         Some(id) => id,
         None => return tool_err(tool_call_id, "task_id is required"),
     };
@@ -1207,7 +1267,10 @@ fn handle_task_message_edit(
 
     match db.edit_message(message_id, content) {
         Ok(msg) => match serde_json::to_string_pretty(&msg) {
-            Ok(json) => tool_ok(tool_call_id, &json),
+            Ok(json) => {
+                let summary = format!("task_message_edit: #{} message #{}", task_id, message_id);
+                tool_ok_summary(tool_call_id, &json, summary)
+            }
             Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
         },
         Err(e) => tool_err(tool_call_id, &format!("edit message: {}", e)),
@@ -1255,7 +1318,10 @@ fn handle_task_search(
 
     match db.search_tasks(project, query, state) {
         Ok(tasks) => match serde_json::to_string_pretty(&tasks) {
-            Ok(json) => tool_ok(tool_call_id, &json),
+            Ok(json) => {
+                let summary = format!("task_search: {} results", tasks.len());
+                tool_ok_summary(tool_call_id, &json, summary)
+            }
             Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
         },
         Err(e) => tool_err(tool_call_id, &format!("search tasks: {}", e)),
@@ -1296,14 +1362,18 @@ fn handle_task_schedule(
                 return tool_ok(tool_call_id, "No ready tasks to schedule.");
             }
             match serde_json::to_string_pretty(&scheduled) {
-                Ok(json) => tool_ok(
-                    tool_call_id,
-                    &format!(
-                        "Scheduled {} task(s) for dispatch:\n{}",
-                        scheduled.len(),
-                        json
-                    ),
-                ),
+                Ok(json) => {
+                    let summary = format!("task_schedule: {} tasks scheduled", scheduled.len());
+                    tool_ok_summary(
+                        tool_call_id,
+                        &format!(
+                            "Scheduled {} task(s) for dispatch:\n{}",
+                            scheduled.len(),
+                            json
+                        ),
+                        summary,
+                    )
+                }
                 Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
             }
         }
@@ -1404,7 +1474,10 @@ fn handle_task_merge(
                 }
 
                 match serde_json::to_string_pretty(&result) {
-                    Ok(json) => tool_ok(tool_call_id, &json),
+                    Ok(json) => {
+                        let summary = format!("task_merge: #{} merged", id);
+                        tool_ok_summary(tool_call_id, &json, summary)
+                    }
                     Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
                 }
             } else {

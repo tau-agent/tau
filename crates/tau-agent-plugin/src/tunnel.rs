@@ -84,6 +84,7 @@ pub fn server_request(
                             text_signature: None,
                         })],
                         is_error: true,
+                        summary: None,
                     }),
                 );
                 // Continue waiting for our ServerResponse.

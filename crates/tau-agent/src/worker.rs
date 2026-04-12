@@ -191,6 +191,7 @@ async fn async_main() -> crate::Result<()> {
                                 tool_call_id,
                                 content: result.content,
                                 is_error: result.is_error,
+                                summary: result.summary,
                             }))
                             .await;
                     })
@@ -676,7 +677,12 @@ async fn handle_session_tool(
                             }
                         ));
                     }
-                    ToolResultMessage::success(tcid, "", text.trim_end())
+                    let mut result = ToolResultMessage::success(tcid, "", text.trim_end());
+                    result.summary = Some(format!(
+                        "session_join: {} sessions completed",
+                        results.len()
+                    ));
+                    result
                 }
                 Ok(crate::protocol::Response::Error { message }) => {
                     ToolResultMessage::error(tcid, "", &message)
@@ -718,7 +724,12 @@ async fn handle_session_tool(
                             }
                         ));
                     }
-                    ToolResultMessage::success(tcid, "", text.trim_end())
+                    let mut result = ToolResultMessage::success(tcid, "", text.trim_end());
+                    result.summary = Some(format!(
+                        "session_join_all: {} sessions completed",
+                        results.len()
+                    ));
+                    result
                 }
                 Ok(crate::protocol::Response::Error { message }) => {
                     ToolResultMessage::error(tcid, "", &message)
@@ -767,7 +778,12 @@ async fn handle_session_tool(
                             }
                         ));
                     }
-                    ToolResultMessage::success(tcid, "", text.trim_end())
+                    let mut result = ToolResultMessage::success(tcid, "", text.trim_end());
+                    result.summary = Some(format!(
+                        "session_join_any: {} sessions completed",
+                        results.len()
+                    ));
+                    result
                 }
                 Ok(crate::protocol::Response::Error { message }) => {
                     ToolResultMessage::error(tcid, "", &message)
@@ -824,7 +840,9 @@ async fn handle_session_tool(
                         .filter(|s| s.parent_id.as_deref() == Some(parent))
                         .collect();
                     if children.is_empty() {
-                        ToolResultMessage::success(tcid, "", "No child sessions")
+                        let mut result = ToolResultMessage::success(tcid, "", "No child sessions");
+                        result.summary = Some("session_list_children: 0 sessions".to_string());
+                        result
                     } else {
                         let mut text = String::new();
                         for c in &children {
@@ -833,7 +851,12 @@ async fn handle_session_tool(
                                 c.id, c.provider, c.model, c.message_count
                             ));
                         }
-                        ToolResultMessage::success(tcid, "", text.trim_end())
+                        let mut result = ToolResultMessage::success(tcid, "", text.trim_end());
+                        result.summary = Some(format!(
+                            "session_list_children: {} sessions",
+                            children.len()
+                        ));
+                        result
                     }
                 }
                 Ok(crate::protocol::Response::Error { message }) => {
@@ -904,10 +927,16 @@ async fn handle_session_tool(
                             _ => {}
                         }
                     }
+                    let msg_count = msgs.len();
                     if text.is_empty() {
-                        ToolResultMessage::success(tcid, "", "(no messages)")
+                        let mut result = ToolResultMessage::success(tcid, "", "(no messages)");
+                        result.summary = Some(format!("session_read: {} (0 messages)", sid));
+                        result
                     } else {
-                        ToolResultMessage::success(tcid, "", text.trim_end())
+                        let mut result = ToolResultMessage::success(tcid, "", text.trim_end());
+                        result.summary =
+                            Some(format!("session_read: {} ({} messages)", sid, msg_count));
+                        result
                     }
                 }
                 Ok(crate::protocol::Response::Error { message }) => {

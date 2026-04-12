@@ -91,6 +91,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                         is_error: result.is_error,
                         timestamp: crate::types::timestamp_ms(),
                         duration_ms: None,
+                        summary: result.summary,
                     });
                 }
                 crate::plugin::PluginMessage::ServerRequest {

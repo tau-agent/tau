@@ -1381,6 +1381,7 @@ mod tests {
                 is_error: false,
                 timestamp: 4001,
                 duration_ms: None,
+                summary: None,
             }),
         )
         .unwrap();
@@ -1665,6 +1666,7 @@ mod tests {
                 is_error: false,
                 timestamp: 2000,
                 duration_ms: None,
+                summary: None,
             }),
         )
         .unwrap();

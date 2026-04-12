@@ -134,6 +134,8 @@ pub struct PluginToolResult {
     pub tool_call_id: String,
     pub content: Vec<ToolResultContent>,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Convert a `PluginToolDef` to a `Tool` (for LLM context).

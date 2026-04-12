@@ -120,6 +120,7 @@ pub(super) async fn execute_tool_impl(
             is_error: true,
             timestamp: timestamp_ms(),
             duration_ms: None,
+            summary: None,
         },
     };
 

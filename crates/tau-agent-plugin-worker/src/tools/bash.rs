@@ -116,6 +116,28 @@ fn format_output(stdout: String, stderr: String, exit_code: i32, timed_out: bool
     }
 }
 
+/// Generate a summary for long bash output.
+fn maybe_add_summary(output: &mut ToolOutput, command: &str, exit_code: i32) {
+    let text_content = output.content.first().map(|c| c.text()).unwrap_or("");
+    let line_count = text_content.lines().count();
+    if line_count > 20 {
+        let cmd_preview = if command.len() > 60 {
+            format!("{}...", &command[..57])
+        } else {
+            command.to_string()
+        };
+        let exit_suffix = if exit_code != 0 {
+            format!(", exit {}", exit_code)
+        } else {
+            String::new()
+        };
+        output.summary = Some(format!(
+            "bash: $ {} → {} lines{}",
+            cmd_preview, line_count, exit_suffix
+        ));
+    }
+}
+
 /// Streaming bash execution: calls `on_delta` for each output line.
 /// Returns the final ToolOutput.
 pub fn execute_streaming(
@@ -168,12 +190,14 @@ pub fn execute_streaming(
     let status = child.wait();
     let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
 
-    format_output(
+    let mut output = format_output(
         collected_stdout,
         collected_stderr,
         exit_code,
         timed_out.load(Ordering::Relaxed),
-    )
+    );
+    maybe_add_summary(&mut output, command, exit_code);
+    output
 }
 
 fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
@@ -220,12 +244,14 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
     let status = child.wait();
     let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
 
-    format_output(
+    let mut output = format_output(
         collected_stdout,
         collected_stderr,
         exit_code,
         timed_out.load(Ordering::Relaxed),
-    )
+    );
+    maybe_add_summary(&mut output, command, exit_code);
+    output
 }
 
 #[cfg(test)]

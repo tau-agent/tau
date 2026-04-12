@@ -293,6 +293,7 @@ pub async fn run(
                         tool_name: remaining_tc.name.clone(),
                         is_error: true,
                         content: "error: cancelled before execution".into(),
+                        summary: None,
                     });
                     let tool_msg = Message::ToolResult(stub.clone());
                     emit_message(config, &tool_msg);
@@ -355,6 +356,7 @@ pub async fn run(
                 tool_name: result.tool_name.clone(),
                 is_error: result.is_error,
                 content,
+                summary: result.summary.clone(),
             });
 
             let tool_msg = Message::ToolResult(result.clone());

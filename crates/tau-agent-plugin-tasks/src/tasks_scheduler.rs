@@ -2813,6 +2813,7 @@ mod tests {
                                 },
                             )],
                             is_error: true,
+                            summary: None,
                         }),
                     );
                 }

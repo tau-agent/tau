@@ -843,14 +843,19 @@ async fn send_and_print(
                         tool_name,
                         is_error,
                         content,
+                        summary,
                         ..
                     } => {
-                        let preview: String =
-                            content.split_whitespace().collect::<Vec<_>>().join(" ");
-                        let preview = if preview.len() > 100 {
-                            format!("{}...", &preview[..100])
+                        let preview = if let Some(summary) = summary {
+                            summary.clone()
                         } else {
-                            preview
+                            let p: String =
+                                content.split_whitespace().collect::<Vec<_>>().join(" ");
+                            if p.len() > 100 {
+                                format!("{}...", &p[..100])
+                            } else {
+                                p
+                            }
                         };
                         if *is_error {
                             eprintln!("[tool error: {} {}]", tool_name, preview);

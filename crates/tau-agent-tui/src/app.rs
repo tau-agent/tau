@@ -183,6 +183,9 @@ pub struct App {
     /// Most recent steer message text (shown above the input box).
     /// Cleared when the next assistant turn starts (`StreamEvent::Start`).
     pub pending_steer: Option<String>,
+
+    /// Whether tool outputs are expanded (showing full output) or collapsed (showing summary).
+    pub all_tools_expanded: bool,
 }
 
 /// Saved state when navigating to a child session.
@@ -258,6 +261,7 @@ impl App {
             current_task_id: None,
             turn_text_finalized: false,
             pending_steer: None,
+            all_tools_expanded: false,
         }
     }
 
@@ -316,6 +320,7 @@ impl App {
                     is_error,
                     content,
                     duration_ms,
+                    summary,
                     ..
                 }) => {
                     let output = content
@@ -337,6 +342,8 @@ impl App {
                         output,
                         is_error: *is_error,
                         duration: duration_ms.map(std::time::Duration::from_millis),
+                        summary: summary.clone(),
+                        expanded: self.all_tools_expanded,
                     });
                 }
                 Message::CompactionSummary(_) => {
@@ -623,6 +630,16 @@ impl App {
             // End: scroll to bottom when scrolled, else pass to textarea
             (KeyCode::End, KeyModifiers::NONE) if self.is_scrolled() => {
                 self.scroll_to_bottom();
+                None
+            }
+            // F3: toggle expand/collapse all tool outputs
+            (KeyCode::F(3), _) => {
+                self.all_tools_expanded = !self.all_tools_expanded;
+                for item in &mut self.messages {
+                    if let MessageItem::ToolComplete { expanded, .. } = item {
+                        *expanded = self.all_tools_expanded;
+                    }
+                }
                 None
             }
             // TAB: open session picker
@@ -1566,6 +1583,16 @@ impl App {
                 self.scroll_to_bottom();
                 None
             }
+            // F3: toggle expand/collapse all tool outputs
+            (KeyCode::F(3), _) => {
+                self.all_tools_expanded = !self.all_tools_expanded;
+                for item in &mut self.messages {
+                    if let MessageItem::ToolComplete { expanded, .. } = item {
+                        *expanded = self.all_tools_expanded;
+                    }
+                }
+                None
+            }
             // TAB: open session picker
             (KeyCode::Tab, _) => Some(Action::OpenSessionPicker),
             // F2: open task picker
@@ -2075,6 +2102,8 @@ impl App {
                         output: "[interrupted]".into(),
                         is_error: true,
                         duration: Some(started_at.elapsed()),
+                        summary: None,
+                        expanded: self.all_tools_expanded,
                     };
                 }
                 _ => {}
@@ -2512,6 +2541,7 @@ impl App {
                 tool_name,
                 is_error,
                 content,
+                summary,
             } => {
                 // Find matching active tool by tool_call_id (search from end)
                 if let Some(item @ MessageItem::ToolActive { .. }) =
@@ -2534,6 +2564,8 @@ impl App {
                         output: content,
                         is_error,
                         duration: Some(started_at.elapsed()),
+                        summary,
+                        expanded: self.all_tools_expanded,
                     };
                 } else {
                     self.messages.push(MessageItem::ToolComplete {
@@ -2542,6 +2574,8 @@ impl App {
                         output: content,
                         is_error,
                         duration: None,
+                        summary,
+                        expanded: self.all_tools_expanded,
                     });
                 }
             }

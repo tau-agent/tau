@@ -408,6 +408,7 @@ fn execute_mock_tool_response(
                 is_error: false,
                 timestamp: timestamp_ms(),
                 duration_ms: None,
+                summary: None,
             }),
             MockToolResponse::ToolError(msg) => Ok(ToolResultMessage {
                 tool_call_id: tool_call.id.clone(),
@@ -420,6 +421,7 @@ fn execute_mock_tool_response(
                 is_error: true,
                 timestamp: timestamp_ms(),
                 duration_ms: None,
+                summary: None,
             }),
             MockToolResponse::ExecutorError(msg) => Err(tau_agent_base::Error::Http(msg)),
             MockToolResponse::Delayed { delay_ms, response } => {

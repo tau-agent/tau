@@ -33,11 +33,11 @@ pub fn tool_def() -> ToolDef {
 }
 
 fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
-    let Some(path) = args.get("path").and_then(|p| p.as_str()) else {
+    let Some(path_str) = args.get("path").and_then(|p| p.as_str()) else {
         return ToolOutput::error("missing 'path' argument");
     };
 
-    let path = super::resolve_path(cwd, path);
+    let path = super::resolve_path(cwd, path_str);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => return ToolOutput::error(format!("failed to read {}: {}", path.display(), e)),
@@ -72,5 +72,17 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
         ));
     }
 
-    ToolOutput::text(result)
+    let summary = if start == 0 && end == total {
+        format!("read: {} ({} lines)", path_str, total)
+    } else {
+        format!(
+            "read: {} (lines {}-{}, {} total)",
+            path_str,
+            start + 1,
+            end,
+            total
+        )
+    };
+
+    ToolOutput::text(result).with_summary(summary)
 }

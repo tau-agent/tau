@@ -179,6 +179,8 @@ pub struct ToolResultMessage {
     pub timestamp: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 impl ToolResultMessage {
@@ -198,6 +200,7 @@ impl ToolResultMessage {
             is_error: false,
             timestamp: timestamp_ms(),
             duration_ms: None,
+            summary: None,
         }
     }
 
@@ -213,6 +216,7 @@ impl ToolResultMessage {
             is_error: true,
             timestamp: timestamp_ms(),
             duration_ms: None,
+            summary: None,
         }
     }
 }
@@ -471,6 +475,7 @@ pub enum StreamEvent {
         is_error: bool,
         /// Full text output.
         content: String,
+        summary: Option<String>,
     },
     Done {
         reason: StopReason,
@@ -545,6 +550,7 @@ mod tests {
             is_error: false,
             timestamp: 1000,
             duration_ms: Some(1234),
+            summary: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains("\"duration_ms\":1234"));
@@ -567,6 +573,36 @@ mod tests {
         assert!(
             !json.contains("duration_ms"),
             "duration_ms: None should not appear in JSON"
+        );
+    }
+
+    #[test]
+    fn tool_result_message_summary_roundtrip() {
+        let mut msg = ToolResultMessage::success("tc1", "read", "file contents...");
+        msg.summary = Some("read: src/main.rs (42 lines)".into());
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(json.contains("\"summary\":\"read: src/main.rs (42 lines)\""));
+        let deserialized: ToolResultMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            deserialized.summary,
+            Some("read: src/main.rs (42 lines)".into())
+        );
+    }
+
+    #[test]
+    fn tool_result_message_summary_backward_compat() {
+        let json = r#"{"tool_call_id":"tc1","tool_name":"bash","content":[{"type":"text","text":"ok"}],"is_error":false,"timestamp":1000}"#;
+        let msg: ToolResultMessage = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(msg.summary, None);
+    }
+
+    #[test]
+    fn tool_result_message_summary_none_not_serialized() {
+        let msg = ToolResultMessage::success("tc1", "bash", "ok");
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            !json.contains("summary"),
+            "summary: None should not appear in JSON"
         );
     }
 }

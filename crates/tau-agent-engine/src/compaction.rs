@@ -382,6 +382,7 @@ mod tests {
                 is_error: false,
                 timestamp: 0,
                 duration_ms: None,
+                summary: None,
             }),
             user(&big),
             assistant(&big, 1000),

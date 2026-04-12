@@ -923,6 +923,7 @@ mod tests {
                     is_error: false,
                     timestamp: 0,
                     duration_ms: None,
+                    summary: None,
                 }),
             ],
             tools: Vec::new(),

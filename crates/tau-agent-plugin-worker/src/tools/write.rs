@@ -48,11 +48,21 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
     }
 
     match std::fs::write(&path, content) {
-        Ok(()) => ToolOutput::text(format!(
-            "Successfully wrote {} bytes to {}",
-            content.len(),
-            path.display()
-        )),
+        Ok(()) => {
+            let line_count = content.lines().count();
+            let summary = format!(
+                "write: {} ({} lines, {} bytes)",
+                path_str,
+                line_count,
+                content.len()
+            );
+            ToolOutput::text(format!(
+                "Successfully wrote {} bytes to {}",
+                content.len(),
+                path.display()
+            ))
+            .with_summary(summary)
+        }
         Err(e) => ToolOutput::error(format!("failed to write {}: {}", path.display(), e)),
     }
 }
