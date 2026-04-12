@@ -557,8 +557,12 @@ fn dispatch_planning(
     let project_instructions =
         tasks_config::load_project_instructions(&task.project, "planning").unwrap_or_default();
 
+    let merge_target = db
+        .get_merge_target(task_id)
+        .unwrap_or_else(|_| "main".into());
+
     // Send planning-specific initial message.
-    let chat_msg = build_planning_message(task, &project_instructions);
+    let chat_msg = build_planning_message(task, &project_instructions, &merge_target);
     let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
@@ -593,10 +597,26 @@ fn dispatch_planning(
 }
 
 /// Build the initial message for a planning-state task.
-fn build_planning_message(task: &Task, project_instructions: &str) -> String {
+fn build_planning_message(task: &Task, project_instructions: &str, merge_target: &str) -> String {
+    let branch = task.branch.as_deref().unwrap_or("(not yet created)");
+
+    // Warn explicitly when the merge target is not main (nested subtask).
+    let nested_warning = if merge_target != "main" {
+        format!(
+            "\nIMPORTANT: This is a subtask. The merge target is {target}, NOT main. \
+             Plan your changes relative to that branch.\n",
+            target = merge_target,
+        )
+    } else {
+        String::new()
+    };
+
     let mut msg = format!(
         "You are in the PLANNING phase for task {id}: {title}\n\
          \n\
+         Task branch: {branch}\n\
+         Merge target: {target}\n\
+         {nested}\
          Use the task_get tool to read the full specification:\n\
          - Call `task_get` with arguments: {{\"id\": {id}}}\n\
          \n\
@@ -616,6 +636,9 @@ fn build_planning_message(task: &Task, project_instructions: &str) -> String {
          **Important**: This is a read-only planning phase. Do NOT create, edit, or write files.\n",
         id = task.id,
         title = task.title,
+        branch = branch,
+        target = merge_target,
+        nested = nested_warning,
     );
 
     if !project_instructions.is_empty() {
@@ -812,9 +835,27 @@ pub fn dispatch_review(
 
 /// Build the initial message for a review session.
 fn build_review_message(task: &Task, project_instructions: &str, merge_target: &str) -> String {
+    let branch = task.branch.as_deref().unwrap_or("(unknown)");
+    let worktree = task.worktree_path.as_deref().unwrap_or("(unknown)");
+
+    // Warn explicitly when the merge target is not main (nested subtask).
+    let nested_warning = if merge_target != "main" {
+        format!(
+            "\nIMPORTANT: The merge target is {target}, NOT main. \
+             Use `git diff {target}...HEAD` (not `git diff main`).\n",
+            target = merge_target,
+        )
+    } else {
+        String::new()
+    };
+
     let mut msg = format!(
         "You are REVIEWING task {id}: {title}\n\
          \n\
+         Task branch: {branch}\n\
+         Worktree: {worktree}\n\
+         Merge target: {target}\n\
+         {nested}\
          Use the task_get tool to read the full specification and review feedback:\n\
          - Call `task_get` with arguments: {{\"id\": {id}}}\n\
          \n\
@@ -836,7 +877,10 @@ fn build_review_message(task: &Task, project_instructions: &str, merge_target: &
            `task_update` with {{\"id\": {id}, \"state\": \"active\"}} to send it back to the worker\n",
         id = task.id,
         title = task.title,
+        branch = branch,
+        worktree = worktree,
         target = merge_target,
+        nested = nested_warning,
     );
 
     if !project_instructions.is_empty() {
@@ -931,7 +975,11 @@ pub fn dispatch_refining(
     let project_instructions =
         tasks_config::load_project_instructions(&task.project, "refining").unwrap_or_default();
 
-    let chat_msg = build_refining_message(task, &project_instructions);
+    let merge_target = db
+        .get_merge_target(task_id)
+        .unwrap_or_else(|_| "main".into());
+
+    let chat_msg = build_refining_message(task, &project_instructions, &merge_target);
     let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
@@ -965,7 +1013,7 @@ pub fn dispatch_refining(
 }
 
 /// Build the initial message for a refining session.
-fn build_refining_message(task: &Task, project_instructions: &str) -> String {
+fn build_refining_message(task: &Task, project_instructions: &str, merge_target: &str) -> String {
     let approval_instructions = if task.require_approval {
         format!(
             "After your review:\n\
@@ -990,9 +1038,25 @@ fn build_refining_message(task: &Task, project_instructions: &str) -> String {
         )
     };
 
+    let branch = task.branch.as_deref().unwrap_or("(not yet created)");
+
+    // Warn explicitly when the merge target is not main (nested subtask).
+    let nested_warning = if merge_target != "main" {
+        format!(
+            "\nIMPORTANT: This is a subtask. The merge target is {target}, NOT main. \
+             Evaluate the plan relative to that branch.\n",
+            target = merge_target,
+        )
+    } else {
+        String::new()
+    };
+
     let mut msg = format!(
         "You are REFINING the plan for task {id}: {title}\n\
          \n\
+         Task branch: {branch}\n\
+         Merge target: {target}\n\
+         {nested}\
          Use the task_get tool to read the task spec and the planning messages:\n\
          - Call `task_get` with arguments: {{\"id\": {id}}}\n\
          \n\
@@ -1010,6 +1074,9 @@ fn build_refining_message(task: &Task, project_instructions: &str) -> String {
          {approval}\n",
         id = task.id,
         title = task.title,
+        branch = branch,
+        target = merge_target,
+        nested = nested_warning,
         approval = approval_instructions,
     );
 
@@ -1299,9 +1366,28 @@ fn build_initial_message(task: &Task, merge_target: &str, project_instructions: 
         )
     };
 
+    let branch = task.branch.as_deref().unwrap_or("(unknown)");
+    let worktree = task.worktree_path.as_deref().unwrap_or("(unknown)");
+
+    // Warn explicitly when the merge target is not main (nested subtask).
+    let nested_warning = if merge_target != "main" {
+        format!(
+            "\nIMPORTANT: Your merge target is {target}, NOT main. \
+             Do all your work in this worktree ({worktree}). Do not switch directories.\n",
+            target = merge_target,
+            worktree = worktree,
+        )
+    } else {
+        String::new()
+    };
+
     let mut msg = format!(
         "You are working on task {id}: {title}\n\
          \n\
+         Your branch: {branch}\n\
+         Your worktree: {worktree}\n\
+         Merge target: {target}\n\
+         {nested}\
          Use the task_get tool (not a bash command) to read the full specification:\n\
          - Call the `task_get` tool with arguments: {{\"id\": {id}}}\n\
          \n\
@@ -1312,8 +1398,11 @@ fn build_initial_message(task: &Task, merge_target: &str, project_instructions: 
          Note: task_get and task_update are agent tools (like bash or edit), not CLI commands.",
         id = task.id,
         title = task.title,
-        review = review_instruction,
+        branch = branch,
+        worktree = worktree,
         target = merge_target,
+        nested = nested_warning,
+        review = review_instruction,
     );
 
     let trimmed = project_instructions.trim();
@@ -1792,7 +1881,9 @@ mod tests {
 
     #[test]
     fn test_build_initial_message_with_review() {
-        let task = make_task(5, 0, None);
+        let mut task = make_task(5, 0, None);
+        task.branch = Some("task-1-5".into());
+        task.worktree_path = Some("/tmp/wt-5".into());
         let msg = build_initial_message(&task, "main", "");
         assert!(msg.contains("task 5"));
         assert!(msg.contains("task_get"));
@@ -1807,12 +1898,20 @@ mod tests {
         assert!(!msg.contains("rebase"));
         // No project instructions supplied — the section header must not appear.
         assert!(!msg.contains("Project-specific worker instructions"));
+        // Branch, worktree, and merge target must be stated explicitly.
+        assert!(msg.contains("Your branch: task-1-5"));
+        assert!(msg.contains("Your worktree: /tmp/wt-5"));
+        assert!(msg.contains("Merge target: main"));
+        // No nested warning for main target.
+        assert!(!msg.contains("IMPORTANT"));
     }
 
     #[test]
     fn test_build_initial_message_skip_review() {
         let mut task = make_task(7, 0, None);
         task.skip_review = true;
+        task.branch = Some("task-1-7".into());
+        task.worktree_path = Some("/tmp/wt-7".into());
         let msg = build_initial_message(&task, "main", "");
         assert!(msg.contains("\"state\": \"approved\""));
         assert!(msg.contains("skip_review is true"));
@@ -1820,7 +1919,9 @@ mod tests {
 
     #[test]
     fn test_build_initial_message_tool_call_format() {
-        let task = make_task(42, 0, None);
+        let mut task = make_task(42, 0, None);
+        task.branch = Some("task-1-42".into());
+        task.worktree_path = Some("/tmp/wt-42".into());
         let msg = build_initial_message(&task, "main", "");
         // Should include JSON argument hint so agent knows the invocation format
         assert!(msg.contains(r#"{"id": 42}"#));
@@ -1835,17 +1936,27 @@ mod tests {
 
     #[test]
     fn test_build_initial_message_uses_merge_target() {
-        let task = make_task(42, 0, None);
+        let mut task = make_task(42, 0, None);
+        task.branch = Some("task-14-42".into());
+        task.worktree_path = Some("/tmp/wt-42".into());
         let msg = build_initial_message(&task, "task-1-5", "");
         assert!(msg.contains("do NOT merge into task-1-5"));
         assert!(!msg.contains("merge into main"));
         // Rebase instruction removed — merge queue handles it.
         assert!(!msg.contains("git rebase"));
+        // Merge target header
+        assert!(msg.contains("Merge target: task-1-5"));
+        // Nested subtask warning should appear.
+        assert!(msg.contains("IMPORTANT"));
+        assert!(msg.contains("NOT main"));
+        assert!(msg.contains("/tmp/wt-42"));
     }
 
     #[test]
     fn test_build_initial_message_includes_project_instructions() {
-        let task = make_task(9, 0, None);
+        let mut task = make_task(9, 0, None);
+        task.branch = Some("task-1-9".into());
+        task.worktree_path = Some("/tmp/wt-9".into());
         let instructions = "- Follow project style\n- Keep diffs minimal";
         let msg = build_initial_message(&task, "main", instructions);
         assert!(msg.contains("Project-specific worker instructions"));
@@ -1855,7 +1966,9 @@ mod tests {
 
     #[test]
     fn test_build_initial_message_blank_instructions_omitted() {
-        let task = make_task(11, 0, None);
+        let mut task = make_task(11, 0, None);
+        task.branch = Some("task-1-11".into());
+        task.worktree_path = Some("/tmp/wt-11".into());
         // Whitespace-only should be treated as empty — no section header.
         let msg = build_initial_message(&task, "main", "   \n\n  ");
         assert!(!msg.contains("Project-specific worker instructions"));
@@ -1863,10 +1976,19 @@ mod tests {
 
     #[test]
     fn test_build_review_message_uses_merge_target() {
-        let task = make_task(10, 0, None);
+        let mut task = make_task(10, 0, None);
+        task.branch = Some("task-14-10".into());
+        task.worktree_path = Some("/tmp/wt-10".into());
         let msg = build_review_message(&task, "", "task-1-5");
         assert!(msg.contains("git diff task-1-5...HEAD"));
-        assert!(!msg.contains("git diff main"));
+        assert!(!msg.contains("git diff main...HEAD"));
+        // Branch and worktree must be stated.
+        assert!(msg.contains("Task branch: task-14-10"));
+        assert!(msg.contains("Worktree: /tmp/wt-10"));
+        assert!(msg.contains("Merge target: task-1-5"));
+        // Nested subtask warning should appear.
+        assert!(msg.contains("IMPORTANT"));
+        assert!(msg.contains("NOT main"));
     }
 
     #[test]
@@ -2719,36 +2841,63 @@ mod tests {
     #[test]
     fn test_build_planning_message() {
         let task = make_task(10, 0, None);
-        let msg = build_planning_message(&task, "");
+        let msg = build_planning_message(&task, "", "main");
         assert!(msg.contains("PLANNING phase"));
         assert!(msg.contains("task 10"));
         assert!(msg.contains("task_get"));
         assert!(msg.contains("Do NOT modify any files"));
         assert!(msg.contains("refining"));
+        // Branch and merge target must be stated.
+        assert!(msg.contains("Task branch:"));
+        assert!(msg.contains("Merge target: main"));
+        // No nested warning for main target.
+        assert!(!msg.contains("IMPORTANT"));
     }
 
     #[test]
     fn test_build_planning_message_with_instructions() {
         let task = make_task(10, 0, None);
-        let msg = build_planning_message(&task, "Always check for race conditions.");
+        let msg = build_planning_message(&task, "Always check for race conditions.", "main");
         assert!(msg.contains("Always check for race conditions"));
         assert!(msg.contains("Project-specific planning instructions"));
     }
 
     #[test]
+    fn test_build_planning_message_nested_subtask() {
+        let mut task = make_task(10, 0, None);
+        task.branch = Some("task-14-10".into());
+        let msg = build_planning_message(&task, "", "task-1-14");
+        assert!(msg.contains("Task branch: task-14-10"));
+        assert!(msg.contains("Merge target: task-1-14"));
+        // Nested subtask warning should appear.
+        assert!(msg.contains("IMPORTANT"));
+        assert!(msg.contains("NOT main"));
+    }
+
+    #[test]
     fn test_build_review_message() {
-        let task = make_task(10, 0, None);
+        let mut task = make_task(10, 0, None);
+        task.branch = Some("task-1-10".into());
+        task.worktree_path = Some("/tmp/wt-10".into());
         let msg = build_review_message(&task, "", "main");
         assert!(msg.contains("REVIEWING task 10"));
         assert!(msg.contains("task_get"));
         assert!(msg.contains("git diff main...HEAD"));
         assert!(msg.contains("approved"));
         assert!(msg.contains("active"));
+        // Branch, worktree, and merge target must be stated.
+        assert!(msg.contains("Task branch: task-1-10"));
+        assert!(msg.contains("Worktree: /tmp/wt-10"));
+        assert!(msg.contains("Merge target: main"));
+        // No nested warning for main target.
+        assert!(!msg.contains("IMPORTANT"));
     }
 
     #[test]
     fn test_build_review_message_with_instructions() {
-        let task = make_task(10, 0, None);
+        let mut task = make_task(10, 0, None);
+        task.branch = Some("task-1-10".into());
+        task.worktree_path = Some("/tmp/wt-10".into());
         let msg = build_review_message(&task, "Check for SQL injection.", "main");
         assert!(msg.contains("Check for SQL injection"));
         assert!(msg.contains("Project-specific review instructions"));
@@ -2756,8 +2905,9 @@ mod tests {
 
     #[test]
     fn test_build_refining_message() {
-        let task = make_task(10, 0, None);
-        let msg = build_refining_message(&task, "");
+        let mut task = make_task(10, 0, None);
+        task.branch = Some("task-1-10".into());
+        let msg = build_refining_message(&task, "", "main");
         assert!(msg.contains("REFINING the plan"));
         assert!(msg.contains("task 10"));
         assert!(msg.contains("task_get"));
@@ -2765,12 +2915,17 @@ mod tests {
         assert!(msg.contains("planning"));
         // Default (require_approval=false): should not mention require_approval
         assert!(!msg.contains("require_approval"));
+        // Branch and merge target must be stated.
+        assert!(msg.contains("Task branch: task-1-10"));
+        assert!(msg.contains("Merge target: main"));
+        // No nested warning for main target.
+        assert!(!msg.contains("IMPORTANT"));
     }
 
     #[test]
     fn test_build_refining_message_with_instructions() {
         let task = make_task(10, 0, None);
-        let msg = build_refining_message(&task, "Ensure backward compat.");
+        let msg = build_refining_message(&task, "Ensure backward compat.", "main");
         assert!(msg.contains("Ensure backward compat."));
         assert!(msg.contains("Project-specific refining instructions"));
     }
@@ -2779,7 +2934,7 @@ mod tests {
     fn test_build_refining_message_require_approval_true() {
         let mut task = make_task(10, 0, None);
         task.require_approval = true;
-        let msg = build_refining_message(&task, "");
+        let msg = build_refining_message(&task, "", "main");
         assert!(msg.contains("REFINING the plan"));
         assert!(msg.contains("task 10"));
         // require_approval=true: should instruct to go to interactive, not ready
@@ -2796,11 +2951,23 @@ mod tests {
     fn test_build_refining_message_require_approval_false() {
         let mut task = make_task(10, 0, None);
         task.require_approval = false;
-        let msg = build_refining_message(&task, "");
+        let msg = build_refining_message(&task, "", "main");
         // require_approval=false: should instruct to go to ready
         assert!(msg.contains("\"state\": \"ready\""));
         // Should also mention interactive as a scope expansion option
         assert!(msg.contains("\"state\": \"interactive\""));
+    }
+
+    #[test]
+    fn test_build_refining_message_nested_subtask() {
+        let mut task = make_task(10, 0, None);
+        task.branch = Some("task-14-10".into());
+        let msg = build_refining_message(&task, "", "task-1-14");
+        assert!(msg.contains("Task branch: task-14-10"));
+        assert!(msg.contains("Merge target: task-1-14"));
+        // Nested subtask warning should appear.
+        assert!(msg.contains("IMPORTANT"));
+        assert!(msg.contains("NOT main"));
     }
 
     #[test]
