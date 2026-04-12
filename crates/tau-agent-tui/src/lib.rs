@@ -134,6 +134,7 @@ async fn run_inner(
         app.parent_id = info.parent_id;
         app.child_count = info.child_count;
         app.session_cwd = info.cwd;
+        app.session_project_name = info.project_name;
     }
 
     // Channel for server responses — background recv tasks push here.
@@ -308,9 +309,12 @@ async fn run_inner(
                     app.picker_edit_tagline = None;
                     app.picker_filter.clear();
                     app.picker_filter_mode = false;
+                    app.picker_project_filter = app.session_project_name.clone();
+                    app.picker_show_all_projects = false;
                     send_request_and_recv(
                         Request::ListSessions {
                             include_archived: false,
+                            project_name: None,
                         },
                         server_tx.clone(),
                     )
@@ -407,6 +411,7 @@ async fn run_inner(
                     send_request_and_recv(
                         Request::ListSessions {
                             include_archived: false,
+                            project_name: None,
                         },
                         server_tx.clone(),
                     )

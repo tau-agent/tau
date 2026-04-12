@@ -25,6 +25,7 @@ pub(super) struct PluginExecutor {
     pub(super) throttle: crate::throttle::ProviderThrottle,
     pub(super) session_id: String,
     pub(super) cwd: String,
+    pub(super) project_name: Option<String>,
     pub(super) test_overrides: SharedTestOverrides,
 }
 
@@ -71,7 +72,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                 arguments: tool_call.arguments.clone(),
                 cwd: Some(self.cwd.clone()),
                 session_id: Some(self.session_id.clone()),
-                project_name: None,
+                project_name: self.project_name.clone(),
             })
             .await?;
 
@@ -295,14 +296,14 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         let st = lock_state(state);
         st.registry.clone()
     };
-    let child_budget = {
+    let (child_budget, project_name) = {
         let st = lock_state(state);
         st.db
             .get_session(session_id)
             .ok()
             .flatten()
-            .map(|s| s.child_budget)
-            .unwrap_or(0)
+            .map(|s| (s.child_budget, s.project_name))
+            .unwrap_or((0, None))
     };
     let plugin_tools = if !test_overrides.mock_tools.is_empty() {
         test_overrides.mock_tools.clone()
@@ -372,6 +373,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                         throttle: throttle_clone,
                         session_id: session_id_for_executor,
                         cwd: cwd_clone,
+                        project_name,
                         test_overrides: test_overrides_clone.clone(),
                     })
                 };
@@ -521,7 +523,7 @@ pub(super) async fn run_child_chat(
                 }
                 Err(e) => eprintln!("child session {} plugin spawn error: {}", session_id, e),
             }
-            pm.notify_session_start_once(&cwd, &session_id);
+            pm.notify_session_start_once(&cwd, &session_id, stored.project_name.as_deref());
         }
 
         // Build system prompt if not set
@@ -756,7 +758,7 @@ pub(super) async fn resume_child_session(
                 }
                 Err(e) => eprintln!("resume session {} plugin spawn error: {}", session_id, e),
             }
-            pm.notify_session_start_once(&cwd, &session_id);
+            pm.notify_session_start_once(&cwd, &session_id, stored.project_name.as_deref());
         }
 
         // Repair any corrupted message history

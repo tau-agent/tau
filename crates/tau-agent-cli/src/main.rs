@@ -1465,7 +1465,10 @@ async fn cmd_auth_status() -> tau_agent::Result<()> {
 async fn cmd_sessions_list(include_archived: bool) -> tau_agent::Result<()> {
     let mut client = tau_agent::client::Client::connect_or_start().await?;
     client
-        .send(&tau_agent::protocol::Request::ListSessions { include_archived })
+        .send(&tau_agent::protocol::Request::ListSessions {
+            include_archived,
+            project_name: None,
+        })
         .await?;
 
     client

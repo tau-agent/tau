@@ -29,11 +29,14 @@ pub(super) async fn execute_tool_impl(
     use crate::protocol::Response;
     use crate::types::*;
 
-    // 1. Ensure session exists, get its cwd
-    let cwd = {
+    // 1. Ensure session exists, get its cwd and project_name
+    let (cwd, project_name) = {
         let st = lock_state(state);
         match st.db.get_session(session_id) {
-            Ok(Some(stored)) => stored.cwd.unwrap_or_else(|| "/tmp".to_string()),
+            Ok(Some(stored)) => (
+                stored.cwd.unwrap_or_else(|| "/tmp".to_string()),
+                stored.project_name,
+            ),
             Ok(None) => {
                 return Response::Error {
                     message: format!("session not found: {}", session_id),
@@ -101,6 +104,7 @@ pub(super) async fn execute_tool_impl(
             throttle: throttle.clone(),
             session_id: session_id.to_string(),
             cwd: cwd.clone(),
+            project_name,
             test_overrides: test_overrides.clone(),
         });
         executor.execute(&tool_call, &output_tx).await
@@ -178,7 +182,7 @@ pub(super) async fn handle_server_request(
             tagline,
             auto_archive,
             notify_parent,
-            ..
+            project_name,
         } => create_session_impl(
             state,
             model_id,
@@ -190,10 +194,14 @@ pub(super) async fn handle_server_request(
             tagline,
             *auto_archive,
             *notify_parent,
+            project_name,
         ),
         Request::GetSessionInfo { session_id } => get_session_info_impl(state, session_id),
         Request::GetMessages { session_id } => get_messages_impl(state, session_id),
-        Request::ListSessions { include_archived } => list_sessions_impl(state, *include_archived),
+        Request::ListSessions {
+            include_archived,
+            project_name,
+        } => list_sessions_impl(state, *include_archived, project_name.as_deref()),
         Request::CancelChat { session_id } => cancel_chat_impl(state, session_id),
         Request::Chat { session_id, text } => {
             match chat_spawn_tx.send((session_id.clone(), text.clone())).await {

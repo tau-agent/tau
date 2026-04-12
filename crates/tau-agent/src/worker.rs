@@ -834,6 +834,7 @@ async fn handle_session_tool(
             }
             let req = crate::protocol::Request::ListSessions {
                 include_archived: false,
+                project_name: None,
             };
             match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::Sessions { sessions }) => {

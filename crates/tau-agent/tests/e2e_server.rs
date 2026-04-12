@@ -46,6 +46,7 @@ fn server_create_session_and_list() {
         &conn2,
         &Request::ListSessions {
             include_archived: false,
+            project_name: None,
         },
     );
     match resp {
@@ -886,6 +887,7 @@ fn queue_message_persists_across_operations() {
         last_phase: None,
         auto_archive: false,
         notify_parent: true,
+        project_name: None,
     })
     .unwrap();
 
@@ -1950,6 +1952,7 @@ done
         &conn,
         &Request::ListSessions {
             include_archived: false,
+            project_name: None,
         },
     );
     match resp {

@@ -135,6 +135,8 @@ pub struct App {
     pub child_count: usize,
     /// Working directory of the current session (used as project key for task queries).
     pub session_cwd: Option<String>,
+    /// Project name of the current session.
+    pub session_project_name: Option<String>,
     /// Session list for the picker overlay.
     pub picker_sessions: Vec<SessionInfo>,
     /// Cursor position in the picker.
@@ -154,6 +156,10 @@ pub struct App {
     pub picker_edit_tagline: Option<(usize, String, usize)>,
     /// Set of session IDs whose subtrees are folded (children hidden).
     pub picker_folded: std::collections::HashSet<String>,
+    /// Project filter for session picker. When Some, only show sessions for this project.
+    pub picker_project_filter: Option<String>,
+    /// Whether the picker is showing all sessions (true) or project-filtered (false).
+    pub picker_show_all_projects: bool,
     /// Task list for the picker overlay (tree-ordered with depth).
     pub picker_tasks: Vec<(usize, TaskInfo)>,
     /// Cursor position in the task picker (into filtered indices).
@@ -201,6 +207,8 @@ pub struct NavEntry {
     pub last_usage_fetch: std::time::Instant,
     /// Working directory of the session at the time of navigation.
     pub session_cwd: Option<String>,
+    /// Project name of the session at the time of navigation.
+    pub session_project_name: Option<String>,
 }
 
 impl App {
@@ -241,6 +249,7 @@ impl App {
             parent_id: None,
             child_count: 0,
             session_cwd: None,
+            session_project_name: None,
             picker_sessions: Vec::new(),
             picker_cursor: 0,
             picker_confirm_delete: None,
@@ -250,6 +259,8 @@ impl App {
             picker_filter_mode: false,
             picker_edit_tagline: None,
             picker_folded: std::collections::HashSet::new(),
+            picker_project_filter: None,
+            picker_show_all_projects: false,
             picker_tasks: Vec::new(),
             task_picker_cursor: 0,
             task_picker_previous_mode: AppMode::Input,
@@ -664,12 +675,25 @@ impl App {
         let needle = self.picker_filter.to_lowercase();
         let filter_empty = self.picker_filter.is_empty();
 
+        // Project filtering: when a project filter is set and we're not in
+        // "show all" mode, restrict to sessions matching the project.
+        let project_filter_active =
+            self.picker_project_filter.is_some() && !self.picker_show_all_projects;
+
         self.picker_sessions
             .iter()
             .enumerate()
             .filter(|(idx, s)| {
                 if hidden.contains(idx) {
                     return false;
+                }
+                // Apply project filter
+                if project_filter_active {
+                    if let Some(ref pf) = self.picker_project_filter {
+                        if s.project_name.as_deref() != Some(pf.as_str()) {
+                            return false;
+                        }
+                    }
                 }
                 if filter_empty {
                     return true;
@@ -1063,6 +1087,12 @@ impl App {
                         self.picker_reset_transient();
                         return Some(Action::RestoreSession { session_id });
                     }
+                    None
+                }
+                // P (shift+p): toggle between project-filtered and all-sessions view
+                (KeyCode::Char('P'), _) => {
+                    self.picker_show_all_projects = !self.picker_show_all_projects;
+                    self.picker_cursor = 0;
                     None
                 }
                 // Ctrl+C: close picker, return to previous mode
@@ -1631,6 +1661,7 @@ impl App {
             subscription_usage: self.subscription_usage.take(),
             last_usage_fetch: self.last_usage_fetch,
             session_cwd: self.session_cwd.clone(),
+            session_project_name: self.session_project_name.clone(),
         });
     }
 
@@ -1647,6 +1678,7 @@ impl App {
         self.parent_id = info.parent_id.clone();
         self.child_count = info.child_count;
         self.session_cwd = info.cwd.clone();
+        self.session_project_name = info.project_name.clone();
         self.current_task_id = None;
         self.totals = UsageTotals::default();
         self.totals.context_window = info.stats.context_window;
@@ -1671,6 +1703,7 @@ impl App {
             self.subscription_usage = entry.subscription_usage;
             self.last_usage_fetch = entry.last_usage_fetch;
             self.session_cwd = entry.session_cwd;
+            self.session_project_name = entry.session_project_name;
             self.current_task_id = None;
             self.scroll_to_bottom();
             self.mode = AppMode::Input;

@@ -17,7 +17,13 @@ use crate::types::{Tool, ToolResultContent};
 #[allow(clippy::large_enum_variant)]
 pub enum PluginRequest {
     /// Initialize the plugin with session context.
-    Init { cwd: String, session_id: String },
+    Init {
+        cwd: String,
+        session_id: String,
+        /// Project name for this session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
+    },
     /// Call a hook.
     Hook {
         name: String,

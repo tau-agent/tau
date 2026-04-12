@@ -559,11 +559,17 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     // Clear the area behind the overlay
     frame.render_widget(Clear, picker_area);
 
-    // Title includes filter when active
+    // Title includes filter and project scope when active
     let title = if !app.picker_filter.is_empty() {
         format!(" Sessions [/{}] ", app.picker_filter)
     } else if app.picker_filter_mode {
         " Sessions [/] ".to_string()
+    } else if let Some(ref pf) = app.picker_project_filter {
+        if app.picker_show_all_projects {
+            " Sessions [all] ".to_string()
+        } else {
+            format!(" Sessions [{}] ", pf)
+        }
     } else {
         " Sessions ".to_string()
     };
@@ -776,6 +782,16 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             spans.push(Span::styled(id_short.to_string(), id_style));
             used += id_len;
 
+            // Project badge: when showing all projects, display [project] after session ID.
+            if app.picker_show_all_projects || app.picker_project_filter.is_none() {
+                if let Some(ref pn) = session.project_name {
+                    let badge = format!(" [{}]", pn);
+                    let badge_w = UnicodeWidthStr::width(badge.as_str());
+                    spans.push(Span::styled(badge, theme.fg(theme.dim)));
+                    used += badge_w;
+                }
+            }
+
             // Right-side info columns: fixed-width, right-aligned, so the
             // same field always appears in the same column across rows.
             //
@@ -896,7 +912,7 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
     } else if app.picker_edit_tagline.is_some() {
         " type tagline  ←/→ move  enter save  esc cancel"
     } else {
-        " /search  j/k nav  enter switch  f fold  r rename  A archive  R restore  D del  tab/esc close"
+        " /search  j/k nav  enter switch  f fold  r rename  P project  A archive  R restore  D del  tab/esc close"
     };
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()

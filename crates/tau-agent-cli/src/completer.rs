@@ -27,6 +27,7 @@ fn query(req: &Request) -> Option<Response> {
 pub fn session_completer() -> Vec<CompletionCandidate> {
     let Some(Response::Sessions { sessions }) = query(&Request::ListSessions {
         include_archived: false,
+        project_name: None,
     }) else {
         return vec![];
     };
@@ -57,6 +58,7 @@ pub fn model_completer() -> Vec<CompletionCandidate> {
 pub fn archived_session_completer() -> Vec<CompletionCandidate> {
     let Some(Response::Sessions { sessions }) = query(&Request::ListSessions {
         include_archived: true,
+        project_name: None,
     }) else {
         return vec![];
     };

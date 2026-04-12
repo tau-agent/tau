@@ -39,6 +39,7 @@ pub(super) fn create_session_impl(
     tagline: &Option<String>,
     auto_archive: bool,
     notify_parent: bool,
+    project_name: &Option<String>,
 ) -> crate::protocol::Response {
     use crate::protocol::Response;
     let st = lock_state(state);
@@ -79,6 +80,32 @@ pub(super) fn create_session_impl(
     let cwd = cwd
         .clone()
         .or_else(|| parent.as_ref().and_then(|p| p.cwd.clone()));
+
+    // Resolve project name: explicit > discovery > parent inheritance.
+    let project_name = project_name
+        .clone()
+        .or_else(|| {
+            cwd.as_deref().and_then(|c| {
+                let path = std::path::Path::new(c);
+                crate::project::discover_project(path).map(|(name, root)| {
+                    // Upsert: register the project in DB if not already present.
+                    let root_str = root.to_string_lossy();
+                    if st
+                        .db
+                        .get_project_by_path(&root_str)
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        let _ = st.db.create_project(&name, &root_str);
+                    } else {
+                        let _ = st.db.update_project_last_seen(&name);
+                    }
+                    name
+                })
+            })
+        })
+        .or_else(|| parent.as_ref().and_then(|p| p.project_name.clone()));
 
     // Resolve the model. When the request supplies an explicit model_id we
     // run it through the alias resolver (operator → project → global →
@@ -168,6 +195,7 @@ pub(super) fn create_session_impl(
         last_phase: None,
         auto_archive,
         notify_parent,
+        project_name,
     };
     match st.db.create_session(&stored) {
         Ok(()) => Response::SessionCreated { session_id: id },
@@ -222,9 +250,15 @@ pub(super) fn get_messages_impl(
 pub(super) fn list_sessions_impl(
     state: &SharedState,
     include_archived: bool,
+    project_name: Option<&str>,
 ) -> crate::protocol::Response {
     let st = lock_state(state);
-    match st.db.list_sessions(include_archived) {
+    let sessions_result = if let Some(pn) = project_name {
+        st.db.list_sessions_by_project(pn, include_archived)
+    } else {
+        st.db.list_sessions(include_archived)
+    };
+    match sessions_result {
         Ok(stored) => {
             let mut infos = Vec::new();
             for s in &stored {
@@ -323,7 +357,7 @@ pub(super) async fn handle_client(
                 tagline,
                 auto_archive,
                 notify_parent,
-                ..
+                project_name,
             } => {
                 // Atomic budget check + session creation (single lock hold)
                 let resp = create_session_impl(
@@ -337,6 +371,7 @@ pub(super) async fn handle_client(
                     &tagline,
                     auto_archive,
                     notify_parent,
+                    &project_name,
                 );
 
                 // If created and no explicit system prompt, set up plugins
@@ -449,7 +484,11 @@ pub(super) async fn handle_client(
                             }
                             Err(e) => eprintln!("failed to spawn session plugins: {}", e),
                         }
-                        pm.notify_session_start_once(&cwd, &session_id);
+                        pm.notify_session_start_once(
+                            &cwd,
+                            &session_id,
+                            stored.project_name.as_deref(),
+                        );
                     }
 
                     // Repair any corrupted message history (e.g. daemon killed
@@ -776,8 +815,11 @@ pub(super) async fn handle_client(
                 );
                 send(&mut writer, &Response::Ok).await.ok();
             }
-            crate::protocol::Request::ListSessions { include_archived } => {
-                let resp = list_sessions_impl(&state, include_archived);
+            crate::protocol::Request::ListSessions {
+                include_archived,
+                project_name,
+            } => {
+                let resp = list_sessions_impl(&state, include_archived, project_name.as_deref());
                 send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::ArchiveSession {

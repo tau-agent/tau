@@ -104,7 +104,7 @@ pub(super) fn session_info(
         context_pct,
         archived: stored.archived,
         last_exit_status: stored.last_exit_status.clone(),
-        project_name: None,
+        project_name: stored.project_name.clone(),
     }
 }
 
@@ -165,7 +165,7 @@ pub(super) fn session_info_from_db_stats(
         context_pct,
         archived: stored.archived,
         last_exit_status: stored.last_exit_status.clone(),
-        project_name: None,
+        project_name: stored.project_name.clone(),
     }
 }
 

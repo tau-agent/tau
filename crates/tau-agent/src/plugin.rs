@@ -385,7 +385,7 @@ impl PluginHandle {
         session_id: Option<&str>,
         on_output: &mut dyn FnMut(&str),
     ) -> crate::Result<crate::types::ToolResultMessage> {
-        self.execute_tool_with_server(tool_call, cwd, session_id, on_output, None)
+        self.execute_tool_with_server(tool_call, cwd, session_id, on_output, None, None)
     }
 
     /// Execute a tool call with optional server request handler.
@@ -400,6 +400,7 @@ impl PluginHandle {
         mut on_server_request: Option<
             &mut dyn FnMut(&crate::protocol::Request) -> crate::protocol::Response,
         >,
+        project_name: Option<&str>,
     ) -> crate::Result<crate::types::ToolResultMessage> {
         self.send(&PluginRequest::ToolCall {
             tool_call_id: tool_call.id.clone(),
@@ -407,7 +408,7 @@ impl PluginHandle {
             arguments: tool_call.arguments.clone(),
             cwd: cwd.map(String::from),
             session_id: session_id.map(String::from),
-            project_name: None,
+            project_name: project_name.map(String::from),
         })?;
 
         loop {
@@ -1148,6 +1149,7 @@ impl PluginManager {
         on_server_request: Option<
             &mut dyn FnMut(&crate::protocol::Request) -> crate::protocol::Response,
         >,
+        project_name: Option<&str>,
     ) -> crate::Result<crate::types::ToolResultMessage> {
         // Try session plugins first
         if let Some(sp) = self.session_plugins.get_mut(session_id)
@@ -1162,6 +1164,7 @@ impl PluginManager {
                     Some(session_id),
                     on_output,
                     on_server_request,
+                    project_name,
                 )?;
                 self.run_after_tool_hooks(session_id, tool_call, &mut result);
                 return Ok(result);
@@ -1178,6 +1181,7 @@ impl PluginManager {
                     Some(session_id),
                     on_output,
                     on_server_request,
+                    project_name,
                 )?;
                 self.run_after_tool_hooks(session_id, tool_call, &mut result);
                 Ok(result)
@@ -1335,14 +1339,19 @@ impl PluginManager {
     }
 
     /// Notify session start to all plugins (only once per session).
-    pub fn notify_session_start_once(&mut self, cwd: &str, session_id: &str) {
+    pub fn notify_session_start_once(
+        &mut self,
+        cwd: &str,
+        session_id: &str,
+        project_name: Option<&str>,
+    ) {
         if !self.initialized_sessions.insert(session_id.to_string()) {
             return; // already notified
         }
         let req = PluginRequest::SessionStart {
             cwd: cwd.to_string(),
             session_id: session_id.to_string(),
-            project_name: None,
+            project_name: project_name.map(String::from),
         };
         for plugin in &mut self.global_plugins {
             if plugin.wants_hook("session_start") {

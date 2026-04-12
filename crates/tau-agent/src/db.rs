@@ -54,6 +54,7 @@ pub struct StoredSession {
     pub auto_archive: bool,
     /// When true, notify parent session on child completion.
     pub notify_parent: bool,
+    pub project_name: Option<String>,
 }
 
 /// Stored project metadata.
@@ -66,7 +67,7 @@ pub struct Project {
 }
 
 /// SELECT column list shared across all queries that return `StoredSession` rows.
-const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent";
+const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name";
 
 /// Map a `rusqlite::Row` (selected with [`SESSION_COLUMNS`]) into a [`StoredSession`].
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<StoredSession> {
@@ -89,6 +90,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<StoredSession> {
         last_phase: row.get(11)?,
         auto_archive: row.get::<_, i32>(12)? != 0,
         notify_parent: row.get::<_, i32>(13)? != 0,
+        project_name: row.get(14)?,
     })
 }
 
@@ -169,6 +171,7 @@ impl Db {
         let _ = conn.execute_batch(
             "ALTER TABLE sessions ADD COLUMN notify_parent INTEGER NOT NULL DEFAULT 1;",
         );
+        let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN project_name TEXT;");
 
         // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
@@ -214,7 +217,8 @@ impl Db {
                 last_exit_status TEXT,
                 last_phase     TEXT,
                 auto_archive   INTEGER NOT NULL DEFAULT 0,
-                notify_parent  INTEGER NOT NULL DEFAULT 1
+                notify_parent  INTEGER NOT NULL DEFAULT 1,
+                project_name TEXT
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,
@@ -253,8 +257,8 @@ impl Db {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         self.conn
             .execute(
-                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                "INSERT INTO sessions (id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent, project_name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     session.id,
                     model_json,
@@ -270,6 +274,7 @@ impl Db {
                     session.last_phase,
                     session.auto_archive as i32,
                     session.notify_parent as i32,
+                    session.project_name,
                 ],
             )
             .map_err(db_err("insert session"))?;
@@ -305,6 +310,39 @@ impl Db {
         let rows = stmt
             .query_map([], row_to_session)
             .map_err(db_err("list sessions"))?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row.map_err(db_err("read session row"))?);
+        }
+        Ok(sessions)
+    }
+
+    /// List sessions for a specific project.
+    pub fn list_sessions_by_project(
+        &self,
+        project_name: &str,
+        include_archived: bool,
+    ) -> crate::Result<Vec<StoredSession>> {
+        let sql = if include_archived {
+            format!(
+                "SELECT {} FROM sessions WHERE project_name = ?1 ORDER BY created_at",
+                SESSION_COLUMNS
+            )
+        } else {
+            format!(
+                "SELECT {} FROM sessions WHERE project_name = ?1 AND archived = 0 ORDER BY created_at",
+                SESSION_COLUMNS
+            )
+        };
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(db_err("prepare list by project"))?;
+
+        let rows = stmt
+            .query_map(params![project_name], row_to_session)
+            .map_err(db_err("list sessions by project"))?;
 
         let mut sessions = Vec::new();
         for row in rows {
@@ -1094,6 +1132,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         };
         db.create_session(&session).unwrap();
 
@@ -1122,6 +1161,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         };
         db.create_session(&session).unwrap();
 
@@ -1160,6 +1200,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         };
         db.create_session(&session).unwrap();
         db.append_message("s1", &Message::User(UserMessage::text("hi")))
@@ -1189,6 +1230,7 @@ mod tests {
                 last_phase: None,
                 auto_archive: false,
                 notify_parent: true,
+                project_name: None,
             })
             .unwrap();
         }
@@ -1217,6 +1259,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
         assert_eq!(db.next_session_id().unwrap(), "s6");
@@ -1242,6 +1285,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1265,6 +1309,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1287,6 +1332,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1319,6 +1365,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1337,6 +1384,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1356,6 +1404,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1385,6 +1434,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1403,6 +1453,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1434,6 +1485,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
         db.append_message("top", &Message::User(UserMessage::text("hello")))
@@ -1455,6 +1507,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
         db.append_message("child1", &Message::User(UserMessage::text("work")))
@@ -1476,6 +1529,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
         db.append_message(
@@ -1500,6 +1554,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
         db.append_message(
@@ -1536,6 +1591,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1562,6 +1618,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1594,6 +1651,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1647,6 +1705,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1673,6 +1732,7 @@ mod tests {
                 last_phase: None,
                 auto_archive: false,
                 notify_parent: true,
+                project_name: None,
             })
             .unwrap();
         }
@@ -1707,6 +1767,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1736,6 +1797,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1761,6 +1823,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1839,6 +1902,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -1983,6 +2047,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
         db.append_message("old_archived", &Message::User(UserMessage::text("hello")))
@@ -2005,6 +2070,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 
@@ -2024,6 +2090,7 @@ mod tests {
             last_phase: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .unwrap();
 

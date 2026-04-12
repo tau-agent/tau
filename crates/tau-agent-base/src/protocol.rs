@@ -51,6 +51,9 @@ pub enum Request {
         /// Include archived sessions in the listing.
         #[serde(default)]
         include_archived: bool,
+        /// If set, only list sessions belonging to this project.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
     },
     /// Archive a session (and all its children).
     ArchiveSession {
