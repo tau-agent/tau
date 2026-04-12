@@ -71,6 +71,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                 arguments: tool_call.arguments.clone(),
                 cwd: Some(self.cwd.clone()),
                 session_id: Some(self.session_id.clone()),
+                project_name: None,
             })
             .await?;
 

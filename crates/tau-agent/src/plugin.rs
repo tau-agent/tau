@@ -407,6 +407,7 @@ impl PluginHandle {
             arguments: tool_call.arguments.clone(),
             cwd: cwd.map(String::from),
             session_id: session_id.map(String::from),
+            project_name: None,
         })?;
 
         loop {
@@ -1341,6 +1342,7 @@ impl PluginManager {
         let req = PluginRequest::SessionStart {
             cwd: cwd.to_string(),
             session_id: session_id.to_string(),
+            project_name: None,
         };
         for plugin in &mut self.global_plugins {
             if plugin.wants_hook("session_start") {

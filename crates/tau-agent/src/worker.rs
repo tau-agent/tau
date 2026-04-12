@@ -148,6 +148,7 @@ async fn async_main() -> crate::Result<()> {
                     arguments,
                     cwd,
                     session_id,
+                    ..
                 } => {
                     // Spawn a concurrent task for each tool call.
                     let msg_tx = reader_msg_tx.clone();
@@ -564,6 +565,7 @@ async fn handle_session_tool(
                     .get("notify_parent")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true),
+                project_name: None,
             };
             let resp = match server_request(msg_tx, pending, create_req).await {
                 Ok(r) => r,

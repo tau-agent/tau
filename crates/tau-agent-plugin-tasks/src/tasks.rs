@@ -543,6 +543,7 @@ fn create_interactive_session(
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
+        project_name: None,
     };
 
     let new_sid = match crate::tasks_scheduler::server_request(writer, reader, create_req) {
@@ -1680,6 +1681,7 @@ pub fn run_tasks_plugin() {
                 arguments,
                 cwd,
                 session_id,
+                ..
             } => {
                 let project = cwd.as_deref().unwrap_or("/tmp");
                 let session = session_id.as_deref();
@@ -2165,6 +2167,7 @@ mod tests {
                                     context_pct: None,
                                     archived: is_archived,
                                     last_exit_status: None,
+                                    project_name: None,
                                 },
                             }
                         }

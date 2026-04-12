@@ -40,6 +40,9 @@ pub enum Request {
         /// When true, notify parent session on child completion (default true).
         #[serde(default = "default_true")]
         notify_parent: bool,
+        /// Project name (from discover_project or explicit).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
     },
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },
@@ -330,6 +333,9 @@ pub struct SessionInfo {
     /// Whether this session is archived.
     #[serde(default)]
     pub archived: bool,
+    /// Project name this session belongs to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
     /// Last exit status: null (never ran), "completed", "error", "cancelled", "max_turns".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit_status: Option<String>,

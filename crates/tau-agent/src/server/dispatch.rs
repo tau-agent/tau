@@ -311,6 +311,7 @@ pub(super) async fn handle_client(
                 tagline,
                 auto_archive,
                 notify_parent,
+                ..
             } => {
                 // Atomic budget check + session creation (single lock hold)
                 let resp = create_session_impl(

@@ -178,6 +178,7 @@ pub(super) async fn handle_server_request(
             tagline,
             auto_archive,
             notify_parent,
+            ..
         } => create_session_impl(
             state,
             model_id,

@@ -67,6 +67,13 @@ pub fn pid_path() -> PathBuf {
     p
 }
 
+/// Returns the operator config directory for a project.
+///
+/// `~/.config/tau/projects/{name}/`
+pub fn project_config_dir(name: &str) -> PathBuf {
+    config_dir().join("projects").join(name)
+}
+
 /// Check if a server is already running by trying to connect.
 pub fn is_running() -> bool {
     std::os::unix::net::UnixStream::connect(socket_path()).is_ok()

@@ -175,6 +175,7 @@ fn create_session(server: &TestServer, cwd: Option<&str>) -> String {
             tagline: Some("test-controller".into()),
             auto_archive: false,
             notify_parent: false,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,

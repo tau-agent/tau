@@ -212,6 +212,7 @@ pub fn merge_task(
             tagline: Some(format!("Merge task {}", task_id)),
             auto_archive: false,
             notify_parent: false,
+            project_name: None,
         },
     )? {
         Response::SessionCreated { session_id } => session_id,

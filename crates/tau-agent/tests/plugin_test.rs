@@ -222,6 +222,7 @@ fn plugin_session_start_hook() {
         .send(&PluginRequest::SessionStart {
             cwd: "/home/test".into(),
             session_id: "s123".into(),
+            project_name: None,
         })
         .unwrap();
 

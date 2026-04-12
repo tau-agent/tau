@@ -34,9 +34,18 @@ pub enum PluginRequest {
         /// Session this tool call belongs to.
         #[serde(skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
+        /// Project name for this session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
     },
     /// Notify session start.
-    SessionStart { cwd: String, session_id: String },
+    SessionStart {
+        cwd: String,
+        session_id: String,
+        /// Project name for this session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_name: Option<String>,
+    },
     /// Notify the plugin it has been idle. Plugin may exit in response.
     Idle,
     /// Server response (server -> plugin tunnel).

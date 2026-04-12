@@ -78,6 +78,12 @@ enum Commands {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// Manage projects
+    #[command(alias = "proj")]
+    Project {
+        #[command(subcommand)]
+        action: ProjectAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -307,6 +313,27 @@ enum AuthAction {
     },
 }
 
+#[derive(Subcommand)]
+enum ProjectAction {
+    /// Initialize a new project in the current directory
+    Init {
+        /// Project name (default: directory name, slugified)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List all known projects
+    #[command(alias = "l")]
+    List,
+    /// Show current project info
+    #[command(alias = "i")]
+    Info,
+    /// Rename the current project
+    Rename {
+        /// New project name
+        new_name: String,
+    },
+}
+
 fn main() {
     clap_complete::env::CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
@@ -423,6 +450,9 @@ async fn run(cli: Cli) -> tau_agent::Result<()> {
         },
         Commands::Task { action } => {
             cmd_task(action)?;
+        }
+        Commands::Project { action } => {
+            cmd_project(action)?;
         }
     }
     Ok(())
@@ -563,6 +593,7 @@ async fn cmd_chat(
                 tagline: None,
                 auto_archive: false,
                 notify_parent: true,
+                project_name: None,
             })
             .await?;
 
@@ -686,6 +717,7 @@ async fn cli_create_session(
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .await?;
 
@@ -1800,11 +1832,15 @@ fn format_time_ago(unix_secs: i64) -> String {
 // Task commands (direct DB access, no server round-trip)
 // ---------------------------------------------------------------------------
 
-fn project_key() -> String {
-    std::env::current_dir()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string()
+fn project_key() -> tau_agent::Result<String> {
+    let cwd =
+        std::env::current_dir().map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
+    match tau_agent::project::discover_project(&cwd) {
+        Some((name, _root)) => Ok(name),
+        None => Err(tau_agent::Error::Io(
+            "not in a tau project — run `tau project init` first".into(),
+        )),
+    }
 }
 
 fn format_task_timestamp(ms: i64) -> String {
@@ -1814,12 +1850,198 @@ fn format_task_timestamp(ms: i64) -> String {
     local.format("%Y-%m-%d %H:%M").to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Project commands
+// ---------------------------------------------------------------------------
+
+fn cmd_project(action: ProjectAction) -> tau_agent::Result<()> {
+    match action {
+        ProjectAction::Init { name } => cmd_project_init(name),
+        ProjectAction::List => cmd_project_list(),
+        ProjectAction::Info => cmd_project_info(),
+        ProjectAction::Rename { new_name } => cmd_project_rename(&new_name),
+    }
+}
+
+fn cmd_project_init(name: Option<String>) -> tau_agent::Result<()> {
+    let cwd =
+        std::env::current_dir().map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
+
+    let name = match name {
+        Some(n) => n,
+        None => {
+            let dir_name = cwd
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string());
+            tau_agent::project::slugify(&dir_name)
+        }
+    };
+
+    tau_agent::project::validate_project_name(&name)?;
+
+    // Check DB for name/path collisions before touching the filesystem.
+    let db = tau_agent::db::Db::open_default()?;
+    if db.get_project(&name)?.is_some() {
+        return Err(tau_agent::Error::Io(format!(
+            "project name '{}' already exists in the registry",
+            name
+        )));
+    }
+
+    // Canonicalize cwd for path collision check (best effort — it exists).
+    let canonical_path = std::fs::canonicalize(&cwd)
+        .map_err(|e| tau_agent::Error::Io(format!("canonicalize: {}", e)))?;
+    let path_str = canonical_path.to_string_lossy().to_string();
+
+    if db.get_project_by_path(&path_str)?.is_some() {
+        return Err(tau_agent::Error::Io(format!(
+            "a project already exists at {}",
+            path_str
+        )));
+    }
+
+    // Create filesystem artifacts.
+    let canonical = tau_agent::project::init_project(&cwd, &name)?;
+    let canonical_str = canonical.to_string_lossy().to_string();
+
+    // Register in global DB.
+    db.create_project(&name, &canonical_str)?;
+
+    eprintln!("initialized project '{}' at {}", name, canonical_str);
+    Ok(())
+}
+
+fn cmd_project_list() -> tau_agent::Result<()> {
+    let db = tau_agent::db::Db::open_default()?;
+    let projects = db.list_projects()?;
+
+    if projects.is_empty() {
+        println!("no projects");
+        return Ok(());
+    }
+
+    println!(
+        "{:<20} {:<50} {:<14} {}",
+        "NAME", "PATH", "LAST SEEN", "CREATED"
+    );
+    for p in &projects {
+        let last_seen = format_time_ago_ms(p.last_seen);
+        let created = format_time_ago_ms(p.created_at);
+        println!(
+            "{:<20} {:<50} {:<14} {}",
+            p.name, p.path, last_seen, created
+        );
+    }
+    Ok(())
+}
+
+fn cmd_project_info() -> tau_agent::Result<()> {
+    let cwd =
+        std::env::current_dir().map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
+
+    let (name, root) = tau_agent::project::discover_project(&cwd).ok_or_else(|| {
+        tau_agent::Error::Io("not in a tau project (no .tau/project.toml found)".into())
+    })?;
+
+    let operator_dir = tau_agent::paths::project_config_dir(&name);
+
+    println!("name:       {}", name);
+    println!("path:       {}", root.display());
+    println!("config dir: {}", operator_dir.display());
+
+    // List .tau config files found.
+    let tau_dir = root.join(".tau");
+    if tau_dir.is_dir() {
+        let mut config_files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&tau_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                    if let Some(fname) = path.file_name() {
+                        config_files.push(fname.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        config_files.sort();
+        if !config_files.is_empty() {
+            println!("configs:    {}", config_files.join(", "));
+        }
+    }
+
+    // Show DB registration status.
+    let db = tau_agent::db::Db::open_default()?;
+    if let Some(proj) = db.get_project(&name)? {
+        println!(
+            "registered: yes (last seen {})",
+            format_time_ago_ms(proj.last_seen)
+        );
+    } else {
+        println!("registered: no (run `tau project init` to register)");
+    }
+
+    Ok(())
+}
+
+fn cmd_project_rename(new_name: &str) -> tau_agent::Result<()> {
+    let cwd =
+        std::env::current_dir().map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
+
+    let (old_name, root) = tau_agent::project::discover_project(&cwd).ok_or_else(|| {
+        tau_agent::Error::Io("not in a tau project (no .tau/project.toml found)".into())
+    })?;
+
+    tau_agent::project::validate_project_name(new_name)?;
+
+    if old_name == new_name {
+        eprintln!("project is already named '{}'", new_name);
+        return Ok(());
+    }
+
+    // Rename operator config directory first (easiest to revert).
+    let old_operator_dir = tau_agent::paths::project_config_dir(&old_name);
+    let new_operator_dir = tau_agent::paths::project_config_dir(new_name);
+    if new_operator_dir.exists() {
+        return Err(tau_agent::Error::Io(format!(
+            "operator config directory already exists: {}",
+            new_operator_dir.display()
+        )));
+    }
+    if old_operator_dir.exists() {
+        std::fs::rename(&old_operator_dir, &new_operator_dir)
+            .map_err(|e| tau_agent::Error::Io(format!("rename operator dir: {}", e)))?;
+    }
+
+    // Update .tau/project.toml.
+    let config = tau_agent::project::ProjectConfig {
+        name: new_name.to_string(),
+    };
+    let toml_str = toml::to_string_pretty(&config)
+        .map_err(|e| tau_agent::Error::Io(format!("serialize project.toml: {}", e)))?;
+    let project_toml = root.join(".tau").join("project.toml");
+    std::fs::write(&project_toml, toml_str)
+        .map_err(|e| tau_agent::Error::Io(format!("write project.toml: {}", e)))?;
+
+    // Update DB.
+    let db = tau_agent::db::Db::open_default()?;
+    db.rename_project(&old_name, new_name)?;
+
+    eprintln!("renamed project '{}' → '{}'", old_name, new_name);
+    Ok(())
+}
+
+/// Format a millisecond timestamp as a relative time string (e.g. "5m ago").
+fn format_time_ago_ms(ms: i64) -> String {
+    format_time_ago(ms / 1000)
+}
+
 fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
     let db = tau_agent::tasks_db::TasksDb::open_default()?;
 
     match action {
         TaskAction::List { state, parent } => {
-            let project = project_key();
+            let project = project_key()?;
             let tasks = db.list_tasks(&project, state.as_deref(), parent, None, None)?;
             if tasks.is_empty() {
                 println!("no tasks");
@@ -1940,7 +2162,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
             require_approval,
             priority,
         } => {
-            let project = project_key();
+            let project = project_key()?;
             let task = db.create_task(
                 &project,
                 &title,
@@ -1993,7 +2215,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
             println!("task #{} marked ready: {}", task.id, task.title);
         }
         TaskAction::Mq => {
-            let project = project_key();
+            let project = project_key()?;
             let approved = db.list_tasks(&project, Some("approved"), None, None, None)?;
             let merging = db.list_tasks(&project, Some("merging"), None, None, None)?;
             if approved.is_empty() && merging.is_empty() {
@@ -2011,7 +2233,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
             }
         }
         TaskAction::Status => {
-            let project = project_key();
+            let project = project_key()?;
             let status = tau_agent::tasks_scheduler::get_status(&db, &project)?;
             print!("{}", tau_agent::tasks_scheduler::format_status(&status));
         }

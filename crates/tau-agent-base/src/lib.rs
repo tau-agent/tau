@@ -7,6 +7,7 @@
 pub mod model_resolve;
 pub mod paths;
 pub mod plugin_protocol;
+pub mod project;
 pub mod protocol;
 pub mod subscription_usage;
 pub mod tool_prompt;

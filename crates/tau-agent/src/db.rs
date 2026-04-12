@@ -56,6 +56,15 @@ pub struct StoredSession {
     pub notify_parent: bool,
 }
 
+/// Stored project metadata.
+#[derive(Debug, Clone)]
+pub struct Project {
+    pub name: String,
+    pub path: String,
+    pub last_seen: i64,
+    pub created_at: i64,
+}
+
 /// SELECT column list shared across all queries that return `StoredSession` rows.
 const SESSION_COLUMNS: &str = "id, model_json, system_prompt, cwd, is_subscription, created_at, parent_id, child_budget, tagline, archived, last_exit_status, last_phase, auto_archive, notify_parent";
 
@@ -133,7 +142,13 @@ impl Db {
                 sender_info TEXT,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_queued_target ON queued_messages(target_session_id);",
+            CREATE INDEX IF NOT EXISTS idx_queued_target ON queued_messages(target_session_id);
+            CREATE TABLE IF NOT EXISTS projects (
+                name        TEXT PRIMARY KEY,
+                path        TEXT NOT NULL UNIQUE,
+                last_seen   INTEGER NOT NULL,
+                created_at  INTEGER NOT NULL
+            );",
         )
         .map_err(db_err("create tables"))?;
 
@@ -216,7 +231,13 @@ impl Db {
                 sender_info TEXT,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX idx_queued_target ON queued_messages(target_session_id);",
+            CREATE INDEX idx_queued_target ON queued_messages(target_session_id);
+            CREATE TABLE projects (
+                name        TEXT PRIMARY KEY,
+                path        TEXT NOT NULL UNIQUE,
+                last_seen   INTEGER NOT NULL,
+                created_at  INTEGER NOT NULL
+            );",
         )
         .map_err(db_err("create tables"))?;
 
@@ -910,6 +931,119 @@ impl Db {
             result.push(row.map_err(db_err("sessions_with_queued row"))?);
         }
         Ok(result)
+    }
+
+    // ----- projects -----
+
+    /// Create a new project. Errors on duplicate name or path.
+    pub fn create_project(&self, name: &str, path: &str) -> crate::Result<Project> {
+        let now = crate::types::timestamp_ms() as i64;
+        self.conn
+            .execute(
+                "INSERT INTO projects (name, path, last_seen, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![name, path, now, now],
+            )
+            .map_err(db_err("insert project"))?;
+        Ok(Project {
+            name: name.to_string(),
+            path: path.to_string(),
+            last_seen: now,
+            created_at: now,
+        })
+    }
+
+    /// Get a project by name.
+    pub fn get_project(&self, name: &str) -> crate::Result<Option<Project>> {
+        self.conn
+            .query_row(
+                "SELECT name, path, last_seen, created_at FROM projects WHERE name = ?1",
+                params![name],
+                |row| {
+                    Ok(Project {
+                        name: row.get(0)?,
+                        path: row.get(1)?,
+                        last_seen: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err("get project"))
+    }
+
+    /// Get a project by its path.
+    pub fn get_project_by_path(&self, path: &str) -> crate::Result<Option<Project>> {
+        self.conn
+            .query_row(
+                "SELECT name, path, last_seen, created_at FROM projects WHERE path = ?1",
+                params![path],
+                |row| {
+                    Ok(Project {
+                        name: row.get(0)?,
+                        path: row.get(1)?,
+                        last_seen: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err("get project by path"))
+    }
+
+    /// List all projects, most recently seen first.
+    pub fn list_projects(&self) -> crate::Result<Vec<Project>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name, path, last_seen, created_at FROM projects ORDER BY last_seen DESC",
+            )
+            .map_err(db_err("prepare list projects"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(Project {
+                    name: row.get(0)?,
+                    path: row.get(1)?,
+                    last_seen: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .map_err(db_err("list projects"))?;
+        let mut projects = Vec::new();
+        for row in rows {
+            projects.push(row.map_err(db_err("read project row"))?);
+        }
+        Ok(projects)
+    }
+
+    /// Rename a project.
+    pub fn rename_project(&self, old_name: &str, new_name: &str) -> crate::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE projects SET name = ?1 WHERE name = ?2",
+                params![new_name, old_name],
+            )
+            .map_err(db_err("rename project"))?;
+        Ok(())
+    }
+
+    /// Update the last_seen timestamp for a project to now.
+    pub fn update_project_last_seen(&self, name: &str) -> crate::Result<()> {
+        let now = crate::types::timestamp_ms() as i64;
+        self.conn
+            .execute(
+                "UPDATE projects SET last_seen = ?1 WHERE name = ?2",
+                params![now, name],
+            )
+            .map_err(db_err("update project last_seen"))?;
+        Ok(())
+    }
+
+    /// Delete a project by name.
+    pub fn delete_project(&self, name: &str) -> crate::Result<()> {
+        self.conn
+            .execute("DELETE FROM projects WHERE name = ?1", params![name])
+            .map_err(db_err("delete project"))?;
+        Ok(())
     }
 }
 
@@ -1723,6 +1857,109 @@ mod tests {
         let stats = db.session_stats("s1").unwrap().unwrap();
         // Should use the good message's tokens, not the error one
         assert_eq!(stats.last_input_tokens, Some(120)); // 100 + 20 + 0
+    }
+
+    #[test]
+    fn test_create_and_get_project() {
+        let db = Db::open_memory().unwrap();
+        let project = db.create_project("myproj", "/tmp/myproj").unwrap();
+        assert_eq!(project.name, "myproj");
+        assert_eq!(project.path, "/tmp/myproj");
+        assert!(project.created_at > 0);
+        assert_eq!(project.last_seen, project.created_at);
+
+        let loaded = db.get_project("myproj").unwrap().unwrap();
+        assert_eq!(loaded.name, "myproj");
+        assert_eq!(loaded.path, "/tmp/myproj");
+        assert_eq!(loaded.created_at, project.created_at);
+
+        // Non-existent returns None
+        assert!(db.get_project("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_create_duplicate_name_fails() {
+        let db = Db::open_memory().unwrap();
+        db.create_project("dup", "/tmp/a").unwrap();
+        assert!(db.create_project("dup", "/tmp/b").is_err());
+    }
+
+    #[test]
+    fn test_create_duplicate_path_fails() {
+        let db = Db::open_memory().unwrap();
+        db.create_project("proj1", "/tmp/same").unwrap();
+        assert!(db.create_project("proj2", "/tmp/same").is_err());
+    }
+
+    #[test]
+    fn test_get_project_by_path() {
+        let db = Db::open_memory().unwrap();
+        db.create_project("alpha", "/tmp/alpha").unwrap();
+        db.create_project("beta", "/tmp/beta").unwrap();
+
+        let found = db.get_project_by_path("/tmp/beta").unwrap().unwrap();
+        assert_eq!(found.name, "beta");
+
+        assert!(db.get_project_by_path("/tmp/nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_list_projects() {
+        let db = Db::open_memory().unwrap();
+        let _p1 = db.create_project("first", "/tmp/first").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let _p2 = db.create_project("second", "/tmp/second").unwrap();
+
+        let list = db.list_projects().unwrap();
+        assert_eq!(list.len(), 2);
+        // ORDER BY last_seen DESC — second (created later) is first
+        assert_eq!(list[0].name, "second");
+        assert_eq!(list[1].name, "first");
+
+        // After updating first's last_seen, it should come first
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.update_project_last_seen("first").unwrap();
+        let list = db.list_projects().unwrap();
+        assert_eq!(list[0].name, "first");
+        assert_eq!(list[1].name, "second");
+    }
+
+    #[test]
+    fn test_rename_project() {
+        let db = Db::open_memory().unwrap();
+        db.create_project("old_name", "/tmp/proj").unwrap();
+        db.rename_project("old_name", "new_name").unwrap();
+
+        assert!(db.get_project("old_name").unwrap().is_none());
+        let renamed = db.get_project("new_name").unwrap().unwrap();
+        assert_eq!(renamed.path, "/tmp/proj");
+    }
+
+    #[test]
+    fn test_update_last_seen() {
+        let db = Db::open_memory().unwrap();
+        let project = db.create_project("proj", "/tmp/proj").unwrap();
+        let original_last_seen = project.last_seen;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.update_project_last_seen("proj").unwrap();
+
+        let updated = db.get_project("proj").unwrap().unwrap();
+        assert!(updated.last_seen > original_last_seen);
+        assert_eq!(updated.created_at, project.created_at);
+    }
+
+    #[test]
+    fn test_delete_project() {
+        let db = Db::open_memory().unwrap();
+        db.create_project("doomed", "/tmp/doomed").unwrap();
+        assert!(db.get_project("doomed").unwrap().is_some());
+
+        db.delete_project("doomed").unwrap();
+        assert!(db.get_project("doomed").unwrap().is_none());
+
+        // Deleting non-existent is a no-op (not an error)
+        db.delete_project("doomed").unwrap();
     }
 
     #[test]

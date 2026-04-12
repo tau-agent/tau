@@ -12,6 +12,7 @@ pub mod worker;
 pub use tau_agent_base::model_resolve;
 pub use tau_agent_base::paths;
 pub use tau_agent_base::plugin_protocol;
+pub use tau_agent_base::project;
 pub use tau_agent_base::protocol;
 pub use tau_agent_base::subscription_usage;
 pub use tau_agent_base::tool_prompt;

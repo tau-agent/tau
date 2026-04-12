@@ -695,6 +695,7 @@ async fn create_session(
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         })
         .await?;
 

@@ -315,6 +315,7 @@ fn protocol_create_session_with_parent() {
         tagline: None,
         auto_archive: false,
         notify_parent: true,
+        project_name: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains("parent_id"));
@@ -388,6 +389,7 @@ fn protocol_session_info_tree_fields() {
         last_exit_status: None,
         state: "idle".into(),
         context_pct: None,
+        project_name: None,
     };
     let json = serde_json::to_string(&info).unwrap();
     assert!(json.contains("parent_id"));
@@ -425,6 +427,7 @@ fn spawn_child_chat_produces_messages() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -445,6 +448,7 @@ fn spawn_child_chat_produces_messages() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -534,6 +538,7 @@ fn spawn_multiple_children_wait_all() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -556,6 +561,7 @@ fn spawn_multiple_children_wait_all() {
                 tagline: None,
                 auto_archive: false,
                 notify_parent: true,
+                project_name: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -669,6 +675,7 @@ fn spawn_child_inherits_parent_model_and_cwd() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -689,6 +696,7 @@ fn spawn_child_inherits_parent_model_and_cwd() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -743,6 +751,7 @@ fn wait_sessions_idle_returns_done() {
                 tagline: None,
                 auto_archive: false,
                 notify_parent: true,
+                project_name: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -791,6 +800,7 @@ fn spawn_delete_parent_cascades() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -810,6 +820,7 @@ fn spawn_delete_parent_cascades() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -873,6 +884,7 @@ fn spawn_cancel_child() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -892,6 +904,7 @@ fn spawn_cancel_child() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -932,6 +945,7 @@ fn wait_sessions_returns_summary() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -951,6 +965,7 @@ fn wait_sessions_returns_summary() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1038,6 +1053,7 @@ fn wait_any_sessions_idle_returns_all() {
                 tagline: None,
                 auto_archive: false,
                 notify_parent: true,
+                project_name: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -1089,6 +1105,7 @@ fn wait_any_sessions_returns_only_completed() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1109,6 +1126,7 @@ fn wait_any_sessions_returns_only_completed() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1140,6 +1158,7 @@ fn wait_any_sessions_returns_only_completed() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1269,6 +1288,7 @@ fn second_child_completion_notifies_parent() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1289,6 +1309,7 @@ fn second_child_completion_notifies_parent() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1559,6 +1580,7 @@ fn await_reply_e2e() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1578,6 +1600,7 @@ fn await_reply_e2e() {
             tagline: None,
             auto_archive: false,
             notify_parent: true,
+            project_name: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,

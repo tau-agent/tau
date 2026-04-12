@@ -419,6 +419,7 @@ pub fn dispatch(
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
+        project_name: None,
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -536,6 +537,7 @@ fn dispatch_planning(
         tagline: Some(format!("Planning task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
+        project_name: None,
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -776,6 +778,7 @@ pub fn dispatch_review(
         tagline: Some(format!("Review task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
+        project_name: None,
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -954,6 +957,7 @@ pub fn dispatch_refining(
         tagline: Some(format!("Refining task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
+        project_name: None,
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -2754,6 +2758,7 @@ mod tests {
             arguments: serde_json::json!({"id": 1}),
             cwd: None,
             session_id: None,
+            project_name: None,
         })
         .unwrap()
             + "\n";
