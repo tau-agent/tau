@@ -473,24 +473,28 @@ fn ensure_tau_gitignore(root: &Path) -> crate::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Set `project_name` on sessions based on their cwd.
+///
+/// All updates are wrapped in a single transaction for atomicity.
 fn rewrite_sessions(
     db: &Db,
     session_cwds: &[(String, Option<String>)],
     path_to_name: &HashMap<String, String>,
 ) -> crate::Result<usize> {
-    let mut updated = 0;
+    db.in_transaction(|db| {
+        let mut updated = 0;
 
-    for (id, cwd) in session_cwds {
-        if let Some(cwd) = cwd {
-            let name = resolve_path_to_name(cwd, path_to_name);
-            if let Some(name) = name {
-                db.set_session_project_name(id, &name)?;
-                updated += 1;
+        for (id, cwd) in session_cwds {
+            if let Some(cwd) = cwd {
+                let name = resolve_path_to_name(cwd, path_to_name);
+                if let Some(name) = name {
+                    db.set_session_project_name(id, &name)?;
+                    updated += 1;
+                }
             }
         }
-    }
 
-    Ok(updated)
+        Ok(updated)
+    })
 }
 
 /// Resolve a path to a project name using the mapping.
@@ -582,19 +586,6 @@ fn rewrite_tasks(
         [],
     )
     .map_err(|e| crate::Error::Io(format!("delete tmp tasks: {}", e)))?;
-
-    // 4. Rename column (if still named `project`)
-    if col_name == "project" {
-        tx.execute_batch("ALTER TABLE tasks RENAME COLUMN project TO project_name;")
-            .map_err(|e| crate::Error::Io(format!("rename project column: {}", e)))?;
-    }
-
-    // 5. Recreate index
-    tx.execute_batch(
-        "DROP INDEX IF EXISTS idx_tasks_project_state;
-         CREATE INDEX IF NOT EXISTS idx_tasks_project_state ON tasks(project_name, state);",
-    )
-    .map_err(|e| crate::Error::Io(format!("recreate task index: {}", e)))?;
 
     tx.commit()
         .map_err(|e| crate::Error::Io(format!("commit tasks txn: {}", e)))?;
@@ -747,7 +738,7 @@ mod tests {
     }
 
     #[test]
-    fn test_task_column_rename() {
+    fn test_task_value_rewrite_and_tmp_deletion() {
         // Create a temporary tasks.db with the old schema
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let conn = Connection::open(tmp.path()).expect("open");
@@ -776,10 +767,10 @@ mod tests {
         let updated = rewrite_tasks(tmp.path(), &path_to_name).expect("rewrite");
         assert_eq!(updated, 1);
 
-        // Verify the column was renamed and values were rewritten
+        // Verify values were rewritten (column is still named `project`)
         let conn = Connection::open(tmp.path()).expect("reopen");
         let name: String = conn
-            .query_row("SELECT project_name FROM tasks WHERE id = 1", [], |row| {
+            .query_row("SELECT project FROM tasks WHERE id = 1", [], |row| {
                 row.get(0)
             })
             .expect("query");
@@ -793,8 +784,9 @@ mod tests {
     }
 
     #[test]
-    fn test_task_rewrite_already_renamed() {
-        // Test idempotency when column is already renamed
+    fn test_task_rewrite_already_renamed_column() {
+        // Test that rewriting works when column is already named `project_name`
+        // (e.g., if task #450 renamed it before this migration re-runs)
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let conn = Connection::open(tmp.path()).expect("open");
         conn.execute_batch(

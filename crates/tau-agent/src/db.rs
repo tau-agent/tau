@@ -1154,6 +1154,24 @@ impl Db {
     pub fn set_session_project_name(&self, id: &str, name: &str) -> crate::Result<()> {
         self.update_session_field(id, "project_name", &name)
     }
+
+    /// Run a closure inside a transaction.
+    ///
+    /// The closure receives a reference to `Self` — all DB operations within
+    /// the closure share the same transaction. Commits on success, rolls back
+    /// on error.
+    pub fn in_transaction<F, T>(&self, f: F) -> crate::Result<T>
+    where
+        F: FnOnce(&Self) -> crate::Result<T>,
+    {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(db_err("begin transaction"))?;
+        let result = f(self)?;
+        tx.commit().map_err(db_err("commit transaction"))?;
+        Ok(result)
+    }
 }
 
 fn default_db_path() -> PathBuf {
