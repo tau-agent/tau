@@ -1289,19 +1289,11 @@ fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         for msg in &detail.messages {
             let author = msg.author.as_deref().unwrap_or("unknown");
             let max_preview = w.saturating_sub(20);
-            let preview: String = msg
-                .content
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(max_preview)
-                .collect();
-            let ellipsis = if msg.content.len() > preview.len() {
-                "..."
-            } else {
-                ""
-            };
+            let first_line = msg.content.lines().next().unwrap_or("");
+            let truncated = first_line.chars().count() > max_preview;
+            let multiline = msg.content.contains('\n');
+            let preview: String = first_line.chars().take(max_preview).collect();
+            let ellipsis = if truncated || multiline { "..." } else { "" };
             lines.push(Line::from(vec![
                 Span::styled(format!("    #{} ", msg.id), theme.fg(theme.muted)),
                 Span::styled(format!("[{}] ", author), theme.fg(theme.dim)),
