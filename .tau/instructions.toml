@@ -1,7 +1,8 @@
 [common]
 instructions = """
  - No unwrap() in non-test code (use expect() instead)
- - When spawning child sessions purely for file reading or code summarization (no reasoning or decision-making required), pass `model: "light"` to session_spawn. Do NOT use "light" for sessions that need to review code, make judgments, write code, plan, or reason — those need the full model.
+ - Prefer the `read` tool for reading individual files. Do NOT spawn child sessions just to read files — use `read` directly. Only spawn child sessions when you need parallel work across many files or when the child needs to do reasoning/analysis beyond simple reading.
+ - When you do spawn child sessions purely for code summarization (no reasoning or decision-making required), pass `model: "light"` to session_spawn. Do NOT use "light" for sessions that need to review code, make judgments, write code, plan, or reason — those need the full model.
 """
 
 [worker]
@@ -15,7 +16,8 @@ instruction = """
 
 [planning]
 instructions = """
- - When spawning sub-sessions purely to read or summarize source files, pass `model: "light"` to session_spawn. Do NOT use "light" for review or analysis sessions that need to make judgments.
+ - Prefer the `read` tool for reading files directly. Only spawn sub-sessions when you need parallel analysis across many files.
+ - When you do spawn sub-sessions purely to summarize source files, pass `model: "light"` to session_spawn. Do NOT use "light" for review or analysis sessions that need to make judgments.
 """
 
 [refining]
