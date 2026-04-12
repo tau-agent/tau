@@ -180,6 +180,9 @@ pub struct App {
     /// turn (regression from task #421).  Reset at the end of each turn
     /// and by `Start`/`Error`.
     pub turn_text_finalized: bool,
+    /// Most recent steer message text (shown above the input box).
+    /// Cleared when the next assistant turn starts (`StreamEvent::Start`).
+    pub pending_steer: Option<String>,
 }
 
 /// Saved state when navigating to a child session.
@@ -254,6 +257,7 @@ impl App {
             task_picker_detail: None,
             current_task_id: None,
             turn_text_finalized: false,
+            pending_steer: None,
         }
     }
 
@@ -1488,6 +1492,7 @@ impl App {
 
                 self.scroll_to_bottom();
                 self.history_index = None;
+                self.pending_steer = Some(text.clone());
                 Some(Action::Steer(text))
             }
             // Alt+Enter during streaming: queued message (runs after steering)
@@ -1623,6 +1628,7 @@ impl App {
         self.restore_messages(&messages);
         self.scroll_to_bottom();
         self.mode = AppMode::Input;
+        self.pending_steer = None;
     }
 
     /// Navigate back to the previous session from the nav stack.
@@ -1641,6 +1647,7 @@ impl App {
             self.current_task_id = None;
             self.scroll_to_bottom();
             self.mode = AppMode::Input;
+            self.pending_steer = None;
             true
         } else {
             false
@@ -2147,6 +2154,7 @@ impl App {
                 self.finalize_in_flight();
                 self.phase = AgentPhase::Idle;
                 self.set_mode(AppMode::Input);
+                self.pending_steer = None;
             }
             Response::Cancelled => {
                 self.finalize_in_flight();
@@ -2164,6 +2172,7 @@ impl App {
                 }
                 self.phase = AgentPhase::Idle;
                 self.set_mode(AppMode::Input);
+                self.pending_steer = None;
             }
             Response::ServerShutdown { restart } => {
                 if restart {
@@ -2182,6 +2191,7 @@ impl App {
                 self.messages.push(MessageItem::Error { text: message });
                 self.phase = AgentPhase::Idle;
                 self.set_mode(AppMode::Input);
+                self.pending_steer = None;
             }
             Response::UserMessage { text } => {
                 // Another client sent a message — display it
@@ -2421,6 +2431,9 @@ impl App {
                 // resetting this, but be defensive in case of
                 // event-ordering quirks.
                 self.turn_text_finalized = false;
+                // Clear the steer indicator — the session has acknowledged
+                // the steer by starting a new assistant turn.
+                self.pending_steer = None;
             }
             StreamEvent::TextDelta { delta, .. } => {
                 // Append to current streaming message
@@ -3765,5 +3778,60 @@ mod tests {
             }
             other => panic!("expected TaskList for refresh, got {other:?}"),
         }
+    }
+
+    // ---- Steer indicator tests ----
+
+    /// Sending a steer message sets `pending_steer`.
+    #[test]
+    fn steer_sets_pending_steer() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.textarea.insert_str("fix the bug");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let action = app.handle_streaming_key(&key);
+
+        assert!(matches!(action, Some(Action::Steer(ref t)) if t == "fix the bug"));
+        assert_eq!(app.pending_steer.as_deref(), Some("fix the bug"));
+    }
+
+    /// StreamEvent::Start clears pending_steer (session acknowledged the steer).
+    #[test]
+    fn stream_start_clears_pending_steer() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.pending_steer = Some("steer text".into());
+
+        app.handle_stream_event(StreamEvent::Start {
+            partial: assistant_message("", StopReason::Stop, None),
+        });
+
+        assert!(
+            app.pending_steer.is_none(),
+            "Start should clear pending_steer"
+        );
+    }
+
+    /// AgentDone clears pending_steer.
+    #[test]
+    fn agent_done_clears_pending_steer() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.pending_steer = Some("steer text".into());
+
+        app.handle_server_response(Response::AgentDone);
+
+        assert!(
+            app.pending_steer.is_none(),
+            "AgentDone should clear pending_steer"
+        );
+    }
+
+    /// pending_steer starts as None.
+    #[test]
+    fn pending_steer_starts_none() {
+        let app = make_app();
+        assert!(app.pending_steer.is_none());
     }
 }

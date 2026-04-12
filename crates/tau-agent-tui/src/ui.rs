@@ -18,20 +18,25 @@ use crate::theme::{Theme, ThemeColor};
 pub fn draw(frame: &mut Frame, app: &App, theme: &Theme) {
     let area = frame.area();
 
-    // Layout: messages(flex) | input(dynamic) | footer(1)
+    // Layout: messages(flex) | steer(0 or 1) | input(dynamic) | footer(1)
     let input_height = input_area_height(app, area.width);
+    let steer_height: u16 = if app.pending_steer.is_some() { 1 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),               // messages
+            Constraint::Length(steer_height), // steer indicator (0 when absent)
             Constraint::Length(input_height), // input area
             Constraint::Length(1),            // footer (stats left, model right)
         ])
         .split(area);
 
     draw_messages(frame, app, theme, chunks[0]);
-    draw_input(frame, app, theme, chunks[1]);
-    draw_footer(frame, app, theme, chunks[2]);
+    if steer_height > 0 {
+        draw_steer_indicator(frame, app, theme, chunks[1]);
+    }
+    draw_input(frame, app, theme, chunks[2]);
+    draw_footer(frame, app, theme, chunks[3]);
 
     // Session picker overlay
     if app.mode == AppMode::SessionPicker {
@@ -225,6 +230,59 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let paragraph = Paragraph::new(Text::from(all_lines)).scroll((scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
+}
+
+// ---------------------------------------------------------------------------
+// Steer indicator (shown above the input box when a steer message is pending)
+// ---------------------------------------------------------------------------
+
+fn draw_steer_indicator(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    let Some(ref steer_text) = app.pending_steer else {
+        return;
+    };
+
+    let w = area.width as usize;
+    // Take the first line only, truncate to fit
+    let first_line = steer_text.lines().next().unwrap_or("");
+    let multi_line = steer_text.contains('\n');
+    let prefix = " [steer] ";
+    let prefix_w = prefix.len();
+    let avail = w.saturating_sub(prefix_w + 1); // +1 for right margin
+    let (display, truncated) = if first_line.len() > avail {
+        (
+            format!("{}...", &first_line[..avail.saturating_sub(3)]),
+            true,
+        )
+    } else {
+        (first_line.to_string(), false)
+    };
+    let ellipsis = if (truncated || multi_line) && !display.ends_with("...") {
+        "..."
+    } else {
+        ""
+    };
+
+    let style = theme
+        .italic_fg(theme.dim)
+        .bg(theme.tool_pending_bg.to_ratatui());
+    let prefix_style = theme
+        .italic_fg(theme.muted)
+        .bg(theme.tool_pending_bg.to_ratatui());
+
+    let content = format!("{}{}{}", prefix, display, ellipsis);
+    let content_w = content.len();
+    let pad = w.saturating_sub(content_w);
+
+    let line = Line::from(vec![
+        Span::styled(prefix.to_string(), prefix_style),
+        Span::styled(format!("{}{}", display, ellipsis), style),
+        Span::styled(
+            " ".repeat(pad),
+            Style::default().bg(theme.tool_pending_bg.to_ratatui()),
+        ),
+    ]);
+
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 // ---------------------------------------------------------------------------
