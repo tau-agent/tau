@@ -109,6 +109,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "Top-level tasks start in 'interactive' state for spec refinement".into(),
                 "Subtasks (with parent_id) start in 'planning' state by default, or 'ready' if skip_planning=true".into(),
+                "WARNING: subtasks are AUTO-DISPATCHED immediately on creation. A planning subtask gets a planning session right away; a ready subtask gets a worker session. Do NOT create subtasks unless you want them to start working immediately.".into(),
                 "Valid states: interactive, planning, refining, ready, active, review, approved, merging, failed, merged, closed".into(),
             ],
         },
@@ -232,6 +233,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             prompt_snippet: Some("Update task fields (title, state, priority, tags, etc.)".into()),
             prompt_guidelines: vec![
                 "State transitions are validated: interactive->planning->refining->ready->active->review->approved->merging->merged".into(),
+                "WARNING: some transitions AUTO-DISPATCH sessions: planning->refining launches a refining session, active->review launches a review session. Wait for these sessions to complete before taking further action on the task.".into(),
                 "Shortcuts: interactive->ready (skip planning), interactive->approved, active->approved (skip_review only)".into(),
                 "Planning cycle: planning->refining, refining->planning (revise), refining->ready (approved), refining->interactive (scope expansion)".into(),
                 "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active (recoverable), merging->failed (terminal), failed->active (manual retry)".into(),
