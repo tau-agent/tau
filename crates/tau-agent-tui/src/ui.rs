@@ -246,20 +246,19 @@ fn draw_steer_indicator(frame: &mut Frame, app: &App, theme: &Theme, area: Rect)
     let first_line = steer_text.lines().next().unwrap_or("");
     let multi_line = steer_text.contains('\n');
     let prefix = " [steer] ";
-    let prefix_w = prefix.len();
+    let prefix_w = UnicodeWidthStr::width(prefix);
     let avail = w.saturating_sub(prefix_w + 1); // +1 for right margin
-    let (display, truncated) = if first_line.len() > avail {
-        (
-            format!("{}...", &first_line[..avail.saturating_sub(3)]),
-            true,
+    let first_line_w = UnicodeWidthStr::width(first_line);
+    let needs_truncate = first_line_w > avail;
+    let display = if needs_truncate {
+        format!(
+            "{}...",
+            truncate_to_width(first_line, avail.saturating_sub(3))
         )
+    } else if multi_line {
+        format!("{}...", first_line)
     } else {
-        (first_line.to_string(), false)
-    };
-    let ellipsis = if (truncated || multi_line) && !display.ends_with("...") {
-        "..."
-    } else {
-        ""
+        first_line.to_string()
     };
 
     let style = theme
@@ -269,13 +268,13 @@ fn draw_steer_indicator(frame: &mut Frame, app: &App, theme: &Theme, area: Rect)
         .italic_fg(theme.muted)
         .bg(theme.tool_pending_bg.to_ratatui());
 
-    let content = format!("{}{}{}", prefix, display, ellipsis);
-    let content_w = content.len();
-    let pad = w.saturating_sub(content_w);
+    let display_w = UnicodeWidthStr::width(display.as_str());
+    let total_w = prefix_w + display_w;
+    let pad = w.saturating_sub(total_w);
 
     let line = Line::from(vec![
         Span::styled(prefix.to_string(), prefix_style),
-        Span::styled(format!("{}{}", display, ellipsis), style),
+        Span::styled(display, style),
         Span::styled(
             " ".repeat(pad),
             Style::default().bg(theme.tool_pending_bg.to_ratatui()),
