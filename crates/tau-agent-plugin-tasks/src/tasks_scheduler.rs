@@ -240,8 +240,11 @@ fn prepare_task(
         tasks_git::create_branch(repo_root, &branch, &base_branch)?;
     }
 
+    // Ensure .tau/worktrees/ directory exists before creating the worktree.
+    tasks_git::ensure_worktrees_dir(&task.project)?;
+
     // Derive worktree path and create it.
-    let worktree_path = tasks_git::task_worktree_path(repo_root, task.id)?;
+    let worktree_path = tasks_git::task_worktree_path(&task.project, task.id);
 
     // Only create worktree if it doesn't already exist.
     if !std::path::Path::new(&worktree_path).exists() {

@@ -154,19 +154,51 @@ pub fn task_branch_name(task_id: i64, parent_id: Option<i64>) -> String {
     }
 }
 
-/// Derive the worktree path for a task given the repo root.
+/// Derive the worktree path for a task given the project root.
 ///
-/// If repo is at `/home/user/src/tau`, returns `/home/user/src/tau-task-{id}`.
-pub fn task_worktree_path(repo_root: &str, task_id: i64) -> tau_agent_plugin::Result<String> {
-    let root = Path::new(repo_root);
-    let repo_name = root.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        tau_agent_plugin::Error::Io(format!("cannot derive repo name from path: {}", repo_root))
+/// If project is at `/home/user/src/tau`, returns `/home/user/src/tau/.tau/worktrees/task-{id}`.
+pub fn task_worktree_path(project_root: &str, task_id: i64) -> String {
+    Path::new(project_root)
+        .join(".tau")
+        .join("worktrees")
+        .join(format!("task-{}", task_id))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Ensure `.tau/worktrees/` directory exists and `.tau/.gitignore` contains `/worktrees/`.
+pub fn ensure_worktrees_dir(project_root: &str) -> tau_agent_plugin::Result<()> {
+    let tau_dir = Path::new(project_root).join(".tau");
+    std::fs::create_dir_all(tau_dir.join("worktrees")).map_err(|e| {
+        tau_agent_plugin::Error::Io(format!(
+            "failed to create .tau/worktrees/ in {}: {}",
+            project_root, e
+        ))
     })?;
-    let parent = root.parent().ok_or_else(|| {
-        tau_agent_plugin::Error::Io(format!("repo root has no parent directory: {}", repo_root))
-    })?;
-    let worktree_dir = format!("{}-task-{}", repo_name, task_id);
-    Ok(parent.join(worktree_dir).to_string_lossy().into_owned())
+
+    // Defensively ensure .tau/.gitignore contains /worktrees/
+    let gitignore_path = tau_dir.join(".gitignore");
+    let worktrees_line = "/worktrees/";
+    if gitignore_path.exists() {
+        let existing = std::fs::read_to_string(&gitignore_path)
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("read .tau/.gitignore: {}", e)))?;
+        if !existing.lines().any(|line| line.trim() == worktrees_line) {
+            let mut content = existing;
+            if !content.ends_with('\n') && !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(worktrees_line);
+            content.push('\n');
+            std::fs::write(&gitignore_path, content).map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("write .tau/.gitignore: {}", e))
+            })?;
+        }
+    } else {
+        std::fs::write(&gitignore_path, format!("{}\n", worktrees_line))
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("write .tau/.gitignore: {}", e)))?;
+    }
+
+    Ok(())
 }
 
 /// Abort a partial rebase if one is in progress in the given worktree.
@@ -390,24 +422,27 @@ mod tests {
 
     #[test]
     fn test_task_worktree_path() {
-        let path = task_worktree_path("/home/kaspar/src/ai/tau", 5).unwrap();
-        assert_eq!(path, "/home/kaspar/src/ai/tau-task-5");
+        let path = task_worktree_path("/home/kaspar/src/ai/tau", 5);
+        assert_eq!(path, "/home/kaspar/src/ai/tau/.tau/worktrees/task-5");
 
-        let path = task_worktree_path("/home/user/project", 42).unwrap();
-        assert_eq!(path, "/home/user/project-task-42");
+        let path = task_worktree_path("/home/user/project", 42);
+        assert_eq!(path, "/home/user/project/.tau/worktrees/task-42");
     }
 
     #[test]
     fn test_task_worktree_path_root() {
-        // Edge case: repo at filesystem root-like path
-        let result = task_worktree_path("/", 5);
-        assert!(result.is_err());
+        // Edge case: project at filesystem root — now produces a valid path
+        let path = task_worktree_path("/", 5);
+        assert_eq!(path, "/.tau/worktrees/task-5");
     }
 
     #[test]
     fn test_end_to_end_branch_and_worktree() {
         let dir = init_test_repo();
         let repo_path = dir.path().to_str().unwrap();
+
+        // Ensure .tau/worktrees/ directory exists (as the scheduler would do)
+        ensure_worktrees_dir(repo_path).unwrap();
 
         // Simulate creating a root task branch + worktree
         let task_id = 5;
@@ -417,7 +452,7 @@ mod tests {
         create_branch(repo_path, &branch, "main").unwrap();
         assert!(branch_exists(repo_path, &branch).unwrap());
 
-        let wt_path = task_worktree_path(repo_path, task_id).unwrap();
+        let wt_path = task_worktree_path(repo_path, task_id);
         create_worktree(repo_path, &wt_path, &branch).unwrap();
         assert!(Path::new(&wt_path).exists());
 
@@ -429,7 +464,7 @@ mod tests {
         create_branch(repo_path, &sub_branch, &branch).unwrap();
         assert!(branch_exists(repo_path, &sub_branch).unwrap());
 
-        let sub_wt_path = task_worktree_path(repo_path, subtask_id).unwrap();
+        let sub_wt_path = task_worktree_path(repo_path, subtask_id);
         create_worktree(repo_path, &sub_wt_path, &sub_branch).unwrap();
         assert!(Path::new(&sub_wt_path).exists());
 
@@ -438,6 +473,53 @@ mod tests {
         remove_worktree(repo_path, &wt_path).unwrap();
         assert!(!Path::new(&sub_wt_path).exists());
         assert!(!Path::new(&wt_path).exists());
+    }
+
+    #[test]
+    fn test_ensure_worktrees_dir() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        // First call creates everything
+        ensure_worktrees_dir(root).unwrap();
+        assert!(dir.path().join(".tau").join("worktrees").is_dir());
+
+        let gitignore =
+            std::fs::read_to_string(dir.path().join(".tau").join(".gitignore")).unwrap();
+        assert!(gitignore.contains("/worktrees/"));
+
+        // Second call is idempotent — no duplicate line
+        ensure_worktrees_dir(root).unwrap();
+        let gitignore =
+            std::fs::read_to_string(dir.path().join(".tau").join(".gitignore")).unwrap();
+        let count = gitignore
+            .lines()
+            .filter(|l| l.trim() == "/worktrees/")
+            .count();
+        assert_eq!(count, 1, "should not duplicate /worktrees/ line");
+    }
+
+    #[test]
+    fn test_ensure_worktrees_dir_existing_gitignore() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+
+        // Pre-create .tau/.gitignore with other content
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join(".gitignore"), "/db/\n").unwrap();
+
+        ensure_worktrees_dir(root).unwrap();
+
+        let gitignore = std::fs::read_to_string(tau_dir.join(".gitignore")).unwrap();
+        assert!(
+            gitignore.contains("/db/"),
+            "should preserve existing content"
+        );
+        assert!(
+            gitignore.contains("/worktrees/"),
+            "should add /worktrees/ line"
+        );
     }
 
     #[test]
