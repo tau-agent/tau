@@ -4,6 +4,7 @@
 //! Dependencies are kept minimal: serde, serde_json, thiserror, and futures
 //! (for async JSON-line I/O helpers used by the client and plugin crates).
 
+pub mod config_chain;
 pub mod model_resolve;
 pub mod paths;
 pub mod plugin_protocol;
@@ -146,3 +147,15 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+// ---------------------------------------------------------------------------
+// Shared test utilities
+// ---------------------------------------------------------------------------
+
+/// Crate-wide env-var mutex.
+///
+/// Multiple test modules (`config_chain`, `project`, …) mutate `XDG_CONFIG_HOME` /
+/// `HOME`. Each module's tests must hold this lock before touching the env,
+/// otherwise parallel test threads stomp on each other.
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

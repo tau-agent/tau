@@ -1,24 +1,26 @@
 //! Model alias configuration.
 //!
-//! Tau resolves model aliases from two files, both named `models.toml`:
+//! Tau resolves model aliases from up to three files, all named `models.toml`:
 //!
-//! | Scope   | File                                       |
-//! |---------|--------------------------------------------|
-//! | Global  | `~/.config/tau/models.toml`                |
-//! | Project | `{project}/.tau/models.toml`               |
+//! | Scope    | File                                       |
+//! |----------|--------------------------------------------|
+//! | Operator | `~/.config/tau/projects/{name}/models.toml` |
+//! | Project  | `{project}/.tau/models.toml`               |
+//! | Global   | `~/.config/tau/models.toml`                |
 //!
 //! Resolution order (implemented in [`crate::model_resolve`]):
 //!
-//!   1. project alias map (from `{cwd}/.tau/models.toml`)
-//!   2. global alias map (from `~/.config/tau/models.toml`)
-//!   3. literal model id
+//!   1. operator alias map (from `~/.config/tau/projects/{name}/models.toml`)
+//!   2. project alias map (from `{cwd}/.tau/models.toml`)
+//!   3. global alias map (from `~/.config/tau/models.toml`)
+//!   4. literal model id
 //!
 //! Only one alias hop is performed, so alias targets must be model ids
 //! (optionally `provider/model-id`), never other aliases.
 //!
 //! ## File format
 //!
-//! Both files share the same shape:
+//! All files share the same shape:
 //!
 //! ```toml
 //! [aliases]
@@ -141,6 +143,31 @@ pub fn load_global_aliases() -> HashMap<String, String> {
 pub fn load_project_aliases(project: &str) -> HashMap<String, String> {
     let path = Path::new(project).join(".tau").join("models.toml");
     read_models_toml(&path)
+}
+
+/// Load model aliases from the operator config directory.
+///
+/// Reads `~/.config/tau/projects/{project_name}/models.toml` and returns
+/// its `[aliases]` map.  Returns an empty map if the file doesn't exist,
+/// is unreadable, or is malformed (a warning is printed to stderr).
+pub fn load_operator_aliases(project_name: &str) -> HashMap<String, String> {
+    let path = crate::paths::project_config_dir(project_name).join("models.toml");
+    read_models_toml(&path)
+}
+
+/// Merge alias maps in priority order (operator > project).
+///
+/// Operator entries override project entries.  The merged result can be
+/// passed to `resolve_model` as the `project_aliases` parameter — this
+/// avoids changing the resolver's signature while adding operator-tier
+/// support.
+pub fn merge_alias_maps(
+    operator: HashMap<String, String>,
+    project: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = project;
+    merged.extend(operator); // operator entries override
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -434,5 +461,73 @@ base_url = "https://api.openai.com/v1"
         );
         let aliases = load_global_aliases();
         assert!(aliases.is_empty());
+    }
+
+    // -- operator aliases ---------------------------------------------------
+
+    #[test]
+    fn operator_loads_from_operator_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _xdg = setup_global(None, None);
+
+        // Create operator config for project "myproj"
+        let operator_dir = crate::paths::project_config_dir("myproj");
+        fs::create_dir_all(&operator_dir).expect("mkdir operator dir");
+        fs::write(
+            operator_dir.join("models.toml"),
+            r#"
+[aliases]
+smart = "operator-model"
+"#,
+        )
+        .expect("write operator models.toml");
+
+        let aliases = load_operator_aliases("myproj");
+        assert_eq!(aliases.len(), 1);
+        assert_eq!(
+            aliases.get("smart").map(String::as_str),
+            Some("operator-model")
+        );
+    }
+
+    #[test]
+    fn operator_missing_dir_returns_empty() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _xdg = setup_global(None, None);
+
+        let aliases = load_operator_aliases("nonexistent-project");
+        assert!(aliases.is_empty());
+    }
+
+    // -- merge_alias_maps ---------------------------------------------------
+
+    #[test]
+    fn merge_operator_overrides_project() {
+        let mut operator = HashMap::new();
+        operator.insert("smart".into(), "operator-model".into());
+        operator.insert("op-only".into(), "op-value".into());
+
+        let mut project = HashMap::new();
+        project.insert("smart".into(), "project-model".into());
+        project.insert("proj-only".into(), "proj-value".into());
+
+        let merged = merge_alias_maps(operator, project);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged.get("smart").map(String::as_str),
+            Some("operator-model"),
+            "operator should override project"
+        );
+        assert_eq!(merged.get("op-only").map(String::as_str), Some("op-value"));
+        assert_eq!(
+            merged.get("proj-only").map(String::as_str),
+            Some("proj-value")
+        );
+    }
+
+    #[test]
+    fn merge_empty_maps() {
+        let merged = merge_alias_maps(HashMap::new(), HashMap::new());
+        assert!(merged.is_empty());
     }
 }

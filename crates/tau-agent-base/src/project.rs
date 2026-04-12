@@ -327,7 +327,6 @@ mod tests {
 
     // Tests that modify environment variables must be serialized to avoid
     // races with the default parallel test runner.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn discover_finds_project_at_root() {
@@ -372,7 +371,9 @@ mod tests {
 
     #[test]
     fn init_creates_files() {
-        let _lock = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _lock = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();
@@ -412,7 +413,9 @@ mod tests {
 
     #[test]
     fn init_rejects_duplicate() {
-        let _lock = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _lock = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();
@@ -430,7 +433,9 @@ mod tests {
 
     #[test]
     fn init_gitignore_no_duplicate_line() {
-        let _lock = ENV_MUTEX.lock().expect("env mutex poisoned");
+        let _lock = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
 
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();

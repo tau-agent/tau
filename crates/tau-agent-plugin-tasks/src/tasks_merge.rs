@@ -81,23 +81,24 @@ pub struct CheckItem {
     pub command: String,
 }
 
-/// Load the project checklist from `{project_dir}/.tau/checklist.toml`.
-/// Returns an empty vec if the file doesn't exist or can't be parsed.
-pub fn load_checklist(project_dir: &str) -> Vec<CheckItem> {
-    let path = std::path::Path::new(project_dir)
-        .join(".tau")
-        .join("checklist.toml");
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    match toml::from_str::<Checklist>(&content) {
-        Ok(cl) => cl.check,
-        Err(e) => {
-            eprintln!("tasks merge: failed to parse checklist: {}", e);
-            Vec::new()
-        }
+/// Load the project checklist from up to three config tiers (operator >
+/// project > global).  Checklist items from higher tiers are prepended:
+/// operator items run first, then project, then global.
+///
+/// Returns an empty vec if no tier has a checklist file.
+pub fn load_checklist(project_dir: &str, project_name: Option<&str>) -> Vec<CheckItem> {
+    let configs: Vec<(_, Checklist)> = tau_agent_base::config_chain::load_all(
+        project_name,
+        Some(project_dir),
+        "checklist.toml",
+        true, // checklist is not security-sensitive
+    );
+
+    let mut items = Vec::new();
+    for (_path, checklist) in configs {
+        items.extend(checklist.check);
     }
+    items
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +280,7 @@ pub fn merge_task(
     }
 
     // 5. Run checklist
-    let checklist = load_checklist(project_dir);
+    let checklist = load_checklist(project_dir, None);
     for item in &checklist {
         log.push_str(&format!("=== Check: {} ===\n", item.name));
         let (output, is_error) = execute_bash(writer, reader, &log_session, &item.command)?;
@@ -588,6 +589,37 @@ pub fn notify_session_of_merge_failure(
 mod tests {
     use super::*;
     use crate::tasks_db::{TaskSession, TaskUpdate, TasksDb};
+
+    // Tests that read config files must be serialized when we override env.
+    static CHECKLIST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct XdgGuard {
+        prev_xdg: Option<String>,
+        prev_home: Option<String>,
+    }
+
+    impl Drop for XdgGuard {
+        fn drop(&mut self) {
+            match &self.prev_xdg {
+                Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+            match &self.prev_home {
+                Some(v) => unsafe { std::env::set_var("HOME", v) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        }
+    }
+
+    fn isolate_config() -> (tempfile::TempDir, XdgGuard) {
+        let config_tmp = tempfile::TempDir::new().unwrap();
+        let guard = XdgGuard {
+            prev_xdg: std::env::var("XDG_CONFIG_HOME").ok(),
+            prev_home: std::env::var("HOME").ok(),
+        };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", config_tmp.path()) };
+        (config_tmp, guard)
+    }
     use tau_agent_plugin::PluginRequest;
 
     // ----- archive role filter -----
@@ -705,6 +737,9 @@ mod tests {
 
     #[test]
     fn test_load_checklist_valid_toml() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_cfg, _xdg) = isolate_config();
+
         let dir = tempfile::TempDir::new().unwrap();
         let tau_dir = dir.path().join(".tau");
         std::fs::create_dir_all(&tau_dir).unwrap();
@@ -726,7 +761,7 @@ command = "cargo test"
         )
         .unwrap();
 
-        let items = load_checklist(dir.path().to_str().unwrap());
+        let items = load_checklist(dir.path().to_str().unwrap(), None);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].name, "fmt");
         assert_eq!(items[0].command, "cargo fmt --check");
@@ -737,42 +772,96 @@ command = "cargo test"
 
     #[test]
     fn test_load_checklist_missing_file() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_cfg, _xdg) = isolate_config();
+
         let dir = tempfile::TempDir::new().unwrap();
-        let items = load_checklist(dir.path().to_str().unwrap());
+        let items = load_checklist(dir.path().to_str().unwrap(), None);
         assert!(items.is_empty());
     }
 
     #[test]
     fn test_load_checklist_empty_file() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_cfg, _xdg) = isolate_config();
+
         let dir = tempfile::TempDir::new().unwrap();
         let tau_dir = dir.path().join(".tau");
         std::fs::create_dir_all(&tau_dir).unwrap();
         std::fs::write(tau_dir.join("checklist.toml"), "").unwrap();
 
-        let items = load_checklist(dir.path().to_str().unwrap());
+        let items = load_checklist(dir.path().to_str().unwrap(), None);
         assert!(items.is_empty());
     }
 
     #[test]
     fn test_load_checklist_no_checks() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_cfg, _xdg) = isolate_config();
+
         let dir = tempfile::TempDir::new().unwrap();
         let tau_dir = dir.path().join(".tau");
         std::fs::create_dir_all(&tau_dir).unwrap();
         std::fs::write(tau_dir.join("checklist.toml"), "# empty checklist\n").unwrap();
 
-        let items = load_checklist(dir.path().to_str().unwrap());
+        let items = load_checklist(dir.path().to_str().unwrap(), None);
         assert!(items.is_empty());
     }
 
     #[test]
     fn test_load_checklist_invalid_toml() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_cfg, _xdg) = isolate_config();
+
         let dir = tempfile::TempDir::new().unwrap();
         let tau_dir = dir.path().join(".tau");
         std::fs::create_dir_all(&tau_dir).unwrap();
         std::fs::write(tau_dir.join("checklist.toml"), "not [[ valid toml {{").unwrap();
 
-        let items = load_checklist(dir.path().to_str().unwrap());
+        let items = load_checklist(dir.path().to_str().unwrap(), None);
         assert!(items.is_empty());
+    }
+
+    #[test]
+    fn test_load_checklist_three_tier_operator_first() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (config_tmp, _xdg) = isolate_config();
+
+        // Global checklist
+        let global_dir = config_tmp.path().join("tau");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(
+            global_dir.join("checklist.toml"),
+            "[[check]]\nname = \"global-lint\"\ncommand = \"lint-global\"\n",
+        )
+        .unwrap();
+
+        // Project checklist
+        let project_tmp = tempfile::TempDir::new().unwrap();
+        let tau_dir = project_tmp.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(
+            tau_dir.join("checklist.toml"),
+            "[[check]]\nname = \"project-test\"\ncommand = \"test-project\"\n",
+        )
+        .unwrap();
+
+        // Operator checklist
+        let operator_dir = global_dir.join("projects").join("myproj");
+        std::fs::create_dir_all(&operator_dir).unwrap();
+        std::fs::write(
+            operator_dir.join("checklist.toml"),
+            "[[check]]\nname = \"operator-fmt\"\ncommand = \"fmt-operator\"\n",
+        )
+        .unwrap();
+
+        let items = load_checklist(project_tmp.path().to_str().unwrap(), Some("myproj"));
+
+        assert_eq!(items.len(), 3);
+        // Operator first, then project, then global
+        assert_eq!(items[0].name, "operator-fmt");
+        assert_eq!(items[1].name, "project-test");
+        assert_eq!(items[2].name, "global-lint");
     }
 
     // ----- merge state validation -----

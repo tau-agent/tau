@@ -17,6 +17,15 @@ use crate::tasks_db::{Task, TaskUpdate, TasksDb};
 use crate::tasks_git;
 use tau_agent_plugin::PluginMessage;
 
+/// Discover the project name for a task's project path.
+///
+/// Uses `discover_project` to walk up from the project directory and read
+/// `.tau/project.toml`. Returns `None` if the project is not initialized.
+fn resolve_project_name(project_path: &str) -> Option<String> {
+    tau_agent_base::project::discover_project(std::path::Path::new(project_path))
+        .map(|(name, _)| name)
+}
+
 // ---------------------------------------------------------------------------
 // Batch selection
 // ---------------------------------------------------------------------------
@@ -442,8 +451,10 @@ pub fn dispatch(
     let merge_target = db
         .get_merge_target(task_id)
         .unwrap_or_else(|_| "main".into());
+    let proj_name = resolve_project_name(&task.project);
     let project_instructions =
-        tasks_config::load_project_instructions(&task.project, "worker").unwrap_or_default();
+        tasks_config::load_project_instructions(&task.project, proj_name.as_deref(), "worker")
+            .unwrap_or_default();
     let chat_msg = build_initial_message(&task, &merge_target, &project_instructions);
     let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
@@ -557,8 +568,10 @@ fn dispatch_planning(
     };
 
     // Load project-specific planning instructions
+    let proj_name = resolve_project_name(&task.project);
     let project_instructions =
-        tasks_config::load_project_instructions(&task.project, "planning").unwrap_or_default();
+        tasks_config::load_project_instructions(&task.project, proj_name.as_deref(), "planning")
+            .unwrap_or_default();
 
     let merge_target = db
         .get_merge_target(task_id)
@@ -798,8 +811,10 @@ pub fn dispatch_review(
     };
 
     // Load project-specific review instructions
+    let proj_name = resolve_project_name(&task.project);
     let project_instructions =
-        tasks_config::load_project_instructions(&task.project, "review").unwrap_or_default();
+        tasks_config::load_project_instructions(&task.project, proj_name.as_deref(), "review")
+            .unwrap_or_default();
 
     let merge_target = db
         .get_merge_target(task.id)
@@ -977,8 +992,10 @@ pub fn dispatch_refining(
     };
 
     // Load project-specific refining instructions
+    let proj_name = resolve_project_name(&task.project);
     let project_instructions =
-        tasks_config::load_project_instructions(&task.project, "refining").unwrap_or_default();
+        tasks_config::load_project_instructions(&task.project, proj_name.as_deref(), "refining")
+            .unwrap_or_default();
 
     let merge_target = db
         .get_merge_target(task_id)

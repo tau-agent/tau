@@ -81,22 +81,34 @@ pub(super) fn create_session_impl(
         .or_else(|| parent.as_ref().and_then(|p| p.cwd.clone()));
 
     // Resolve the model. When the request supplies an explicit model_id we
-    // run it through the alias resolver (project map → global map → literal
-    // id). When no model_id is given we inherit from the parent or fall
-    // back to the server-wide default, preserving the historical behavior
-    // for sessions that don't ask for a specific model.
+    // run it through the alias resolver (operator → project → global →
+    // literal id). When no model_id is given we inherit from the parent or
+    // fall back to the server-wide default, preserving the historical
+    // behavior for sessions that don't ask for a specific model.
     //
-    // NOTE: load_project_aliases performs file I/O while we hold the state
-    // lock. This mirrors how `load_project_instructions` is invoked from
-    // the task scheduler — see models_config.rs for the rationale.
+    // NOTE: load_project_aliases / load_operator_aliases perform file I/O
+    // while we hold the state lock. This mirrors how
+    // `load_project_instructions` is invoked from the task scheduler —
+    // see models_config.rs for the rationale.
     let model = if let Some(mid) = model_id {
         let project_aliases = cwd
             .as_deref()
-            .map(crate::models_config::load_project_aliases);
+            .map(crate::models_config::load_project_aliases)
+            .unwrap_or_default();
+        // Discover project name from cwd for operator-tier aliases.
+        let project_name = cwd.as_deref().and_then(|c| {
+            tau_agent_base::project::discover_project(std::path::Path::new(c)).map(|(name, _)| name)
+        });
+        let operator_aliases = project_name
+            .as_deref()
+            .map(crate::models_config::load_operator_aliases)
+            .unwrap_or_default();
+        let merged_project =
+            crate::models_config::merge_alias_maps(operator_aliases, project_aliases);
         let resolved = crate::model_resolve::resolve_model(
             mid,
             provider_name.as_deref(),
-            project_aliases.as_ref(),
+            Some(&merged_project).filter(|m| !m.is_empty()),
             &st.global_aliases,
             &st.all_models,
         );
@@ -979,8 +991,18 @@ pub(super) async fn handle_client(
                 };
                 let project: Vec<AliasInfo> = match cwd.as_deref() {
                     Some(c) => {
-                        let map = crate::models_config::load_project_aliases(c);
-                        let mut entries: Vec<AliasInfo> = map
+                        let project_map = crate::models_config::load_project_aliases(c);
+                        // Discover project name for operator-tier aliases.
+                        let proj_name =
+                            tau_agent_base::project::discover_project(std::path::Path::new(c))
+                                .map(|(name, _)| name);
+                        let operator_map = proj_name
+                            .as_deref()
+                            .map(crate::models_config::load_operator_aliases)
+                            .unwrap_or_default();
+                        let merged =
+                            crate::models_config::merge_alias_maps(operator_map, project_map);
+                        let mut entries: Vec<AliasInfo> = merged
                             .into_iter()
                             .map(|(name, target)| AliasInfo { name, target })
                             .collect();
@@ -1051,11 +1073,23 @@ pub(super) async fn handle_client(
                         .and_then(|s| s.cwd);
                     let project_aliases = cwd
                         .as_deref()
-                        .map(crate::models_config::load_project_aliases);
+                        .map(crate::models_config::load_project_aliases)
+                        .unwrap_or_default();
+                    // Discover project name for operator-tier aliases.
+                    let proj_name = cwd.as_deref().and_then(|c| {
+                        tau_agent_base::project::discover_project(std::path::Path::new(c))
+                            .map(|(name, _)| name)
+                    });
+                    let operator_aliases = proj_name
+                        .as_deref()
+                        .map(crate::models_config::load_operator_aliases)
+                        .unwrap_or_default();
+                    let merged_project =
+                        crate::models_config::merge_alias_maps(operator_aliases, project_aliases);
                     match crate::model_resolve::resolve_model(
                         &model_id,
                         None,
-                        project_aliases.as_ref(),
+                        Some(&merged_project).filter(|m| !m.is_empty()),
                         &st.global_aliases,
                         &st.all_models,
                     ) {
