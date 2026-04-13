@@ -2187,6 +2187,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
                 skip_review,
                 skip_planning,
                 require_approval,
+                None,
             )?;
             println!("created task #{}: {}", task.id, task.title);
         }

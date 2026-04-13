@@ -19,6 +19,7 @@ pub struct Task {
     pub tags: Option<serde_json::Value>,
     pub affected_files: Option<serde_json::Value>,
     pub branch: Option<String>,
+    pub merge_target: Option<String>,
     pub worktree_path: Option<String>,
     pub session_id: Option<String>,
     pub skip_review: bool,
@@ -64,6 +65,7 @@ pub struct TaskUpdate {
     pub skip_review: Option<bool>,
     pub skip_planning: Option<bool>,
     pub require_approval: Option<bool>,
+    pub merge_target: Option<String>,
 }
 
 /// Result of `assign_task`, containing the updated task plus information
@@ -400,6 +402,18 @@ impl TasksDb {
             .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate require_approval: {}", e)))?;
         }
 
+        // Add merge_target column if it doesn't exist.
+        let has_merge_target: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'merge_target'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_merge_target {
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN merge_target TEXT;")
+                .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate merge_target: {}", e)))?;
+        }
+
         // Migrate done -> merged/closed terminal states.
         let has_done: bool = conn
             .prepare("SELECT COUNT(*) FROM tasks WHERE state = 'done'")
@@ -439,6 +453,7 @@ impl TasksDb {
         skip_review: bool,
         skip_planning: bool,
         require_approval: bool,
+        merge_target: Option<&str>,
     ) -> tau_agent_plugin::Result<Task> {
         let now = tau_agent_plugin::timestamp_ms() as i64;
         let priority = priority.unwrap_or(0);
@@ -458,8 +473,8 @@ impl TasksDb {
 
         self.conn
             .execute(
-                "INSERT INTO tasks (project_name, title, state, priority, parent_id, tags, skip_review, skip_planning, require_approval, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO tasks (project_name, title, state, priority, parent_id, tags, skip_review, skip_planning, require_approval, merge_target, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     project_name,
                     title,
@@ -470,6 +485,7 @@ impl TasksDb {
                     skip_review as i32,
                     skip_planning as i32,
                     require_approval as i32,
+                    merge_target,
                     now,
                     now,
                 ],
@@ -486,7 +502,7 @@ impl TasksDb {
         self.conn
             .query_row(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
+                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval,
                         created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
@@ -507,7 +523,7 @@ impl TasksDb {
     ) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut sql = String::from(
             "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                    branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
+                    branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval,
                     created_at, updated_at
              FROM tasks WHERE project_name = ?1",
         );
@@ -721,6 +737,19 @@ impl TasksDb {
                 "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "require_approval", old_str, new_str, session_id, now],
+            )
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+        }
+
+        if let Some(ref val) = update.merge_target {
+            let old_str = task.merge_target.clone();
+            let new_str = val.to_string();
+            params_vec.push(Box::new(val.clone()));
+            sets.push("merge_target = ?".to_string());
+            tx.execute(
+                "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, "merge_target", old_str, new_str, session_id, now],
             )
             .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
         }
@@ -994,7 +1023,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
-                        t.tags, t.affected_files, t.branch,
+                        t.tags, t.affected_files, t.branch, t.merge_target,
                         t.worktree_path, t.session_id, t.skip_review, t.skip_planning, t.require_approval, t.created_at,
                         t.updated_at
                  FROM task_relations r
@@ -1026,7 +1055,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
-                        t.tags, t.affected_files, t.branch,
+                        t.tags, t.affected_files, t.branch, t.merge_target,
                         t.worktree_path, t.session_id, t.skip_review, t.skip_planning, t.require_approval, t.created_at,
                         t.updated_at
                  FROM tasks t
@@ -1064,7 +1093,7 @@ impl TasksDb {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project_name {
             Some(p) => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
+                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved' AND project_name = ?1
@@ -1074,7 +1103,7 @@ impl TasksDb {
             ),
             None => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
+                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved'
@@ -1131,7 +1160,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
+                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval,
                         created_at, updated_at
                  FROM tasks
                  WHERE project_name = ?1
@@ -1206,7 +1235,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
+                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval,
                         created_at, updated_at
                  FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
             )
@@ -1509,7 +1538,7 @@ impl TasksDb {
 
         if let Some(state) = state_filter {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
-                    t.tags, t.affected_files, t.branch,
+                    t.tags, t.affected_files, t.branch, t.merge_target,
                     t.worktree_path, t.session_id, t.skip_review, t.skip_planning, t.require_approval, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
@@ -1532,7 +1561,7 @@ impl TasksDb {
             }
         } else {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
-                    t.tags, t.affected_files, t.branch,
+                    t.tags, t.affected_files, t.branch, t.merge_target,
                     t.worktree_path, t.session_id, t.skip_review, t.skip_planning, t.require_approval, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
@@ -1610,6 +1639,12 @@ impl TasksDb {
             .get_task(task_id)?
             .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
+        // Explicit override wins
+        if let Some(ref target) = task.merge_target {
+            return Ok(target.clone());
+        }
+
+        // Default: parent's branch (subtask) or "main" (root)
         match task.parent_id {
             None => Ok("main".to_string()),
             Some(pid) => {
@@ -1668,7 +1703,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, worktree_path, session_id, skip_review, skip_planning, require_approval,
+                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval,
                         created_at, updated_at
                  FROM tasks
                  WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
@@ -1730,13 +1765,14 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         tags,
         affected_files,
         branch: row.get(8)?,
-        worktree_path: row.get(9)?,
-        session_id: row.get(10)?,
-        skip_review: row.get::<_, i32>(11)? != 0,
-        skip_planning: row.get::<_, i32>(12)? != 0,
-        require_approval: row.get::<_, i32>(13)? != 0,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        merge_target: row.get(9)?,
+        worktree_path: row.get(10)?,
+        session_id: row.get(11)?,
+        skip_review: row.get::<_, i32>(12)? != 0,
+        skip_planning: row.get::<_, i32>(13)? != 0,
+        require_approval: row.get::<_, i32>(14)? != 0,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 
@@ -1776,6 +1812,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1805,6 +1842,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1825,6 +1863,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let _t2 = db
@@ -1837,10 +1876,13 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let _t3 = db
-            .create_task("other", "Task 3", None, None, None, false, false, false)
+            .create_task(
+                "other", "Task 3", None, None, None, false, false, false, None,
+            )
             .unwrap();
 
         // All non-terminal tasks for /project
@@ -1885,6 +1927,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
         db.create_task(
@@ -1896,6 +1939,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
 
@@ -1924,6 +1968,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2060,6 +2105,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2103,6 +2149,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         // interactive -> ready -> active -> review -> approved
@@ -2205,6 +2252,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    None,
                 )
                 .unwrap();
 
@@ -2259,6 +2307,7 @@ mod tests {
                     false,
                     false,
                     false,
+                    None,
                 )
                 .unwrap();
 
@@ -2310,6 +2359,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2340,6 +2390,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2369,6 +2420,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2423,6 +2475,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -2435,6 +2488,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2464,6 +2518,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2487,6 +2542,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -2499,6 +2555,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2519,6 +2576,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let _t2 = db
@@ -2531,6 +2589,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t3 = db
@@ -2543,6 +2602,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2575,6 +2635,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let _child1 = db
@@ -2587,6 +2648,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let _child2 = db
@@ -2599,6 +2661,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2622,6 +2685,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.create_task(
@@ -2633,6 +2697,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
         db.create_task(
@@ -2644,6 +2709,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
         db.create_task(
@@ -2655,6 +2721,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         )
         .unwrap();
 
@@ -2693,6 +2760,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.add_message(task.id, "msg", None).unwrap();
@@ -2711,7 +2779,17 @@ mod tests {
     fn test_skip_review_roundtrip() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("test-project", "Test", None, None, None, true, false, false)
+            .create_task(
+                "test-project",
+                "Test",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         assert!(task.skip_review);
 
@@ -2743,6 +2821,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -2800,6 +2879,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2832,6 +2912,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -2862,6 +2943,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2885,6 +2967,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2913,6 +2996,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2961,6 +3045,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(parent.state, "interactive");
@@ -2976,6 +3061,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(child.state, "planning");
@@ -2995,6 +3081,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3009,6 +3096,7 @@ mod tests {
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(child.state, "ready");
@@ -3030,6 +3118,7 @@ mod tests {
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -3040,7 +3129,17 @@ mod tests {
     fn test_skip_planning_roundtrip() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("test-project", "Test", None, None, None, false, true, false)
+            .create_task(
+                "test-project",
+                "Test",
+                None,
+                None,
+                None,
+                false,
+                true,
+                false,
+                None,
+            )
             .unwrap();
         assert!(task.skip_planning);
 
@@ -3061,7 +3160,17 @@ mod tests {
     fn test_require_approval_roundtrip() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("test-project", "Test", None, None, None, false, false, true)
+            .create_task(
+                "test-project",
+                "Test",
+                None,
+                None,
+                None,
+                false,
+                false,
+                true,
+                None,
+            )
             .unwrap();
         assert!(task.require_approval);
 
@@ -3091,6 +3200,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert!(!task.require_approval);
@@ -3109,6 +3219,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -3139,7 +3250,17 @@ mod tests {
     fn test_active_to_approved_allowed_with_skip_review() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("test-project", "Test", None, None, None, true, false, false)
+            .create_task(
+                "test-project",
+                "Test",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -3180,6 +3301,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert!(task.branch.is_none());
@@ -3210,6 +3332,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert!(task.worktree_path.is_none());
@@ -3244,6 +3367,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3279,6 +3403,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_worktree_path(t1.id, "/tmp/wt-1").unwrap();
@@ -3303,6 +3428,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_worktree_path(t2.id, "/tmp/wt-2").unwrap();
@@ -3327,6 +3453,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -3350,6 +3477,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_worktree_path(t4.id, "/tmp/wt-4").unwrap();
@@ -3398,6 +3526,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3418,6 +3547,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_branch(parent.id, "task-1").unwrap();
@@ -3432,6 +3562,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3452,6 +3583,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         // Don't set a branch on parent — should fall back to "main"
@@ -3466,6 +3598,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3480,12 +3613,178 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
+    #[test]
+    fn test_get_merge_target_explicit_override_root() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Root with override",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                Some("develop"),
+            )
+            .unwrap();
+
+        let target = db.get_merge_target(task.id).unwrap();
+        assert_eq!(target, "develop");
+    }
+
+    #[test]
+    fn test_get_merge_target_explicit_override_subtask() {
+        let db = TasksDb::open_memory().unwrap();
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        db.set_branch(parent.id, "task-1").unwrap();
+
+        // Subtask with explicit merge_target should override parent's branch
+        let child = db
+            .create_task(
+                "test-project",
+                "Child with override",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                false,
+                false,
+                Some("main"),
+            )
+            .unwrap();
+
+        let target = db.get_merge_target(child.id).unwrap();
+        assert_eq!(target, "main");
+    }
+
+    #[test]
+    fn test_merge_target_roundtrip_create() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "With merge target",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                Some("release/v2"),
+            )
+            .unwrap();
+
+        assert_eq!(task.merge_target.as_deref(), Some("release/v2"));
+    }
+
+    #[test]
+    fn test_merge_target_roundtrip_update() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Update merge target",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(task.merge_target.is_none());
+
+        let updated = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    merge_target: Some("develop".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated.merge_target.as_deref(), Some("develop"));
+
+        // Verify get_merge_target uses the override
+        let target = db.get_merge_target(task.id).unwrap();
+        assert_eq!(target, "develop");
+    }
+
+    #[test]
+    fn test_merge_target_null_preserves_default_behavior() {
+        let db = TasksDb::open_memory().unwrap();
+        // Root task without merge_target should still return "main"
+        let task = db
+            .create_task(
+                "test-project",
+                "Default behavior",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(task.merge_target.is_none());
+        assert_eq!(db.get_merge_target(task.id).unwrap(), "main");
+
+        // Subtask without merge_target should derive from parent branch
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        db.set_branch(parent.id, "feature-branch").unwrap();
+
+        let child = db
+            .create_task(
+                "test-project",
+                "Child",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
+            .unwrap();
+        assert!(child.merge_target.is_none());
+        assert_eq!(db.get_merge_target(child.id).unwrap(), "feature-branch");
+    }
+
     // ----- dependency enforcement tests -----
 
     /// Helper: create a task and move it to a given state using valid transitions.
     fn create_task_in_state(db: &TasksDb, project: &str, title: &str, state: &str) -> Task {
         let task = db
-            .create_task(project, title, None, None, None, true, false, false)
+            .create_task(project, title, None, None, None, true, false, false, None)
             .unwrap();
         let transitions: &[&str] = match state {
             "interactive" => &[],
@@ -3752,6 +4051,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3763,10 +4063,30 @@ mod tests {
     fn test_cross_project_relation_allowed() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("project-a", "Task A", None, None, None, false, false, false)
+            .create_task(
+                "project-a",
+                "Task A",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         let t2 = db
-            .create_task("project-b", "Task B", None, None, None, false, false, false)
+            .create_task(
+                "project-b",
+                "Task B",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
             .unwrap();
 
         // Cross-project relations should succeed
@@ -3783,10 +4103,30 @@ mod tests {
     fn test_cross_project_cycle_detection() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("project-a", "Task A", None, None, None, false, false, false)
+            .create_task(
+                "project-a",
+                "Task A",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         let t2 = db
-            .create_task("project-b", "Task B", None, None, None, false, false, false)
+            .create_task(
+                "project-b",
+                "Task B",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
             .unwrap();
 
         // A depends_on B (cross-project) should work
@@ -3810,6 +4150,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3822,6 +4163,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3846,6 +4188,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3858,6 +4201,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t3 = db
@@ -3870,6 +4214,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3895,6 +4240,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3907,6 +4253,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3930,6 +4277,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3942,6 +4290,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3961,6 +4310,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3973,6 +4323,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -3995,6 +4346,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -4007,6 +4359,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t3 = db
@@ -4019,6 +4372,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let t4 = db
@@ -4031,6 +4385,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4072,16 +4427,16 @@ mod tests {
         // Then D -> A should be rejected (cycle through either path)
         let db = TasksDb::open_memory().unwrap();
         let a = db
-            .create_task("p", "A", None, None, None, false, false, false)
+            .create_task("p", "A", None, None, None, false, false, false, None)
             .unwrap();
         let b = db
-            .create_task("p", "B", None, None, None, false, false, false)
+            .create_task("p", "B", None, None, None, false, false, false, None)
             .unwrap();
         let c = db
-            .create_task("p", "C", None, None, None, false, false, false)
+            .create_task("p", "C", None, None, None, false, false, false, None)
             .unwrap();
         let d = db
-            .create_task("p", "D", None, None, None, false, false, false)
+            .create_task("p", "D", None, None, None, false, false, false, None)
             .unwrap();
 
         db.add_relation(a.id, b.id, "depends_on").unwrap();
@@ -4095,7 +4450,7 @@ mod tests {
 
         // But D -> (new task E) is fine
         let e = db
-            .create_task("p", "E", None, None, None, false, false, false)
+            .create_task("p", "E", None, None, None, false, false, false, None)
             .unwrap();
         db.add_relation(d.id, e.id, "depends_on").unwrap();
     }
@@ -4106,19 +4461,19 @@ mod tests {
         // Adding E -> C should be rejected (cycle C -> D -> E -> C)
         let db = TasksDb::open_memory().unwrap();
         let a = db
-            .create_task("p", "A", None, None, None, false, false, false)
+            .create_task("p", "A", None, None, None, false, false, false, None)
             .unwrap();
         let b = db
-            .create_task("p", "B", None, None, None, false, false, false)
+            .create_task("p", "B", None, None, None, false, false, false, None)
             .unwrap();
         let c = db
-            .create_task("p", "C", None, None, None, false, false, false)
+            .create_task("p", "C", None, None, None, false, false, false, None)
             .unwrap();
         let d = db
-            .create_task("p", "D", None, None, None, false, false, false)
+            .create_task("p", "D", None, None, None, false, false, false, None)
             .unwrap();
         let e = db
-            .create_task("p", "E", None, None, None, false, false, false)
+            .create_task("p", "E", None, None, None, false, false, false, None)
             .unwrap();
 
         db.add_relation(a.id, b.id, "depends_on").unwrap();
@@ -4135,10 +4490,10 @@ mod tests {
         // A depends_on B, B blocks A — no real cycle since blocks is informational
         let db = TasksDb::open_memory().unwrap();
         let a = db
-            .create_task("p", "A", None, None, None, false, false, false)
+            .create_task("p", "A", None, None, None, false, false, false, None)
             .unwrap();
         let b = db
-            .create_task("p", "B", None, None, None, false, false, false)
+            .create_task("p", "B", None, None, None, false, false, false, None)
             .unwrap();
 
         db.add_relation(a.id, b.id, "depends_on").unwrap();
@@ -4151,20 +4506,20 @@ mod tests {
         // A -> C and B -> C is fine (convergent, no cycle)
         let db = TasksDb::open_memory().unwrap();
         let a = db
-            .create_task("p", "A", None, None, None, false, false, false)
+            .create_task("p", "A", None, None, None, false, false, false, None)
             .unwrap();
         let b = db
-            .create_task("p", "B", None, None, None, false, false, false)
+            .create_task("p", "B", None, None, None, false, false, false, None)
             .unwrap();
         let c = db
-            .create_task("p", "C", None, None, None, false, false, false)
+            .create_task("p", "C", None, None, None, false, false, false, None)
             .unwrap();
 
         db.add_relation(a.id, c.id, "depends_on").unwrap();
         db.add_relation(b.id, c.id, "depends_on").unwrap();
         // And C -> D is fine (no cycle)
         let d = db
-            .create_task("p", "D", None, None, None, false, false, false)
+            .create_task("p", "D", None, None, None, false, false, false, None)
             .unwrap();
         db.add_relation(c.id, d.id, "depends_on").unwrap();
     }
@@ -4193,6 +4548,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4215,6 +4571,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4247,6 +4604,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4287,7 +4645,17 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
 
         let t1 = db
-            .create_task("project-a", "Task A", None, None, None, true, false, false)
+            .create_task(
+                "project-a",
+                "Task A",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         db.update_task(
             t1.id,
@@ -4310,7 +4678,17 @@ mod tests {
         .unwrap();
 
         let t2 = db
-            .create_task("project-b", "Task B", None, None, None, true, false, false)
+            .create_task(
+                "project-b",
+                "Task B",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         db.update_task(
             t2.id,
@@ -4358,6 +4736,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4390,6 +4769,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4430,6 +4810,7 @@ mod tests {
             tags: None,
             affected_files: None,
             branch: None,
+            merge_target: None,
             worktree_path: None,
             session_id: None,
             skip_review: false,
@@ -4518,6 +4899,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let child1 = db
@@ -4530,6 +4912,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let child2 = db
@@ -4542,6 +4925,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4565,6 +4949,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let child = db
@@ -4577,6 +4962,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let grandchild = db
@@ -4589,6 +4975,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4612,6 +4999,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4634,6 +5022,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4679,6 +5068,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_session_id(task.id, "s1").unwrap();
@@ -4706,6 +5096,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -4782,6 +5173,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4813,6 +5205,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4842,6 +5235,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4881,6 +5275,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4935,6 +5330,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -4990,6 +5386,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -5041,6 +5438,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -5102,6 +5500,7 @@ mod tests {
                     true,
                     true,
                     false,
+                    None,
                 )
                 .unwrap();
 
@@ -5174,6 +5573,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -5206,6 +5606,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -5230,7 +5631,9 @@ mod tests {
         let project = "test-project";
 
         let task = db
-            .create_task(project, "Do work", None, None, None, false, true, false)
+            .create_task(
+                project, "Do work", None, None, None, false, true, false, None,
+            )
             .unwrap();
         // interactive -> ready (skip_planning)
         db.update_task(
@@ -5254,7 +5657,17 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
 
         let task_a = db
-            .create_task("project-a", "Task A", None, None, None, false, true, false)
+            .create_task(
+                "project-a",
+                "Task A",
+                None,
+                None,
+                None,
+                false,
+                true,
+                false,
+                None,
+            )
             .unwrap();
         db.update_task(
             task_a.id,
@@ -5268,7 +5681,17 @@ mod tests {
         db.assign_task(task_a.id, "s100").unwrap();
 
         let task_b = db
-            .create_task("project-b", "Task B", None, None, None, false, false, false)
+            .create_task(
+                "project-b",
+                "Task B",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         db.update_task(
             task_b.id,

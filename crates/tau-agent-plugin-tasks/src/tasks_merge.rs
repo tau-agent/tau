@@ -710,7 +710,17 @@ mod tests {
     fn test_sessions_to_archive_via_db() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("test-project", "T", None, None, None, true, false, false)
+            .create_task(
+                "test-project",
+                "T",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+                None,
+            )
             .unwrap();
         db.record_session(task.id, "s-worker", "worker").unwrap();
         db.record_session(task.id, "s-reviewer", "reviewer")
@@ -890,6 +900,7 @@ command = "cargo test"
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         // interactive -> ready
@@ -942,6 +953,7 @@ command = "cargo test"
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -970,6 +982,7 @@ command = "cargo test"
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -1026,6 +1039,7 @@ command = "cargo test"
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -1087,6 +1101,7 @@ command = "cargo test"
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1102,6 +1117,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
         let child2 = db
@@ -1114,6 +1130,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1185,6 +1202,7 @@ command = "cargo test"
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1199,6 +1217,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
         let _child2 = db
@@ -1211,6 +1230,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1277,6 +1297,7 @@ command = "cargo test"
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1301,6 +1322,7 @@ command = "cargo test"
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1316,6 +1338,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1415,6 +1438,7 @@ command = "cargo test"
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -1429,6 +1453,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1483,6 +1508,7 @@ command = "cargo test"
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -1508,6 +1534,7 @@ command = "cargo test"
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         // Don't set session_id on parent
@@ -1522,6 +1549,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
             )
             .unwrap();
 

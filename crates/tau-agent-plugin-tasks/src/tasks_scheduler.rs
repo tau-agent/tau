@@ -219,16 +219,9 @@ fn prepare_task(
 ) -> tau_agent_plugin::Result<ScheduledTask> {
     let branch = tasks_git::task_branch_name(task.id, task.parent_id);
 
-    // Determine the base branch: parent's branch, or "main".
-    let base_branch = match task.parent_id {
-        Some(pid) => {
-            let parent = db.get_task(pid)?.ok_or_else(|| {
-                tau_agent_plugin::Error::Io(format!("parent task {} not found", pid))
-            })?;
-            parent.branch.as_deref().unwrap_or("main").to_string()
-        }
-        None => "main".to_string(),
-    };
+    // Determine the base branch: merge target (explicit override, parent's
+    // branch, or "main").
+    let base_branch = db.get_merge_target(task.id)?;
 
     // Create branch (skip if it already exists — idempotent).
     if !tasks_git::branch_exists(repo_root, &branch)? {
@@ -1790,6 +1783,7 @@ mod tests {
                 )
             }),
             branch: None,
+            merge_target: None,
             worktree_path: None,
             session_id: None,
             skip_review: false,
@@ -2289,6 +2283,7 @@ mod tests {
                 true,
                 true,
                 false,
+                None,
             )
             .unwrap();
         // interactive -> ready
@@ -2469,6 +2464,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -2532,6 +2528,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -2606,6 +2603,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         // interactive -> ready
@@ -2674,6 +2672,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         // interactive -> ready
@@ -2734,6 +2733,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -2749,6 +2749,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
 
@@ -2799,6 +2800,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.record_session(task.id, "planner-session", "planner")
@@ -3081,6 +3083,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let child = db
@@ -3093,6 +3096,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(child.state, "planning");
@@ -3117,6 +3121,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -3211,6 +3216,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         let child = db
@@ -3223,6 +3229,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
             )
             .unwrap();
         assert_eq!(child.state, "planning");

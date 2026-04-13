@@ -152,6 +152,7 @@ pub fn handle_task_create(
         false,
         false,
         false,
+        None,
     ) {
         Ok(task) => Response::TaskUpdated {
             task: task_to_info(task),
@@ -187,6 +188,7 @@ pub fn handle_task_update(
         skip_review,
         skip_planning,
         require_approval,
+        merge_target: None,
     };
     match db.update_task(id, &update, None) {
         Ok(task) => Response::TaskUpdated {
