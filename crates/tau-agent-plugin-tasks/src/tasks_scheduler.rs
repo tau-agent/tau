@@ -1480,6 +1480,7 @@ pub enum WaitReason {
         task_id: i64,
         title: String,
         state: String,
+        project_name: String,
     },
     /// Affected files overlap with an active/in-flight task.
     FileConflict {
@@ -1548,6 +1549,7 @@ pub fn get_status(db: &TasksDb, project_name: &str) -> tau_agent_plugin::Result<
                     task_id: d.id,
                     title: d.title.clone(),
                     state: d.state.clone(),
+                    project_name: d.project_name.clone(),
                 })
                 .collect();
             active.push(TaskStatus {
@@ -1566,6 +1568,7 @@ pub fn get_status(db: &TasksDb, project_name: &str) -> tau_agent_plugin::Result<
                         task_id: d.id,
                         title: d.title.clone(),
                         state: d.state.clone(),
+                        project_name: d.project_name.clone(),
                     })
                     .collect();
                 blocked.push(TaskStatus {
@@ -1722,8 +1725,17 @@ fn format_task_line(out: &mut String, ts: &TaskStatus) {
                 task_id,
                 title: _,
                 state,
+                project_name,
             } => {
-                let _ = write!(out, "  ⏳ depends on #{} ({})", task_id, state);
+                if project_name != &ts.task.project_name {
+                    let _ = write!(
+                        out,
+                        "  ⏳ depends on #{} ({}) [{}]",
+                        task_id, state, project_name
+                    );
+                } else {
+                    let _ = write!(out, "  ⏳ depends on #{} ({})", task_id, state);
+                }
             }
             WaitReason::FileConflict {
                 files,
@@ -3254,5 +3266,72 @@ mod tests {
         assert!(output.contains("QUEUED - READY"));
         assert!(output.contains("#2"));
         assert!(output.contains("file conflict"));
+    }
+
+    #[test]
+    fn test_get_status_cross_project_dependency() {
+        let db = TasksDb::open_memory().unwrap();
+        let dep = create_ready_task(&db, "project-b", "Cross-project dep", 5, None);
+        let task = create_ready_task(&db, "project-a", "Blocked task", 3, None);
+        db.add_relation(task.id, dep.id, "depends_on").unwrap();
+
+        let status = get_status(&db, "project-a").unwrap();
+        assert_eq!(status.blocked.len(), 1);
+        assert_eq!(status.blocked[0].task.id, task.id);
+        assert!(matches!(
+            &status.blocked[0].wait_reasons[0],
+            WaitReason::Dependency { task_id, project_name, .. }
+                if *task_id == dep.id && project_name == "project-b"
+        ));
+    }
+
+    #[test]
+    fn test_format_task_line_cross_project_dependency() {
+        let mut task = make_task(10, 5, None);
+        task.project_name = "project-a".to_string();
+        let ts = TaskStatus {
+            task,
+            session_id: None,
+            wait_reasons: vec![WaitReason::Dependency {
+                task_id: 20,
+                title: "Cross dep".into(),
+                state: "active".into(),
+                project_name: "project-b".into(),
+            }],
+        };
+        let mut out = String::new();
+        format_task_line(&mut out, &ts);
+        assert!(
+            out.contains("depends on #20 (active) [project-b]"),
+            "expected cross-project format, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_format_task_line_same_project_dependency() {
+        let ts = TaskStatus {
+            task: make_task(10, 5, None),
+            session_id: None,
+            wait_reasons: vec![WaitReason::Dependency {
+                task_id: 20,
+                title: "Same dep".into(),
+                state: "active".into(),
+                project_name: "test-project".into(),
+            }],
+        };
+        let mut out = String::new();
+        format_task_line(&mut out, &ts);
+        assert!(
+            out.contains("depends on #20 (active)"),
+            "expected same-project format, got: {}",
+            out
+        );
+        // Should NOT contain project name in brackets
+        assert!(
+            !out.contains("[test-project]"),
+            "same-project dep should not show project name, got: {}",
+            out
+        );
     }
 }

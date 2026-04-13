@@ -856,7 +856,7 @@ fn handle_task_get(db: &TasksDb, args: &serde_json::Value, tool_call_id: &str) -
         Err(e) => return tool_err(tool_call_id, &format!("get subtasks: {}", e)),
     };
 
-    // Build enriched relations with dependency status
+    // Build enriched relations with dependency status and cross-project context
     let enriched_relations: Vec<serde_json::Value> = relations
         .iter()
         .map(|rel| {
@@ -865,20 +865,33 @@ fn handle_task_get(db: &TasksDb, args: &serde_json::Value, tool_call_id: &str) -
                 "to_task": rel.to_task,
                 "relation": rel.relation,
             });
-            // For depends_on relations where this task is the dependent,
-            // include whether the dependency is satisfied or blocking.
-            if rel.relation == "depends_on"
-                && rel.from_task == id
-                && let Ok(Some(dep_task)) = db.get_task(rel.to_task)
-            {
-                let satisfied = dep_task.state == "merged" || dep_task.state == "closed";
-                obj["dependency_status"] = if satisfied {
-                    serde_json::json!("satisfied")
-                } else {
-                    serde_json::json!("blocking")
-                };
-                obj["dependency_state"] = serde_json::json!(dep_task.state);
+
+            // Determine the "other" task ID for cross-project detection
+            let other_task_id = if rel.from_task == id {
+                rel.to_task
+            } else {
+                rel.from_task
+            };
+
+            if let Ok(Some(other_task)) = db.get_task(other_task_id) {
+                // Add project_name if the other task is in a different project
+                if other_task.project_name != task.project_name {
+                    obj["project_name"] = serde_json::json!(other_task.project_name);
+                }
+
+                // For depends_on relations where this task is the dependent,
+                // include whether the dependency is satisfied or blocking.
+                if rel.relation == "depends_on" && rel.from_task == id {
+                    let satisfied = other_task.state == "merged" || other_task.state == "closed";
+                    obj["dependency_status"] = if satisfied {
+                        serde_json::json!("satisfied")
+                    } else {
+                        serde_json::json!("blocking")
+                    };
+                    obj["dependency_state"] = serde_json::json!(other_task.state);
+                }
             }
+
             obj
         })
         .collect();
@@ -3250,7 +3263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_task_relate_cross_project_rejected() {
+    fn test_task_relate_cross_project_allowed() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
             .create_task("project-a", "A", None, None, None, false, false, false)
@@ -3264,8 +3277,7 @@ mod tests {
             &serde_json::json!({"from_task": t1.id, "to_task": t2.id, "relation": "depends_on"}),
             "tc1",
         );
-        assert!(result.is_error);
-        assert!(extract_text(&result).contains("across projects"));
+        assert!(!result.is_error, "cross-project relation should succeed");
     }
 
     #[test]
@@ -3435,6 +3447,80 @@ mod tests {
 
         let relations = parsed["relations"].as_array().unwrap();
         assert_eq!(relations.len(), 1);
+        assert!(relations[0].get("dependency_status").is_none());
+    }
+
+    #[test]
+    fn test_task_get_cross_project_relation_shows_project_name() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("project-a", "Task A", None, None, None, false, false, false)
+            .unwrap();
+        let t2 = db
+            .create_task("project-b", "Task B", None, None, None, false, false, false)
+            .unwrap();
+
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+
+        let result = handle_task_get(&db, &serde_json::json!({"id": t1.id}), "tc1");
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let relations = parsed["relations"].as_array().unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0]["project_name"], "project-b");
+        assert_eq!(relations[0]["dependency_status"], "blocking");
+    }
+
+    #[test]
+    fn test_task_get_same_project_relation_no_project_name() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("project-a", "Task A", None, None, None, false, false, false)
+            .unwrap();
+        let t2 = db
+            .create_task("project-a", "Task B", None, None, None, false, false, false)
+            .unwrap();
+
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+
+        let result = handle_task_get(&db, &serde_json::json!({"id": t1.id}), "tc1");
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let relations = parsed["relations"].as_array().unwrap();
+        assert_eq!(relations.len(), 1);
+        assert!(
+            relations[0].get("project_name").is_none(),
+            "same-project relation should not include project_name"
+        );
+    }
+
+    #[test]
+    fn test_task_get_cross_project_blocks_relation() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("project-a", "Task A", None, None, None, false, false, false)
+            .unwrap();
+        let t2 = db
+            .create_task("project-b", "Task B", None, None, None, false, false, false)
+            .unwrap();
+
+        // t1 blocks t2 (cross-project)
+        db.add_relation(t1.id, t2.id, "blocks").unwrap();
+
+        let result = handle_task_get(&db, &serde_json::json!({"id": t1.id}), "tc1");
+        assert!(!result.is_error);
+        let text = extract_text(&result);
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        let relations = parsed["relations"].as_array().unwrap();
+        assert_eq!(relations.len(), 1);
+        // Cross-project blocks should show project_name
+        assert_eq!(relations[0]["project_name"], "project-b");
+        // blocks relation should not have dependency_status
         assert!(relations[0].get("dependency_status").is_none());
     }
 

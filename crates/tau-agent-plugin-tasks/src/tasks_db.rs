@@ -883,36 +883,24 @@ impl TasksDb {
             .unchecked_transaction()
             .map_err(|e| tau_agent_plugin::Error::Io(format!("add_relation begin: {}", e)))?;
 
-        // Validate both tasks exist
-        let from = tx
-            .query_row(
-                "SELECT project_name FROM tasks WHERE id = ?1",
-                params![from_task],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("check from_task: {}", e)))?
-            .ok_or_else(|| {
-                tau_agent_plugin::Error::Io(format!("from_task {} not found", from_task))
-            })?;
+        // Validate both tasks exist (cross-project relations are allowed)
+        tx.query_row(
+            "SELECT 1 FROM tasks WHERE id = ?1",
+            params![from_task],
+            |_row| Ok(()),
+        )
+        .optional()
+        .map_err(|e| tau_agent_plugin::Error::Io(format!("check from_task: {}", e)))?
+        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("from_task {} not found", from_task)))?;
 
-        let to = tx
-            .query_row(
-                "SELECT project_name FROM tasks WHERE id = ?1",
-                params![to_task],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("check to_task: {}", e)))?
-            .ok_or_else(|| tau_agent_plugin::Error::Io(format!("to_task {} not found", to_task)))?;
-
-        // Both tasks must be in the same project
-        if from != to {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "cannot relate tasks across projects: '{}' and '{}'",
-                from, to
-            )));
-        }
+        tx.query_row(
+            "SELECT 1 FROM tasks WHERE id = ?1",
+            params![to_task],
+            |_row| Ok(()),
+        )
+        .optional()
+        .map_err(|e| tau_agent_plugin::Error::Io(format!("check to_task: {}", e)))?
+        .ok_or_else(|| tau_agent_plugin::Error::Io(format!("to_task {} not found", to_task)))?;
 
         // Prevent circular dependencies for depends_on.
         // BFS from to_task following depends_on edges; if we reach from_task
@@ -3772,7 +3760,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_project_relation_rejected() {
+    fn test_cross_project_relation_allowed() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
             .create_task("project-a", "Task A", None, None, None, false, false, false)
@@ -3781,8 +3769,32 @@ mod tests {
             .create_task("project-b", "Task B", None, None, None, false, false, false)
             .unwrap();
 
-        let err = db.add_relation(t1.id, t2.id, "depends_on").unwrap_err();
-        assert!(err.to_string().contains("across projects"));
+        // Cross-project relations should succeed
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+
+        let relations = db.get_relations(t1.id).unwrap();
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].from_task, t1.id);
+        assert_eq!(relations[0].to_task, t2.id);
+        assert_eq!(relations[0].relation, "depends_on");
+    }
+
+    #[test]
+    fn test_cross_project_cycle_detection() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task("project-a", "Task A", None, None, None, false, false, false)
+            .unwrap();
+        let t2 = db
+            .create_task("project-b", "Task B", None, None, None, false, false, false)
+            .unwrap();
+
+        // A depends_on B (cross-project) should work
+        db.add_relation(t1.id, t2.id, "depends_on").unwrap();
+
+        // B depends_on A (cross-project) should fail — cycle
+        let err = db.add_relation(t2.id, t1.id, "depends_on").unwrap_err();
+        assert!(err.to_string().contains("circular dependency"));
     }
 
     #[test]
