@@ -674,7 +674,7 @@ fn create_interactive_session(
         model,
         provider: None,
         system_prompt: None,
-        cwd: Some(project_path),
+        cwd: Some(project_path.clone()),
         parent_id: parent_session_id.map(String::from),
         child_budget: 16,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
@@ -730,10 +730,23 @@ fn create_interactive_session(
         }
     };
 
+    // Load project instructions for the interactive phase.
+    let project_instructions = crate::tasks_config::load_project_instructions(
+        &project_path,
+        Some(&task.project_name),
+        "interactive",
+    )
+    .unwrap_or_default();
+
     // Queue an initial message so the session has context when the user connects.
     // Interactive tasks get a "gather-first" instruction: the session should
     // read the spec and understand requirements but NOT start any work until
     // the user explicitly says to proceed.
+    let instructions_section = if project_instructions.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nProject instructions:\n{project_instructions}")
+    };
     let initial_msg = format!(
         "You are working on task {id}: {title}.\n\
          \n\
@@ -750,7 +763,8 @@ fn create_interactive_session(
          3. Transition the task to 'ready' state: call task_update with arguments {{\"id\": {id}, \"state\": \"ready\"}}\n\
          4. Tell the user the task has been queued for scheduling\n\
          Do NOT edit project files directly — the scheduler will create an isolated branch/worktree \
-         and dispatch a worker session to do the implementation.",
+         and dispatch a worker session to do the implementation.\
+         {instructions_section}",
         id = task.id,
         title = task.title,
     );
