@@ -1641,7 +1641,7 @@ mod tests {
 
         let make_task = |id: i64| TaskInfo {
             id,
-            project: String::new(),
+            project_name: String::new(),
             title: format!("Task {}", id),
             state: "active".to_string(),
             priority: 0,

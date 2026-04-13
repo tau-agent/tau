@@ -79,6 +79,13 @@ fn init_git_repo(dir: &std::path::Path) -> PathBuf {
 
     run(&["init", "-b", "main"]);
     std::fs::write(repo.join("README.md"), "# Test Project\n").unwrap();
+
+    // Create .tau/project.toml so the tasks plugin can discover the project
+    // name from cwd (fallback when project_name is not in the protocol).
+    let tau_dir = repo.join(".tau");
+    std::fs::create_dir_all(&tau_dir).unwrap();
+    std::fs::write(tau_dir.join("project.toml"), "name = \"e2e-test\"\n").unwrap();
+
     run(&["add", "."]);
     run(&["commit", "-m", "Initial commit"]);
 
@@ -161,7 +168,7 @@ fn exec_tool_err(
 }
 
 /// Create a session on the server and return its ID.
-fn create_session(server: &TestServer, cwd: Option<&str>) -> String {
+fn create_session(server: &TestServer, cwd: Option<&str>, project_name: Option<&str>) -> String {
     let conn = server.connect();
     match send_recv(
         &conn,
@@ -175,7 +182,7 @@ fn create_session(server: &TestServer, cwd: Option<&str>) -> String {
             tagline: Some("test-controller".into()),
             auto_archive: false,
             notify_parent: false,
-            project_name: None,
+            project_name: project_name.map(String::from),
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -255,6 +262,29 @@ fn start_server_with_tasks(
     let data_home = _repo_path.parent().unwrap().join("xdg_data");
     std::fs::create_dir_all(&data_home).unwrap();
     let data_home_str = data_home.to_string_lossy().to_string();
+
+    // Create tau.db with a projects table so the tasks plugin can resolve
+    // project_name → path. The tasks plugin opens tau.db read-only at startup.
+    let tau_data_dir = data_home.join("tau");
+    std::fs::create_dir_all(&tau_data_dir).unwrap();
+    {
+        let tau_db_path = tau_data_dir.join("tau.db");
+        let conn = rusqlite::Connection::open(&tau_db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS projects (
+                name TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (name, path) VALUES (?1, ?2)",
+            rusqlite::params!["e2e-test", _repo_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+    }
 
     let plugins_config = PluginsConfig {
         no_default_worker: true,
@@ -343,7 +373,7 @@ fn full_task_lifecycle_pipeline() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Create controller session (cwd = repo)
-    let sid = create_session(&server, Some(&repo_str));
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
 
     // -----------------------------------------------------------------------
     // Step 1: Create a parent task (interactive)
@@ -634,7 +664,7 @@ fn skip_planning_subtask_starts_ready() {
     );
     std::thread::sleep(Duration::from_millis(500));
 
-    let sid = create_session(&server, Some(&repo_str));
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
 
     // Create parent
     let parent = exec_tool_ok(
@@ -698,7 +728,7 @@ fn affected_files_guard_on_refining_to_ready() {
     );
     std::thread::sleep(Duration::from_millis(500));
 
-    let sid = create_session(&server, Some(&repo_str));
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
 
     // Create parent + subtask
     let parent = exec_tool_ok(
@@ -785,7 +815,7 @@ fn refining_to_planning_backward_transition() {
     );
     std::thread::sleep(Duration::from_millis(500));
 
-    let sid = create_session(&server, Some(&repo_str));
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
 
     // Create parent + subtask
     let parent = exec_tool_ok(
@@ -876,7 +906,7 @@ fn refining_to_interactive_escalation() {
     );
     std::thread::sleep(Duration::from_millis(500));
 
-    let sid = create_session(&server, Some(&repo_str));
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
 
     // Create parent + subtask
     let parent = exec_tool_ok(
@@ -947,7 +977,7 @@ fn review_transition_without_rebase() {
     );
     std::thread::sleep(Duration::from_millis(500));
 
-    let sid = create_session(&server, Some(&repo_str));
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
 
     // Create parent + subtask (skip_planning=true to go straight to ready)
     let parent = exec_tool_ok(
@@ -1034,7 +1064,7 @@ fn active_to_approved_requires_skip_review() {
     );
     std::thread::sleep(Duration::from_millis(500));
 
-    let sid = create_session(&server, Some(&repo_str));
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
 
     // Create parent + subtask (skip_review=false)
     let parent = exec_tool_ok(

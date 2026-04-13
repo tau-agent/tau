@@ -5,7 +5,7 @@ use crate::protocol::{Response, TaskInfo, TaskMessageInfo, TaskRelationInfo};
 fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
     TaskInfo {
         id: t.id,
-        project: t.project,
+        project_name: t.project_name,
         title: t.title,
         state: t.state,
         priority: t.priority,

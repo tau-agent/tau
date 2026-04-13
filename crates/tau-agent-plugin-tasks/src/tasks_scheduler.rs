@@ -19,13 +19,6 @@ use tau_agent_plugin::PluginMessage;
 
 /// Discover the project name for a task's project path.
 ///
-/// Uses `discover_project` to walk up from the project directory and read
-/// `.tau/project.toml`. Returns `None` if the project is not initialized.
-fn resolve_project_name(project_path: &str) -> Option<String> {
-    tau_agent_base::project::discover_project(std::path::Path::new(project_path))
-        .map(|(name, _)| name)
-}
-
 // ---------------------------------------------------------------------------
 // Batch selection
 // ---------------------------------------------------------------------------
@@ -141,15 +134,19 @@ pub(crate) const MAX_CONCURRENT_TASKS: usize = 8;
 /// remaining capacity allows.
 ///
 /// Returns the list of tasks that were prepared for dispatch.
-pub fn schedule(db: &TasksDb, project: &str) -> tau_agent_plugin::Result<Vec<ScheduledTask>> {
+pub fn schedule(
+    db: &TasksDb,
+    project_name: &str,
+    project_path: &str,
+) -> tau_agent_plugin::Result<Vec<ScheduledTask>> {
     // Check how many tasks are already in-flight.
-    let inflight = db.count_inflight_tasks(project)?;
+    let inflight = db.count_inflight_tasks(project_name)?;
     if inflight >= MAX_CONCURRENT_TASKS {
         return Ok(Vec::new());
     }
     let remaining_capacity = MAX_CONCURRENT_TASKS - inflight;
 
-    let schedulable_tasks = db.get_schedulable_tasks(project)?;
+    let schedulable_tasks = db.get_schedulable_tasks(project_name)?;
 
     if schedulable_tasks.is_empty() {
         return Ok(Vec::new());
@@ -187,7 +184,7 @@ pub fn schedule(db: &TasksDb, project: &str) -> tau_agent_plugin::Result<Vec<Sch
     if !ready_tasks.is_empty() {
         // Collect affected_files from already in-flight tasks to prevent
         // file conflicts between new and active tasks.
-        let inflight = db.get_inflight_tasks(project)?;
+        let inflight = db.get_inflight_tasks(project_name)?;
         let active_files: Vec<(i64, Vec<String>)> = inflight
             .iter()
             .map(|t| (t.id, extract_files(&t.affected_files)))
@@ -196,7 +193,7 @@ pub fn schedule(db: &TasksDb, project: &str) -> tau_agent_plugin::Result<Vec<Sch
         let batch = select_non_conflicting(&ready_tasks, &active_files);
         if !batch.is_empty() {
             // We need the repo root to create branches and worktrees.
-            let repo_root = tasks_git::get_repo_root(project)?;
+            let repo_root = tasks_git::get_repo_root(project_path)?;
 
             for task in batch {
                 match prepare_task(db, task, &repo_root) {
@@ -241,10 +238,10 @@ fn prepare_task(
     }
 
     // Ensure .tau/worktrees/ directory exists before creating the worktree.
-    tasks_git::ensure_worktrees_dir(&task.project)?;
+    tasks_git::ensure_worktrees_dir(repo_root)?;
 
     // Derive worktree path and create it.
-    let worktree_path = tasks_git::task_worktree_path(&task.project, task.id);
+    let worktree_path = tasks_git::task_worktree_path(repo_root, task.id);
 
     // Only create worktree if it doesn't already exist.
     if !std::path::Path::new(&worktree_path).exists() {
@@ -353,6 +350,7 @@ pub fn dispatch(
     db: &TasksDb,
     task_id: i64,
     parent_session_id: Option<&str>,
+    project_path: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<String> {
@@ -362,13 +360,13 @@ pub fn dispatch(
 
     // Handle planning-state dispatch (no worktree, read-only session)
     if task.state == "planning" {
-        return dispatch_planning(db, &task, parent_session_id, writer, reader);
+        return dispatch_planning(db, &task, parent_session_id, project_path, writer, reader);
     }
 
     // Task must be active (prepared by schedule) or ready (we'll prepare it).
     if task.state == "ready" {
         // Not yet prepared — do it inline.
-        let repo_root = tasks_git::get_repo_root(&task.project)?;
+        let repo_root = tasks_git::get_repo_root(project_path)?;
         prepare_task(db, &task, &repo_root)?;
         // Re-read after prepare.
     } else if task.state != "active" {
@@ -431,7 +429,7 @@ pub fn dispatch(
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
-        project_name: None,
+        project_name: Some(task.project_name.clone()),
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -454,9 +452,8 @@ pub fn dispatch(
     let merge_target = db
         .get_merge_target(task_id)
         .unwrap_or_else(|_| "main".into());
-    let proj_name = resolve_project_name(&task.project);
     let project_instructions =
-        tasks_config::load_project_instructions(&task.project, proj_name.as_deref(), "worker")
+        tasks_config::load_project_instructions(project_path, Some(&task.project_name), "worker")
             .unwrap_or_default();
     let chat_msg = build_initial_message(&task, &merge_target, &project_instructions);
     let chat_req = tau_agent_plugin::Request::Chat {
@@ -503,6 +500,7 @@ fn dispatch_planning(
     db: &TasksDb,
     task: &Task,
     parent_session_id: Option<&str>,
+    project_path: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<String> {
@@ -545,13 +543,13 @@ fn dispatch_planning(
         model,
         provider: None,
         system_prompt: None,
-        cwd: Some(task.project.clone()),
+        cwd: Some(project_path.to_string()),
         parent_id: hierarchy_parent,
         child_budget: 16,
         tagline: Some(format!("Planning task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
-        project_name: None,
+        project_name: Some(task.project_name.clone()),
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -571,9 +569,8 @@ fn dispatch_planning(
     };
 
     // Load project-specific planning instructions
-    let proj_name = resolve_project_name(&task.project);
     let project_instructions =
-        tasks_config::load_project_instructions(&task.project, proj_name.as_deref(), "planning")
+        tasks_config::load_project_instructions(project_path, Some(&task.project_name), "planning")
             .unwrap_or_default();
 
     let merge_target = db
@@ -746,6 +743,7 @@ pub fn dispatch_review(
     db: &TasksDb,
     task: &Task,
     parent_session_id: Option<&str>,
+    project_path: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<String> {
@@ -782,7 +780,10 @@ pub fn dispatch_review(
     let hierarchy_parent = resolve_hierarchy_parent(db, task);
 
     // Review sessions use the task's worktree as cwd.
-    let cwd = task.worktree_path.clone().or(Some(task.project.clone()));
+    let cwd = task
+        .worktree_path
+        .clone()
+        .or(Some(project_path.to_string()));
 
     let create_req = tau_agent_plugin::Request::CreateSession {
         model,
@@ -794,7 +795,7 @@ pub fn dispatch_review(
         tagline: Some(format!("Review task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
-        project_name: None,
+        project_name: Some(task.project_name.clone()),
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -814,9 +815,8 @@ pub fn dispatch_review(
     };
 
     // Load project-specific review instructions
-    let proj_name = resolve_project_name(&task.project);
     let project_instructions =
-        tasks_config::load_project_instructions(&task.project, proj_name.as_deref(), "review")
+        tasks_config::load_project_instructions(project_path, Some(&task.project_name), "review")
             .unwrap_or_default();
 
     let merge_target = db
@@ -930,6 +930,7 @@ pub fn dispatch_refining(
     db: &TasksDb,
     task: &Task,
     parent_session_id: Option<&str>,
+    project_path: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<String> {
@@ -969,13 +970,13 @@ pub fn dispatch_refining(
         model,
         provider: None,
         system_prompt: None,
-        cwd: Some(task.project.clone()),
+        cwd: Some(project_path.to_string()),
         parent_id: hierarchy_parent,
         child_budget: 16,
         tagline: Some(format!("Refining task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
-        project_name: None,
+        project_name: Some(task.project_name.clone()),
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -995,9 +996,8 @@ pub fn dispatch_refining(
     };
 
     // Load project-specific refining instructions
-    let proj_name = resolve_project_name(&task.project);
     let project_instructions =
-        tasks_config::load_project_instructions(&task.project, proj_name.as_deref(), "refining")
+        tasks_config::load_project_instructions(project_path, Some(&task.project_name), "refining")
             .unwrap_or_default();
 
     let merge_target = db
@@ -1166,6 +1166,7 @@ pub struct MergeAttempt {
 /// Returns the list of merge attempts (both successes and failures).
 pub fn merge_approved(
     db: &TasksDb,
+    resolve_path: &dyn Fn(&str) -> tau_agent_plugin::Result<String>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<Vec<MergeAttempt>> {
@@ -1189,7 +1190,7 @@ pub fn merge_approved(
 
     for tasks in by_target.values() {
         for task in tasks {
-            let attempt = merge_one_task(db, task, writer, reader);
+            let attempt = merge_one_task(db, task, resolve_path, writer, reader);
             attempts.push(attempt);
         }
     }
@@ -1204,6 +1205,7 @@ pub fn merge_approved(
 fn merge_one_task(
     db: &TasksDb,
     task: &Task,
+    resolve_path: &dyn Fn(&str) -> tau_agent_plugin::Result<String>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> MergeAttempt {
@@ -1261,8 +1263,18 @@ fn merge_one_task(
     eprintln!("tasks scheduler: auto-merging task {} ({})", task_id, title);
 
     // Run the merge
-    let project_dir = &current.project;
-    match crate::tasks_merge::merge_task(db, task_id, project_dir, writer, reader) {
+    let project_dir = match resolve_path(&current.project_name) {
+        Ok(p) => p,
+        Err(e) => {
+            return MergeAttempt {
+                task_id,
+                title,
+                success: false,
+                log: format!("resolve project path: {}", e),
+            };
+        }
+    };
+    match crate::tasks_merge::merge_task(db, task_id, &project_dir, writer, reader) {
         Ok(result) => {
             if result.success {
                 // Transition to merged
@@ -1502,12 +1514,12 @@ pub struct SchedulerStatus {
 }
 
 /// Compute the current scheduler status: active, queued, and blocked tasks.
-pub fn get_status(db: &TasksDb, project: &str) -> tau_agent_plugin::Result<SchedulerStatus> {
-    let inflight_count = db.count_inflight_tasks(project)?;
+pub fn get_status(db: &TasksDb, project_name: &str) -> tau_agent_plugin::Result<SchedulerStatus> {
+    let inflight_count = db.count_inflight_tasks(project_name)?;
     let max_concurrent = MAX_CONCURRENT_TASKS;
 
     // Get all non-terminal tasks for this project.
-    let all_tasks = db.list_tasks(project, None, None, None, None)?;
+    let all_tasks = db.list_tasks(project_name, None, None, None, None)?;
 
     // Collect active tasks (in-flight working states).
     let inflight_states: HashSet<&str> = ["active", "review", "merging", "refining"]
@@ -1754,7 +1766,7 @@ mod tests {
     fn make_task(id: i64, priority: i64, files: Option<Vec<&str>>) -> Task {
         Task {
             id,
-            project: "/project".to_string(),
+            project_name: "test-project".to_string(),
             title: format!("Task {}", id),
             state: "ready".to_string(),
             priority,
@@ -2019,7 +2031,7 @@ mod tests {
     #[test]
     fn test_schedule_empty_db() {
         let db = TasksDb::open_memory().unwrap();
-        let result = schedule(&db, "/project");
+        let result = schedule(&db, "test-project", "/fake/path");
         // Will fail because /project is not a git repo, but with empty tasks
         // it should return empty before reaching git operations.
         assert!(result.is_ok());
@@ -2165,16 +2177,16 @@ mod tests {
         let files_other = serde_json::json!(["src/other.rs"]);
 
         // Create two ready tasks with overlapping and non-overlapping files.
-        let t1 = create_ready_task(&db, "/project", "Active task", 10, Some(&files_shared));
-        let t2 = create_ready_task(&db, "/project", "Blocked task", 5, Some(&files_shared));
-        let t3 = create_ready_task(&db, "/project", "Free task", 3, Some(&files_other));
+        let t1 = create_ready_task(&db, "test-project", "Active task", 10, Some(&files_shared));
+        let t2 = create_ready_task(&db, "test-project", "Blocked task", 5, Some(&files_shared));
+        let t3 = create_ready_task(&db, "test-project", "Free task", 3, Some(&files_other));
 
         // Simulate t1 being already active (dispatched in a previous pass).
         db.assign_task(t1.id, "s1").expect("assign t1");
 
         // Now only t2 and t3 are in ready state.
         let schedulable = db
-            .get_schedulable_tasks("/project")
+            .get_schedulable_tasks("test-project")
             .expect("get schedulable");
         let schedulable_ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
         assert!(schedulable_ids.contains(&t2.id));
@@ -2182,7 +2194,7 @@ mod tests {
         assert!(!schedulable_ids.contains(&t1.id)); // t1 is active, not schedulable
 
         // Collect active task files.
-        let inflight = db.get_inflight_tasks("/project").expect("get inflight");
+        let inflight = db.get_inflight_tasks("test-project").expect("get inflight");
         let active_files: Vec<(i64, Vec<String>)> = inflight
             .iter()
             .map(|t| (t.id, extract_files(&t.affected_files)))
@@ -2208,20 +2220,20 @@ mod tests {
         let db = TasksDb::open_memory().expect("open in-memory db");
         let files = serde_json::json!(["src/server.rs"]);
 
-        let t1 = create_ready_task(&db, "/project", "First task", 10, Some(&files));
-        let t2 = create_ready_task(&db, "/project", "Second task", 5, Some(&files));
+        let t1 = create_ready_task(&db, "test-project", "First task", 10, Some(&files));
+        let t2 = create_ready_task(&db, "test-project", "Second task", 5, Some(&files));
 
         // Simulate t1 being dispatched (active).
         db.assign_task(t1.id, "s1").expect("assign t1");
 
         // t2 should be blocked while t1 is active.
-        let inflight = db.get_inflight_tasks("/project").expect("get inflight");
+        let inflight = db.get_inflight_tasks("test-project").expect("get inflight");
         let active_files: Vec<(i64, Vec<String>)> = inflight
             .iter()
             .map(|t| (t.id, extract_files(&t.affected_files)))
             .collect();
         let schedulable = db
-            .get_schedulable_tasks("/project")
+            .get_schedulable_tasks("test-project")
             .expect("get schedulable");
         let batch = select_non_conflicting(&schedulable, &active_files);
         assert!(batch.is_empty() || batch.iter().all(|t| t.id != t2.id));
@@ -2230,14 +2242,14 @@ mod tests {
         move_to_merged(&db, t1.id);
 
         // t2 should now be schedulable.
-        let inflight = db.get_inflight_tasks("/project").expect("get inflight");
+        let inflight = db.get_inflight_tasks("test-project").expect("get inflight");
         let active_files: Vec<(i64, Vec<String>)> = inflight
             .iter()
             .map(|t| (t.id, extract_files(&t.affected_files)))
             .collect();
         assert!(active_files.is_empty(), "no inflight tasks after t1 merged");
         let schedulable = db
-            .get_schedulable_tasks("/project")
+            .get_schedulable_tasks("test-project")
             .expect("get schedulable");
         let batch = select_non_conflicting(&schedulable, &active_files);
         let batch_ids: Vec<i64> = batch.iter().map(|t| t.id).collect();
@@ -2325,11 +2337,11 @@ mod tests {
         let files_a = serde_json::json!(["src/a.rs"]);
         let files_b = serde_json::json!(["src/b.rs"]);
 
-        let dep = create_ready_task(&db, "/project", "Dependency", 5, Some(&files_a));
-        let blocked = create_ready_task(&db, "/project", "Blocked", 3, Some(&files_b));
+        let dep = create_ready_task(&db, "test-project", "Dependency", 5, Some(&files_a));
+        let blocked = create_ready_task(&db, "test-project", "Blocked", 3, Some(&files_b));
         let free = create_ready_task(
             &db,
-            "/project",
+            "test-project",
             "Free",
             1,
             Some(&serde_json::json!(["src/c.rs"])),
@@ -2338,7 +2350,7 @@ mod tests {
         db.add_relation(blocked.id, dep.id, "depends_on").unwrap();
 
         // get_schedulable_tasks should exclude "blocked" but include "dep" and "free"
-        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let schedulable = db.get_schedulable_tasks("test-project").unwrap();
         let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
         assert!(ids.contains(&dep.id));
         assert!(!ids.contains(&blocked.id));
@@ -2351,14 +2363,14 @@ mod tests {
         let files_shared = serde_json::json!(["src/shared.rs"]);
         let files_other = serde_json::json!(["src/other.rs"]);
 
-        let dep = create_ready_task(&db, "/project", "Dependency", 10, Some(&files_shared));
-        let blocked = create_ready_task(&db, "/project", "Blocked", 5, Some(&files_other));
-        let free = create_ready_task(&db, "/project", "Free", 1, Some(&files_other));
+        let dep = create_ready_task(&db, "test-project", "Dependency", 10, Some(&files_shared));
+        let blocked = create_ready_task(&db, "test-project", "Blocked", 5, Some(&files_other));
+        let free = create_ready_task(&db, "test-project", "Free", 1, Some(&files_other));
 
         db.add_relation(blocked.id, dep.id, "depends_on").unwrap();
 
         // get_schedulable_tasks filters out "blocked"
-        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let schedulable = db.get_schedulable_tasks("test-project").unwrap();
         assert_eq!(schedulable.len(), 2);
 
         // select_non_conflicting on the filtered set
@@ -2373,13 +2385,13 @@ mod tests {
     #[test]
     fn test_dependency_becomes_schedulable_after_dep_merged() {
         let db = TasksDb::open_memory().unwrap();
-        let dep = create_ready_task(&db, "/project", "Dep", 5, None);
-        let task = create_ready_task(&db, "/project", "Task", 3, None);
+        let dep = create_ready_task(&db, "test-project", "Dep", 5, None);
+        let task = create_ready_task(&db, "test-project", "Task", 3, None);
 
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
 
         // Before: only dep is schedulable
-        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let schedulable = db.get_schedulable_tasks("test-project").unwrap();
         let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
         assert!(ids.contains(&dep.id));
         assert!(!ids.contains(&task.id));
@@ -2388,7 +2400,7 @@ mod tests {
         move_to_merged(&db, dep.id);
 
         // After: task should now be schedulable
-        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let schedulable = db.get_schedulable_tasks("test-project").unwrap();
         let ids: Vec<i64> = schedulable.iter().map(|t| t.id).collect();
         assert!(ids.contains(&task.id));
     }
@@ -2402,7 +2414,13 @@ mod tests {
         let mut writer: Vec<u8> = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
 
-        let attempts = merge_approved(&db, &mut writer, &mut reader).unwrap();
+        let attempts = merge_approved(
+            &db,
+            &|_| Ok("/fake/path".to_string()),
+            &mut writer,
+            &mut reader,
+        )
+        .unwrap();
         assert!(attempts.is_empty());
     }
 
@@ -2411,12 +2429,18 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
 
         // Create a task in ready state — should not be picked up by merge_approved
-        create_ready_task(&db, "/project", "Ready task", 5, None);
+        create_ready_task(&db, "test-project", "Ready task", 5, None);
 
         let mut writer: Vec<u8> = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
 
-        let attempts = merge_approved(&db, &mut writer, &mut reader).unwrap();
+        let attempts = merge_approved(
+            &db,
+            &|_| Ok("/fake/path".to_string()),
+            &mut writer,
+            &mut reader,
+        )
+        .unwrap();
         assert!(attempts.is_empty());
     }
 
@@ -2427,7 +2451,7 @@ mod tests {
         // Create a task and move it to approved state
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Will be moved",
                 None,
                 None,
@@ -2472,7 +2496,13 @@ mod tests {
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
 
         // merge_approved should skip this task because it re-checks state
-        let attempts = merge_approved(&db, &mut writer, &mut reader).unwrap();
+        let attempts = merge_approved(
+            &db,
+            &|_| Ok("/fake/path".to_string()),
+            &mut writer,
+            &mut reader,
+        )
+        .unwrap();
         // get_approved_tasks returns nothing since we moved it out of approved
         assert!(attempts.is_empty());
     }
@@ -2483,7 +2513,16 @@ mod tests {
 
         // Create and approve a task
         let task = db
-            .create_task("/project", "Merge me", None, None, None, true, false, false)
+            .create_task(
+                "test-project",
+                "Merge me",
+                None,
+                None,
+                None,
+                true,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -2512,7 +2551,13 @@ mod tests {
         let mut writer: Vec<u8> = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
 
-        let attempts = merge_approved(&db, &mut writer, &mut reader).unwrap();
+        let attempts = merge_approved(
+            &db,
+            &|_| Ok("/fake/path".to_string()),
+            &mut writer,
+            &mut reader,
+        )
+        .unwrap();
         assert_eq!(attempts.len(), 1);
         assert!(!attempts[0].success);
 
@@ -2543,7 +2588,7 @@ mod tests {
         // set (simulating a stale session from a previous lifecycle phase).
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Already dispatched task",
                 Some(5),
                 None,
@@ -2573,7 +2618,14 @@ mod tests {
         // (empty reader), but the error must NOT be "already has session".
         let mut buf = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
-        let result = dispatch(&db, task.id, Some("caller-session"), &mut buf, &mut reader);
+        let result = dispatch(
+            &db,
+            task.id,
+            Some("caller-session"),
+            "/fake/path",
+            &mut buf,
+            &mut reader,
+        );
 
         assert!(
             result.is_err(),
@@ -2604,7 +2656,7 @@ mod tests {
         // Create a task and simulate it having already been dispatched.
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Already dispatched task",
                 Some(5),
                 None,
@@ -2636,7 +2688,14 @@ mod tests {
         // → returns None → dispatch falls through to CreateSession → fails EOF.
         let mut buf = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
-        let result = dispatch(&db, task.id, Some("caller-session"), &mut buf, &mut reader);
+        let result = dispatch(
+            &db,
+            task.id,
+            Some("caller-session"),
+            "/fake/path",
+            &mut buf,
+            &mut reader,
+        );
 
         // Error is expected (no server), but must NOT be "already has session".
         assert!(result.is_err());
@@ -2657,7 +2716,7 @@ mod tests {
         // Create a parent task with a session.
         let parent = db
             .create_task(
-                "/project",
+                "test-project",
                 "Parent task",
                 Some(5),
                 None,
@@ -2672,7 +2731,7 @@ mod tests {
         // Create a child task under the parent.
         let child = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child task",
                 Some(5),
                 Some(parent.id),
@@ -2722,7 +2781,7 @@ mod tests {
 
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Test task",
                 Some(5),
                 None,
@@ -3003,11 +3062,20 @@ mod tests {
 
         // Create a parent task, then a subtask (which defaults to planning)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let child = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child",
                 None,
                 Some(parent.id),
@@ -3020,7 +3088,7 @@ mod tests {
         assert_eq!(child.state, "planning");
 
         // get_schedulable_tasks should include planning tasks
-        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let schedulable = db.get_schedulable_tasks("test-project").unwrap();
         assert!(schedulable.iter().any(|t| t.id == child.id));
     }
 
@@ -3031,7 +3099,7 @@ mod tests {
         // Create a task in planning state
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Interactive",
                 None,
                 None,
@@ -3051,7 +3119,7 @@ mod tests {
         )
         .unwrap();
 
-        let schedulable = db.get_schedulable_tasks("/project").unwrap();
+        let schedulable = db.get_schedulable_tasks("test-project").unwrap();
         assert_eq!(schedulable.len(), 1);
         assert_eq!(schedulable[0].id, task.id);
         assert_eq!(schedulable[0].state, "planning");
@@ -3060,7 +3128,7 @@ mod tests {
     #[test]
     fn test_get_status_empty() {
         let db = TasksDb::open_memory().unwrap();
-        let status = get_status(&db, "/project").unwrap();
+        let status = get_status(&db, "test-project").unwrap();
         assert!(status.active.is_empty());
         assert!(status.queued_planning.is_empty());
         assert!(status.queued_ready.is_empty());
@@ -3072,11 +3140,11 @@ mod tests {
     #[test]
     fn test_get_status_active_tasks() {
         let db = TasksDb::open_memory().unwrap();
-        let task = create_ready_task(&db, "/project", "Active task", 5, None);
+        let task = create_ready_task(&db, "test-project", "Active task", 5, None);
         db.assign_task(task.id, "s1").unwrap();
         // task is now active
 
-        let status = get_status(&db, "/project").unwrap();
+        let status = get_status(&db, "test-project").unwrap();
         assert_eq!(status.active.len(), 1);
         assert_eq!(status.active[0].task.id, task.id);
         assert_eq!(status.inflight_count, 1);
@@ -3085,11 +3153,11 @@ mod tests {
     #[test]
     fn test_get_status_blocked_by_dependency() {
         let db = TasksDb::open_memory().unwrap();
-        let dep = create_ready_task(&db, "/project", "Dependency", 5, None);
-        let task = create_ready_task(&db, "/project", "Blocked task", 3, None);
+        let dep = create_ready_task(&db, "test-project", "Dependency", 5, None);
+        let task = create_ready_task(&db, "test-project", "Blocked task", 3, None);
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
 
-        let status = get_status(&db, "/project").unwrap();
+        let status = get_status(&db, "test-project").unwrap();
         assert_eq!(status.blocked.len(), 1);
         assert_eq!(status.blocked[0].task.id, task.id);
         assert!(matches!(
@@ -3105,12 +3173,12 @@ mod tests {
     fn test_get_status_file_conflict() {
         let db = TasksDb::open_memory().unwrap();
         let files = serde_json::json!(["src/shared.rs"]);
-        let active_task = create_ready_task(&db, "/project", "Active", 5, Some(&files));
+        let active_task = create_ready_task(&db, "test-project", "Active", 5, Some(&files));
         db.assign_task(active_task.id, "s1").unwrap();
 
-        let queued_task = create_ready_task(&db, "/project", "Queued", 3, Some(&files));
+        let queued_task = create_ready_task(&db, "test-project", "Queued", 3, Some(&files));
 
-        let status = get_status(&db, "/project").unwrap();
+        let status = get_status(&db, "test-project").unwrap();
         assert_eq!(status.active.len(), 1);
         assert_eq!(status.queued_ready.len(), 1);
         assert_eq!(status.queued_ready[0].task.id, queued_task.id);
@@ -3124,11 +3192,20 @@ mod tests {
     fn test_get_status_planning_tasks() {
         let db = TasksDb::open_memory().unwrap();
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let child = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child",
                 None,
                 Some(parent.id),
@@ -3140,7 +3217,7 @@ mod tests {
             .unwrap();
         assert_eq!(child.state, "planning");
 
-        let status = get_status(&db, "/project").unwrap();
+        let status = get_status(&db, "test-project").unwrap();
         // child should be in queued_planning
         assert!(
             status

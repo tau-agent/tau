@@ -3444,7 +3444,7 @@ mod tests {
     fn make_task_info(id: i64, title: &str, state: &str) -> TaskInfo {
         TaskInfo {
             id,
-            project: "/test".into(),
+            project_name: "test-project".into(),
             title: title.into(),
             state: state.into(),
             priority: 0,

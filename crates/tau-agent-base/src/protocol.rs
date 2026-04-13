@@ -393,7 +393,7 @@ pub struct AliasInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskInfo {
     pub id: i64,
-    pub project: String,
+    pub project_name: String,
     pub title: String,
     pub state: String,
     pub priority: i64,
@@ -773,7 +773,7 @@ mod tests {
     fn task_protocol_serde_roundtrip() {
         let task = TaskInfo {
             id: 42,
-            project: "/tmp/test".into(),
+            project_name: "test-project".into(),
             title: "test task".into(),
             state: "active".into(),
             priority: 5,

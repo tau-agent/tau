@@ -213,7 +213,7 @@ pub fn merge_task(
             tagline: Some(format!("Merge task {}", task_id)),
             auto_archive: false,
             notify_parent: false,
-            project_name: None,
+            project_name: Some(task.project_name.clone()),
         },
     )? {
         Response::SessionCreated { session_id } => session_id,
@@ -710,7 +710,7 @@ mod tests {
     fn test_sessions_to_archive_via_db() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "T", None, None, None, true, false, false)
+            .create_task("test-project", "T", None, None, None, true, false, false)
             .unwrap();
         db.record_session(task.id, "s-worker", "worker").unwrap();
         db.record_session(task.id, "s-reviewer", "reviewer")
@@ -882,7 +882,7 @@ command = "cargo test"
     fn make_merging_task(db: &TasksDb) -> i64 {
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Test merge",
                 None,
                 None,
@@ -934,7 +934,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Not merging",
                 None,
                 None,
@@ -951,7 +951,7 @@ command = "cargo test"
         let mut writer: Vec<u8> = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
 
-        let result = merge_task(&db, task.id, "/project", &mut writer, &mut reader);
+        let result = merge_task(&db, task.id, "test-project", &mut writer, &mut reader);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("must be 'merging'"), "got: {}", err);
@@ -962,7 +962,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "No branch",
                 None,
                 None,
@@ -1005,7 +1005,7 @@ command = "cargo test"
         let mut writer: Vec<u8> = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
 
-        let result = merge_task(&db, task.id, "/project", &mut writer, &mut reader);
+        let result = merge_task(&db, task.id, "test-project", &mut writer, &mut reader);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("no branch"),
@@ -1018,7 +1018,7 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "No worktree",
                 None,
                 None,
@@ -1062,7 +1062,7 @@ command = "cargo test"
         let mut writer: Vec<u8> = Vec::new();
         let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
 
-        let result = merge_task(&db, task.id, "/project", &mut writer, &mut reader);
+        let result = merge_task(&db, task.id, "test-project", &mut writer, &mut reader);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("no worktree"),
@@ -1078,14 +1078,23 @@ command = "cargo test"
 
         // Create parent
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
 
         // Create two subtasks and move them to merged
         let child1 = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child 1",
                 None,
                 Some(parent.id),
@@ -1097,7 +1106,7 @@ command = "cargo test"
             .unwrap();
         let child2 = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child 2",
                 None,
                 Some(parent.id),
@@ -1167,13 +1176,22 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
 
         let child1 = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child 1",
                 None,
                 Some(parent.id),
@@ -1185,7 +1203,7 @@ command = "cargo test"
             .unwrap();
         let _child2 = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child 2",
                 None,
                 Some(parent.id),
@@ -1250,7 +1268,16 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let task = db
-            .create_task("/project", "Root", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Root",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
 
         let mut writer: Vec<u8> = Vec::new();
@@ -1265,14 +1292,23 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
 
         let child = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child",
                 None,
                 Some(parent.id),
@@ -1370,13 +1406,22 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
 
         let child = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child Task",
                 None,
                 Some(parent.id),
@@ -1429,7 +1474,16 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let task = db
-            .create_task("/project", "Root", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Root",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
 
         let mut writer: Vec<u8> = Vec::new();
@@ -1445,13 +1499,22 @@ command = "cargo test"
         let db = TasksDb::open_memory().unwrap();
 
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         // Don't set session_id on parent
 
         let child = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child",
                 None,
                 Some(parent.id),

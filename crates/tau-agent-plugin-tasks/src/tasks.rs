@@ -5,6 +5,8 @@
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
+use rusqlite::params;
+
 use crate::tasks_db::{TaskUpdate, TasksDb};
 use crate::tasks_merge;
 use crate::tasks_scheduler;
@@ -14,8 +16,101 @@ use tau_agent_plugin::{
 };
 
 // ---------------------------------------------------------------------------
+// ProjectResolver — resolves project_name → filesystem path
+// ---------------------------------------------------------------------------
+
+/// Resolves project names to filesystem paths by reading the `projects` table
+/// in `tau.db`.
+///
+/// The tasks plugin runs as a separate process and frequently needs the
+/// filesystem path for a project (git operations, session cwd, config
+/// loading). Many of these code paths are outside of ToolCall context
+/// (event drain, startup cleanup, merge queue), so we cannot rely on the
+/// `cwd` field from `PluginRequest::ToolCall`.
+///
+/// Instead, the resolver opens `tau.db` **read-only** at startup and queries
+/// the `projects` table. No caching needed — SQLite queries on a small table
+/// are cheap and the read-only connection avoids locking.
+pub(crate) struct ProjectResolver {
+    conn: rusqlite::Connection,
+}
+
+impl ProjectResolver {
+    /// Open `tau.db` read-only. Returns `Err` if the file doesn't exist or
+    /// can't be opened.
+    fn open() -> tau_agent_plugin::Result<Self> {
+        let path = tau_agent_plugin::data_dir().join("tau.db");
+        let conn = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| tau_agent_plugin::Error::Io(format!("open tau.db: {}", e)))?;
+        Ok(Self { conn })
+    }
+
+    /// Resolve a project name to its filesystem path.
+    pub(crate) fn resolve(&self, project_name: &str) -> tau_agent_plugin::Result<String> {
+        self.conn
+            .query_row(
+                "SELECT path FROM projects WHERE name = ?1",
+                params![project_name],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!(
+                    "project '{}' not found in registry: {}",
+                    project_name, e
+                ))
+            })
+    }
+
+    /// Create a resolver for testing with an in-memory database.
+    #[cfg(test)]
+    fn test(entries: &[(&str, &str)]) -> Self {
+        let conn =
+            rusqlite::Connection::open_in_memory().expect("open in-memory db for test resolver");
+        conn.execute_batch(
+            "CREATE TABLE projects (
+                name TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )",
+        )
+        .expect("create projects table for test resolver");
+        for (name, path) in entries {
+            conn.execute(
+                "INSERT INTO projects (name, path) VALUES (?1, ?2)",
+                params![name, path],
+            )
+            .expect("insert test project");
+        }
+        Self { conn }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Discover a project name from a directory path by walking up to find
+/// `.tau/project.toml`. This is a fallback for when the server doesn't
+/// yet provide `project_name` in the ToolCall (before task #449 is merged).
+fn discover_project_name(start: &str) -> Option<String> {
+    let mut dir = std::path::PathBuf::from(start);
+    loop {
+        let config_path = dir.join(".tau").join("project.toml");
+        if config_path.is_file() {
+            let contents = std::fs::read_to_string(&config_path).ok()?;
+            // Parse as a TOML table and extract the "name" key.
+            let table: toml::Table = contents.parse().ok()?;
+            return table.get("name").and_then(|v| v.as_str()).map(String::from);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
 
 fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
     tau_agent_plugin::tunnel::send_message(writer, msg);
@@ -416,7 +511,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
 /// Context shared across tool-handler calls: project path, calling session,
 /// and the tool-call identifier used to route the response.
 struct ToolCtx<'a> {
-    project: &'a str,
+    project_name: Option<&'a str>,
     session_id: Option<&'a str>,
     tool_call_id: &'a str,
 }
@@ -425,11 +520,20 @@ fn handle_task_create(
     db: &TasksDb,
     args: &serde_json::Value,
     ctx: &ToolCtx<'_>,
+    resolver: &ProjectResolver,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     pending_events: &mut Vec<SchedulerEvent>,
 ) -> PluginToolResult {
-    let project = ctx.project;
+    let project_name = match ctx.project_name {
+        Some(p) => p,
+        None => {
+            return tool_err(
+                ctx.tool_call_id,
+                "Tasks require a project. Run `tau project init` first.",
+            );
+        }
+    };
     let session_id = ctx.session_id;
     let tool_call_id = ctx.tool_call_id;
     let title = match args.get("title").and_then(|v| v.as_str()) {
@@ -454,7 +558,7 @@ fn handle_task_create(
     let message = args.get("message").and_then(|v| v.as_str());
 
     match db.create_task(
-        project,
+        project_name,
         title,
         priority,
         parent_id,
@@ -467,7 +571,7 @@ fn handle_task_create(
             // Subtasks start in ready or planning state — trigger a schedule pass.
             if task.state == "ready" || task.state == "planning" {
                 pending_events.push(SchedulerEvent::ScheduleNeeded(
-                    project.to_string(),
+                    project_name.to_string(),
                     session_id.map(String::from),
                 ));
             }
@@ -475,7 +579,7 @@ fn handle_task_create(
             // Interactive tasks get a fresh session for the user to drive
             if task.state == "interactive"
                 && let Some(new_sid) =
-                    create_interactive_session(db, &task, project, session_id, writer, reader)
+                    create_interactive_session(db, &task, resolver, session_id, writer, reader)
             {
                 let _ = db.set_session_id(task.id, &new_sid);
                 let _ = db.record_session(task.id, &new_sid, "interactive");
@@ -521,12 +625,24 @@ fn handle_task_create(
 fn create_interactive_session(
     db: &TasksDb,
     task: &crate::tasks_db::Task,
-    project: &str,
+    resolver: &ProjectResolver,
     parent_session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> Option<String> {
     use tau_agent_plugin::{Request, Response};
+
+    // Resolve the project path for the session's working directory.
+    let project_path = match resolver.resolve(&task.project_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "tasks: failed to resolve project '{}' for interactive session: {}",
+                task.project_name, e
+            );
+            return None;
+        }
+    };
 
     // Inherit model from the parent session so the interactive task uses
     // the same model as its creator.
@@ -537,13 +653,13 @@ fn create_interactive_session(
         model,
         provider: None,
         system_prompt: None,
-        cwd: Some(project.to_string()),
+        cwd: Some(project_path),
         parent_id: parent_session_id.map(String::from),
         child_budget: 16,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
         notify_parent: false,
-        project_name: None,
+        project_name: Some(task.project_name.clone()),
     };
 
     let new_sid = match crate::tasks_scheduler::server_request(writer, reader, create_req) {
@@ -792,7 +908,7 @@ fn handle_task_get(db: &TasksDb, args: &serde_json::Value, tool_call_id: &str) -
 fn handle_task_list(
     db: &TasksDb,
     args: &serde_json::Value,
-    project: &str,
+    project_name: &str,
     tool_call_id: &str,
 ) -> PluginToolResult {
     let state = args.get("state").and_then(|v| v.as_str());
@@ -800,7 +916,7 @@ fn handle_task_list(
     let tag = args.get("tag").and_then(|v| v.as_str());
     let limit = args.get("limit").and_then(|v| v.as_i64());
 
-    match db.list_tasks(project, state, parent_id, tag, limit) {
+    match db.list_tasks(project_name, state, parent_id, tag, limit) {
         Ok(tasks) => match serde_json::to_string_pretty(&tasks) {
             Ok(json) => {
                 let summary = format!("task_list: {} tasks", tasks.len());
@@ -817,6 +933,7 @@ fn handle_task_update(
     args: &serde_json::Value,
     session_id: Option<&str>,
     tool_call_id: &str,
+    resolver: &ProjectResolver,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     pending_events: &mut Vec<SchedulerEvent>,
@@ -916,7 +1033,7 @@ fn handle_task_update(
                 "approved" => pending_events.push(SchedulerEvent::MergeNeeded),
                 "ready" | "planning" => {
                     pending_events.push(SchedulerEvent::ScheduleNeeded(
-                        task.project.clone(),
+                        task.project_name.clone(),
                         session_id.map(String::from),
                     ));
                 }
@@ -951,7 +1068,15 @@ fn handle_task_update(
             // Automated review dispatch: when transitioning to review,
             // auto-launch a review session.
             if task.state == "review" && old_state.as_deref() == Some("active") {
-                match tasks_scheduler::dispatch_review(db, &task, session_id, writer, reader) {
+                let project_path = resolver.resolve(&task.project_name).unwrap_or_default();
+                match tasks_scheduler::dispatch_review(
+                    db,
+                    &task,
+                    session_id,
+                    &project_path,
+                    writer,
+                    reader,
+                ) {
                     Ok(review_sid) => {
                         eprintln!(
                             "tasks: auto-dispatched review session {} for task {}",
@@ -982,7 +1107,15 @@ fn handle_task_update(
                 && (old_state.as_deref() == Some("planning")
                     || old_state.as_deref() == Some("interactive"))
             {
-                match tasks_scheduler::dispatch_refining(db, &task, session_id, writer, reader) {
+                let project_path = resolver.resolve(&task.project_name).unwrap_or_default();
+                match tasks_scheduler::dispatch_refining(
+                    db,
+                    &task,
+                    session_id,
+                    &project_path,
+                    writer,
+                    reader,
+                ) {
                     Ok(refining_sid) => {
                         eprintln!(
                             "tasks: auto-dispatched refining session {} for task {}",
@@ -1052,14 +1185,8 @@ fn handle_task_update(
                     }
                 };
                 if needs_session
-                    && let Some(new_sid) = create_interactive_session(
-                        db,
-                        &task,
-                        &task.project,
-                        session_id,
-                        writer,
-                        reader,
-                    )
+                    && let Some(new_sid) =
+                        create_interactive_session(db, &task, resolver, session_id, writer, reader)
                 {
                     let _ = db.set_session_id(task.id, &new_sid);
                     let _ = db.record_session(task.id, &new_sid, "interactive");
@@ -1108,7 +1235,7 @@ fn handle_task_update(
             // When a task transitions to a terminal state, auto-archive its session
             // and notify the parent task's session.
             if task.state == "merged" || task.state == "closed" {
-                auto_archive_task_session(db, &task, writer, reader);
+                auto_archive_task_session(db, &task, resolver, writer, reader);
 
                 // Notify parent session that this individual subtask completed
                 tasks_merge::notify_parent_of_subtask_done(db, task.id, writer, reader);
@@ -1169,6 +1296,7 @@ fn handle_task_update(
 fn auto_archive_task_session(
     db: &TasksDb,
     task: &crate::tasks_db::Task,
+    resolver: &ProjectResolver,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) {
@@ -1204,11 +1332,11 @@ fn auto_archive_task_session(
     // Clean up worktree if still present
     if let Some(ref wt_path) = task.worktree_path {
         if let Some(ref branch) = task.branch {
-            // Need repo root for git commands. Try to find it from the
-            // task's project directory.
-            if let Ok(repo_root) = crate::tasks_git::get_repo_root(&task.project) {
-                let _ = crate::tasks_git::remove_worktree(&repo_root, wt_path);
-                let _ = crate::tasks_git::delete_branch(&repo_root, branch);
+            if let Ok(project_path) = resolver.resolve(&task.project_name) {
+                if let Ok(repo_root) = crate::tasks_git::get_repo_root(&project_path) {
+                    let _ = crate::tasks_git::remove_worktree(&repo_root, wt_path);
+                    let _ = crate::tasks_git::delete_branch(&repo_root, branch);
+                }
             }
         }
         let _ = db.clear_worktree(task.id);
@@ -1310,7 +1438,7 @@ fn handle_task_relate(
 fn handle_task_search(
     db: &TasksDb,
     args: &serde_json::Value,
-    project: &str,
+    project_name: &str,
     tool_call_id: &str,
 ) -> PluginToolResult {
     let query = match args.get("query").and_then(|v| v.as_str()) {
@@ -1319,7 +1447,7 @@ fn handle_task_search(
     };
     let state = args.get("state").and_then(|v| v.as_str());
 
-    match db.search_tasks(project, query, state) {
+    match db.search_tasks(project_name, query, state) {
         Ok(tasks) => match serde_json::to_string_pretty(&tasks) {
             Ok(json) => {
                 let summary = format!("task_search: {} results", tasks.len());
@@ -1334,15 +1462,15 @@ fn handle_task_search(
 fn handle_task_status(
     db: &TasksDb,
     args: &serde_json::Value,
-    project: &str,
+    project_name: &str,
     tool_call_id: &str,
 ) -> PluginToolResult {
-    let project = args
+    let project_name = args
         .get("project")
         .and_then(|v| v.as_str())
-        .unwrap_or(project);
+        .unwrap_or(project_name);
 
-    match tasks_scheduler::get_status(db, project) {
+    match tasks_scheduler::get_status(db, project_name) {
         Ok(status) => tool_ok(tool_call_id, &tasks_scheduler::format_status(&status)),
         Err(e) => tool_err(tool_call_id, &format!("scheduler status: {}", e)),
     }
@@ -1351,15 +1479,21 @@ fn handle_task_status(
 fn handle_task_schedule(
     db: &TasksDb,
     args: &serde_json::Value,
-    project: &str,
+    project_name: &str,
+    resolver: &ProjectResolver,
     tool_call_id: &str,
 ) -> PluginToolResult {
-    let project = args
+    let project_name = args
         .get("project")
         .and_then(|v| v.as_str())
-        .unwrap_or(project);
+        .unwrap_or(project_name);
 
-    match tasks_scheduler::schedule(db, project) {
+    let project_path = match resolver.resolve(project_name) {
+        Ok(p) => p,
+        Err(e) => return tool_err(tool_call_id, &format!("resolve project: {}", e)),
+    };
+
+    match tasks_scheduler::schedule(db, project_name, &project_path) {
         Ok(scheduled) => {
             if scheduled.is_empty() {
                 return tool_ok(tool_call_id, "No ready tasks to schedule.");
@@ -1388,6 +1522,7 @@ fn handle_task_dispatch(
     db: &TasksDb,
     args: &serde_json::Value,
     session_id: Option<&str>,
+    resolver: &ProjectResolver,
     tool_call_id: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
@@ -1397,7 +1532,18 @@ fn handle_task_dispatch(
         None => return tool_err(tool_call_id, "id is required"),
     };
 
-    match tasks_scheduler::dispatch(db, id, session_id, writer, reader) {
+    // Look up the task to get its project_name, then resolve to path.
+    let task = match db.get_task(id) {
+        Ok(Some(t)) => t,
+        Ok(None) => return tool_err(tool_call_id, &format!("task {} not found", id)),
+        Err(e) => return tool_err(tool_call_id, &format!("get task: {}", e)),
+    };
+    let project_path = match resolver.resolve(&task.project_name) {
+        Ok(p) => p,
+        Err(e) => return tool_err(tool_call_id, &format!("resolve project: {}", e)),
+    };
+
+    match tasks_scheduler::dispatch(db, id, session_id, &project_path, writer, reader) {
         Ok(sid) => tool_ok(
             tool_call_id,
             &format!("Task {} dispatched. Session: {}", id, sid),
@@ -1410,6 +1556,7 @@ fn handle_task_merge(
     db: &TasksDb,
     args: &serde_json::Value,
     session_id: Option<&str>,
+    resolver: &ProjectResolver,
     tool_call_id: &str,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
@@ -1449,8 +1596,11 @@ fn handle_task_merge(
     }
 
     // Run the merge
-    let project_dir = &task.project;
-    match tasks_merge::merge_task(db, id, project_dir, writer, reader) {
+    let project_dir = match resolver.resolve(&task.project_name) {
+        Ok(p) => p,
+        Err(e) => return tool_err(tool_call_id, &format!("resolve project: {}", e)),
+    };
+    match tasks_merge::merge_task(db, id, &project_dir, writer, reader) {
         Ok(result) => {
             if result.success {
                 // Transition to merged
@@ -1578,6 +1728,15 @@ pub fn run_tasks_plugin() {
         }
     };
 
+    // Open a read-only connection to tau.db for resolving project_name → path.
+    let resolver = match ProjectResolver::open() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tasks plugin: failed to open project resolver: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
 
@@ -1629,18 +1788,20 @@ pub fn run_tasks_plugin() {
             );
             if let Some(ref wt_path) = task.worktree_path {
                 if let Some(ref branch) = task.branch {
-                    if let Ok(repo_root) = crate::tasks_git::get_repo_root(&task.project) {
-                        if let Err(e) = crate::tasks_git::remove_worktree(&repo_root, wt_path) {
-                            eprintln!(
-                                "tasks: startup cleanup: failed to remove worktree for task {}: {}",
-                                task.id, e
-                            );
-                        }
-                        if let Err(e) = crate::tasks_git::delete_branch(&repo_root, branch) {
-                            eprintln!(
-                                "tasks: startup cleanup: failed to delete branch for task {}: {}",
-                                task.id, e
-                            );
+                    if let Ok(project_path) = resolver.resolve(&task.project_name) {
+                        if let Ok(repo_root) = crate::tasks_git::get_repo_root(&project_path) {
+                            if let Err(e) = crate::tasks_git::remove_worktree(&repo_root, wt_path) {
+                                eprintln!(
+                                    "tasks: startup cleanup: failed to remove worktree for task {}: {}",
+                                    task.id, e
+                                );
+                            }
+                            if let Err(e) = crate::tasks_git::delete_branch(&repo_root, branch) {
+                                eprintln!(
+                                    "tasks: startup cleanup: failed to delete branch for task {}: {}",
+                                    task.id, e
+                                );
+                            }
                         }
                     }
                 }
@@ -1681,9 +1842,15 @@ pub fn run_tasks_plugin() {
                 arguments,
                 cwd,
                 session_id,
-                ..
+                project_name,
             } => {
-                let project = cwd.as_deref().unwrap_or("/tmp");
+                // Use project_name from the protocol. If not provided (server
+                // hasn't been updated yet), fall back to discovering the
+                // project from cwd by looking for .tau/project.toml.
+                let project_name: Option<String> = project_name
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| cwd.as_deref().and_then(discover_project_name));
+                let project_name = project_name.as_deref();
                 let session = session_id.as_deref();
 
                 let result = match name.as_str() {
@@ -1691,16 +1858,20 @@ pub fn run_tasks_plugin() {
                         &db,
                         &arguments,
                         &ToolCtx {
-                            project,
+                            project_name,
                             session_id: session,
                             tool_call_id: &tool_call_id,
                         },
+                        &resolver,
                         &mut writer,
                         &mut chan_reader,
                         &mut pending_events,
                     ),
                     "task_get" => handle_task_get(&db, &arguments, &tool_call_id),
-                    "task_list" => handle_task_list(&db, &arguments, project, &tool_call_id),
+                    "task_list" => {
+                        let pn = project_name.unwrap_or("unknown");
+                        handle_task_list(&db, &arguments, pn, &tool_call_id)
+                    }
                     "task_assign" => handle_task_assign(
                         &db,
                         &arguments,
@@ -1714,6 +1885,7 @@ pub fn run_tasks_plugin() {
                         &arguments,
                         session,
                         &tool_call_id,
+                        &resolver,
                         &mut writer,
                         &mut chan_reader,
                         &mut pending_events,
@@ -1721,15 +1893,23 @@ pub fn run_tasks_plugin() {
                     "task_message" => handle_task_message(&db, &arguments, session, &tool_call_id),
                     "task_message_edit" => handle_task_message_edit(&db, &arguments, &tool_call_id),
                     "task_relate" => handle_task_relate(&db, &arguments, &tool_call_id),
-                    "task_search" => handle_task_search(&db, &arguments, project, &tool_call_id),
-                    "task_status" => handle_task_status(&db, &arguments, project, &tool_call_id),
+                    "task_search" => {
+                        let pn = project_name.unwrap_or("unknown");
+                        handle_task_search(&db, &arguments, pn, &tool_call_id)
+                    }
+                    "task_status" => {
+                        let pn = project_name.unwrap_or("unknown");
+                        handle_task_status(&db, &arguments, pn, &tool_call_id)
+                    }
                     "task_schedule" => {
-                        handle_task_schedule(&db, &arguments, project, &tool_call_id)
+                        let pn = project_name.unwrap_or("unknown");
+                        handle_task_schedule(&db, &arguments, pn, &resolver, &tool_call_id)
                     }
                     "task_merge" => handle_task_merge(
                         &db,
                         &arguments,
                         session,
+                        &resolver,
                         &tool_call_id,
                         &mut writer,
                         &mut chan_reader,
@@ -1738,6 +1918,7 @@ pub fn run_tasks_plugin() {
                         &db,
                         &arguments,
                         session,
+                        &resolver,
                         &tool_call_id,
                         &mut writer,
                         &mut chan_reader,
@@ -1749,7 +1930,13 @@ pub fn run_tasks_plugin() {
 
                 // Drain pending scheduler events and run the
                 // corresponding passes immediately.
-                drain_scheduler_events(&mut pending_events, &db, &mut writer, &mut chan_reader);
+                drain_scheduler_events(
+                    &mut pending_events,
+                    &db,
+                    &resolver,
+                    &mut writer,
+                    &mut chan_reader,
+                );
             }
             PluginRequest::Init { .. } | PluginRequest::SessionStart { .. } => {
                 send_message(
@@ -1769,14 +1956,20 @@ pub fn run_tasks_plugin() {
                             // Look up the task's project for the schedule pass.
                             if let Ok(Some(task)) = db.get_task(task_id) {
                                 pending_events.push(SchedulerEvent::ScheduleNeeded(
-                                    task.project.clone(),
+                                    task.project_name.clone(),
                                     None,
                                 ));
                             }
                         }
                         _ => {}
                     }
-                    drain_scheduler_events(&mut pending_events, &db, &mut writer, &mut chan_reader);
+                    drain_scheduler_events(
+                        &mut pending_events,
+                        &db,
+                        &resolver,
+                        &mut writer,
+                        &mut chan_reader,
+                    );
                 }
                 send_message(
                     &mut writer,
@@ -1891,6 +2084,7 @@ impl BufRead for ChannelLineReader {
 fn drain_scheduler_events(
     events: &mut Vec<SchedulerEvent>,
     db: &TasksDb,
+    resolver: &ProjectResolver,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) {
@@ -1906,9 +2100,9 @@ fn drain_scheduler_events(
     for ev in batch {
         match ev {
             SchedulerEvent::MergeNeeded => need_merge = true,
-            SchedulerEvent::ScheduleNeeded(project, session_id) => {
-                if !schedule_projects.iter().any(|(p, _)| p == &project) {
-                    schedule_projects.push((project, session_id));
+            SchedulerEvent::ScheduleNeeded(project_name, session_id) => {
+                if !schedule_projects.iter().any(|(p, _)| p == &project_name) {
+                    schedule_projects.push((project_name, session_id));
                 }
             }
         }
@@ -1917,11 +2111,18 @@ fn drain_scheduler_events(
     // Run merge pass first (merging may unblock dependencies that become
     // ready, but schedule passes are triggered by explicit events anyway).
     if need_merge {
-        run_merge_pass(db, writer, reader);
+        run_merge_pass(db, resolver, writer, reader);
     }
 
-    for (project, session_id) in &schedule_projects {
-        run_schedule_pass(db, project, session_id.as_deref(), writer, reader);
+    for (project_name, session_id) in &schedule_projects {
+        run_schedule_pass(
+            db,
+            project_name,
+            resolver,
+            session_id.as_deref(),
+            writer,
+            reader,
+        );
     }
 }
 
@@ -1935,8 +2136,14 @@ fn drain_scheduler_events(
 /// writer (stdout) and reader (channel from stdin) as tool handlers —
 /// this is safe because the merge pass and tool handling are never
 /// concurrent (both run on the main thread).
-fn run_merge_pass(db: &TasksDb, writer: &mut impl Write, reader: &mut impl BufRead) {
-    match tasks_scheduler::merge_approved(db, writer, reader) {
+fn run_merge_pass(
+    db: &TasksDb,
+    resolver: &ProjectResolver,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let resolve_fn = |name: &str| resolver.resolve(name);
+    match tasks_scheduler::merge_approved(db, &resolve_fn, writer, reader) {
         Ok(attempts) => {
             for a in &attempts {
                 if !a.success {
@@ -1961,12 +2168,24 @@ fn run_merge_pass(db: &TasksDb, writer: &mut impl Write, reader: &mut impl BufRe
 /// Triggered when a task transitions to `ready` or `planning`.
 fn run_schedule_pass(
     db: &TasksDb,
-    project: &str,
+    project_name: &str,
+    resolver: &ProjectResolver,
     session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) {
-    match tasks_scheduler::schedule(db, project) {
+    let project_path = match resolver.resolve(project_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "tasks scheduler: cannot resolve project '{}': {}",
+                project_name, e
+            );
+            return;
+        }
+    };
+
+    match tasks_scheduler::schedule(db, project_name, &project_path) {
         Ok(scheduled) => {
             for st in &scheduled {
                 if st.branch.is_empty() {
@@ -1983,7 +2202,9 @@ fn run_schedule_pass(
                 }
                 // Dispatch each scheduled task (create session + send initial message).
                 // Pass the triggering session_id so dispatch() can inherit its model.
-                if let Err(e) = tasks_scheduler::dispatch(db, st.id, session_id, writer, reader) {
+                if let Err(e) =
+                    tasks_scheduler::dispatch(db, st.id, session_id, &project_path, writer, reader)
+                {
                     eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
 
                     // For non-planning tasks, schedule() already transitioned
@@ -2107,6 +2328,19 @@ mod tests {
         };
         let reader = MockReader { shared };
         (writer, BufReader::new(reader))
+    }
+
+    /// Create a test `ProjectResolver` that maps "test-project" → "/test/project"
+    /// (and a few other common test names). Used by tests that call handlers
+    /// needing path resolution.
+    fn test_resolver() -> ProjectResolver {
+        ProjectResolver::test(&[
+            ("test-project", "/test/project"),
+            ("p", "/test/p"),
+            ("project-a", "/test/project-a"),
+            ("project-b", "/test/project-b"),
+            ("other", "/test/other"),
+        ])
     }
 
     struct MockShared {
@@ -2275,6 +2509,7 @@ mod tests {
     #[test]
     fn test_tool_handlers_via_db() {
         // Test handlers directly with an in-memory DB
+        let resolver = test_resolver();
         let db = TasksDb::open_memory().unwrap();
         let (mut writer, mut reader) = mock_io();
 
@@ -2283,10 +2518,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Test task", "priority": 3, "message": "Hello"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2315,7 +2551,7 @@ mod tests {
         assert_eq!(full["messages"].as_array().unwrap().len(), 1);
 
         // List
-        let result = handle_task_list(&db, &serde_json::json!({}), "/project", "tc3");
+        let result = handle_task_list(&db, &serde_json::json!({}), "test-project", "tc3");
         assert!(!result.is_error);
         let text = extract_text(&result);
         let tasks: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
@@ -2327,6 +2563,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "ready"}),
             Some("s1"),
             "tc4",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2342,6 +2579,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "merging"}),
             None,
             "tc5",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2361,7 +2599,7 @@ mod tests {
         let result = handle_task_search(
             &db,
             &serde_json::json!({"query": "Test"}),
-            "/project",
+            "test-project",
             "tc7",
         );
         assert!(!result.is_error);
@@ -2373,15 +2611,17 @@ mod tests {
     #[test]
     fn test_tool_create_missing_title() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
         let result = handle_task_create(
             &db,
             &serde_json::json!({}),
             &ToolCtx {
-                project: "/p",
+                project_name: Some("p"),
                 session_id: None,
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2394,10 +2634,10 @@ mod tests {
     fn test_tool_relate() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/p", "A", None, None, None, false, false, false)
+            .create_task("p", "A", None, None, None, false, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/p", "B", None, None, None, false, false, false)
+            .create_task("p", "B", None, None, None, false, false, false)
             .unwrap();
 
         let result = handle_task_relate(
@@ -2420,7 +2660,7 @@ mod tests {
     fn test_tool_message_edit() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/p", "A", None, None, None, false, false, false)
+            .create_task("p", "A", None, None, None, false, false, false)
             .unwrap();
         let msg = db.add_message(task.id, "original", None).unwrap();
 
@@ -2474,6 +2714,7 @@ mod tests {
     #[test]
     fn test_task_assign_handler() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a task and move to ready
@@ -2481,10 +2722,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Assignable task"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2499,6 +2741,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "ready"}),
             Some("s1"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2523,16 +2766,18 @@ mod tests {
     #[test]
     fn test_task_assign_uses_context_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Task for context session"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2545,6 +2790,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "ready"}),
             Some("s1"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2567,16 +2813,18 @@ mod tests {
     #[test]
     fn test_task_assign_interactive_reassigns_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Interactive task"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2606,16 +2854,18 @@ mod tests {
     #[test]
     fn test_task_assign_no_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "No session task"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: None,
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2628,6 +2878,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "ready"}),
             None,
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2649,6 +2900,7 @@ mod tests {
     #[test]
     fn test_subtask_defaults() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create parent task
@@ -2656,10 +2908,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Parent"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2673,10 +2926,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id, "skip_review": true}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc2",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2691,10 +2945,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Subtask skip plan", "parent_id": parent_id, "skip_planning": true}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc3",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2707,11 +2962,21 @@ mod tests {
     #[test]
     fn test_active_to_approved_requires_skip_review() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create task without skip_review
         let task = db
-            .create_task("/project", "No skip", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "No skip",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.update_task(
             task.id,
@@ -2730,6 +2995,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "approved"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2743,6 +3009,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("s1"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2753,12 +3020,13 @@ mod tests {
     #[test]
     fn test_active_to_approved_with_skip_review() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create task with skip_review=true
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Skip review",
                 None,
                 None,
@@ -2785,6 +3053,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "approved"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2798,7 +3067,16 @@ mod tests {
     fn test_session_tracking_on_message() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Tracked", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Tracked",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
 
         // Add a message with a session — should record contributor
@@ -2819,10 +3097,11 @@ mod tests {
     #[test]
     fn test_session_tracking_on_update_to_review() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Review track",
                 None,
                 None,
@@ -2849,6 +3128,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("reviewer-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -2869,7 +3149,7 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Idempotent",
                 None,
                 None,
@@ -2930,7 +3210,16 @@ mod tests {
     fn test_task_relate_self_referential_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("/project", "Self", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Self",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
 
         let result = handle_task_relate(
@@ -2946,10 +3235,10 @@ mod tests {
     fn test_task_relate_cross_project_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project-a", "A", None, None, None, false, false, false)
+            .create_task("project-a", "A", None, None, None, false, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project-b", "B", None, None, None, false, false, false)
+            .create_task("project-b", "B", None, None, None, false, false, false)
             .unwrap();
 
         let result = handle_task_relate(
@@ -2965,10 +3254,10 @@ mod tests {
     fn test_task_relate_circular_rejected() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project", "T1", None, None, None, false, false, false)
+            .create_task("test-project", "T1", None, None, None, false, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project", "T2", None, None, None, false, false, false)
+            .create_task("test-project", "T2", None, None, None, false, false, false)
             .unwrap();
 
         // T1 depends_on T2 — OK
@@ -2994,7 +3283,7 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let dep = db
             .create_task(
-                "/project",
+                "test-project",
                 "Dependency",
                 None,
                 None,
@@ -3006,7 +3295,7 @@ mod tests {
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Dependent",
                 None,
                 None,
@@ -3036,7 +3325,7 @@ mod tests {
         // Create dep and move to merged
         let dep = db
             .create_task(
-                "/project",
+                "test-project",
                 "Dependency",
                 None,
                 None,
@@ -3086,7 +3375,7 @@ mod tests {
 
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Dependent",
                 None,
                 None,
@@ -3113,10 +3402,10 @@ mod tests {
     fn test_task_get_non_depends_on_has_no_status() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("/project", "T1", None, None, None, false, false, false)
+            .create_task("test-project", "T1", None, None, None, false, false, false)
             .unwrap();
         let t2 = db
-            .create_task("/project", "T2", None, None, None, false, false, false)
+            .create_task("test-project", "T2", None, None, None, false, false, false)
             .unwrap();
 
         db.add_relation(t1.id, t2.id, "related").unwrap();
@@ -3136,16 +3425,18 @@ mod tests {
     #[test]
     fn test_interactive_task_creates_fresh_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Interactive task"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("creating-session"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3173,6 +3464,7 @@ mod tests {
     #[test]
     fn test_interactive_task_no_parent_session_still_creates_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create without a session_id context — session still created, just no parent
@@ -3180,10 +3472,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "No parent session task"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: None,
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3207,6 +3500,7 @@ mod tests {
     #[test]
     fn test_subtask_does_not_create_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create parent (interactive — gets mock-s1)
@@ -3214,10 +3508,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Parent"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3230,10 +3525,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc2",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3252,12 +3548,13 @@ mod tests {
     #[test]
     fn test_auto_archive_session_on_closed() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a task with a session_id
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Auto archive",
                 None,
                 None,
@@ -3303,6 +3600,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "closed"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3325,12 +3623,13 @@ mod tests {
     #[test]
     fn test_auto_archive_no_session_id() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a task without a session_id and transition to closed
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "No session",
                 None,
                 None,
@@ -3347,6 +3646,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "closed"}),
             None,
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3360,12 +3660,13 @@ mod tests {
     #[test]
     fn test_auto_archive_all_task_sessions_on_closed() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a task with a session_id (worker)
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Multi-session archive",
                 None,
                 None,
@@ -3421,6 +3722,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "closed"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3448,19 +3750,29 @@ mod tests {
     #[test]
     fn test_update_to_closed_notifies_parent_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
         let mut events = Vec::new();
 
         // Create parent with a session
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
 
         // Child subtask starts in ready state (skip_planning=true)
         let child = db
             .create_task(
-                "/project",
+                "test-project",
                 "Child Task",
                 None,
                 Some(parent.id),
@@ -3478,6 +3790,7 @@ mod tests {
             &serde_json::json!({"id": child.id, "state": "closed"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -3521,13 +3834,14 @@ mod tests {
     #[test]
     fn test_update_to_approved_emits_merge_event() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
         let mut events = Vec::new();
 
         // Create a task with skip_review and move to approved
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Merge trigger",
                 None,
                 None,
@@ -3554,6 +3868,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "approved"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -3565,6 +3880,7 @@ mod tests {
     #[test]
     fn test_update_to_ready_emits_schedule_event() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
         let mut events = Vec::new();
 
@@ -3573,10 +3889,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Interactive task"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3590,6 +3907,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "ready"}),
             Some("s1"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -3598,7 +3916,7 @@ mod tests {
         assert_eq!(
             events,
             vec![SchedulerEvent::ScheduleNeeded(
-                "/project".into(),
+                "test-project".into(),
                 Some("s1".into())
             )]
         );
@@ -3607,6 +3925,7 @@ mod tests {
     #[test]
     fn test_create_subtask_emits_schedule_event() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
         let mut events = Vec::new();
 
@@ -3615,10 +3934,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Parent"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3631,10 +3951,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc2",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -3643,7 +3964,7 @@ mod tests {
         assert_eq!(
             events,
             vec![SchedulerEvent::ScheduleNeeded(
-                "/project".into(),
+                "test-project".into(),
                 Some("s1".into())
             )]
         );
@@ -3652,13 +3973,21 @@ mod tests {
     #[test]
     fn test_update_to_other_state_no_event() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
         let mut events = Vec::new();
 
         // Create task and move to active (via assign)
         let task = db
             .create_task(
-                "/project", "No event", None, None, None, false, false, false,
+                "test-project",
+                "No event",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3678,6 +4007,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -3693,9 +4023,9 @@ mod tests {
         let mut events = vec![
             SchedulerEvent::MergeNeeded,
             SchedulerEvent::MergeNeeded,
-            SchedulerEvent::ScheduleNeeded("/project-a".into(), Some("s1".into())),
-            SchedulerEvent::ScheduleNeeded("/project-a".into(), Some("s2".into())),
-            SchedulerEvent::ScheduleNeeded("/project-b".into(), None),
+            SchedulerEvent::ScheduleNeeded("project-a".into(), Some("s1".into())),
+            SchedulerEvent::ScheduleNeeded("project-a".into(), Some("s2".into())),
+            SchedulerEvent::ScheduleNeeded("project-b".into(), None),
         ];
 
         // We can't easily test the actual passes (they need real git repos),
@@ -3715,18 +4045,18 @@ mod tests {
         }
         assert!(need_merge);
         assert_eq!(schedule_projects.len(), 2);
-        assert!(schedule_projects.iter().any(|(p, _)| p == "/project-a"));
-        assert!(schedule_projects.iter().any(|(p, _)| p == "/project-b"));
+        assert!(schedule_projects.iter().any(|(p, _)| p == "project-a"));
+        assert!(schedule_projects.iter().any(|(p, _)| p == "project-b"));
         // First occurrence of project-a wins — carries s1's session ID
         let a_entry = schedule_projects
             .iter()
-            .find(|(p, _)| p == "/project-a")
+            .find(|(p, _)| p == "project-a")
             .unwrap();
         assert_eq!(a_entry.1, Some("s1".into()));
         // project-b had no session
         let b_entry = schedule_projects
             .iter()
-            .find(|(p, _)| p == "/project-b")
+            .find(|(p, _)| p == "project-b")
             .unwrap();
         assert_eq!(b_entry.1, None);
     }
@@ -3736,11 +4066,12 @@ mod tests {
     #[test]
     fn test_review_to_active_notifies_worker_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
 
         // Create a task, assign it a session, advance to review state
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Review notify test",
                 None,
                 None,
@@ -3782,6 +4113,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "active"}),
             Some("reviewer-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3806,13 +4138,14 @@ mod tests {
     #[test]
     fn test_review_to_active_no_session_no_panic() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
 
         // Task with no session_id — review -> active should succeed silently.
         // assign_task now sets session_id, so we clear it afterwards to
         // simulate a task whose session was removed.
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "No session review",
                 None,
                 None,
@@ -3852,6 +4185,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "active"}),
             None,
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3867,12 +4201,13 @@ mod tests {
     #[test]
     fn test_approved_to_active_no_notification() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
 
         // Test that approved → active does NOT send a QueueMessage
         // (only review → active should trigger the notification)
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Approved bounce",
                 None,
                 None,
@@ -3912,6 +4247,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "active"}),
             Some("reviewer-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -3928,12 +4264,13 @@ mod tests {
     #[test]
     fn test_active_to_review_dispatches_review_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a task with skip_review=false and advance to active
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Review dispatch test",
                 None,
                 None,
@@ -3962,6 +4299,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("worker-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -3991,11 +4329,12 @@ mod tests {
     #[test]
     fn test_review_dispatch_records_reviewer_role() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Reviewer role test",
                 None,
                 None,
@@ -4023,6 +4362,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("worker-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4049,12 +4389,13 @@ mod tests {
     #[test]
     fn test_second_active_to_review_reuses_existing_reviewer_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a task and advance to active
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Reuse reviewer test",
                 None,
                 None,
@@ -4083,6 +4424,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("worker-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4121,6 +4463,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("worker-session"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4161,12 +4504,13 @@ mod tests {
     #[test]
     fn test_archived_reviewer_creates_new_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
 
         // First, create a reviewer session using normal mock
         let (mut writer, mut reader) = mock_io();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Archived reviewer test",
                 None,
                 None,
@@ -4195,6 +4539,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("worker-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4235,6 +4580,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "review"}),
             Some("worker-session"),
             "tc2",
+            &resolver,
             &mut writer2,
             &mut reader2,
             &mut events,
@@ -4269,15 +4615,25 @@ mod tests {
     #[test]
     fn test_second_planning_to_refining_reuses_existing_refiner_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask in planning state
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Refiner reuse test",
                 Some(5),
                 Some(parent.id),
@@ -4298,6 +4654,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "refining"}),
             Some("planning-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4336,6 +4693,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "refining"}),
             Some("planning-session"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4374,14 +4732,24 @@ mod tests {
     #[test]
     fn test_archived_refiner_creates_new_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
 
         // Create a subtask in planning state
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Archived refiner test",
                 Some(5),
                 Some(parent.id),
@@ -4401,6 +4769,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "refining"}),
             Some("planning-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4441,6 +4810,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "refining"}),
             Some("planning-session"),
             "tc2",
+            &resolver,
             &mut writer2,
             &mut reader2,
             &mut events,
@@ -4477,15 +4847,25 @@ mod tests {
     #[test]
     fn test_planning_to_refining_creates_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask (defaults to planning state)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Subtask with plan",
                 Some(5),
                 Some(parent.id),
@@ -4507,6 +4887,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "refining"}),
             Some("planning-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4537,6 +4918,7 @@ mod tests {
     #[test]
     fn test_interactive_to_refining_creates_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create an interactive task
@@ -4544,10 +4926,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Direct refine task"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -4563,6 +4946,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "refining"}),
             Some("s1"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4588,15 +4972,25 @@ mod tests {
     #[test]
     fn test_refining_to_ready_rejected_without_affected_files() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask in planning state
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "No files task",
                 Some(5),
                 Some(parent.id),
@@ -4626,6 +5020,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "ready"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4641,15 +5036,25 @@ mod tests {
     #[test]
     fn test_refining_to_ready_succeeds_with_affected_files() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask in planning state
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Has files task",
                 Some(5),
                 Some(parent.id),
@@ -4687,6 +5092,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "ready"}),
             Some("s1"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4703,15 +5109,25 @@ mod tests {
     #[test]
     fn test_refining_to_planning_resumes_planning_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask in planning state with a session
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Needs revision",
                 Some(5),
                 Some(parent.id),
@@ -4741,6 +5157,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "planning"}),
             Some("refining-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4764,6 +5181,7 @@ mod tests {
     #[test]
     fn test_claiming_parent_updates_session_on_all_descendants() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create parent (interactive — gets mock-s1)
@@ -4771,10 +5189,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Parent"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -4787,10 +5206,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Subtask 1", "parent_id": parent_id}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc2",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -4804,10 +5224,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Subtask 2", "parent_id": parent_id}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc3",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -4848,6 +5269,7 @@ mod tests {
     #[test]
     fn test_claiming_does_not_affect_non_descendant_sessions() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create two independent tasks
@@ -4855,10 +5277,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Task A"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -4870,10 +5293,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Task B"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc2",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -4909,15 +5333,25 @@ mod tests {
     #[test]
     fn test_transition_to_interactive_creates_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask (planning state, no session)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Scope expansion",
                 Some(5),
                 Some(parent.id),
@@ -4937,6 +5371,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "interactive"}),
             Some("triggering-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -4976,15 +5411,25 @@ mod tests {
     #[test]
     fn test_transition_to_interactive_no_session_context() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask in planning state (no session)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "CLI takeover",
                 Some(5),
                 Some(parent.id),
@@ -5004,6 +5449,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "interactive"}),
             None, // no session context
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -5043,6 +5489,7 @@ mod tests {
     #[test]
     fn test_transition_to_interactive_with_live_session_no_new_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create an interactive task (gets mock-s1)
@@ -5050,10 +5497,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Already has session"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -5070,6 +5518,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "planning"}),
             Some("s1"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -5083,6 +5532,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "interactive"}),
             Some("s1"),
             "tc3",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -5106,6 +5556,7 @@ mod tests {
     #[test]
     fn test_transition_to_interactive_with_archived_session_creates_new() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
 
         // Create task with a session using normal mock
         let (mut writer, mut reader) = mock_io();
@@ -5113,10 +5564,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Session will be archived"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -5148,6 +5600,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "interactive"}),
             Some("triggering-session"),
             "tc2",
+            &resolver,
             &mut writer2,
             &mut reader2,
             &mut events,
@@ -5171,15 +5624,25 @@ mod tests {
     #[test]
     fn test_refining_to_interactive_creates_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask in refining state (simulating scope expansion)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Needs scope expansion",
                 Some(5),
                 Some(parent.id),
@@ -5206,6 +5669,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "interactive"}),
             Some("refiner-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -5243,15 +5707,25 @@ mod tests {
     #[test]
     fn test_transition_to_interactive_sends_info_message_new_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask in planning state (no session)
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Scope expansion notify",
                 Some(5),
                 Some(parent.id),
@@ -5270,6 +5744,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "interactive"}),
             Some("triggering-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -5309,6 +5784,7 @@ mod tests {
     #[test]
     fn test_transition_to_interactive_sends_info_message_existing_session() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create an interactive task (gets mock-s1)
@@ -5316,10 +5792,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Existing session notify"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -5335,6 +5812,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "planning"}),
             Some("s1"),
             "tc2",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -5354,6 +5832,7 @@ mod tests {
             &serde_json::json!({"id": task_id, "state": "interactive"}),
             Some("s1"),
             "tc3",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -5388,15 +5867,25 @@ mod tests {
     #[test]
     fn test_refining_to_interactive_sends_info_with_correct_state() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a subtask and advance to refining
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Refine notify",
                 Some(5),
                 Some(parent.id),
@@ -5423,6 +5912,7 @@ mod tests {
             &serde_json::json!({"id": task.id, "state": "interactive"}),
             Some("refiner-session"),
             "tc1",
+            &resolver,
             &mut writer,
             &mut reader,
             &mut events,
@@ -5457,6 +5947,7 @@ mod tests {
     #[test]
     fn test_initial_interactive_state_no_return_notification() {
         let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
 
         // Create a top-level task (starts as interactive) — should NOT
@@ -5466,10 +5957,11 @@ mod tests {
             &db,
             &serde_json::json!({"title": "Fresh interactive task"}),
             &ToolCtx {
-                project: "/project",
+                project_name: Some("test-project"),
                 session_id: Some("s1"),
                 tool_call_id: "tc1",
             },
+            &resolver,
             &mut writer,
             &mut reader,
             &mut Vec::new(),
@@ -5511,7 +6003,7 @@ mod tests {
         // Create and prepare a task (active state).
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Idempotent dispatch test",
                 None,
                 None,
@@ -5543,6 +6035,7 @@ mod tests {
             &db,
             task.id,
             Some("parent-session"),
+            "/test/project",
             &mut writer,
             &mut reader,
         );
@@ -5561,6 +6054,7 @@ mod tests {
             &db,
             task.id,
             Some("parent-session"),
+            "/test/project",
             &mut writer,
             &mut reader,
         );
@@ -5603,7 +6097,7 @@ mod tests {
         // Create a task and simulate it having already been dispatched as worker.
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "No duplicate session test",
                 None,
                 None,
@@ -5637,7 +6131,14 @@ mod tests {
 
         // Call dispatch directly (as run_schedule_pass would).
         // The mock_io will answer GetSessionInfo with archived=false → reuse.
-        let result = tasks_scheduler::dispatch(&db, task.id, None, &mut writer, &mut reader);
+        let result = tasks_scheduler::dispatch(
+            &db,
+            task.id,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        );
         assert!(result.is_ok(), "expected Ok, got: {:?}", result);
 
         // No new worker session should have been created.
@@ -5654,6 +6155,7 @@ mod tests {
     #[test]
     fn test_schedule_pass_dispatch_failure_notifies_and_reverts() {
         // When run_schedule_pass fails to create a session (e.g. child_budget
+        let resolver = test_resolver();
         // exceeded), it should:
         //   1. Add a warning message to the task
         //   2. Send a QueueMessage to the triggering session
@@ -5664,11 +6166,20 @@ mod tests {
 
         // Create a subtask in planning state (no git/worktree needed).
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Budget fail task",
                 None,
                 Some(parent.id),
@@ -5682,7 +6193,8 @@ mod tests {
 
         run_schedule_pass(
             &db,
-            "/project",
+            "test-project",
+            &resolver,
             Some("trigger-session"),
             &mut writer,
             &mut reader,
@@ -5738,11 +6250,20 @@ mod tests {
         // Create a subtask and manually advance to active (simulating
         // what prepare_task does during schedule()).
         let parent = db
-            .create_task("/project", "Parent", None, None, None, false, false, false)
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
             .unwrap();
         let task = db
             .create_task(
-                "/project",
+                "test-project",
                 "Revert test",
                 None,
                 Some(parent.id),
