@@ -654,17 +654,16 @@ async fn run_inner(
                     app.task_picker_filter.clear();
                     app.task_picker_filter_mode = false;
                     app.task_picker_create_mode = false;
-                    if let Some(ref cwd) = app.session_cwd {
-                        send_request_and_recv(
-                            Request::TaskList {
-                                project: cwd.clone(),
-                                state: None,
-                                parent_id: None,
-                            },
-                            server_tx.clone(),
-                        )
-                        .await?;
-                    }
+                    let project = app.task_project();
+                    send_request_and_recv(
+                        Request::TaskList {
+                            project,
+                            state: None,
+                            parent_id: None,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
                 }
                 Action::TaskDispatch { id } => {
                     send_request_and_recv(

@@ -1976,7 +1976,7 @@ impl App {
 
     /// Get the project path for task DB queries.
     /// Uses the current session's cwd if available, falls back to process cwd.
-    fn task_project(&self) -> String {
+    pub fn task_project(&self) -> String {
         if let Some(ref name) = self.session_project_name {
             return name.clone();
         }
