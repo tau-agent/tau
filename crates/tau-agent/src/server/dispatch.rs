@@ -299,7 +299,7 @@ pub(super) fn cancel_chat_impl(
     // flag. Immediately emit Cancelled + Phase(Idle) so the TUI never gets
     // stuck, and clear the stale flag.
     let lock = session_lock(session_locks, session_id);
-    if lock.try_lock().is_some() {
+    if let Some(_guard) = lock.try_lock() {
         broadcast_to_subscribers(state, session_id, &crate::protocol::Response::Cancelled);
         emit_phase(state, session_id, crate::types::AgentPhase::Idle);
         let mut st = lock_state(state);
