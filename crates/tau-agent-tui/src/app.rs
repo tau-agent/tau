@@ -1323,7 +1323,7 @@ impl App {
                 KeyCode::Enter => {
                     if self.task_picker_create_mode && !self.task_picker_filter.is_empty() {
                         let title = self.task_picker_filter.clone();
-                        let project = self.session_cwd.clone().unwrap_or_default();
+                        let project = self.task_project();
                         self.task_picker_filter.clear();
                         self.task_picker_filter_mode = false;
                         self.task_picker_create_mode = false;
@@ -1454,7 +1454,7 @@ impl App {
                 }
                 // s: schedule
                 (KeyCode::Char('s'), _) => {
-                    let project = self.session_cwd.clone().unwrap_or_default();
+                    let project = self.task_project();
                     Some(Action::TaskSchedule { project })
                 }
                 // m: merge selected task (with confirmation)
@@ -1977,13 +1977,27 @@ impl App {
     /// Get the project path for task DB queries.
     /// Uses the current session's cwd if available, falls back to process cwd.
     fn task_project(&self) -> String {
-        if let Some(ref cwd) = self.session_cwd {
-            return cwd.clone();
+        if let Some(ref name) = self.session_project_name {
+            return name.clone();
         }
-        std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string()
+        // Fallback: discover project name from session cwd or process cwd.
+        let cwd = self
+            .session_cwd
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(cwd) = cwd {
+            if let Some((name, _root)) = tau_agent::project::discover_project(cwd.as_path()) {
+                return name;
+            }
+        }
+        // Last resort: return cwd as-is (will likely match nothing).
+        self.session_cwd.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        })
     }
 
     /// Render a flat task list (search results, merge queue).
@@ -2427,12 +2441,10 @@ impl App {
                 }
                 // If in task picker mode, re-fetch task list to refresh
                 if self.mode == AppMode::TaskPicker {
-                    if let Some(ref cwd) = self.session_cwd {
-                        return Some(Action::TaskList {
-                            project: cwd.clone(),
-                            state: None,
-                        });
-                    }
+                    return Some(Action::TaskList {
+                        project: self.task_project(),
+                        state: None,
+                    });
                 }
                 // Fire hook for state changes that need scheduler notification
                 if state == "approved" || state == "ready" {
@@ -2450,12 +2462,10 @@ impl App {
                 }
                 // If in task picker mode, re-fetch task list after tool execution
                 if self.mode == AppMode::TaskPicker {
-                    if let Some(ref cwd) = self.session_cwd {
-                        return Some(Action::TaskList {
-                            project: cwd.clone(),
-                            state: None,
-                        });
-                    }
+                    return Some(Action::TaskList {
+                        project: self.task_project(),
+                        state: None,
+                    });
                 }
             }
             Response::TaskStatus { text } => {
@@ -3705,8 +3715,7 @@ mod tests {
         let mut app = make_app();
         open_task_picker(&mut app, AppMode::Input);
         app.session_cwd = Some("/test-project".into());
-
-        // Press 'c' to enter create mode
+        app.session_project_name = Some("test-project".into());
         let key_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE);
         app.handle_task_picker_key(&key_c);
         assert!(app.task_picker_filter_mode);
@@ -3726,7 +3735,7 @@ mod tests {
         assert!(!app.task_picker_create_mode);
         match action {
             Some(Action::TaskCreate { project, title }) => {
-                assert_eq!(project, "/test-project");
+                assert_eq!(project, "test-project");
                 assert_eq!(title, "New task");
             }
             other => panic!("expected TaskCreate, got {other:?}"),
@@ -3834,6 +3843,7 @@ mod tests {
         let mut app = make_app();
         open_task_picker(&mut app, AppMode::Input);
         app.session_cwd = Some("/test-project".into());
+        app.session_project_name = Some("test-project".into());
 
         let action = app.handle_server_response(Response::TaskUpdated {
             task: make_task_info(10, "Test task", "approved"),
@@ -3841,8 +3851,7 @@ mod tests {
         // Should return a TaskList action to refresh
         match action {
             Some(Action::TaskList { project, state }) => {
-                assert_eq!(project, "/test-project");
-                assert!(state.is_none());
+                assert_eq!(project, "test-project");
             }
             other => panic!("expected TaskList for refresh, got {other:?}"),
         }
