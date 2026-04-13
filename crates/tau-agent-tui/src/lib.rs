@@ -40,6 +40,48 @@ pub async fn run(
     context_window: u64,
     is_subscription: bool,
 ) -> tau_agent::Result<()> {
+    run_tui(
+        session_id,
+        model,
+        provider,
+        context_window,
+        is_subscription,
+        false,
+    )
+    .await
+}
+
+/// Run the TUI starting in session picker mode.
+///
+/// Like `run()`, but the session picker overlay opens immediately on startup.
+/// Used when `tau` is invoked with no subcommand.
+pub async fn run_with_picker(
+    session_id: String,
+    model: String,
+    provider: String,
+    context_window: u64,
+    is_subscription: bool,
+) -> tau_agent::Result<()> {
+    run_tui(
+        session_id,
+        model,
+        provider,
+        context_window,
+        is_subscription,
+        true,
+    )
+    .await
+}
+
+/// Common TUI entry point.
+async fn run_tui(
+    session_id: String,
+    model: String,
+    provider: String,
+    context_window: u64,
+    is_subscription: bool,
+    start_in_picker: bool,
+) -> tau_agent::Result<()> {
     // Set up terminal
     enable_raw_mode().map_err(|e| tau_agent::Error::Io(e.to_string()))?;
     let mut stdout = io::stdout();
@@ -74,6 +116,7 @@ pub async fn run(
         provider,
         context_window,
         is_subscription,
+        start_in_picker,
     )
     .await;
 
@@ -114,6 +157,7 @@ async fn run_inner(
     provider: String,
     context_window: u64,
     is_subscription: bool,
+    start_in_picker: bool,
 ) -> tau_agent::Result<Option<String>> {
     let saved_settings = settings::load();
     let theme = match saved_settings.tui.theme.as_deref() {
@@ -206,6 +250,27 @@ async fn run_inner(
         }
     })
     .detach();
+
+    // If starting in picker mode, open the session picker immediately
+    if start_in_picker {
+        app.picker_previous_mode = AppMode::Input;
+        app.mode = AppMode::SessionPicker;
+        app.picker_sessions.clear();
+        app.picker_confirm_delete = None;
+        app.picker_edit_tagline = None;
+        app.picker_filter.clear();
+        app.picker_filter_mode = false;
+        app.picker_project_filter = app.session_project_name.clone();
+        app.picker_show_all_projects = false;
+        send_request_and_recv(
+            Request::ListSessions {
+                include_archived: false,
+                project_name: None,
+            },
+            server_tx.clone(),
+        )
+        .await?;
+    }
 
     // Fetch initial subscription usage if applicable
     if is_subscription {

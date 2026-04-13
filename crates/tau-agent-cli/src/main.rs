@@ -7,7 +7,7 @@ use clap_complete::ArgValueCandidates;
 #[command(name = "tau", about = "LLM agent CLI", infer_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -349,7 +349,14 @@ fn main() {
 }
 
 async fn run(cli: Cli) -> tau_agent::Result<()> {
-    match cli.command {
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => {
+            // `tau` bare: open TUI with session picker
+            return cmd_default().await;
+        }
+    };
+    match command {
         Commands::Chat {
             message,
             session,
@@ -357,6 +364,7 @@ async fn run(cli: Cli) -> tau_agent::Result<()> {
             no_tui,
             child_budget,
         } => {
+            maybe_auto_init();
             // Resolve model: CLI flag > saved setting > hardcoded default
             let model = model.unwrap_or_else(|| {
                 tau_agent_tui::settings::load()
@@ -458,6 +466,193 @@ async fn run(cli: Cli) -> tau_agent::Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Default command: open TUI with session picker
+// ---------------------------------------------------------------------------
+
+async fn cmd_default() -> tau_agent::Result<()> {
+    // Auto-init check
+    maybe_auto_init();
+
+    // Resolve model from settings
+    let model = tau_agent_tui::settings::load()
+        .tui
+        .model
+        .unwrap_or_else(|| "claude-opus-4-6".into());
+
+    // Connect to server, create an initial session for the TUI
+    let mut client = tau_agent::client::Client::connect_or_start().await?;
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from));
+
+    // Parse "provider/model" syntax
+    let (provider, model_id) = if let Some(idx) = model.find('/') {
+        (Some(model[..idx].to_string()), model[idx + 1..].to_string())
+    } else {
+        (None, model.to_string())
+    };
+
+    // Create session (needed for TUI initialization)
+    client
+        .send(&tau_agent::protocol::Request::CreateSession {
+            model: Some(model_id),
+            provider,
+            system_prompt: None,
+            cwd,
+            parent_id: None,
+            child_budget: 16,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        })
+        .await?;
+
+    let mut created_id = None;
+    client
+        .recv_streaming(|resp| {
+            if let tau_agent::protocol::Response::SessionCreated { session_id } = resp {
+                created_id = Some(session_id.clone());
+            }
+        })
+        .await?;
+    let session_id =
+        created_id.ok_or_else(|| tau_agent::Error::Io("failed to create session".into()))?;
+
+    // Get session info
+    let info = get_session_info(&mut client, &session_id).await.ok();
+    let info_model = info.as_ref().map(|i| i.model.clone()).unwrap_or_default();
+    let info_provider = info
+        .as_ref()
+        .map(|i| i.provider.clone())
+        .unwrap_or_default();
+    let context_window = info.as_ref().map(|i| i.stats.context_window).unwrap_or(0);
+    let is_subscription = info.as_ref().is_some_and(|i| i.stats.is_subscription);
+
+    // Run TUI starting in picker mode
+    tau_agent_tui::run_with_picker(
+        session_id,
+        info_model,
+        info_provider,
+        context_window,
+        is_subscription,
+    )
+    .await?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Auto-project-init prompt
+// ---------------------------------------------------------------------------
+
+/// If we're in a git directory without `.tau/project.toml`, ask the user
+/// whether to initialize a tau project. No-op if not applicable.
+fn maybe_auto_init() {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    // Already a project? Nothing to do.
+    if tau_agent::project::discover_project(&cwd).is_some() {
+        return;
+    }
+
+    // No .git? Not a project candidate.
+    if !cwd.join(".git").exists() {
+        return;
+    }
+
+    // Check "declined" flag
+    let declined_path = cwd.join(".tau").join(".no-auto-init");
+    if declined_path.exists() {
+        return;
+    }
+
+    // Prompt user
+    eprint!("Initialize tau project here? [Y/n] ");
+    use std::io::Write;
+    std::io::stderr().flush().ok();
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return;
+    }
+    let answer = answer.trim().to_lowercase();
+
+    if answer.is_empty() || answer == "y" || answer == "yes" {
+        // Initialize project
+        let name = cwd
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string());
+        let name = tau_agent::project::slugify(&name);
+
+        if tau_agent::project::validate_project_name(&name).is_err() {
+            eprintln!("Invalid project name '{}', skipping auto-init.", name);
+            return;
+        }
+
+        let db = match tau_agent::db::Db::open_default() {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("Failed to open database: {}", e);
+                return;
+            }
+        };
+
+        // Check for name/path collisions
+        let canonical = match std::fs::canonicalize(&cwd) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to canonicalize path: {}", e);
+                return;
+            }
+        };
+        let path_str = canonical.to_string_lossy().to_string();
+
+        let name_exists = db.get_project(&name).ok().flatten().is_some();
+        let path_exists = db.get_project_by_path(&path_str).ok().flatten().is_some();
+
+        if name_exists || path_exists {
+            eprintln!("Project name or path already registered, skipping auto-init.");
+            return;
+        }
+
+        match tau_agent::project::init_project(&cwd, &name) {
+            Ok(canonical_path) => {
+                let canonical_str = canonical_path.to_string_lossy().to_string();
+                if let Err(e) = db.create_project(&name, &canonical_str) {
+                    eprintln!(
+                        "Warning: project created on disk but DB registration failed: {}",
+                        e
+                    );
+                } else {
+                    eprintln!("Initialized project '{}' at {}", name, canonical_str);
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize project: {}", e);
+            }
+        }
+    } else {
+        // Store decline flag
+        let tau_dir = cwd.join(".tau");
+        std::fs::create_dir_all(&tau_dir).ok();
+        // Write a minimal .gitignore so the .tau/ dir doesn't show up
+        // in git status when it only contains the decline flag.
+        let gitignore_path = tau_dir.join(".gitignore");
+        if !gitignore_path.exists() {
+            std::fs::write(&gitignore_path, "*\n").ok();
+        }
+        std::fs::write(declined_path, "").ok();
+        eprintln!("Skipped. Won't ask again for this directory.");
+    }
 }
 
 // ---------------------------------------------------------------------------

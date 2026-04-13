@@ -756,14 +756,14 @@ fn draw_session_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) 
             // Both triangle glyphs render at width 1, plus one trailing space.
             used += 2;
 
-            // State indicator
+            // State indicator: ● (idle/green), ▶ (active), * (current)
             let (state_char, state_color) = if is_current {
                 ("*", theme.accent)
             } else if session.state == "idle" {
-                (".", theme.dim)
+                ("●", theme.success)
             } else {
                 // Active states: thinking, responding, tool_exec, etc.
-                (">", theme.success)
+                ("▶", theme.warning)
             };
             spans.push(Span::styled(
                 format!("{} ", state_char),
