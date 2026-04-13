@@ -25,6 +25,72 @@ pub use crate::plugin_protocol::{
 };
 
 // ---------------------------------------------------------------------------
+// Sandbox config: per-project sandbox prefix resolution
+// ---------------------------------------------------------------------------
+
+/// Configuration from `sandbox.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// Default sandbox prefix for this tier.
+    #[serde(default)]
+    pub prefix: Option<Vec<String>>,
+    /// Named sandbox profiles.
+    #[serde(default)]
+    pub profiles: HashMap<String, SandboxProfile>,
+}
+
+/// A named sandbox profile with its own prefix command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxProfile {
+    pub prefix: Vec<String>,
+}
+
+/// Resolve the sandbox prefix for a session.
+///
+/// Resolution order:
+/// 1. Load `sandbox.toml` via `config_chain::load_first` (operator > global,
+///    NO project tier — security-sensitive).
+/// 2. If `sandbox_profile` is specified, look up that profile in the config.
+/// 3. Use the default `prefix` from `sandbox.toml`.
+/// 4. Fall back to `session_prefix` from `plugins.toml` (backward compat).
+///
+/// The `{cwd}` placeholder is NOT expanded here — callers expand it when
+/// building the final command.
+pub fn resolve_sandbox_prefix(
+    project_name: Option<&str>,
+    sandbox_profile: Option<&str>,
+    legacy_prefix: Option<&[String]>,
+) -> Option<Vec<String>> {
+    // Load sandbox.toml via config chain (operator > global, NO project tier)
+    let config: Option<SandboxConfig> = crate::config_chain::load_first(
+        project_name,
+        None, // project_path — not used since allow_project_tier=false
+        "sandbox.toml",
+        false, // security-sensitive: skip project tier
+    );
+
+    if let Some(config) = config {
+        // If a profile was requested, try to resolve it
+        if let Some(profile_name) = sandbox_profile {
+            if let Some(profile) = config.profiles.get(profile_name) {
+                return Some(profile.prefix.clone());
+            }
+            eprintln!(
+                "sandbox: profile '{}' not found, using default",
+                profile_name
+            );
+        }
+        // Use the default prefix from sandbox.toml
+        if config.prefix.is_some() {
+            return config.prefix;
+        }
+    }
+
+    // Fall back to legacy session_prefix from plugins.toml
+    legacy_prefix.map(|p| p.to_vec())
+}
+
+// ---------------------------------------------------------------------------
 // Plugin handle
 // ---------------------------------------------------------------------------
 
@@ -734,13 +800,20 @@ pub struct SessionPlugins {
 }
 
 impl SessionPlugins {
-    /// Spawn session plugins from config entries, prepending session_prefix.
+    /// Spawn session plugins from config entries, prepending the sandbox prefix.
     /// Returns the plugin set and a list of failure messages for any plugins
     /// that failed to start.
-    pub fn spawn(config: &PluginsConfig, cwd: &str) -> crate::Result<(Self, Vec<String>)> {
+    ///
+    /// `sandbox_prefix` overrides `config.session_prefix` when provided.
+    pub fn spawn(
+        config: &PluginsConfig,
+        cwd: &str,
+        sandbox_prefix: Option<&[String]>,
+    ) -> crate::Result<(Self, Vec<String>)> {
         let mut plugins = Vec::new();
         let mut failures = Vec::new();
-        let prefix = config.session_prefix.as_deref().unwrap_or(&[]);
+        let prefix =
+            sandbox_prefix.unwrap_or_else(|| config.session_prefix.as_deref().unwrap_or(&[]));
 
         let entries: Vec<_> = if config.session.is_empty() && !config.no_default_worker {
             // No config: use default built-in worker
@@ -1045,15 +1118,24 @@ impl PluginManager {
 
     /// Ensure session plugins are spawned for the given session.
     /// Returns a list of failure messages for any plugins that failed to start.
+    ///
+    /// `project_name` is used to resolve per-project sandbox prefix from
+    /// `sandbox.toml` via the config chain (operator > global).
     pub fn ensure_session_plugins(
         &mut self,
         session_id: &str,
         cwd: &str,
+        project_name: Option<&str>,
     ) -> crate::Result<Vec<String>> {
         if self.session_plugins.contains_key(session_id) {
             return Ok(Vec::new());
         }
-        let (sp, failures) = SessionPlugins::spawn(&self.config, cwd)?;
+        let sandbox_prefix = resolve_sandbox_prefix(
+            project_name,
+            None, // no profile for now (future: could come from task)
+            self.config.session_prefix.as_deref(),
+        );
+        let (sp, failures) = SessionPlugins::spawn(&self.config, cwd, sandbox_prefix.as_deref())?;
         self.session_plugins.insert(session_id.to_string(), sp);
         Ok(failures)
     }
@@ -1522,4 +1604,264 @@ pub fn load_plugins_config() -> PluginsConfig {
         .ok()
         .and_then(|content| toml::from_str(&content).ok())
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// Guard that overrides XDG_CONFIG_HOME and restores it on drop.
+    struct XdgGuard {
+        prev_xdg: Option<String>,
+    }
+
+    impl Drop for XdgGuard {
+        fn drop(&mut self) {
+            match &self.prev_xdg {
+                Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+                None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            }
+        }
+    }
+
+    fn set_xdg(dir: &std::path::Path) -> XdgGuard {
+        let guard = XdgGuard {
+            prev_xdg: std::env::var("XDG_CONFIG_HOME").ok(),
+        };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir) };
+        guard
+    }
+
+    // -- SandboxConfig deserialization tests --
+
+    #[test]
+    fn sandbox_config_deserialize_prefix_only() {
+        let toml = r#"prefix = ["sandbox", "run", "--"]"#;
+        let config: SandboxConfig = toml::from_str(toml).expect("parse failed");
+        assert_eq!(
+            config.prefix,
+            Some(vec![
+                "sandbox".to_string(),
+                "run".to_string(),
+                "--".to_string()
+            ])
+        );
+        assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn sandbox_config_deserialize_with_profiles() {
+        let toml = r#"
+prefix = ["sandbox", "run", "--profile", "rust-dev", "--"]
+
+[profiles.strict]
+prefix = ["sandbox", "run", "--profile", "strict", "--"]
+
+[profiles.network-disabled]
+prefix = ["sandbox", "run", "--no-network", "--"]
+"#;
+        let config: SandboxConfig = toml::from_str(toml).expect("parse failed");
+        assert!(config.prefix.is_some());
+        assert_eq!(config.profiles.len(), 2);
+        assert_eq!(
+            config.profiles["strict"].prefix,
+            vec![
+                "sandbox".to_string(),
+                "run".to_string(),
+                "--profile".to_string(),
+                "strict".to_string(),
+                "--".to_string()
+            ]
+        );
+        assert_eq!(
+            config.profiles["network-disabled"].prefix,
+            vec![
+                "sandbox".to_string(),
+                "run".to_string(),
+                "--no-network".to_string(),
+                "--".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_config_deserialize_empty() {
+        let toml = "";
+        let config: SandboxConfig = toml::from_str(toml).expect("parse failed");
+        assert!(config.prefix.is_none());
+        assert!(config.profiles.is_empty());
+    }
+
+    // -- resolve_sandbox_prefix tests --
+
+    #[test]
+    fn resolve_sandbox_prefix_no_config_returns_legacy() {
+        let _g = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let config_tmp = TempDir::new().expect("temp dir");
+        let _xdg = set_xdg(config_tmp.path());
+        // No sandbox.toml on disk
+
+        let legacy = vec!["legacy-prefix".to_string(), "--".to_string()];
+        let result = resolve_sandbox_prefix(None, None, Some(&legacy));
+        assert_eq!(result, Some(legacy));
+    }
+
+    #[test]
+    fn resolve_sandbox_prefix_no_config_no_legacy_returns_none() {
+        let _g = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let config_tmp = TempDir::new().expect("temp dir");
+        let _xdg = set_xdg(config_tmp.path());
+
+        let result = resolve_sandbox_prefix(None, None, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_sandbox_prefix_global_sandbox_toml_overrides_legacy() {
+        let _g = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let config_tmp = TempDir::new().expect("temp dir");
+        let _xdg = set_xdg(config_tmp.path());
+
+        let global_dir = config_tmp.path().join("tau");
+        fs::create_dir_all(&global_dir).expect("create dir");
+        fs::write(
+            global_dir.join("sandbox.toml"),
+            r#"prefix = ["sandbox", "run", "--"]"#,
+        )
+        .expect("write");
+
+        let legacy = vec!["old-prefix".to_string()];
+        let result = resolve_sandbox_prefix(None, None, Some(&legacy));
+        assert_eq!(
+            result,
+            Some(vec![
+                "sandbox".to_string(),
+                "run".to_string(),
+                "--".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_prefix_operator_overrides_global() {
+        let _g = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let config_tmp = TempDir::new().expect("temp dir");
+        let _xdg = set_xdg(config_tmp.path());
+
+        // Global sandbox.toml
+        let global_dir = config_tmp.path().join("tau");
+        fs::create_dir_all(&global_dir).expect("create dir");
+        fs::write(
+            global_dir.join("sandbox.toml"),
+            r#"prefix = ["global-sandbox", "--"]"#,
+        )
+        .expect("write");
+
+        // Operator sandbox.toml for project "myproj"
+        let operator_dir = global_dir.join("projects").join("myproj");
+        fs::create_dir_all(&operator_dir).expect("create dir");
+        fs::write(
+            operator_dir.join("sandbox.toml"),
+            r#"prefix = ["operator-sandbox", "--"]"#,
+        )
+        .expect("write");
+
+        let result = resolve_sandbox_prefix(Some("myproj"), None, None);
+        assert_eq!(
+            result,
+            Some(vec!["operator-sandbox".to_string(), "--".to_string()])
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_prefix_named_profile() {
+        let _g = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let config_tmp = TempDir::new().expect("temp dir");
+        let _xdg = set_xdg(config_tmp.path());
+
+        let global_dir = config_tmp.path().join("tau");
+        fs::create_dir_all(&global_dir).expect("create dir");
+        fs::write(
+            global_dir.join("sandbox.toml"),
+            r#"
+prefix = ["default-sandbox", "--"]
+
+[profiles.strict]
+prefix = ["strict-sandbox", "--"]
+"#,
+        )
+        .expect("write");
+
+        let result = resolve_sandbox_prefix(None, Some("strict"), None);
+        assert_eq!(
+            result,
+            Some(vec!["strict-sandbox".to_string(), "--".to_string()])
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_prefix_missing_profile_falls_back_to_default() {
+        let _g = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let config_tmp = TempDir::new().expect("temp dir");
+        let _xdg = set_xdg(config_tmp.path());
+
+        let global_dir = config_tmp.path().join("tau");
+        fs::create_dir_all(&global_dir).expect("create dir");
+        fs::write(
+            global_dir.join("sandbox.toml"),
+            r#"prefix = ["default-sandbox", "--"]"#,
+        )
+        .expect("write");
+
+        // Request a profile that doesn't exist
+        let result = resolve_sandbox_prefix(None, Some("nonexistent"), None);
+        assert_eq!(
+            result,
+            Some(vec!["default-sandbox".to_string(), "--".to_string()])
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_prefix_sandbox_toml_no_prefix_falls_to_legacy() {
+        let _g = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let config_tmp = TempDir::new().expect("temp dir");
+        let _xdg = set_xdg(config_tmp.path());
+
+        // sandbox.toml with profiles but no default prefix
+        let global_dir = config_tmp.path().join("tau");
+        fs::create_dir_all(&global_dir).expect("create dir");
+        fs::write(
+            global_dir.join("sandbox.toml"),
+            r#"
+[profiles.strict]
+prefix = ["strict-sandbox", "--"]
+"#,
+        )
+        .expect("write");
+
+        let legacy = vec!["legacy".to_string()];
+        let result = resolve_sandbox_prefix(None, None, Some(&legacy));
+        // No default prefix in sandbox.toml, falls through to legacy
+        assert_eq!(result, Some(vec!["legacy".to_string()]));
+    }
 }

@@ -386,7 +386,7 @@ pub(super) async fn handle_client(
                     };
                     let cwd_str = cwd_resolved.as_deref().unwrap_or("/tmp");
                     let mut pm = plugins.lock().expect("plugins mutex poisoned");
-                    match pm.ensure_session_plugins(&id, cwd_str) {
+                    match pm.ensure_session_plugins(&id, cwd_str, project_name.as_deref()) {
                         Ok(failures) => {
                             for msg in &failures {
                                 queue_info_to_session(&state, &id, msg);
@@ -476,7 +476,11 @@ pub(super) async fn handle_client(
                     // Ensure session plugins are spawned and notify session start
                     {
                         let mut pm = plugins.lock().expect("plugins mutex poisoned");
-                        match pm.ensure_session_plugins(&session_id, &cwd) {
+                        match pm.ensure_session_plugins(
+                            &session_id,
+                            &cwd,
+                            stored.project_name.as_deref(),
+                        ) {
                             Ok(failures) => {
                                 for msg in &failures {
                                     queue_info_to_session(&state, &session_id, msg);
@@ -1529,20 +1533,18 @@ pub(super) async fn handle_client(
                 }
             }
             crate::protocol::Request::ReloadPlugins { session_id } => {
-                let cwd = {
+                let (cwd, project_name) = {
                     let st = lock_state(&state);
-                    st.db
-                        .get_session(&session_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.cwd)
-                        .unwrap_or_else(|| "/tmp".to_string())
+                    match st.db.get_session(&session_id).ok().flatten() {
+                        Some(s) => (s.cwd.unwrap_or_else(|| "/tmp".to_string()), s.project_name),
+                        None => ("/tmp".to_string(), None),
+                    }
                 };
                 let result = {
                     let mut pm = plugins.lock().expect("plugins mutex poisoned");
                     pm.reload_config();
                     pm.destroy_session_plugins(&session_id);
-                    pm.ensure_session_plugins(&session_id, &cwd)
+                    pm.ensure_session_plugins(&session_id, &cwd, project_name.as_deref())
                         .map(|failures| {
                             for msg in &failures {
                                 queue_info_to_session(&state, &session_id, msg);

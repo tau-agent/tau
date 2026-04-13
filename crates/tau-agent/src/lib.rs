@@ -10,6 +10,7 @@ pub mod server;
 pub mod worker;
 
 // Re-export from tau-agent-base for backward compatibility
+pub use tau_agent_base::config_chain;
 pub use tau_agent_base::model_resolve;
 pub use tau_agent_base::paths;
 pub use tau_agent_base::plugin_protocol;
@@ -49,3 +50,11 @@ pub use tau_agent_client as client;
 // Re-export from tau-agent-plugin-worker for backward compatibility
 pub use tau_agent_plugin_worker::orchestration;
 pub use tau_agent_plugin_worker::tools;
+
+/// Process-global env-var mutex for tests that mutate `XDG_CONFIG_HOME` / `HOME`.
+///
+/// Multiple test modules (`models_config`, `plugin`, …) mutate environment
+/// variables.  Since cargo runs tests in parallel within a single binary,
+/// all such tests must acquire this mutex first.
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

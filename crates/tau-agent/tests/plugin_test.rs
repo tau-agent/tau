@@ -568,7 +568,9 @@ fn session_plugins_idle_sweep() {
 
     let mut manager = PluginManager::new(config);
     let session_id = "idle-test";
-    manager.ensure_session_plugins(session_id, "/tmp").unwrap();
+    manager
+        .ensure_session_plugins(session_id, "/tmp", None)
+        .unwrap();
 
     // Set last_activity to the past so idle sweep triggers
     // We can't easily backdate, so use a zero idle_timeout
@@ -600,7 +602,9 @@ fn session_plugins_idle_sweep_skips_subscribed() {
 
     let mut manager = PluginManager::new(config);
     let session_id = "subscribed-test";
-    manager.ensure_session_plugins(session_id, "/tmp").unwrap();
+    manager
+        .ensure_session_plugins(session_id, "/tmp", None)
+        .unwrap();
 
     let idle_timeout = std::time::Duration::from_secs(0);
     let has_subscriber = |sid: &str| sid == session_id;

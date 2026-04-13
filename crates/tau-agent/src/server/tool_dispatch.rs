@@ -53,7 +53,7 @@ pub(super) async fn execute_tool_impl(
     // 2. Ensure session plugins are spawned
     {
         let mut pm = plugins.lock().expect("plugins mutex poisoned");
-        match pm.ensure_session_plugins(session_id, &cwd) {
+        match pm.ensure_session_plugins(session_id, &cwd, project_name.as_deref()) {
             Ok(failures) => {
                 for msg in &failures {
                     queue_info_to_session(state, session_id, msg);

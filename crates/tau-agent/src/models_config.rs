@@ -345,11 +345,9 @@ cheap = "openai/gpt-4.1-mini"
     }
 
     // NOTE: these tests mutate process-global env vars and therefore
-    // must not run in parallel with each other.  Cargo runs tests within
-    // a single file in parallel by default, so we serialize with a
-    // static mutex.  Using `std::sync::Mutex` (not parking_lot) keeps
-    // the dep list small.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // must not run in parallel with each other.  We use the crate-level
+    // TEST_ENV_MUTEX to serialize with all other env-mutating tests.
+    use crate::TEST_ENV_MUTEX as ENV_LOCK;
 
     #[test]
     fn global_missing_both_files_returns_empty() {
