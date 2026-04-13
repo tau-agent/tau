@@ -350,6 +350,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active (recoverable), merging->failed (terminal), failed->active (manual retry)".into(),
                 "Universal overrides: any state->closed (manual close), any state->interactive (human takes over, except from merged), any state->failed".into(),
                 "active -> approved is only allowed if skip_review=true on the task".into(),
+                "When working in an interactive task session and the user wants to start implementation, transition the task to 'ready' state. Do NOT edit project files directly — the scheduler will create an isolated branch/worktree and dispatch a worker session. Make sure affected_files is set before transitioning.".into(),
             ],
         },
         PluginToolDef {
@@ -741,7 +742,15 @@ fn create_interactive_session(
          \n\
          This is an interactive task. Read the spec and gather all necessary information \
          (understand the requirements, explore relevant code, ask clarifying questions), \
-         but do NOT start making any changes until the user explicitly tells you to proceed.",
+         but do NOT start making any changes until the user explicitly tells you to proceed.\n\
+         \n\
+         When the user wants to start implementation (says \"go\", \"start\", \"do it\", etc.):\n\
+         1. Make sure the task has affected_files set (call task_update to set them if needed)\n\
+         2. Make sure the task spec/messages capture the full requirements\n\
+         3. Transition the task to 'ready' state: call task_update with arguments {{\"id\": {id}, \"state\": \"ready\"}}\n\
+         4. Tell the user the task has been queued for scheduling\n\
+         Do NOT edit project files directly — the scheduler will create an isolated branch/worktree \
+         and dispatch a worker session to do the implementation.",
         id = task.id,
         title = task.title,
     );
