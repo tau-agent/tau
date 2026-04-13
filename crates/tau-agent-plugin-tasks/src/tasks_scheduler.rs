@@ -17,8 +17,6 @@ use crate::tasks_db::{Task, TaskUpdate, TasksDb};
 use crate::tasks_git;
 use tau_agent_plugin::PluginMessage;
 
-/// Discover the project name for a task's project path.
-///
 // ---------------------------------------------------------------------------
 // Batch selection
 // ---------------------------------------------------------------------------

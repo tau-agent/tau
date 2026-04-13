@@ -1068,34 +1068,43 @@ fn handle_task_update(
             // Automated review dispatch: when transitioning to review,
             // auto-launch a review session.
             if task.state == "review" && old_state.as_deref() == Some("active") {
-                let project_path = resolver.resolve(&task.project_name).unwrap_or_default();
-                match tasks_scheduler::dispatch_review(
-                    db,
-                    &task,
-                    session_id,
-                    &project_path,
-                    writer,
-                    reader,
-                ) {
-                    Ok(review_sid) => {
-                        eprintln!(
-                            "tasks: auto-dispatched review session {} for task {}",
-                            review_sid, task.id
-                        );
+                match resolver.resolve(&task.project_name) {
+                    Ok(project_path) => {
+                        match tasks_scheduler::dispatch_review(
+                            db,
+                            &task,
+                            session_id,
+                            &project_path,
+                            writer,
+                            reader,
+                        ) {
+                            Ok(review_sid) => {
+                                eprintln!(
+                                    "tasks: auto-dispatched review session {} for task {}",
+                                    review_sid, task.id
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "tasks: failed to auto-dispatch review for task {}: {}",
+                                    task.id, e
+                                );
+                                let _ = db.add_message(
+                                    task.id,
+                                    &format!(
+                                        "⚠️ Auto-dispatch of review session failed: {}. \
+                                         Task is in review state but has no reviewer session.",
+                                        e
+                                    ),
+                                    Some("system"),
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!(
-                            "tasks: failed to auto-dispatch review for task {}: {}",
-                            task.id, e
-                        );
-                        let _ = db.add_message(
-                            task.id,
-                            &format!(
-                                "⚠️ Auto-dispatch of review session failed: {}. \
-                                 Task is in review state but has no reviewer session.",
-                                e
-                            ),
-                            Some("system"),
+                            "tasks: cannot resolve project '{}' for review dispatch: {}",
+                            task.project_name, e
                         );
                     }
                 }
@@ -1107,34 +1116,43 @@ fn handle_task_update(
                 && (old_state.as_deref() == Some("planning")
                     || old_state.as_deref() == Some("interactive"))
             {
-                let project_path = resolver.resolve(&task.project_name).unwrap_or_default();
-                match tasks_scheduler::dispatch_refining(
-                    db,
-                    &task,
-                    session_id,
-                    &project_path,
-                    writer,
-                    reader,
-                ) {
-                    Ok(refining_sid) => {
-                        eprintln!(
-                            "tasks: auto-dispatched refining session {} for task {}",
-                            refining_sid, task.id
-                        );
+                match resolver.resolve(&task.project_name) {
+                    Ok(project_path) => {
+                        match tasks_scheduler::dispatch_refining(
+                            db,
+                            &task,
+                            session_id,
+                            &project_path,
+                            writer,
+                            reader,
+                        ) {
+                            Ok(refining_sid) => {
+                                eprintln!(
+                                    "tasks: auto-dispatched refining session {} for task {}",
+                                    refining_sid, task.id
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "tasks: failed to auto-dispatch refining for task {}: {}",
+                                    task.id, e
+                                );
+                                let _ = db.add_message(
+                                    task.id,
+                                    &format!(
+                                        "⚠️ Auto-dispatch of refining session failed: {}. \
+                                         Task is in refining state but has no refiner session.",
+                                        e
+                                    ),
+                                    Some("system"),
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!(
-                            "tasks: failed to auto-dispatch refining for task {}: {}",
-                            task.id, e
-                        );
-                        let _ = db.add_message(
-                            task.id,
-                            &format!(
-                                "⚠️ Auto-dispatch of refining session failed: {}. \
-                                 Task is in refining state but has no refiner session.",
-                                e
-                            ),
-                            Some("system"),
+                            "tasks: cannot resolve project '{}' for refining dispatch: {}",
+                            task.project_name, e
                         );
                     }
                 }
