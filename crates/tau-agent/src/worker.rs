@@ -566,6 +566,7 @@ async fn handle_session_tool(
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true),
                 project_name: None,
+                sandbox_profile: None,
             };
             let resp = match server_request(msg_tx, pending, create_req).await {
                 Ok(r) => r,

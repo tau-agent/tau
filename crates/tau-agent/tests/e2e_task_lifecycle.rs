@@ -183,6 +183,7 @@ fn create_session(server: &TestServer, cwd: Option<&str>, project_name: Option<&
             auto_archive: false,
             notify_parent: false,
             project_name: project_name.map(String::from),
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,

@@ -421,6 +421,7 @@ pub fn dispatch(
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),
+        sandbox_profile: task.sandbox_profile.clone(),
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -541,6 +542,7 @@ fn dispatch_planning(
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),
+        sandbox_profile: task.sandbox_profile.clone(),
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -787,6 +789,7 @@ pub fn dispatch_review(
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),
+        sandbox_profile: task.sandbox_profile.clone(),
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -968,6 +971,7 @@ pub fn dispatch_refining(
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),
+        sandbox_profile: task.sandbox_profile.clone(),
     };
 
     let session_id = match server_request(writer, reader, create_req)? {
@@ -1711,6 +1715,10 @@ fn format_task_line(out: &mut String, ts: &TaskStatus) {
         ts.task.id, ts.task.title, sid, files_str
     );
 
+    if let Some(profile) = ts.task.sandbox_profile.as_deref() {
+        let _ = write!(out, " 🔒{}", profile);
+    }
+
     // Append wait reasons.
     for reason in &ts.wait_reasons {
         match reason {
@@ -1789,6 +1797,7 @@ mod tests {
             skip_review: false,
             skip_planning: false,
             require_approval: false,
+            sandbox_profile: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -2284,6 +2293,7 @@ mod tests {
                 true,
                 false,
                 None,
+                None,
             )
             .unwrap();
         // interactive -> ready
@@ -2465,6 +2475,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -2528,6 +2539,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -2604,6 +2616,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         // interactive -> ready
@@ -2673,6 +2686,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         // interactive -> ready
@@ -2734,6 +2748,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -2749,6 +2764,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -2800,6 +2816,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3084,6 +3101,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let child = db
@@ -3096,6 +3114,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3121,6 +3140,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3217,6 +3237,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let child = db
@@ -3229,6 +3250,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();

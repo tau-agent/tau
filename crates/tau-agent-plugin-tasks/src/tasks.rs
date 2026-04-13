@@ -200,6 +200,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "merge_target": {
                         "type": "string",
                         "description": "Override merge target branch (default: parent's branch for subtasks, 'main' for root tasks)"
+                    },
+                    "sandbox_profile": {
+                        "type": "string",
+                        "description": "Sandbox profile name from sandbox.toml to use when dispatching this task's sessions"
                     }
                 },
                 "required": ["title"]
@@ -329,6 +333,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "merge_target": {
                         "type": "string",
                         "description": "Override merge target branch (default: parent's branch for subtasks, 'main' for root tasks)"
+                    },
+                    "sandbox_profile": {
+                        "type": "string",
+                        "description": "Sandbox profile name from sandbox.toml to use when dispatching this task's sessions"
                     }
                 },
                 "required": ["id"]
@@ -565,6 +573,7 @@ fn handle_task_create(
         .unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str());
     let merge_target = args.get("merge_target").and_then(|v| v.as_str());
+    let sandbox_profile = args.get("sandbox_profile").and_then(|v| v.as_str());
 
     match db.create_task(
         project_name,
@@ -576,6 +585,7 @@ fn handle_task_create(
         skip_planning,
         require_approval,
         merge_target,
+        sandbox_profile,
     ) {
         Ok(task) => {
             // Subtasks start in ready or planning state — trigger a schedule pass.
@@ -670,6 +680,7 @@ fn create_interactive_session(
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),
+        sandbox_profile: task.sandbox_profile.clone(),
     };
 
     let new_sid = match crate::tasks_scheduler::server_request(writer, reader, create_req) {
@@ -977,6 +988,10 @@ fn handle_task_update(
         require_approval: args.get("require_approval").and_then(|v| v.as_bool()),
         merge_target: args
             .get("merge_target")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        sandbox_profile: args
+            .get("sandbox_profile")
             .and_then(|v| v.as_str())
             .map(String::from),
     };
@@ -2679,10 +2694,10 @@ mod tests {
     fn test_tool_relate() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("p", "A", None, None, None, false, false, false, None)
+            .create_task("p", "A", None, None, None, false, false, false, None, None)
             .unwrap();
         let t2 = db
-            .create_task("p", "B", None, None, None, false, false, false, None)
+            .create_task("p", "B", None, None, None, false, false, false, None, None)
             .unwrap();
 
         let result = handle_task_relate(
@@ -2705,7 +2720,7 @@ mod tests {
     fn test_tool_message_edit() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("p", "A", None, None, None, false, false, false, None)
+            .create_task("p", "A", None, None, None, false, false, false, None, None)
             .unwrap();
         let msg = db.add_message(task.id, "original", None).unwrap();
 
@@ -3022,6 +3037,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -3081,6 +3097,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -3124,6 +3141,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3157,6 +3175,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3206,6 +3225,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3270,6 +3290,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3296,6 +3317,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3308,6 +3330,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3334,6 +3357,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3346,6 +3370,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3382,6 +3407,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -3394,6 +3420,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3425,6 +3452,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3477,6 +3505,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
@@ -3506,6 +3535,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3518,6 +3548,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3548,6 +3579,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3560,6 +3592,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3591,6 +3624,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3603,6 +3637,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3636,6 +3671,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let t2 = db
@@ -3648,6 +3684,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -3811,6 +3848,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
@@ -3887,6 +3925,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3924,6 +3963,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -4017,6 +4057,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -4032,6 +4073,7 @@ mod tests {
                 true,
                 true,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -4102,6 +4144,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -4243,6 +4286,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4335,6 +4379,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
@@ -4410,6 +4455,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4472,6 +4518,7 @@ mod tests {
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -4536,6 +4583,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -4602,6 +4650,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4663,6 +4712,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -4780,6 +4830,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -4892,6 +4943,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -4904,6 +4956,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5010,6 +5063,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -5022,6 +5076,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5128,6 +5183,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -5140,6 +5196,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5255,6 +5312,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -5267,6 +5325,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5321,6 +5380,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -5333,6 +5393,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5396,6 +5457,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -5408,6 +5470,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5622,6 +5685,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -5634,6 +5698,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5702,6 +5767,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -5714,6 +5780,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -5917,6 +5984,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -5929,6 +5997,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -6002,6 +6071,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -6014,6 +6084,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -6164,6 +6235,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -6176,6 +6248,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -6296,6 +6369,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -6391,6 +6465,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.update_task(
@@ -6462,6 +6537,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -6474,6 +6550,7 @@ mod tests {
                 false,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -6548,6 +6625,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let task = db
@@ -6560,6 +6638,7 @@ mod tests {
                 false,
                 true, // skip_planning → starts in ready
                 false,
+                None,
                 None,
             )
             .unwrap();

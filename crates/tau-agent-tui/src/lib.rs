@@ -530,6 +530,7 @@ async fn run_inner(
                             parent_id: None,
                             priority: None,
                             tags: vec![],
+                            sandbox_profile: None,
                         },
                         server_tx.clone(),
                     )
@@ -558,6 +559,7 @@ async fn run_inner(
                             skip_review: None,
                             skip_planning: None,
                             require_approval: None,
+                            sandbox_profile: None,
                         },
                         server_tx.clone(),
                     )
@@ -701,6 +703,7 @@ async fn create_session(
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         })
         .await?;
 

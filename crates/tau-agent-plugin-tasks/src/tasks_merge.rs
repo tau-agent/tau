@@ -214,6 +214,7 @@ pub fn merge_task(
             auto_archive: false,
             notify_parent: false,
             project_name: Some(task.project_name.clone()),
+            sandbox_profile: None,
         },
     )? {
         Response::SessionCreated { session_id } => session_id,
@@ -720,6 +721,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.record_session(task.id, "s-worker", "worker").unwrap();
@@ -901,6 +903,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         // interactive -> ready
@@ -954,6 +957,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -982,6 +986,7 @@ command = "cargo test"
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1039,6 +1044,7 @@ command = "cargo test"
                 true,
                 false,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1102,6 +1108,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1118,6 +1125,7 @@ command = "cargo test"
                 true,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let child2 = db
@@ -1130,6 +1138,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1203,6 +1212,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1218,6 +1228,7 @@ command = "cargo test"
                 true,
                 false,
                 None,
+                None,
             )
             .unwrap();
         let _child2 = db
@@ -1230,6 +1241,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1298,6 +1310,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1323,6 +1336,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1338,6 +1352,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1439,6 +1454,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -1453,6 +1469,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1509,6 +1526,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1535,6 +1553,7 @@ command = "cargo test"
                 false,
                 false,
                 None,
+                None,
             )
             .unwrap();
         // Don't set session_id on parent
@@ -1549,6 +1568,7 @@ command = "cargo test"
                 false,
                 true,
                 false,
+                None,
                 None,
             )
             .unwrap();

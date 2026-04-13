@@ -515,7 +515,8 @@ pub(super) async fn run_child_chat(
         // Ensure session plugins
         {
             let mut pm = plugins.lock().expect("plugins mutex poisoned");
-            match pm.ensure_session_plugins(&session_id, &cwd, stored.project_name.as_deref()) {
+            match pm.ensure_session_plugins(&session_id, &cwd, stored.project_name.as_deref(), None)
+            {
                 Ok(failures) => {
                     for msg in &failures {
                         queue_info_to_session(&state, &session_id, msg);
@@ -750,7 +751,8 @@ pub(super) async fn resume_child_session(
         // Ensure session plugins
         {
             let mut pm = plugins.lock().expect("plugins mutex poisoned");
-            match pm.ensure_session_plugins(&session_id, &cwd, stored.project_name.as_deref()) {
+            match pm.ensure_session_plugins(&session_id, &cwd, stored.project_name.as_deref(), None)
+            {
                 Ok(failures) => {
                     for msg in &failures {
                         queue_info_to_session(&state, &session_id, msg);

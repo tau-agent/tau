@@ -33,6 +33,7 @@ fn server_create_session_and_list() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     );
     let session_id = match resp {
@@ -82,6 +83,7 @@ fn server_create_child_session_with_budget() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -103,6 +105,7 @@ fn server_create_child_session_with_budget() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -162,6 +165,7 @@ fn server_budget_exceeded() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -183,6 +187,7 @@ fn server_budget_exceeded() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { .. } => {}
@@ -204,6 +209,7 @@ fn server_budget_exceeded() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::Error { message } => {
@@ -238,6 +244,7 @@ fn server_delete_session_tree() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -258,6 +265,7 @@ fn server_delete_session_tree() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -321,6 +329,7 @@ fn server_wait_sessions_immediate() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -367,6 +376,7 @@ fn server_chat_simple_text() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -443,6 +453,7 @@ fn server_chat_tool_call_loop() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -525,6 +536,7 @@ fn server_chat_error_preserves_partial_messages() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -631,6 +643,7 @@ fn server_session_resume_after_restart() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -754,6 +767,7 @@ fn steer_queues_message_for_idle_session() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -995,6 +1009,7 @@ fn server_chat_with_mock_tool_success() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1132,6 +1147,7 @@ fn server_chat_with_mock_tool_error() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1255,6 +1271,7 @@ fn server_chat_multi_tool_calls() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1384,6 +1401,7 @@ fn server_chat_multi_turn_tool_loop() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1515,6 +1533,7 @@ fn server_chat_tool_schemas_in_context() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1633,6 +1652,7 @@ fn session_dump_and_replay() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2230,6 +2250,7 @@ done
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2327,6 +2348,7 @@ fn server_execute_tool_basic() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2388,6 +2410,7 @@ fn server_execute_tool_error() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2449,6 +2472,7 @@ fn server_execute_tool_persistence() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2597,6 +2621,7 @@ fn server_log_provider_chat_returns_immediately() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -2725,6 +2750,7 @@ fn create_session_with_model(
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     )
 }

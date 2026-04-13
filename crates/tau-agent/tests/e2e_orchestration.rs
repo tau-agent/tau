@@ -324,6 +324,7 @@ fn protocol_create_session_with_parent() {
         auto_archive: false,
         notify_parent: true,
         project_name: None,
+        sandbox_profile: None,
     };
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains("parent_id"));
@@ -436,6 +437,7 @@ fn spawn_child_chat_produces_messages() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -457,6 +459,7 @@ fn spawn_child_chat_produces_messages() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -547,6 +550,7 @@ fn spawn_multiple_children_wait_all() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -570,6 +574,7 @@ fn spawn_multiple_children_wait_all() {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                sandbox_profile: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -684,6 +689,7 @@ fn spawn_child_inherits_parent_model_and_cwd() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -705,6 +711,7 @@ fn spawn_child_inherits_parent_model_and_cwd() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -760,6 +767,7 @@ fn wait_sessions_idle_returns_done() {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                sandbox_profile: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -809,6 +817,7 @@ fn spawn_delete_parent_cascades() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -829,6 +838,7 @@ fn spawn_delete_parent_cascades() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -893,6 +903,7 @@ fn spawn_cancel_child() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -913,6 +924,7 @@ fn spawn_cancel_child() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -954,6 +966,7 @@ fn wait_sessions_returns_summary() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -974,6 +987,7 @@ fn wait_sessions_returns_summary() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1062,6 +1076,7 @@ fn wait_any_sessions_idle_returns_all() {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                sandbox_profile: None,
             },
         ) {
             Response::SessionCreated { session_id } => session_id,
@@ -1114,6 +1129,7 @@ fn wait_any_sessions_returns_only_completed() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1135,6 +1151,7 @@ fn wait_any_sessions_returns_only_completed() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1167,6 +1184,7 @@ fn wait_any_sessions_returns_only_completed() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1297,6 +1315,7 @@ fn second_child_completion_notifies_parent() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1318,6 +1337,7 @@ fn second_child_completion_notifies_parent() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1589,6 +1609,7 @@ fn await_reply_e2e() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,
@@ -1609,6 +1630,7 @@ fn await_reply_e2e() {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         },
     ) {
         Response::SessionCreated { session_id } => session_id,

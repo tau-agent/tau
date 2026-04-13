@@ -596,6 +596,7 @@ async fn cmd_chat(
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                sandbox_profile: None,
             })
             .await?;
 
@@ -720,6 +721,7 @@ async fn cli_create_session(
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            sandbox_profile: None,
         })
         .await?;
 
@@ -2187,6 +2189,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
                 skip_review,
                 skip_planning,
                 require_approval,
+                None,
                 None,
             )?;
             println!("created task #{}: {}", task.id, task.title);

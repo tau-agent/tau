@@ -358,6 +358,7 @@ pub(super) async fn handle_client(
                 auto_archive,
                 notify_parent,
                 project_name,
+                sandbox_profile,
             } => {
                 // Atomic budget check + session creation (single lock hold)
                 let resp = create_session_impl(
@@ -386,7 +387,12 @@ pub(super) async fn handle_client(
                     };
                     let cwd_str = cwd_resolved.as_deref().unwrap_or("/tmp");
                     let mut pm = plugins.lock().expect("plugins mutex poisoned");
-                    match pm.ensure_session_plugins(&id, cwd_str, project_name.as_deref()) {
+                    match pm.ensure_session_plugins(
+                        &id,
+                        cwd_str,
+                        project_name.as_deref(),
+                        sandbox_profile.as_deref(),
+                    ) {
                         Ok(failures) => {
                             for msg in &failures {
                                 queue_info_to_session(&state, &id, msg);
@@ -480,6 +486,7 @@ pub(super) async fn handle_client(
                             &session_id,
                             &cwd,
                             stored.project_name.as_deref(),
+                            None,
                         ) {
                             Ok(failures) => {
                                 for msg in &failures {
@@ -1544,7 +1551,7 @@ pub(super) async fn handle_client(
                     let mut pm = plugins.lock().expect("plugins mutex poisoned");
                     pm.reload_config();
                     pm.destroy_session_plugins(&session_id);
-                    pm.ensure_session_plugins(&session_id, &cwd, project_name.as_deref())
+                    pm.ensure_session_plugins(&session_id, &cwd, project_name.as_deref(), None)
                         .map(|failures| {
                             for msg in &failures {
                                 queue_info_to_session(&state, &session_id, msg);
@@ -1680,9 +1687,15 @@ pub(super) async fn handle_client(
                 parent_id,
                 priority,
                 tags,
+                sandbox_profile,
             } => {
                 let resp = super::task_handlers::handle_task_create(
-                    &project, &title, parent_id, priority, &tags,
+                    &project,
+                    &title,
+                    parent_id,
+                    priority,
+                    &tags,
+                    sandbox_profile.as_deref(),
                 );
                 send(&mut writer, &resp).await?;
             }
@@ -1696,6 +1709,7 @@ pub(super) async fn handle_client(
                 skip_review,
                 skip_planning,
                 require_approval,
+                sandbox_profile,
             } => {
                 let resp = super::task_handlers::handle_task_update(
                     id,
@@ -1707,6 +1721,7 @@ pub(super) async fn handle_client(
                     skip_review,
                     skip_planning,
                     require_approval,
+                    sandbox_profile,
                 );
                 send(&mut writer, &resp).await?;
             }

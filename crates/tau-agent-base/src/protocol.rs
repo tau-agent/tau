@@ -43,6 +43,9 @@ pub enum Request {
         /// Project name (from discover_project or explicit).
         #[serde(skip_serializing_if = "Option::is_none")]
         project_name: Option<String>,
+        /// Sandbox profile name (from task config) for plugin spawning.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sandbox_profile: Option<String>,
     },
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },
@@ -179,6 +182,8 @@ pub enum Request {
         priority: Option<i32>,
         #[serde(default)]
         tags: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sandbox_profile: Option<String>,
     },
     /// Update a task (state, title, priority, etc.).
     TaskUpdate {
@@ -199,6 +204,8 @@ pub enum Request {
         skip_planning: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         require_approval: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sandbox_profile: Option<String>,
     },
     /// Search tasks by query.
     TaskSearch {
@@ -406,6 +413,8 @@ pub struct TaskInfo {
     pub skip_review: bool,
     pub skip_planning: bool,
     pub require_approval: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_profile: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -786,6 +795,7 @@ mod tests {
             skip_review: false,
             skip_planning: true,
             require_approval: false,
+            sandbox_profile: None,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -821,6 +831,7 @@ mod tests {
                 parent_id: None,
                 priority: Some(3),
                 tags: vec!["a".into()],
+                sandbox_profile: None,
             },
             Request::TaskUpdate {
                 id: 42,
@@ -832,6 +843,7 @@ mod tests {
                 skip_review: None,
                 skip_planning: None,
                 require_approval: None,
+                sandbox_profile: None,
             },
             Request::TaskSearch {
                 project: "/tmp".into(),

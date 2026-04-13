@@ -18,6 +18,7 @@ fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
         skip_review: t.skip_review,
         skip_planning: t.skip_planning,
         require_approval: t.require_approval,
+        sandbox_profile: t.sandbox_profile,
         created_at: t.created_at,
         updated_at: t.updated_at,
     }
@@ -129,6 +130,7 @@ pub fn handle_task_create(
     parent_id: Option<i64>,
     priority: Option<i32>,
     tags: &[String],
+    sandbox_profile: Option<&str>,
 ) -> Response {
     let db = match open_tasks_db() {
         Ok(db) => db,
@@ -153,6 +155,7 @@ pub fn handle_task_create(
         false,
         false,
         None,
+        sandbox_profile,
     ) {
         Ok(task) => Response::TaskUpdated {
             task: task_to_info(task),
@@ -174,6 +177,7 @@ pub fn handle_task_update(
     skip_review: Option<bool>,
     skip_planning: Option<bool>,
     require_approval: Option<bool>,
+    sandbox_profile: Option<String>,
 ) -> Response {
     let db = match open_tasks_db() {
         Ok(db) => db,
@@ -189,6 +193,7 @@ pub fn handle_task_update(
         skip_planning,
         require_approval,
         merge_target: None,
+        sandbox_profile,
     };
     match db.update_task(id, &update, None) {
         Ok(task) => Response::TaskUpdated {

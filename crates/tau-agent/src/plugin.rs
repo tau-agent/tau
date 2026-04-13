@@ -1126,13 +1126,14 @@ impl PluginManager {
         session_id: &str,
         cwd: &str,
         project_name: Option<&str>,
+        sandbox_profile: Option<&str>,
     ) -> crate::Result<Vec<String>> {
         if self.session_plugins.contains_key(session_id) {
             return Ok(Vec::new());
         }
         let sandbox_prefix = resolve_sandbox_prefix(
             project_name,
-            None, // no profile for now (future: could come from task)
+            sandbox_profile,
             self.config.session_prefix.as_deref(),
         );
         let (sp, failures) = SessionPlugins::spawn(&self.config, cwd, sandbox_prefix.as_deref())?;

@@ -53,7 +53,7 @@ pub(super) async fn execute_tool_impl(
     // 2. Ensure session plugins are spawned
     {
         let mut pm = plugins.lock().expect("plugins mutex poisoned");
-        match pm.ensure_session_plugins(session_id, &cwd, project_name.as_deref()) {
+        match pm.ensure_session_plugins(session_id, &cwd, project_name.as_deref(), None) {
             Ok(failures) => {
                 for msg in &failures {
                     queue_info_to_session(state, session_id, msg);
@@ -183,6 +183,7 @@ pub(super) async fn handle_server_request(
             auto_archive,
             notify_parent,
             project_name,
+            sandbox_profile: _,
         } => create_session_impl(
             state,
             model_id,
@@ -642,7 +643,15 @@ pub(super) async fn handle_server_request(
             parent_id,
             priority,
             tags,
-        } => super::task_handlers::handle_task_create(project, title, *parent_id, *priority, tags),
+            sandbox_profile,
+        } => super::task_handlers::handle_task_create(
+            project,
+            title,
+            *parent_id,
+            *priority,
+            tags,
+            sandbox_profile.as_deref(),
+        ),
         Request::TaskUpdate {
             id,
             state: new_state,
@@ -653,6 +662,7 @@ pub(super) async fn handle_server_request(
             skip_review,
             skip_planning,
             require_approval,
+            sandbox_profile,
         } => super::task_handlers::handle_task_update(
             *id,
             new_state.clone(),
@@ -663,6 +673,7 @@ pub(super) async fn handle_server_request(
             *skip_review,
             *skip_planning,
             *require_approval,
+            sandbox_profile.clone(),
         ),
         Request::TaskSearch {
             project,
