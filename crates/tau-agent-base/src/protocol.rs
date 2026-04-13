@@ -349,6 +349,11 @@ pub struct SessionInfo {
     /// Last exit status: null (never ran), "completed", "error", "cancelled", "max_turns".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit_status: Option<String>,
+    /// True when a chat turn is actively running for this session right now.
+    /// False means the session is idle — `state` may reflect a stale phase
+    /// from a previous turn or server restart.
+    #[serde(default)]
+    pub is_live: bool,
 }
 
 /// Result for a single session in WaitSessions response.

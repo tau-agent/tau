@@ -46,9 +46,16 @@ pub struct StoredSession {
     pub child_budget: u32,
     pub tagline: Option<String>,
     pub archived: bool,
-    /// Last exit status: null (never ran), "completed", "error", "cancelled", "max_turns".
+    /// How the most recent **finished** turn ended.
+    /// `None` means the session has never completed a turn.
+    /// Possible values: `"completed"`, `"error"`, `"cancelled"`, `"max_turns"`.
+    /// Updated once per turn at completion; independent of `last_phase`.
     pub last_exit_status: Option<String>,
-    /// Last known agent phase (persisted for observability across restarts).
+    /// Phase as of the most recent `emit_phase` call.
+    /// **May be stale** if the server crashed or restarted mid-turn — a non-idle
+    /// value does NOT imply a turn is currently running.  Use the in-memory
+    /// `State::live_sessions` set (exposed as `SessionInfo::is_live`) to
+    /// determine whether a session is genuinely active right now.
     pub last_phase: Option<String>,
     /// When true, auto-archive this session (and its subtree) after completion+join.
     pub auto_archive: bool,
@@ -600,6 +607,15 @@ impl Db {
     /// Update the persisted agent phase for a session.
     pub fn update_phase(&self, session_id: &str, phase: &str) -> crate::Result<()> {
         self.update_session_field(session_id, "last_phase", &phase)
+    }
+
+    /// Reset `last_phase` to `"idle"` for every session.
+    /// Called on clean shutdown so that only crashes leave non-idle persisted phases.
+    pub fn reset_all_phases(&self) -> crate::Result<()> {
+        self.conn
+            .execute("UPDATE sessions SET last_phase = 'idle' WHERE last_phase IS NOT NULL AND last_phase != 'idle'", [])
+            .map_err(db_err("reset all phases"))?;
+        Ok(())
     }
 
     /// Replace messages before `keep_from_id` with a compaction summary.

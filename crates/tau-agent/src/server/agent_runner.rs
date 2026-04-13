@@ -482,7 +482,7 @@ pub(super) async fn run_child_chat(
     // Acquire per-session lock
     let _session_guard = session_lock(&session_locks, &session_id).lock_arc().await;
 
-    // Set up cancel flag
+    // Set up cancel flag and mark session as live.
     let cancel_flag: Arc<AtomicBool> = {
         let mut st = lock_state(&state);
         let flag = st
@@ -490,7 +490,9 @@ pub(super) async fn run_child_chat(
             .entry(session_id.clone())
             .or_insert_with(|| Arc::new(AtomicBool::new(false)));
         flag.store(false, Ordering::Relaxed);
-        flag.clone()
+        let flag = flag.clone();
+        st.live_sessions.insert(session_id.clone());
+        flag
     };
 
     let chat_result: Result<(bool, bool), crate::Error> = async {
@@ -681,6 +683,11 @@ pub(super) async fn run_child_chat(
     }
 
     emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+    // Mark session as no longer live.
+    {
+        let mut st = lock_state(&state);
+        st.live_sessions.remove(&session_id);
+    }
     notify_session_done_waiters(&state);
 
     // Before the session lock drops, check whether new messages arrived while
@@ -718,7 +725,7 @@ pub(super) async fn resume_child_session(
     // Acquire per-session lock
     let _session_guard = session_lock(&session_locks, &session_id).lock_arc().await;
 
-    // Set up cancel flag
+    // Set up cancel flag and mark session as live.
     let cancel_flag: Arc<AtomicBool> = {
         let mut st = lock_state(&state);
         let flag = st
@@ -726,7 +733,9 @@ pub(super) async fn resume_child_session(
             .entry(session_id.clone())
             .or_insert_with(|| Arc::new(AtomicBool::new(false)));
         flag.store(false, Ordering::Relaxed);
-        flag.clone()
+        let flag = flag.clone();
+        st.live_sessions.insert(session_id.clone());
+        flag
     };
 
     let chat_result: Result<(bool, bool), crate::Error> = async {
@@ -916,6 +925,11 @@ pub(super) async fn resume_child_session(
     }
 
     emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+    // Mark session as no longer live.
+    {
+        let mut st = lock_state(&state);
+        st.live_sessions.remove(&session_id);
+    }
     notify_session_done_waiters(&state);
 
     // Before the session lock drops, check whether new messages arrived while

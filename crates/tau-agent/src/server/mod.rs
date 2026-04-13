@@ -152,7 +152,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     use registry::{
         spawn_bg_chat_receiver, spawn_global_plugin_background_tasks, spawn_idle_sweep,
     };
-    use state::restore_phases_from_db;
+    use state::log_stale_phases_at_startup;
 
     let default_model = config
         .models
@@ -218,13 +218,14 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         has_queued: HashMap::new(),
         subscribers: HashMap::new(),
         phases: HashMap::new(),
+        live_sessions: HashSet::new(),
         waited_sessions: HashSet::new(),
         session_done_waiters: Vec::new(),
         reply_waiters: HashMap::new(),
         next_msg_id: 0,
     }));
 
-    restore_phases_from_db(&state);
+    log_stale_phases_at_startup(&state);
 
     let shutdown = ShutdownHandle::new();
 
@@ -295,6 +296,14 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         .detach();
     }
 
+    // Persist idle phase for all sessions on clean shutdown (same as production `run()`).
+    {
+        let st = lock_state(&state);
+        if let Err(e) = st.db.reset_all_phases() {
+            eprintln!("warning: failed to reset phases on shutdown: {}", e);
+        }
+    }
+
     Ok(())
 }
 
@@ -306,7 +315,7 @@ pub async fn run() -> crate::Result<()> {
         build_registry, spawn_bg_chat_receiver, spawn_global_plugin_background_tasks,
         spawn_idle_sweep,
     };
-    use state::restore_phases_from_db;
+    use state::log_stale_phases_at_startup;
 
     let registry = build_registry();
     let cfg = config::load_config()?;
@@ -363,13 +372,14 @@ pub async fn run() -> crate::Result<()> {
         has_queued: HashMap::new(),
         subscribers: HashMap::new(),
         phases: HashMap::new(),
+        live_sessions: HashSet::new(),
         waited_sessions: HashSet::new(),
         session_done_waiters: Vec::new(),
         reply_waiters: HashMap::new(),
         next_msg_id: 0,
     }));
 
-    restore_phases_from_db(&state);
+    log_stale_phases_at_startup(&state);
 
     let shutdown = ShutdownHandle::new();
 
@@ -520,6 +530,15 @@ pub async fn run() -> crate::Result<()> {
             "timeout: {} request(s) still in flight, exiting anyway",
             shutdown.active_count()
         );
+    }
+
+    // Persist idle phase for all sessions so a clean shutdown starts from
+    // a clean slate.  Only crashes leave non-idle persisted phases.
+    {
+        let st = lock_state(&state);
+        if let Err(e) = st.db.reset_all_phases() {
+            eprintln!("warning: failed to reset phases on shutdown: {}", e);
+        }
     }
 
     // Cleanup

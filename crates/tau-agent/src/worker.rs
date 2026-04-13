@@ -810,14 +810,28 @@ async fn handle_session_tool(
                 session_id: sid.to_string(),
             };
             match server_request(msg_tx, pending, req).await {
-                Ok(crate::protocol::Response::SessionInfo { info }) => ToolResultMessage::success(
-                    tcid,
-                    "",
-                    format!(
-                        "Session {}: {}/{}, {} messages, {} children",
-                        info.id, info.provider, info.model, info.message_count, info.child_count
-                    ),
-                ),
+                Ok(crate::protocol::Response::SessionInfo { info }) => {
+                    let status = if info.is_live {
+                        format!("LIVE ({})", info.state)
+                    } else if let Some(ref exit) = info.last_exit_status {
+                        format!("idle (last: {})", exit)
+                    } else {
+                        "idle".to_string()
+                    };
+                    ToolResultMessage::success(
+                        tcid,
+                        "",
+                        format!(
+                            "Session {}: {} — {}/{}, {} messages, {} children",
+                            info.id,
+                            status,
+                            info.provider,
+                            info.model,
+                            info.message_count,
+                            info.child_count
+                        ),
+                    )
+                }
                 Ok(crate::protocol::Response::Error { message }) => {
                     ToolResultMessage::error(tcid, "", &message)
                 }

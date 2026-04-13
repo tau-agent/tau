@@ -32,6 +32,10 @@ pub(super) struct State {
     pub(super) subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
     /// Current agent phase per session, for new subscribers.
     pub(super) phases: HashMap<String, crate::types::AgentPhase>,
+    /// Sessions with an actively running agent turn in this process.
+    /// Inserted at the start of each Chat/resume turn, removed on completion.
+    /// This is the authoritative "is something happening right now" signal.
+    pub(super) live_sessions: HashSet<String>,
     /// Sessions currently being waited on by WaitSessions/WaitAnySessions.
     /// Maps child_session_id -> parent_session_id. Used to suppress redundant
     /// completion notifications when parent is actively joining.
@@ -68,35 +72,34 @@ pub(super) fn session_lock(locks: &SessionLocks, session_id: &str) -> Arc<smol::
         .clone()
 }
 
-/// Restore `State.phases` from persisted `last_phase` values in the database.
-/// Called once at startup so sessions show their last-known state instead of
-/// defaulting to "idle".
-pub(super) fn restore_phases_from_db(state: &SharedState) {
-    let mut st = lock_state(state);
+/// Called once at startup.  Non-idle persisted phases are **not** restored
+/// into `state.phases` because no chat loops are running after a restart.
+/// Instead, a diagnostic warning is logged listing sessions whose persisted
+/// phase was non-idle — indicating the previous server instance may have
+/// exited uncleanly while those sessions were mid-turn.
+pub(super) fn log_stale_phases_at_startup(state: &SharedState) {
+    let st = lock_state(state);
     let sessions = match st.db.list_sessions(false) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("warning: failed to load sessions for phase restore: {}", e);
+            eprintln!("warning: failed to load sessions for phase check: {}", e);
             return;
         }
     };
-    for s in sessions {
-        if let Some(ref phase_str) = s.last_phase {
-            let phase = match phase_str.as_str() {
-                "idle" => crate::types::AgentPhase::Idle,
-                "thinking" => crate::types::AgentPhase::Thinking,
-                "working" => crate::types::AgentPhase::Responding,
-                "running tools" => crate::types::AgentPhase::ToolExec,
-                "sending request" => crate::types::AgentPhase::Connecting,
-                "preparing" => crate::types::AgentPhase::Preparing,
-                "compacting" => crate::types::AgentPhase::Compacting,
-                "rate limited" => crate::types::AgentPhase::RateLimited,
-                "waiting" => crate::types::AgentPhase::Waiting,
-                _ => crate::types::AgentPhase::Idle,
-            };
-            if phase != crate::types::AgentPhase::Idle {
-                st.phases.insert(s.id.clone(), phase);
-            }
-        }
+    let stale: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.last_phase.as_deref().is_some_and(|p| p != "idle"))
+        .collect();
+    if !stale.is_empty() {
+        let ids: Vec<_> = stale
+            .iter()
+            .map(|s| format!("{} ({})", s.id, s.last_phase.as_deref().unwrap_or("?")))
+            .collect();
+        eprintln!(
+            "warning: {} session(s) had non-idle persisted phases at startup \
+             (possibly unclean previous shutdown): {}",
+            stale.len(),
+            ids.join(", ")
+        );
     }
 }

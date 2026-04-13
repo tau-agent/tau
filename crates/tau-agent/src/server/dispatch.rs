@@ -222,6 +222,7 @@ pub(super) fn get_session_info_impl(
                     last_msg,
                     children,
                     st.phases.get(session_id),
+                    st.live_sessions.contains(session_id),
                 ),
             }
         }
@@ -269,6 +270,7 @@ pub(super) fn list_sessions_impl(
                     db_stats.as_ref(),
                     children,
                     st.phases.get(&s.id),
+                    st.live_sessions.contains(&s.id),
                 ));
             }
             crate::protocol::Response::Sessions { sessions: infos }
@@ -450,6 +452,12 @@ pub(super) async fn handle_client(
                     flag.store(false, Ordering::Relaxed);
                     flag.clone()
                 };
+
+                // Mark session as live (turn actively running).
+                {
+                    let mut st = lock_state(&state);
+                    st.live_sessions.insert(session_id.clone());
+                }
 
                 emit_phase(&state, &session_id, crate::types::AgentPhase::Preparing);
 
@@ -728,6 +736,11 @@ pub(super) async fn handle_client(
                 }
 
                 emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+                // Mark session as no longer live.
+                {
+                    let mut st = lock_state(&state);
+                    st.live_sessions.remove(&session_id);
+                }
                 notify_session_done_waiters(&state);
 
                 // Before the session lock drops, check whether new messages

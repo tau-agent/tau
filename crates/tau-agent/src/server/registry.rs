@@ -73,6 +73,7 @@ pub(super) fn session_info(
     last_message_time: Option<i64>,
     child_count: usize,
     phase: Option<&crate::types::AgentPhase>,
+    is_live: bool,
 ) -> SessionInfo {
     let stats = compute_stats(messages, &stored.model, stored.is_subscription);
     let context_pct = if stats.context_window > 0 {
@@ -104,6 +105,7 @@ pub(super) fn session_info(
         context_pct,
         archived: stored.archived,
         last_exit_status: stored.last_exit_status.clone(),
+        is_live,
         project_name: stored.project_name.clone(),
     }
 }
@@ -115,6 +117,7 @@ pub(super) fn session_info_from_db_stats(
     db_stats: Option<&crate::db::DbSessionStats>,
     child_count: usize,
     phase: Option<&crate::types::AgentPhase>,
+    is_live: bool,
 ) -> SessionInfo {
     let empty = crate::db::DbSessionStats::default();
     let ds = db_stats.unwrap_or(&empty);
@@ -165,6 +168,7 @@ pub(super) fn session_info_from_db_stats(
         context_pct,
         archived: stored.archived,
         last_exit_status: stored.last_exit_status.clone(),
+        is_live,
         project_name: stored.project_name.clone(),
     }
 }

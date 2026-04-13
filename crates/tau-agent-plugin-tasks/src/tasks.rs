@@ -2461,6 +2461,7 @@ mod tests {
                                     context_pct: None,
                                     archived: is_archived,
                                     last_exit_status: None,
+                                    is_live: false,
                                     project_name: None,
                                 },
                             }

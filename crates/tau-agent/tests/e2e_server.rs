@@ -2992,3 +2992,333 @@ worker = "fast-model"
 
     shutdown(&sock);
 }
+
+/// `SessionInfo.is_live` must be false for a freshly created session (no turn),
+/// and false after a completed chat turn.  During a turn it should be true,
+/// but we verify that indirectly via the post-completion false assertion.
+#[test]
+fn session_info_is_live_false_when_idle() {
+    let server = TestServer::start(vec![MockResponse::Text("reply".into())]);
+    let conn = server.connect();
+
+    // Create session
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Before any chat: is_live should be false
+    let conn2 = server.connect();
+    let resp = send_recv(
+        &conn2,
+        &Request::GetSessionInfo {
+            session_id: sid.clone(),
+        },
+    );
+    match resp {
+        Response::SessionInfo { info } => {
+            assert!(!info.is_live, "new session should not be live");
+            assert_eq!(info.state, "idle");
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Run a chat to completion
+    let conn3 = server.connect();
+    let responses = send_recv_all(
+        &conn3,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello".into(),
+        },
+    );
+    assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // After chat: is_live should be false again
+    let conn4 = server.connect();
+    let resp2 = send_recv(
+        &conn4,
+        &Request::GetSessionInfo {
+            session_id: sid.clone(),
+        },
+    );
+    match resp2 {
+        Response::SessionInfo { info } => {
+            assert!(
+                !info.is_live,
+                "session should not be live after turn completes"
+            );
+            assert_eq!(info.state, "idle");
+            assert_eq!(info.last_exit_status.as_deref(), Some("completed"));
+        }
+        other => panic!("{:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// After a restart with a poisoned last_phase in the DB, is_live must be false
+/// (no chat loop running) even though the DB says "sending request".
+#[test]
+fn session_info_is_live_false_after_restart_with_stale_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("test.sock");
+    let db_path = dir.path().join("test.db");
+
+    // -- Server 1: create a session, chat, shutdown --
+    let model = mock_model();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![MockResponse::Text("r1".into())]));
+
+    let config = tau_agent::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.clone(),
+        db_path: db_path.clone(),
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    let handle = std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config).await.ok();
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Chat to completion
+    let conn2 = UnixStream::connect(&sock_path).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let resps = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello".into(),
+        },
+    );
+    assert!(resps.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Shutdown server 1
+    let conn3 = UnixStream::connect(&sock_path).unwrap();
+    conn3
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_recv(&conn3, &Request::Shutdown { restart: false });
+    handle.join().ok();
+
+    // Poison the DB: set last_phase to non-idle
+    {
+        let db = tau_agent::db::Db::open(&db_path).unwrap();
+        db.update_phase(&sid, "sending request").unwrap();
+    }
+
+    // -- Server 2: restart with same DB --
+    std::fs::remove_file(&sock_path).ok();
+    let model2 = mock_model();
+    let mut registry2 = tau_agent::provider::ProviderRegistry::new();
+    registry2.register(MockProvider::new(vec![]));
+
+    let config2 = tau_agent::server::TestServerConfig {
+        registry: registry2,
+        models: vec![model2],
+        socket_path: sock_path.clone(),
+        db_path: db_path.clone(),
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    let _handle2 = std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config2).await.ok();
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // GetSessionInfo: is_live must be false despite stale DB phase
+    let conn4 = UnixStream::connect(&sock_path).unwrap();
+    conn4
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let resp = send_recv(
+        &conn4,
+        &Request::GetSessionInfo {
+            session_id: sid.clone(),
+        },
+    );
+    match resp {
+        Response::SessionInfo { info } => {
+            assert!(
+                !info.is_live,
+                "is_live must be false after restart with stale phase"
+            );
+            assert_eq!(
+                info.state, "idle",
+                "state must be idle (phases map is empty after restart)"
+            );
+        }
+        other => panic!("{:?}", other),
+    }
+
+    // Shutdown
+    if let Ok(c) = UnixStream::connect(&sock_path) {
+        let req = serde_json::to_string(&Request::Shutdown { restart: false }).unwrap();
+        let mut c = c;
+        let _ = c.write_all(format!("{}\n", req).as_bytes());
+        let _ = c.flush();
+    }
+}
+
+/// Clean shutdown writes last_phase="idle" for all sessions.
+#[test]
+fn clean_shutdown_resets_phases_to_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("test.sock");
+    let db_path = dir.path().join("test.db");
+
+    let model = mock_model();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![MockResponse::Text("r".into())]));
+
+    let config = tau_agent::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.clone(),
+        db_path: db_path.clone(),
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    let handle = std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config).await.ok();
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Chat to completion — this sets last_phase to something, then idle
+    let conn2 = UnixStream::connect(&sock_path).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let resps = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello".into(),
+        },
+    );
+    assert!(resps.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Manually poison the phase in DB to simulate mid-turn state
+    {
+        let db = tau_agent::db::Db::open(&db_path).unwrap();
+        db.update_phase(&sid, "thinking").unwrap();
+        // Verify it was written
+        let s = db.get_session(&sid).unwrap().unwrap();
+        assert_eq!(s.last_phase.as_deref(), Some("thinking"));
+    }
+
+    // Clean shutdown
+    let conn3 = UnixStream::connect(&sock_path).unwrap();
+    conn3
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_recv(&conn3, &Request::Shutdown { restart: false });
+    handle.join().ok();
+
+    // Verify DB was cleaned up
+    {
+        let db = tau_agent::db::Db::open(&db_path).unwrap();
+        let s = db.get_session(&sid).unwrap().unwrap();
+        assert_eq!(
+            s.last_phase.as_deref(),
+            Some("idle"),
+            "clean shutdown must write last_phase='idle' for all sessions"
+        );
+    }
+}
