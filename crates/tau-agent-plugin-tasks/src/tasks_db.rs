@@ -354,6 +354,24 @@ impl TasksDb {
     /// - Dropping the `assigned_session` column (consolidated into `session_id`).
     /// - Adding the `skip_planning` column.
     fn migrate(conn: &Connection) -> tau_agent_plugin::Result<()> {
+        // Rename project → project_name if the old column still exists.
+        let has_old_project: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'project'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if has_old_project {
+            conn.execute_batch(
+                "ALTER TABLE tasks RENAME COLUMN project TO project_name; \
+                 DROP INDEX IF EXISTS idx_tasks_project_state; \
+                 CREATE INDEX IF NOT EXISTS idx_tasks_project_state ON tasks(project_name, state);",
+            )
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("migrate project -> project_name: {}", e))
+            })?;
+        }
+
         // Check if assigned_session column still exists.
         let has_assigned_session: bool = conn
             .prepare(
@@ -5912,5 +5930,95 @@ mod tests {
         assert_eq!(db.count_inflight_tasks("project-a").unwrap(), 1);
         assert_eq!(db.count_inflight_tasks("project-b").unwrap(), 1);
         assert_eq!(db.count_inflight_tasks("project-c").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_migrate_project_to_project_name() {
+        // Simulate a database with the old "project" column name.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY,
+                project TEXT NOT NULL,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'interactive',
+                priority INTEGER DEFAULT 0,
+                parent_id INTEGER REFERENCES tasks(id),
+                tags TEXT,
+                affected_files TEXT,
+                branch TEXT,
+                worktree_path TEXT,
+                session_id TEXT,
+                skip_review INTEGER NOT NULL DEFAULT 0,
+                skip_planning INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_messages (
+                id INTEGER PRIMARY KEY,
+                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                content TEXT NOT NULL,
+                author TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_relations (
+                from_task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                to_task INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                relation TEXT NOT NULL,
+                PRIMARY KEY (from_task, to_task, relation)
+            );
+            CREATE TABLE IF NOT EXISTS task_history (
+                id INTEGER PRIMARY KEY,
+                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                field TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_tasks_project_state ON tasks(project, state);
+            INSERT INTO tasks (project, title, state, priority, skip_review, skip_planning, created_at, updated_at)
+                VALUES ('test-project', 'Test task', 'active', 0, 0, 0, 1000, 1000);",
+        )
+        .unwrap();
+
+        // Verify old column exists
+        let has_old: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'project'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(has_old);
+
+        // Run migration
+        TasksDb::migrate(&conn).unwrap();
+
+        // Verify new column exists and old is gone
+        let has_new: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'project_name'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(has_new, "project_name column should exist after migration");
+
+        let has_old_after: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'project'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            !has_old_after,
+            "old project column should be gone after migration"
+        );
+
+        // Verify data is preserved
+        let name: String = conn
+            .query_row("SELECT project_name FROM tasks WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "test-project");
     }
 }
