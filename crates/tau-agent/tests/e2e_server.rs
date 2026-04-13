@@ -3322,3 +3322,286 @@ fn clean_shutdown_resets_phases_to_idle() {
         );
     }
 }
+
+/// CancelChat on an idle session (no active chat loop) must immediately
+/// emit Cancelled + Phase(Idle) to subscribers so the TUI never gets stuck.
+#[test]
+fn cancel_chat_without_active_loop_emits_cancelled() {
+    use std::io::{BufRead, BufReader};
+    use tau_agent::types::StreamEvent;
+
+    let server = TestServer::start(vec![]);
+
+    // Create a session (no chat — session is idle)
+    let conn = server.connect();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Subscribe on a separate connection
+    let sub_conn = server.connect();
+    sub_conn
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    {
+        let mut sub_w = sub_conn.try_clone().unwrap();
+        let req = serde_json::to_string(&Request::Subscribe {
+            session_id: sid.clone(),
+        })
+        .unwrap();
+        std::io::Write::write_all(&mut sub_w, format!("{}\n", req).as_bytes()).unwrap();
+        std::io::Write::flush(&mut sub_w).unwrap();
+    }
+    let mut sub_reader = BufReader::new(sub_conn.try_clone().unwrap());
+
+    // Read the initial phase event that Subscribe always sends
+    let mut line = String::new();
+    sub_reader.read_line(&mut line).unwrap();
+    let initial: Response = serde_json::from_str(line.trim()).unwrap();
+    match &initial {
+        Response::Stream { event } => match event.as_ref() {
+            StreamEvent::Phase { phase } => {
+                assert_eq!(*phase, tau_agent::types::AgentPhase::Idle);
+            }
+            other => panic!("expected Phase event, got {:?}", other),
+        },
+        other => panic!("expected Stream, got {:?}", other),
+    }
+
+    // Send CancelChat
+    let cancel_conn = server.connect();
+    let resp = send_recv(
+        &cancel_conn,
+        &Request::CancelChat {
+            session_id: sid.clone(),
+        },
+    );
+    assert!(matches!(resp, Response::Ok), "expected Ok, got {:?}", resp);
+
+    // Subscriber should receive Cancelled
+    let mut line2 = String::new();
+    sub_reader.read_line(&mut line2).unwrap();
+    let r2: Response = serde_json::from_str(line2.trim()).unwrap();
+    assert!(
+        matches!(r2, Response::Cancelled),
+        "expected Cancelled, got {:?}",
+        r2
+    );
+
+    // Subscriber should receive Phase(Idle)
+    let mut line3 = String::new();
+    sub_reader.read_line(&mut line3).unwrap();
+    let r3: Response = serde_json::from_str(line3.trim()).unwrap();
+    match &r3 {
+        Response::Stream { event } => match event.as_ref() {
+            StreamEvent::Phase { phase } => {
+                assert_eq!(
+                    *phase,
+                    tau_agent::types::AgentPhase::Idle,
+                    "expected Phase(Idle)"
+                );
+            }
+            other => panic!("expected Phase event, got {:?}", other),
+        },
+        other => panic!("expected Stream(Phase), got {:?}", other),
+    }
+
+    server.shutdown();
+}
+
+/// After a server restart with a stale (non-idle) phase in the DB,
+/// subscribers must see Idle and new chats must complete normally.
+#[test]
+fn server_restart_clears_stale_phases() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("test.sock");
+    let db_path = dir.path().join("test.db");
+
+    // -- Server 1: create a session, chat, shutdown --
+    let model = mock_model();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![MockResponse::Text("r1".into())]));
+
+    let config = tau_agent::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.clone(),
+        db_path: db_path.clone(),
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    let handle = std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config).await.ok();
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Chat to completion
+    let conn2 = UnixStream::connect(&sock_path).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let resps = send_recv_all(
+        &conn2,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello".into(),
+        },
+    );
+    assert!(resps.iter().any(|r| matches!(r, Response::AgentDone)));
+
+    // Shutdown server 1
+    let conn3 = UnixStream::connect(&sock_path).unwrap();
+    conn3
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_recv(&conn3, &Request::Shutdown { restart: false });
+    handle.join().ok();
+
+    // Poison the DB: set last_phase to non-idle
+    {
+        let db = tau_agent::db::Db::open(&db_path).unwrap();
+        db.update_phase(&sid, "sending request").unwrap();
+    }
+
+    // -- Server 2: restart with same DB --
+    std::fs::remove_file(&sock_path).ok();
+    let model2 = mock_model();
+    let mut registry2 = tau_agent::provider::ProviderRegistry::new();
+    registry2.register(MockProvider::new(vec![MockResponse::Text("r2".into())]));
+
+    let config2 = tau_agent::server::TestServerConfig {
+        registry: registry2,
+        models: vec![model2],
+        socket_path: sock_path.clone(),
+        db_path: db_path.clone(),
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    let handle2 = std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config2).await.ok();
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Subscribe — initial phase must be Idle (not the stale "sending request")
+    {
+        use std::io::{BufRead, BufReader};
+        use tau_agent::types::StreamEvent;
+
+        let sub_conn = UnixStream::connect(&sock_path).unwrap();
+        sub_conn
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        {
+            let mut sub_w = sub_conn.try_clone().unwrap();
+            let req = serde_json::to_string(&Request::Subscribe {
+                session_id: sid.clone(),
+            })
+            .unwrap();
+            std::io::Write::write_all(&mut sub_w, format!("{}\n", req).as_bytes()).unwrap();
+            std::io::Write::flush(&mut sub_w).unwrap();
+        }
+        let mut sub_reader = BufReader::new(sub_conn.try_clone().unwrap());
+        let mut line = String::new();
+        sub_reader.read_line(&mut line).unwrap();
+        let initial: Response = serde_json::from_str(line.trim()).unwrap();
+        match &initial {
+            Response::Stream { event } => match event.as_ref() {
+                StreamEvent::Phase { phase } => {
+                    assert_eq!(
+                        *phase,
+                        tau_agent::types::AgentPhase::Idle,
+                        "initial phase after restart must be Idle, not stale"
+                    );
+                }
+                other => panic!("expected Phase event, got {:?}", other),
+            },
+            other => panic!("expected Stream, got {:?}", other),
+        }
+    }
+
+    // Send a new Chat — must complete with AgentDone
+    let conn4 = UnixStream::connect(&sock_path).unwrap();
+    conn4
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let resps2 = send_recv_all(
+        &conn4,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hello again".into(),
+        },
+    );
+    assert!(
+        resps2.iter().any(|r| matches!(r, Response::AgentDone)),
+        "new chat must complete with AgentDone after restart"
+    );
+
+    // Shutdown server 2
+    if let Ok(c) = UnixStream::connect(&sock_path) {
+        let req = serde_json::to_string(&Request::Shutdown { restart: false }).unwrap();
+        let mut c = c;
+        let _ = c.write_all(format!("{}\n", req).as_bytes());
+        let _ = c.flush();
+    }
+    handle2.join().ok();
+}

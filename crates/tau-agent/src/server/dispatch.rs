@@ -281,7 +281,11 @@ pub(super) fn list_sessions_impl(
     }
 }
 
-pub(super) fn cancel_chat_impl(state: &SharedState, session_id: &str) -> crate::protocol::Response {
+pub(super) fn cancel_chat_impl(
+    state: &SharedState,
+    session_id: &str,
+    session_locks: &SessionLocks,
+) -> crate::protocol::Response {
     let mut st = lock_state(state);
     if let Some(flag) = st.cancel_flags.get(session_id) {
         flag.store(true, Ordering::Relaxed);
@@ -289,6 +293,19 @@ pub(super) fn cancel_chat_impl(state: &SharedState, session_id: &str) -> crate::
         st.cancel_flags
             .insert(session_id.to_string(), Arc::new(AtomicBool::new(true)));
     }
+    drop(st);
+
+    // If no chat loop is running for this session, no one will read the cancel
+    // flag. Immediately emit Cancelled + Phase(Idle) so the TUI never gets
+    // stuck, and clear the stale flag.
+    let lock = session_lock(session_locks, session_id);
+    if lock.try_lock().is_some() {
+        broadcast_to_subscribers(state, session_id, &crate::protocol::Response::Cancelled);
+        emit_phase(state, session_id, crate::types::AgentPhase::Idle);
+        let mut st = lock_state(state);
+        st.cancel_flags.remove(session_id);
+    }
+
     crate::protocol::Response::Ok
 }
 
@@ -820,7 +837,7 @@ pub(super) async fn handle_client(
                 send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::CancelChat { session_id } => {
-                cancel_chat_impl(&state, &session_id);
+                cancel_chat_impl(&state, &session_id, &session_locks);
                 send(&mut writer, &Response::Ok).await.ok();
             }
             crate::protocol::Request::Steer { session_id, text } => {
