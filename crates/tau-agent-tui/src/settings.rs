@@ -32,6 +32,16 @@ fn settings_path() -> PathBuf {
     }
 }
 
+/// The hardcoded fallback model when no setting is configured.
+const DEFAULT_MODEL: &str = "claude-opus-4-6";
+
+/// Resolve the default model for new sessions.
+///
+/// Priority: `[tui] model` from `settings.toml` → hardcoded fallback.
+pub fn default_model() -> String {
+    load().tui.model.unwrap_or_else(|| DEFAULT_MODEL.into())
+}
+
 pub fn load() -> Settings {
     let path = settings_path();
     if !path.exists() {

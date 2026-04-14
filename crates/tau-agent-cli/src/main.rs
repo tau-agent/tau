@@ -366,12 +366,7 @@ async fn run(cli: Cli) -> tau_agent::Result<()> {
         } => {
             maybe_auto_init();
             // Resolve model: CLI flag > saved setting > hardcoded default
-            let model = model.unwrap_or_else(|| {
-                tau_agent_tui::settings::load()
-                    .tui
-                    .model
-                    .unwrap_or_else(|| "claude-opus-4-6".into())
-            });
+            let model = model.unwrap_or_else(tau_agent_tui::settings::default_model);
             cmd_chat(message, session, &model, no_tui, child_budget).await?;
         }
         Commands::Worker => {
@@ -477,10 +472,7 @@ async fn cmd_default() -> tau_agent::Result<()> {
     maybe_auto_init();
 
     // Resolve model from settings
-    let model = tau_agent_tui::settings::load()
-        .tui
-        .model
-        .unwrap_or_else(|| "claude-opus-4-6".into());
+    let model = tau_agent_tui::settings::default_model();
 
     // Connect to server, create an initial session for the TUI
     let mut client = tau_agent::client::Client::connect_or_start().await?;

@@ -549,10 +549,11 @@ async fn run_inner(
                 }
                 Action::NewSession => {
                     // Create a fresh session with defaults
+                    let model = crate::settings::default_model();
                     let cwd = std::env::current_dir()
                         .ok()
                         .and_then(|p| p.to_str().map(String::from));
-                    match create_session(None, cwd, None).await {
+                    match create_session(Some(model), cwd, None).await {
                         Ok(new_id) => match fetch_session_info(&new_id).await {
                             Ok(new_info) => {
                                 app.save_nav_state();
