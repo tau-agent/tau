@@ -181,6 +181,10 @@ pub struct App {
 
     /// Whether tool outputs are expanded (showing full output) or collapsed (showing summary).
     pub all_tools_expanded: bool,
+
+    /// Local input history for arrow-key scrollback.
+    /// Includes both regular chat messages and slash commands.
+    pub input_history: Vec<String>,
 }
 
 /// Saved state when navigating to a child session.
@@ -261,6 +265,7 @@ impl App {
             turn_text_finalized: false,
             pending_steer: None,
             all_tools_expanded: false,
+            input_history: Vec::new(),
         }
     }
 
@@ -293,6 +298,7 @@ impl App {
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !text.is_empty() {
+                        self.input_history.push(text.clone());
                         self.messages.push(MessageItem::User { text });
                     }
                 }
@@ -359,15 +365,12 @@ impl App {
         }
     }
 
-    /// Get user message history (most recent last, owned strings).
-    fn user_history(&self) -> Vec<String> {
-        self.messages
-            .iter()
-            .filter_map(|m| match m {
-                MessageItem::User { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect()
+    /// Push a raw input line into the local input history.
+    fn push_input_history(&mut self, text: &str) {
+        // Deduplicate: skip if identical to the most recent entry.
+        if self.input_history.last().map(|s| s.as_str()) != Some(text) {
+            self.input_history.push(text.to_string());
+        }
     }
 
     /// Set textarea content from a string.
@@ -497,10 +500,13 @@ impl App {
 
                 // Handle slash commands
                 if text.starts_with('/') {
+                    self.push_input_history(&text);
+                    self.history_index = None;
                     return self.handle_slash_command(&text);
                 }
 
                 // Don't add user message locally — it arrives via Subscribe broadcast
+                self.push_input_history(&text);
                 self.scroll_to_bottom();
                 self.mode = AppMode::Streaming;
                 self.history_index = None;
@@ -518,10 +524,13 @@ impl App {
 
                 // Handle slash commands
                 if text.starts_with('/') {
+                    self.push_input_history(&text);
+                    self.history_index = None;
                     return self.handle_slash_command(&text);
                 }
 
                 // Session is idle — send immediately, no need to queue
+                self.push_input_history(&text);
                 self.scroll_to_bottom();
                 self.mode = AppMode::Streaming;
                 self.history_index = None;
@@ -551,21 +560,21 @@ impl App {
             (KeyCode::Up, KeyModifiers::NONE) => {
                 let (row, _) = self.textarea.cursor();
                 if row == 0 {
-                    let history = self.user_history();
-                    if history.is_empty() {
+                    if self.input_history.is_empty() {
                         return None;
                     }
                     let new_idx = match self.history_index {
                         None => {
                             // Save current text before browsing
                             self.history_saved_text = self.textarea.lines().join("\n");
-                            history.len() - 1
+                            self.input_history.len() - 1
                         }
                         Some(i) if i > 0 => i - 1,
                         Some(_) => return None, // already at oldest
                     };
                     self.history_index = Some(new_idx);
-                    self.set_textarea_text(&history[new_idx]);
+                    let entry = self.input_history[new_idx].clone();
+                    self.set_textarea_text(&entry);
                     return None;
                 }
                 self.textarea.input(event_to_tui_textarea(key));
@@ -574,10 +583,10 @@ impl App {
             // Down arrow: browse history forward or restore saved text
             (KeyCode::Down, KeyModifiers::NONE) => {
                 if let Some(idx) = self.history_index {
-                    let history = self.user_history();
-                    if idx + 1 < history.len() {
+                    if idx + 1 < self.input_history.len() {
                         self.history_index = Some(idx + 1);
-                        self.set_textarea_text(&history[idx + 1]);
+                        let entry = self.input_history[idx + 1].clone();
+                        self.set_textarea_text(&entry);
                     } else {
                         // Past end: restore saved text
                         self.history_index = None;
@@ -1495,9 +1504,12 @@ impl App {
 
                 // Handle slash commands immediately, don't queue them
                 if text.starts_with('/') {
+                    self.push_input_history(&text);
+                    self.history_index = None;
                     return self.handle_slash_command(&text);
                 }
 
+                self.push_input_history(&text);
                 self.scroll_to_bottom();
                 self.history_index = None;
                 self.pending_steer = Some(text.clone());
@@ -1515,11 +1527,14 @@ impl App {
 
                 // Handle slash commands immediately, don't queue them
                 if text.starts_with('/') {
+                    self.push_input_history(&text);
+                    self.history_index = None;
                     return self.handle_slash_command(&text);
                 }
 
                 // Send to server immediately as a queued message; the server
                 // will process it once the current agent turn finishes.
+                self.push_input_history(&text);
                 self.messages.push(MessageItem::Status {
                     text: format!("[queued: {}]", text),
                 });
@@ -3924,5 +3939,223 @@ mod tests {
                 .any(|m| matches!(m, MessageItem::Status { text } if text.contains("queued"))),
             "should show queued status message"
         );
+    }
+
+    // ---- Input history (slash command scrollback) tests ----
+
+    /// Regular chat messages are added to input_history.
+    #[test]
+    fn input_history_includes_regular_messages() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("hello world");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_input_key(&key);
+
+        assert_eq!(app.input_history, vec!["hello world"]);
+    }
+
+    /// Slash commands are added to input_history.
+    #[test]
+    fn input_history_includes_slash_commands() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("/help");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_input_key(&key);
+
+        assert_eq!(app.input_history, vec!["/help"]);
+    }
+
+    /// Both regular messages and slash commands appear in input_history
+    /// in order.
+    #[test]
+    fn input_history_interleaves_chat_and_slash() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+
+        // Send a regular message
+        app.textarea.insert_str("first");
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_input_key(&key);
+
+        // Reset mode (SendChat switches to Streaming)
+        app.mode = AppMode::Input;
+
+        // Send a slash command
+        app.textarea.insert_str("/help");
+        app.handle_input_key(&key);
+
+        // Send another regular message
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("second");
+        app.handle_input_key(&key);
+
+        assert_eq!(app.input_history, vec!["first", "/help", "second"]);
+    }
+
+    /// Consecutive duplicate entries are deduplicated.
+    #[test]
+    fn input_history_deduplicates_consecutive() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+
+        app.textarea.insert_str("/help");
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_input_key(&key);
+
+        app.textarea.insert_str("/help");
+        app.handle_input_key(&key);
+
+        assert_eq!(app.input_history, vec!["/help"]);
+    }
+
+    /// Non-consecutive duplicate entries are NOT deduplicated.
+    #[test]
+    fn input_history_keeps_nonconsecutive_duplicates() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        app.textarea.insert_str("/help");
+        app.handle_input_key(&key);
+
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("/status");
+        app.handle_input_key(&key);
+
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("/help");
+        app.handle_input_key(&key);
+
+        assert_eq!(app.input_history, vec!["/help", "/status", "/help"]);
+    }
+
+    /// Up arrow retrieves the last slash command from history.
+    #[test]
+    fn up_arrow_retrieves_slash_command() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+
+        // Add a slash command to history
+        app.textarea.insert_str("/model");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_input_key(&enter);
+
+        // Press up arrow
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        app.handle_input_key(&up);
+
+        assert_eq!(app.textarea.lines().join("\n"), "/model");
+        assert_eq!(app.history_index, Some(0));
+    }
+
+    /// Slash commands sent during streaming (steer) are added to history.
+    #[test]
+    fn slash_command_during_streaming_added_to_history() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.textarea.insert_str("/help");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_streaming_key(&key);
+
+        assert_eq!(app.input_history, vec!["/help"]);
+    }
+
+    /// Steer messages during streaming are added to history.
+    #[test]
+    fn steer_message_added_to_history() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.textarea.insert_str("fix the bug");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        app.handle_streaming_key(&key);
+
+        assert_eq!(app.input_history, vec!["fix the bug"]);
+    }
+
+    /// Alt+Enter (queue message) during streaming adds to history.
+    #[test]
+    fn queued_message_added_to_history() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.textarea.insert_str("queued text");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        app.handle_streaming_key(&key);
+
+        assert_eq!(app.input_history, vec!["queued text"]);
+    }
+
+    /// Alt+Enter with slash command during streaming adds to history.
+    #[test]
+    fn alt_enter_slash_during_streaming_added_to_history() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.textarea.insert_str("/help");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        app.handle_streaming_key(&key);
+
+        assert_eq!(app.input_history, vec!["/help"]);
+    }
+
+    /// Alt+Enter in input mode adds to history.
+    #[test]
+    fn alt_enter_in_input_mode_added_to_history() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("alt msg");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        app.handle_input_key(&key);
+
+        assert_eq!(app.input_history, vec!["alt msg"]);
+    }
+
+    /// Alt+Enter with slash command in input mode adds to history.
+    #[test]
+    fn alt_enter_slash_in_input_mode_added_to_history() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("/help");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        app.handle_input_key(&key);
+
+        assert_eq!(app.input_history, vec!["/help"]);
+    }
+
+    /// Restored user messages populate input_history for scrollback.
+    #[test]
+    fn restore_messages_populates_input_history() {
+        let mut app = make_app();
+
+        use tau_agent::types::{TextContent, UserContent, UserMessage};
+        let messages = vec![
+            Message::User(UserMessage {
+                content: vec![UserContent::Text(TextContent {
+                    text: "first message".into(),
+                    text_signature: None,
+                })],
+                timestamp: 0,
+            }),
+            Message::User(UserMessage {
+                content: vec![UserContent::Text(TextContent {
+                    text: "second message".into(),
+                    text_signature: None,
+                })],
+                timestamp: 0,
+            }),
+        ];
+
+        app.restore_messages(&messages);
+
+        assert_eq!(app.input_history, vec!["first message", "second message"]);
     }
 }
