@@ -51,14 +51,6 @@ pub enum AppMode {
     TaskPicker,
 }
 
-/// A steering message is sent as the next turn right after the current one.
-/// A queued message is sent after all steering messages.
-#[derive(Debug, Clone)]
-pub struct QueuedMessage {
-    pub text: String,
-    pub is_steering: bool,
-}
-
 /// Which task-picker action is waiting for y/n confirmation.
 #[derive(Debug, Clone, Copy)]
 pub enum TaskPickerConfirmAction {
@@ -112,9 +104,6 @@ pub struct App {
     pub tick_counter: usize,
     /// Last escape press time for double-escape detection.
     pub last_escape: std::time::Instant,
-    /// Messages queued while the agent is working.
-    /// Steering messages (is_steering=true) are drained first, then queued.
-    pub queued_messages: Vec<QueuedMessage>,
     /// Command history index (None = composing new, Some(i) = browsing history).
     pub history_index: Option<usize>,
     /// Saved text when entering history browse (restored on down past end).
@@ -236,7 +225,6 @@ impl App {
             last_escape: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(10))
                 .expect("10s subtraction should not underflow Instant"),
-            queued_messages: Vec::new(),
             history_index: None,
             history_saved_text: String::new(),
             pending_subscription_usage: false,
@@ -435,30 +423,6 @@ impl App {
                     self.pending_subscription_usage = false;
                     return Some(Action::GetSubscriptionUsage);
                 }
-                // After AgentDone, drain steering messages first, then queued
-                while self.mode == AppMode::Input && !self.queued_messages.is_empty() {
-                    // Steering messages first, then queued
-                    let idx = self
-                        .queued_messages
-                        .iter()
-                        .position(|m| m.is_steering)
-                        .unwrap_or(0);
-                    let next = self.queued_messages.remove(idx);
-
-                    // Handle slash commands from queue without sending to LLM
-                    if next.text.starts_with('/') {
-                        let action = self.handle_slash_command(&next.text);
-                        if action.is_some() {
-                            return action;
-                        }
-                        continue;
-                    }
-
-                    // Don't add user message locally — it arrives via Subscribe broadcast
-                    self.scroll_to_bottom();
-                    self.mode = AppMode::Streaming;
-                    return Some(Action::SendQueued(next.text));
-                }
                 None
             }
             Event::ServerDone => {
@@ -542,7 +506,7 @@ impl App {
                 self.history_index = None;
                 Some(Action::SendChat(text))
             }
-            // Alt+Enter: queue message (sent after current turn)
+            // Alt+Enter while idle: send immediately (same as plain Enter)
             (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
                 let text: String = self.textarea.lines().join("\n");
                 let text = text.trim().to_string();
@@ -552,19 +516,16 @@ impl App {
                 self.textarea.select_all();
                 self.textarea.cut();
 
-                // Handle slash commands immediately, don't queue them
+                // Handle slash commands
                 if text.starts_with('/') {
                     return self.handle_slash_command(&text);
                 }
 
-                self.queued_messages.push(QueuedMessage {
-                    text: text.clone(),
-                    is_steering: false,
-                });
-                self.messages.push(MessageItem::Status {
-                    text: format!("[queued: {}]", text),
-                });
-                None
+                // Session is idle — send immediately, no need to queue
+                self.scroll_to_bottom();
+                self.mode = AppMode::Streaming;
+                self.history_index = None;
+                Some(Action::SendChat(text))
             }
             // Shift+Enter: insert newline
             (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
@@ -1542,7 +1503,7 @@ impl App {
                 self.pending_steer = Some(text.clone());
                 Some(Action::Steer(text))
             }
-            // Alt+Enter during streaming: queued message (runs after steering)
+            // Alt+Enter during streaming: queue message on the server (sent after current turn)
             (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
                 let text: String = self.textarea.lines().join("\n");
                 let text = text.trim().to_string();
@@ -1557,14 +1518,12 @@ impl App {
                     return self.handle_slash_command(&text);
                 }
 
-                self.queued_messages.push(QueuedMessage {
-                    text: text.clone(),
-                    is_steering: false,
-                });
+                // Send to server immediately as a queued message; the server
+                // will process it once the current agent turn finishes.
                 self.messages.push(MessageItem::Status {
                     text: format!("[queued: {}]", text),
                 });
-                None
+                Some(Action::QueueMessage(text))
             }
             // Shift+Enter during streaming: insert newline in textarea
             (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
@@ -2746,8 +2705,9 @@ pub enum Action {
     GetStatus,
     GetSubscriptionUsage,
     SetCwd(String),
-    /// Send the next queued message (after AgentDone).
-    SendQueued(String),
+    /// Queue a message on the server immediately (for Alt+Enter during streaming).
+    /// The server will process it after the current agent turn finishes.
+    QueueMessage(String),
     /// Inject a steering message into the running agent loop.
     Steer(String),
     /// Open the session picker overlay.
@@ -3910,5 +3870,59 @@ mod tests {
     fn pending_steer_starts_none() {
         let app = make_app();
         assert!(app.pending_steer.is_none());
+    }
+
+    // ---- Alt+Enter (queue message) tests ----
+
+    /// Regression: Alt+Enter while the session is idle (Input mode) should send
+    /// the message immediately as a regular chat (Action::SendChat), not buffer
+    /// it in a client-side queue that is only drained on the next server event.
+    #[test]
+    fn alt_enter_in_input_mode_sends_immediately() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("hello from idle");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        let action = app.handle_input_key(&key);
+
+        // Should produce a SendChat action, not None
+        assert!(
+            matches!(action, Some(Action::SendChat(ref t)) if t == "hello from idle"),
+            "Alt+Enter in Input mode should send immediately, got {action:?}"
+        );
+        // Mode should transition to Streaming
+        assert_eq!(app.mode, AppMode::Streaming);
+        // Textarea should be cleared
+        assert!(app.textarea.lines().iter().all(|l: &String| l.is_empty()));
+    }
+
+    /// Alt+Enter while streaming should send a QueueMessage to the server
+    /// immediately — no client-side buffering.
+    #[test]
+    fn alt_enter_in_streaming_mode_sends_queue_message() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.textarea.insert_str("run after current turn");
+
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        let action = app.handle_streaming_key(&key);
+
+        // Should produce a QueueMessage action
+        assert!(
+            matches!(action, Some(Action::QueueMessage(ref t)) if t == "run after current turn"),
+            "Alt+Enter in Streaming mode should return QueueMessage, got {action:?}"
+        );
+        // Mode should remain Streaming (we're still busy)
+        assert_eq!(app.mode, AppMode::Streaming);
+        // Textarea should be cleared
+        assert!(app.textarea.lines().iter().all(|l: &String| l.is_empty()));
+        // A "[queued: ...]" status message should be displayed
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::Status { text } if text.contains("queued"))),
+            "should show queued status message"
+        );
     }
 }

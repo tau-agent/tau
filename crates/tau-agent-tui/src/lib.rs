@@ -295,11 +295,23 @@ async fn run_inner(
         if let Some(action) = action {
             let sid = app.session_id.clone();
             match action {
-                Action::SendChat(text) | Action::SendQueued(text) => {
+                Action::SendChat(text) => {
                     // Fire-and-forget: responses arrive via Subscribe connection
                     send_fire_and_forget(Request::Chat {
                         session_id: sid,
                         text,
+                    })
+                    .await?;
+                }
+                Action::QueueMessage(text) => {
+                    // Send to the server immediately; it will process the message
+                    // once the current agent turn finishes (no client-side buffering).
+                    send_fire_and_forget(Request::QueueMessage {
+                        target_session_id: sid,
+                        content: text,
+                        sender_info: "user".into(),
+                        await_reply: false,
+                        reply_to: None,
                     })
                     .await?;
                 }
