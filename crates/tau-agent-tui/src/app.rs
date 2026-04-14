@@ -298,7 +298,7 @@ impl App {
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !text.is_empty() {
-                        self.input_history.push(text.clone());
+                        self.push_input_history(&text);
                         self.messages.push(MessageItem::User { text });
                     }
                 }
