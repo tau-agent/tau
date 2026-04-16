@@ -109,6 +109,14 @@ async fn run_tui(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| tau_agent::Error::Io(e.to_string()))?;
 
+    // Install TUI-aware shutdown handler.  On SIGTERM/SIGHUP (parent
+    // shell closed, systemd stop) we restore the terminal so the user's
+    // shell isn't left in raw mode / alt-screen, then exit.  SIGINT is
+    // intentionally *not* handled here — it stays in the regular
+    // crossterm event stream so the in-app Ctrl-C handling (cancel
+    // current turn without quitting) keeps working.
+    install_tui_signal_handler();
+
     let result = run_inner(
         &mut terminal,
         session_id,
@@ -120,22 +128,8 @@ async fn run_tui(
     )
     .await;
 
-    // Restore terminal
     // Restore terminal — pop keyboard enhancement before leaving alternate screen
-    execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
-    {
-        // Disable xterm modifyOtherKeys
-        use io::Write;
-        let _ = io::stdout().write_all(b"\x1b[>4;0m");
-        let _ = io::stdout().flush();
-    }
-    execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )
-    .ok();
-    disable_raw_mode().ok();
+    restore_terminal();
     terminal.show_cursor().ok();
 
     // Print exit message with session resume hint
@@ -147,6 +141,50 @@ async fn run_tui(
     }
 
     result.map(|_| ())
+}
+
+/// Best-effort terminal restoration.  Used by both the normal exit path
+/// and the SIGTERM/SIGHUP signal handler.  Safe to call multiple times.
+fn restore_terminal() {
+    use io::Write;
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    let _ = stdout.write_all(b"\x1b[>4;0m");
+    let _ = stdout.flush();
+    let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+}
+
+/// Install a TUI-aware shutdown handler for SIGTERM / SIGHUP.
+///
+/// SIGINT is intentionally not handled here: in the TUI we want Ctrl-C
+/// to reach the in-app event loop (which translates it into "cancel the
+/// current chat turn"), not to tear down the process.
+///
+/// On SIGTERM/SIGHUP this handler restores the terminal and exits with
+/// the conventional 128 + signo code.  Cleanup is best-effort — we can't
+/// flush the agent session here without re-entering smol from a foreign
+/// thread, so we accept that some state may be lost on hard signals.
+fn install_tui_signal_handler() {
+    let signals = [
+        nix::sys::signal::Signal::SIGTERM,
+        nix::sys::signal::Signal::SIGHUP,
+    ];
+    if let Err(e) = tau_agent::shutdown::install_for(signals, |sig| {
+        restore_terminal();
+        eprintln!(
+            "tau: received {}, exiting",
+            tau_agent::shutdown::signal_name(sig),
+        );
+        let code = match sig {
+            nix::sys::signal::Signal::SIGHUP => 129,
+            nix::sys::signal::Signal::SIGTERM => 143,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }) {
+        eprintln!("tau-tui: failed to install signal handler: {}", e);
+    }
 }
 
 /// Returns Ok(Some(session_id)) if the session was kept, Ok(None) if it was deleted (empty).

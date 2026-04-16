@@ -25,3 +25,4 @@ unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+nix.workspace = true

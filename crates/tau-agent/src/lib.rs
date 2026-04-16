@@ -7,6 +7,7 @@ pub mod models_config;
 pub mod plugin;
 pub mod replay;
 pub mod server;
+pub mod shutdown;
 pub mod worker;
 
 // Re-export from tau-agent-base for backward compatibility

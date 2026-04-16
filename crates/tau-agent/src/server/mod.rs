@@ -383,6 +383,23 @@ pub async fn run() -> crate::Result<()> {
 
     let shutdown = ShutdownHandle::new();
 
+    // Install signal-driven graceful shutdown.  SIGTERM (e.g. systemd
+    // stop) and SIGHUP (parent shell closed) request the same drain path
+    // as `tau server stop` would.  SIGINT keeps the process responsive to
+    // Ctrl-C when run with `--foreground`.
+    {
+        let shutdown = shutdown.clone();
+        if let Err(e) = crate::shutdown::install(move |sig| {
+            eprintln!(
+                "tau server: received {}, requesting shutdown",
+                crate::shutdown::signal_name(sig),
+            );
+            shutdown.request_shutdown(false);
+        }) {
+            eprintln!("tau server: failed to install signal handlers: {}", e);
+        }
+    }
+
     // Spawn a task that closes the listener when shutdown is requested.
     // This unblocks the accept() call below.
     let shutdown_watcher = shutdown.clone();

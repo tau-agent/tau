@@ -340,12 +340,109 @@ fn main() {
     clap_complete::env::CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
 
+    // Block SIGTERM/SIGHUP early (before smol starts and spawns threads)
+    // so the dedicated waiter thread can reliably receive them.  The
+    // initial handler is a basic "exit cleanly" — chat modes upgrade it
+    // to also CancelChat the in-flight session and restore the terminal.
+    install_default_signal_handler();
+
     smol::block_on(async {
         if let Err(e) = run(cli).await {
             eprintln!("error: {}", e);
             std::process::exit(1);
         }
     });
+}
+
+/// Process-wide registry: the session id of the currently in-flight chat,
+/// if any.  Updated by chat modes so the SIGTERM/SIGHUP handler can issue
+/// a CancelChat before exiting.
+static ACTIVE_CHAT_SESSION: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_active_chat_session(id: Option<String>) {
+    if let Ok(mut guard) = ACTIVE_CHAT_SESSION.lock() {
+        *guard = id;
+    }
+}
+
+fn current_active_chat_session() -> Option<String> {
+    ACTIVE_CHAT_SESSION.lock().ok().and_then(|g| g.clone())
+}
+
+/// Best-effort: ask the running server to cancel the given session's
+/// chat.  Used from signal handlers — must be quick and infallible.
+fn fire_and_forget_cancel(session_id: &str) {
+    use std::io::Write;
+    let req = tau_agent::protocol::Request::CancelChat {
+        session_id: session_id.to_string(),
+    };
+    let mut line = match serde_json::to_string(&req) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    line.push('\n');
+    if let Ok(stream) = std::os::unix::net::UnixStream::connect(tau_agent::server::socket_path()) {
+        let mut w = std::io::BufWriter::new(stream);
+        let _ = w.write_all(line.as_bytes());
+        let _ = w.flush();
+    }
+}
+
+/// Default signal handler for non-chat CLI modes (sessions list, server
+/// status, etc.): print and exit with the appropriate status code.
+fn install_default_signal_handler() {
+    if let Err(e) = tau_agent::shutdown::install(|sig| {
+        let code = match sig {
+            nix::sys::signal::Signal::SIGHUP => 129,
+            nix::sys::signal::Signal::SIGINT => 130,
+            nix::sys::signal::Signal::SIGTERM => 143,
+            _ => 1,
+        };
+        eprintln!(
+            "tau: received {}, exiting",
+            tau_agent::shutdown::signal_name(sig),
+        );
+        std::process::exit(code);
+    }) {
+        eprintln!("tau: failed to install signal handlers: {}", e);
+    }
+}
+
+/// Replace the signal handler with one tailored for non-TUI chat modes:
+/// SIGTERM / SIGHUP / SIGINT cancel the in-flight chat (if any) and exit.
+///
+/// The TUI installs a different handler that also restores the terminal
+/// (and leaves SIGINT alone so the in-app Ctrl-C handling keeps working).
+fn install_chat_signal_handler() {
+    let cancel = |sig: nix::sys::signal::Signal| {
+        if let Some(sid) = current_active_chat_session() {
+            eprintln!(
+                "\ntau: received {}, cancelling chat and exiting",
+                tau_agent::shutdown::signal_name(sig),
+            );
+            fire_and_forget_cancel(&sid);
+        } else {
+            eprintln!(
+                "\ntau: received {}, exiting",
+                tau_agent::shutdown::signal_name(sig),
+            );
+        }
+        let code = match sig {
+            nix::sys::signal::Signal::SIGHUP => 129,
+            nix::sys::signal::Signal::SIGINT => 130,
+            nix::sys::signal::Signal::SIGTERM => 143,
+            _ => 1,
+        };
+        std::process::exit(code);
+    };
+    let signals = [
+        nix::sys::signal::Signal::SIGTERM,
+        nix::sys::signal::Signal::SIGHUP,
+        nix::sys::signal::Signal::SIGINT,
+    ];
+    if let Err(e) = tau_agent::shutdown::install_for(signals, cancel) {
+        eprintln!("tau: failed to install chat signal handlers: {}", e);
+    }
 }
 
 async fn run(cli: Cli) -> tau_agent::Result<()> {
@@ -471,6 +568,9 @@ async fn cmd_default() -> tau_agent::Result<()> {
     // Auto-init check
     maybe_auto_init();
 
+    // TUI installs its own SIGTERM/SIGHUP handler that restores the
+    // terminal before exiting; nothing to do here.
+
     // Resolve model from settings
     let model = tau_agent_tui::settings::default_model();
 
@@ -514,6 +614,9 @@ async fn cmd_default() -> tau_agent::Result<()> {
         .await?;
     let session_id =
         created_id.ok_or_else(|| tau_agent::Error::Io("failed to create session".into()))?;
+
+    // Track the active session so the SIGTERM/SIGHUP handler can cancel it.
+    set_active_chat_session(Some(session_id.clone()));
 
     // Get session info
     let info = get_session_info(&mut client, &session_id).await.ok();
@@ -756,6 +859,12 @@ async fn cmd_chat(
     no_tui: bool,
     child_budget: u32,
 ) -> tau_agent::Result<()> {
+    // Install chat-mode signal handler for the non-TUI variants.  The
+    // TUI installs its own (different) handler from inside its run loop
+    // so the terminal is restored on signal-driven exit.
+    if no_tui || message.is_some() {
+        install_chat_signal_handler();
+    }
     let mut client = tau_agent::client::Client::connect_or_start().await?;
 
     // Parse "provider/model" syntax
@@ -806,6 +915,10 @@ async fn cmd_chat(
     } else {
         get_session_info(&mut client, &session_id).await.ok()
     };
+
+    // Make the active session id visible to the signal handler installed
+    // above, so SIGTERM/SIGHUP can issue a CancelChat before exiting.
+    set_active_chat_session(Some(session_id.clone()));
     let info_model = info.as_ref().map(|i| i.model.clone()).unwrap_or_default();
     let info_provider = info
         .as_ref()
