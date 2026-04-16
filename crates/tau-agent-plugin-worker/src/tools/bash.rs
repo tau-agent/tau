@@ -1,13 +1,75 @@
 //! Bash tool — execute shell commands.
 
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Pid, setsid};
 
 use super::{ToolDef, ToolOutput};
 use tau_agent_plugin::Tool;
+
+// ---------------------------------------------------------------------------
+// Tracked-PGID registry
+//
+// Every bash child spawned by this tool is run in its own session/process
+// group via `setsid()`.  We register the resulting PGID here so that on
+// process shutdown (SIGTERM/SIGHUP, panic, etc.) we can SIGKILL every
+// orphaned process group instead of leaking them.
+//
+// The registry is intentionally minimal: callers track on spawn, untrack
+// on completion / cancel / timeout, and a single `kill_all_tracked()`
+// helper drains it during shutdown.
+// ---------------------------------------------------------------------------
+
+static TRACKED_PGIDS: LazyLock<Mutex<HashSet<i32>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Register a PGID (almost always the bash child's own pid, post-`setsid`)
+/// so it can be killed on shutdown.
+pub fn track_pgid(pgid: i32) {
+    if let Ok(mut set) = TRACKED_PGIDS.lock() {
+        set.insert(pgid);
+    }
+}
+
+/// Remove a PGID from the registry once the corresponding bash invocation
+/// has finished (normal exit, cancel, or timeout).
+pub fn untrack_pgid(pgid: i32) {
+    if let Ok(mut set) = TRACKED_PGIDS.lock() {
+        set.remove(&pgid);
+    }
+}
+
+/// SIGKILL every tracked process group and clear the registry.
+///
+/// Cheap and infallible: errors from `killpg` are ignored (process group
+/// may already be gone).  Safe to call multiple times.
+///
+/// Intended to be called from a signal handler / shutdown path in the
+/// worker process.  Does **not** wait for the killed processes.
+pub fn kill_all_tracked() {
+    let pgids: Vec<i32> = match TRACKED_PGIDS.lock() {
+        Ok(mut set) => set.drain().collect(),
+        Err(_) => return,
+    };
+    for pgid in pgids {
+        let _ = signal::killpg(Pid::from_raw(pgid), Signal::SIGKILL);
+    }
+}
+
+/// Test/debug helper: return any one tracked PGID, or None if none.
+pub fn first_tracked_pgid() -> Option<i32> {
+    TRACKED_PGIDS
+        .lock()
+        .ok()
+        .and_then(|s| s.iter().next().copied())
+}
+
+/// Test/debug helper: number of tracked PGIDs.
+pub fn tracked_pgid_count() -> usize {
+    TRACKED_PGIDS.lock().map(|s| s.len()).unwrap_or(0)
+}
 
 pub fn tool_def() -> ToolDef {
     ToolDef {
@@ -67,6 +129,10 @@ fn start_watchdog(child_id: u32, timeout_secs: u64) -> Arc<AtomicBool> {
         flag.store(true, Ordering::Relaxed);
         // Kill the entire process group (negative PID).
         let _ = signal::killpg(Pid::from_raw(child_id as i32), Signal::SIGKILL);
+        // The reaper / wait() path will untrack this PGID, but the kill
+        // path is the last point at which we *know* the timeout fired,
+        // so untrack here too in case the wait races with shutdown.
+        untrack_pgid(child_id as i32);
     });
     timed_out
 }
@@ -158,6 +224,9 @@ pub fn execute_streaming(
         Err(e) => return ToolOutput::error(format!("failed to execute command: {}", e)),
     };
 
+    let pgid = child.id() as i32;
+    track_pgid(pgid);
+
     let timed_out = start_watchdog(child.id(), timeout_secs);
 
     let stdout = child.stdout.take();
@@ -191,6 +260,7 @@ pub fn execute_streaming(
     let collected_stderr = stderr_handle.join().unwrap_or_default();
     let status = child.wait();
     let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+    untrack_pgid(pgid);
 
     let mut output = format_output(
         collected_stdout,
@@ -213,6 +283,9 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
         Ok(c) => c,
         Err(e) => return ToolOutput::error(format!("failed to execute command: {}", e)),
     };
+
+    let pgid = child.id() as i32;
+    track_pgid(pgid);
 
     let timed_out = start_watchdog(child.id(), timeout_secs);
 
@@ -245,6 +318,7 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
     let collected_stderr = stderr_handle.join().unwrap_or_default();
     let status = child.wait();
     let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+    untrack_pgid(pgid);
 
     let mut output = format_output(
         collected_stdout,
@@ -260,10 +334,22 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    /// Serialise tests that exercise the global TRACKED_PGIDS registry.
+    /// Without this, `kill_all_tracked_kills_running_bash_children`
+    /// drains PGIDs from concurrent timeout tests and kills their bash
+    /// children early, breaking their assertions.
+    static REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_registry() -> std::sync::MutexGuard<'static, ()> {
+        REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn bash_simple_command() {
+        let _guard = lock_registry();
         let output = execute(json!({"command": "echo hello"}), "/tmp");
         assert!(!output.is_error);
         assert!(output.content[0].text().contains("hello"));
@@ -271,6 +357,7 @@ mod tests {
 
     #[test]
     fn bash_timeout_kills_process() {
+        let _guard = lock_registry();
         let start = Instant::now();
         let output = execute(json!({"command": "sleep 60", "timeout": 2}), "/tmp");
         let elapsed = start.elapsed();
@@ -290,6 +377,7 @@ mod tests {
 
     #[test]
     fn bash_timeout_not_triggered() {
+        let _guard = lock_registry();
         let start = Instant::now();
         let output = execute(json!({"command": "echo fast", "timeout": 10}), "/tmp");
         let elapsed = start.elapsed();
@@ -301,6 +389,7 @@ mod tests {
 
     #[test]
     fn bash_streaming_timeout() {
+        let _guard = lock_registry();
         let start = Instant::now();
         let mut deltas = Vec::new();
         let output = execute_streaming(
@@ -323,6 +412,7 @@ mod tests {
 
     #[test]
     fn bash_timeout_kills_child_processes() {
+        let _guard = lock_registry();
         // Verify that child processes spawned by bash are also killed (process group kill).
         let start = Instant::now();
         let output = execute(
@@ -334,5 +424,84 @@ mod tests {
         assert!(output.is_error);
         assert!(output.content[0].text().contains("timed out"));
         assert!(elapsed.as_secs() < 5);
+    }
+
+    #[test]
+    fn kill_all_tracked_kills_running_bash_children() {
+        let _guard = lock_registry();
+        // Spawn a bash command with a long sleep on a background thread,
+        // wait for it to register itself in TRACKED_PGIDS, then call
+        // kill_all_tracked() and verify the process group is gone.
+        use std::time::Duration;
+
+        // Use a unique marker so we can find our specific process via ps.
+        let marker = format!("tau-bash-kill-test-{}", std::process::id());
+        let marker_for_thread = marker.clone();
+
+        let handle = std::thread::spawn(move || {
+            // sleep 30; the marker is encoded in the command so we can grep for it.
+            execute(
+                json!({
+                    "command": format!("# {}\nsleep 30", marker_for_thread),
+                    "timeout": 60,
+                }),
+                "/tmp",
+            )
+        });
+
+        // Wait until the bash invocation registers a PGID.
+        let pgid = {
+            let mut found = None;
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(100));
+                if let Ok(set) = TRACKED_PGIDS.lock()
+                    && let Some(p) = set.iter().next().copied()
+                {
+                    found = Some(p);
+                    break;
+                }
+            }
+            found.expect("bash child failed to register PGID within 5s")
+        };
+
+        // Sanity: the process group is alive.
+        assert!(
+            signal::killpg(Pid::from_raw(pgid), None).is_ok(),
+            "expected pgid {} to be alive before kill_all_tracked()",
+            pgid,
+        );
+
+        // Drain and kill.
+        kill_all_tracked();
+
+        // Registry must be empty.
+        assert!(
+            TRACKED_PGIDS
+                .lock()
+                .expect("registry mutex poisoned")
+                .is_empty(),
+            "TRACKED_PGIDS not empty after kill_all_tracked()",
+        );
+
+        // Process group should be gone within a short timeout.
+        let mut still_alive = true;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if signal::killpg(Pid::from_raw(pgid), None).is_err() {
+                still_alive = false;
+                break;
+            }
+        }
+        assert!(
+            !still_alive,
+            "pgid {} still alive 5s after kill_all_tracked()",
+            pgid,
+        );
+
+        // The execute() call should now return (timed-out / killed).
+        let output = handle.join().expect("bash thread panicked");
+        // It either reports the killed sub-process exit or treats it as
+        // an error — we don't care which, just that it returned.
+        let _ = output;
     }
 }

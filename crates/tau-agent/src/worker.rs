@@ -53,6 +53,29 @@ fn next_request_id() -> String {
 
 /// Run the worker. Called from `tau worker`.
 pub fn run() {
+    // Install signal handlers: on SIGTERM/SIGHUP/SIGINT, kill any tracked
+    // bash process groups and exit.  Without this, an orphaned `tau worker`
+    // (e.g. its parent server died) would leave `sleep`-style children
+    // running indefinitely.
+    if let Err(e) = crate::shutdown::install(|sig| {
+        eprintln!(
+            "tau worker: received {}, killing tracked bash children",
+            crate::shutdown::signal_name(sig),
+        );
+        tau_agent_plugin_worker::tools::bash::kill_all_tracked();
+        // The worker has no other graceful state to flush — exit promptly.
+        // Use the conventional 128 + signal-number exit code.
+        let code = match sig {
+            nix::sys::signal::Signal::SIGTERM => 143,
+            nix::sys::signal::Signal::SIGHUP => 129,
+            nix::sys::signal::Signal::SIGINT => 130,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }) {
+        eprintln!("tau worker: failed to install signal handlers: {}", e);
+    }
+
     smol::block_on(async_main()).expect("worker failed");
 }
 
@@ -367,6 +390,8 @@ async fn execute_bash_async(
     };
 
     let child_id = child.id();
+    let pgid = child_id as i32;
+    tau_agent_plugin_worker::tools::bash::track_pgid(pgid);
 
     // Extract stdout/stderr and wrap in async readers.
     let stdout = child
@@ -401,6 +426,11 @@ async fn execute_bash_async(
             nix::unistd::Pid::from_raw(child_id as i32),
             nix::sys::signal::Signal::SIGKILL,
         );
+        // Drop the registry entry as well — the wait() path will also
+        // untrack, but if the worker is racing shutdown the timeout path
+        // is the last guaranteed point at which we know the PGID is
+        // (about to be) dead.
+        tau_agent_plugin_worker::tools::bash::untrack_pgid(child_id as i32);
     });
 
     // Read stdout (with streaming deltas) and stderr concurrently.
@@ -450,6 +480,8 @@ async fn execute_bash_async(
 
     // Cancel the killer (child already exited).
     killer.cancel().await;
+
+    tau_agent_plugin_worker::tools::bash::untrack_pgid(pgid);
 
     // Format output.
     format_bash_output(
