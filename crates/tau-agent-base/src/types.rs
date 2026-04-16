@@ -349,6 +349,37 @@ pub struct Context {
 // Stream options
 // ---------------------------------------------------------------------------
 
+/// Effort level for adaptive thinking (Anthropic Opus 4.6+, Sonnet 4.6).
+///
+/// Passed through to provider-specific effort strings (e.g. Anthropic's
+/// `output_config.effort`). The `XHigh` level is mapped per-model: on
+/// `claude-opus-4-6` it becomes `"max"`, on `claude-opus-4-7` it becomes
+/// `"xhigh"`, and on other adaptive models it falls back to `"high"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingEffort {
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+}
+
+/// How thinking content is returned in the response.
+///
+/// Anthropic's API defaults to `Omitted` for `claude-opus-4-7` and Mythos
+/// Preview; tau defaults to `Summarized` when thinking is enabled so the
+/// behaviour matches older Claude 4 models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingDisplay {
+    /// Thinking blocks contain summarized thinking text.
+    Summarized,
+    /// Thinking blocks return an empty thinking field; the encrypted
+    /// signature still travels back for multi-turn continuity.
+    Omitted,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -359,9 +390,26 @@ pub struct StreamOptions {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
-    /// Extended thinking budget (Anthropic-specific for now)
+    /// Extended thinking budget (Anthropic-specific non-adaptive path).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u64>,
+    /// Explicit on/off for extended thinking.
+    ///
+    /// `None` means provider default: if `thinking_budget` is set or (for
+    /// adaptive-thinking models) an effort is set, thinking is enabled.
+    /// `Some(true)` forces thinking on; on adaptive-thinking models this
+    /// triggers the adaptive path even without a budget. `Some(false)`
+    /// forces thinking off regardless of the other fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_enabled: Option<bool>,
+    /// Effort level for adaptive thinking (Anthropic-specific for now).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<ThinkingEffort>,
+    /// Controls how thinking content is returned in the response
+    /// (Anthropic-specific for now). Defaults to `Summarized` when thinking
+    /// is enabled on the Anthropic provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<ThinkingDisplay>,
 }
 
 // ---------------------------------------------------------------------------
