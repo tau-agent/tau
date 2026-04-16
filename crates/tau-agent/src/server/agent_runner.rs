@@ -2,8 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::notifications::{
-    broadcast_to_subscribers, emit_phase, notify_parent_of_child_completion,
-    notify_session_done_waiters, queue_and_maybe_resume, queue_info_to_session,
+    broadcast_to_subscribers, broadcast_to_subscribers_and_wait, emit_phase, emit_phase_and_wait,
+    notify_parent_of_child_completion, notify_session_done_waiters, queue_and_maybe_resume,
+    queue_info_to_session,
 };
 use super::registry::{maybe_respawn_for_queued, resolve_api_key};
 use super::state::{SessionLocks, SharedState, lock_state, session_lock};
@@ -594,10 +595,12 @@ pub(super) async fn run_child_chat(
     }
     .await;
 
-    // Broadcast terminal response and notify parent.
+    // Broadcast terminal response and notify parent. Terminal broadcasts use
+    // the awaiting variant so subscribers observe them before the session
+    // transitions to idle via another code path.
     match chat_result {
         Ok((true, _)) => {
-            broadcast_to_subscribers(&state, &session_id, &Response::Cancelled);
+            broadcast_to_subscribers_and_wait(&state, &session_id, &Response::Cancelled).await;
             // Notify parent about cancellation.
             notify_parent_of_child_completion(
                 &state,
@@ -655,7 +658,7 @@ pub(super) async fn run_child_chat(
                     &test_overrides,
                 );
             }
-            broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
+            broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
         }
         Err(ref e) => {
             let err_msg = format!("child agent error: {}", e);
@@ -666,7 +669,7 @@ pub(super) async fn run_child_chat(
                     message: err_msg.clone(),
                 },
             );
-            broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
+            broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
             // Notify parent about error.
             notify_parent_of_child_completion(
                 &state,
@@ -682,7 +685,9 @@ pub(super) async fn run_child_chat(
         }
     }
 
-    emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+    // Terminal Idle — await so the TUI sees it settle before any other
+    // idle-indicator path (session lock released, live_sessions cleared).
+    emit_phase_and_wait(&state, &session_id, crate::types::AgentPhase::Idle).await;
     // Mark session as no longer live.
     {
         let mut st = lock_state(&state);
@@ -841,9 +846,10 @@ pub(super) async fn resume_child_session(
     .await;
 
     // Broadcast terminal response and notify parent (same as run_child_chat).
+    // Terminal broadcasts are awaited; see module comment in notifications.rs.
     match chat_result {
         Ok((true, _)) => {
-            broadcast_to_subscribers(&state, &session_id, &Response::Cancelled);
+            broadcast_to_subscribers_and_wait(&state, &session_id, &Response::Cancelled).await;
             notify_parent_of_child_completion(
                 &state,
                 &session_locks,
@@ -898,7 +904,7 @@ pub(super) async fn resume_child_session(
                     &test_overrides,
                 );
             }
-            broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
+            broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
         }
         Err(ref e) => {
             let err_msg = format!("child agent error: {}", e);
@@ -909,7 +915,7 @@ pub(super) async fn resume_child_session(
                     message: err_msg.clone(),
                 },
             );
-            broadcast_to_subscribers(&state, &session_id, &Response::AgentDone);
+            broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
             notify_parent_of_child_completion(
                 &state,
                 &session_locks,
@@ -924,7 +930,7 @@ pub(super) async fn resume_child_session(
         }
     }
 
-    emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+    emit_phase_and_wait(&state, &session_id, crate::types::AgentPhase::Idle).await;
     // Mark session as no longer live.
     {
         let mut st = lock_state(&state);

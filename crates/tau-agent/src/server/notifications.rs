@@ -1,3 +1,34 @@
+//! Subscriber notification primitives.
+//!
+//! # Broadcast delivery rules
+//!
+//! Subscribers are registered per-session as `smol::channel::Sender<Response>`
+//! values. There are two broadcast primitives:
+//!
+//! * [`broadcast_to_subscribers`] — fire-and-forget `try_send`.  If a
+//!   subscriber's channel is full, the message is dropped (with a log line)
+//!   and the subscriber is retained. This is the right shape for
+//!   high-frequency streaming deltas (`TextDelta`, `ThinkingDelta`, transient
+//!   `Phase` transitions, `Status` updates) where backpressure would slow the
+//!   entire agent loop and stale drops are acceptable.
+//!
+//! * [`broadcast_to_subscribers_and_wait`] — async `send().await` on each
+//!   subscriber. Guarantees the message is enqueued in every subscriber's
+//!   channel before returning, so later ordering-sensitive events (or the
+//!   session becoming idle from a different code path) can't race ahead of
+//!   this one. Used for terminal responses where ordering matters:
+//!   `AgentDone`, terminal `Cancelled`, terminal `Phase(Idle)`, and
+//!   shutdown-path broadcasts.
+//!
+//! **Rule of thumb**: if dropping or reordering the message could leave a
+//! subscriber (TUI, API client, parent session) in a stale state, use the
+//! awaiting variant. Otherwise the fast path is fine.
+//!
+//! The awaiting variant deliberately does **not** hold the state mutex across
+//! `.await`: it clones the subscriber senders out of the map, drops the
+//! state lock, and then awaits each send. This avoids a slow subscriber
+//! blocking unrelated session traffic.
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -175,7 +206,32 @@ pub(super) fn last_assistant_text(messages: &[Message]) -> String {
 
 /// Update the session's phase and broadcast a Phase event to subscribers.
 /// Also persists the phase to DB for meaningful transitions so it survives restarts.
+///
+/// Uses fire-and-forget broadcast — suitable for transient phase transitions
+/// (Thinking, Responding, ToolExec, ...). For the terminal `Idle` transition
+/// at the end of a run, prefer [`emit_phase_and_wait`] so the TUI can't
+/// observe idleness before receiving the final `AgentDone`.
 pub(super) fn emit_phase(state: &SharedState, session_id: &str, phase: crate::types::AgentPhase) {
+    let resp = persist_phase(state, session_id, phase);
+    broadcast_to_subscribers(state, session_id, &resp);
+}
+
+/// Awaiting variant of [`emit_phase`]. Ensures every subscriber has enqueued
+/// the Phase event before returning. Use for terminal `Phase(Idle)`.
+pub(super) async fn emit_phase_and_wait(
+    state: &SharedState,
+    session_id: &str,
+    phase: crate::types::AgentPhase,
+) {
+    let resp = persist_phase(state, session_id, phase);
+    broadcast_to_subscribers_and_wait(state, session_id, &resp).await;
+}
+
+fn persist_phase(
+    state: &SharedState,
+    session_id: &str,
+    phase: crate::types::AgentPhase,
+) -> Response {
     {
         let mut st = lock_state(state);
         st.phases.insert(session_id.to_string(), phase);
@@ -185,10 +241,9 @@ pub(super) fn emit_phase(state: &SharedState, session_id: &str, phase: crate::ty
             eprintln!("warning: failed to persist phase for {}: {}", session_id, e);
         }
     }
-    let resp = Response::Stream {
+    Response::Stream {
         event: Box::new(crate::types::StreamEvent::Phase { phase }),
-    };
-    broadcast_to_subscribers(state, session_id, &resp);
+    }
 }
 
 /// Wake all registered session-done waiters so they re-check completion.
@@ -203,6 +258,9 @@ pub(super) fn notify_session_done_waiters(state: &SharedState) {
     });
 }
 
+/// Fire-and-forget broadcast to subscribers (`try_send`).
+/// If a subscriber's channel is full, the message is dropped. See the
+/// module-level comment for when to use this vs. [`broadcast_to_subscribers_and_wait`].
 pub(super) fn broadcast_to_subscribers(state: &SharedState, session_id: &str, resp: &Response) {
     let mut st = lock_state(state);
     if let Some(subs) = st.subscribers.get_mut(session_id) {
@@ -216,6 +274,55 @@ pub(super) fn broadcast_to_subscribers(state: &SharedState, session_id: &str, re
                 }
             }
         });
+        if subs.is_empty() {
+            st.subscribers.remove(session_id);
+        }
+    }
+}
+
+/// Awaiting broadcast to subscribers. Uses `send().await` on each subscriber
+/// so a bounded/full channel backpressures the emitter until the subscriber
+/// has made room. Guarantees every live subscriber has the message enqueued
+/// (in subscription order) before this function returns.
+///
+/// Does **not** hold the state lock across `.await`: clones subscriber
+/// senders out of the map, drops the lock, then awaits each send. Closed
+/// subscribers are pruned from the map after delivery.
+pub(super) async fn broadcast_to_subscribers_and_wait(
+    state: &SharedState,
+    session_id: &str,
+    resp: &Response,
+) {
+    // Clone subscriber senders out under the lock, then drop it.
+    let senders: Vec<smol::channel::Sender<Response>> = {
+        let st = lock_state(state);
+        match st.subscribers.get(session_id) {
+            Some(subs) => subs.clone(),
+            None => return,
+        }
+    };
+
+    // Await delivery to each subscriber in registration order. Track which
+    // senders dropped so we can prune them afterwards.
+    let mut closed_indices: Vec<usize> = Vec::new();
+    for (idx, tx) in senders.iter().enumerate() {
+        if let Err(smol::channel::SendError(_)) = tx.send(resp.clone()).await {
+            // Receiver dropped — the subscriber disconnected.
+            closed_indices.push(idx);
+        }
+    }
+
+    if closed_indices.is_empty() {
+        return;
+    }
+
+    // Prune closed subscribers. We match on Sender equality via `same_channel`
+    // to avoid removing senders that were newly added while we awaited.
+    let mut st = lock_state(state);
+    if let Some(subs) = st.subscribers.get_mut(session_id) {
+        let closed: Vec<&smol::channel::Sender<Response>> =
+            closed_indices.iter().map(|&i| &senders[i]).collect();
+        subs.retain(|tx| !closed.iter().any(|c| c.same_channel(tx)));
         if subs.is_empty() {
             st.subscribers.remove(session_id);
         }
@@ -260,5 +367,194 @@ pub(super) fn auto_archive_done_sessions(
         if let Err(e) = st.db.archive_session_tree(sid) {
             eprintln!("auto-archive session {} failed: {}", sid, e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+    use crate::provider::ProviderRegistry;
+    use crate::server::state::State;
+    use crate::types::{Model, ModelCost, ThinkingStyle};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    fn mk_model() -> Model {
+        Model {
+            id: "test/test".into(),
+            name: "test".into(),
+            api: "anthropic".into(),
+            provider: "test".into(),
+            base_url: "".into(),
+            thinking: ThinkingStyle::default(),
+            cost: ModelCost::default(),
+            context_window: 100_000,
+            max_tokens: 4096,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn mk_state() -> SharedState {
+        let db = Db::open_memory().expect("open memory db");
+        Arc::new(Mutex::new(State {
+            db,
+            registry: ProviderRegistry::new(),
+            auth: crate::auth::AuthStorage::open_default(),
+            config: crate::config::Config::default(),
+            global_aliases: HashMap::new(),
+            default_model: mk_model(),
+            all_models: vec![mk_model()],
+            usage_cache: None,
+            cancel_flags: HashMap::new(),
+            has_queued: HashMap::new(),
+            subscribers: HashMap::new(),
+            phases: HashMap::new(),
+            live_sessions: HashSet::new(),
+            waited_sessions: HashSet::new(),
+            session_done_waiters: Vec::new(),
+            reply_waiters: HashMap::new(),
+            next_msg_id: 0,
+        }))
+    }
+
+    /// A bounded-buffer subscriber should backpressure `broadcast_to_subscribers_and_wait`
+    /// until its receiver reads. This guards the ordering guarantee that
+    /// motivated this module (TUI must observe `AgentDone` before idleness).
+    #[test]
+    fn awaiting_broadcast_backpressures_full_subscriber() {
+        smol::block_on(async {
+            let state = mk_state();
+            let sid = "s-test";
+
+            // Register a bounded(1) subscriber. Fill it so the next send must block.
+            let (tx, rx) = smol::channel::bounded::<Response>(1);
+            {
+                let mut st = lock_state(&state);
+                st.subscribers.insert(sid.into(), vec![tx]);
+            }
+
+            // Occupy the 1-slot buffer with a dummy value so AgentDone must wait.
+            {
+                let st = lock_state(&state);
+                let subs = st.subscribers.get(sid).expect("subs present");
+                subs[0]
+                    .try_send(Response::Ok)
+                    .expect("room for one pre-filled value");
+            }
+
+            // Race the awaiting broadcast against a timeout. It should *not*
+            // complete until the receiver drains the channel.
+            let broadcast = broadcast_to_subscribers_and_wait(&state, sid, &Response::AgentDone);
+            futures::pin_mut!(broadcast);
+            let timeout = smol::Timer::after(Duration::from_millis(100));
+            futures::pin_mut!(timeout);
+            let result = futures::future::select(broadcast, timeout).await;
+            assert!(
+                matches!(result, futures::future::Either::Right(_)),
+                "awaiting broadcast completed before subscriber drained"
+            );
+
+            // Receiver now reads the pre-filled dummy, freeing a slot.
+            assert!(matches!(rx.recv().await, Ok(Response::Ok)));
+
+            // The still-pending broadcast future should resolve quickly now.
+            let broadcast = match result {
+                futures::future::Either::Left(_) => unreachable!(),
+                futures::future::Either::Right((_, fut)) => fut,
+            };
+            let done = smol::Timer::after(Duration::from_secs(2));
+            futures::pin_mut!(done);
+            let result2 = futures::future::select(broadcast, done).await;
+            assert!(
+                matches!(result2, futures::future::Either::Left(_)),
+                "awaiting broadcast did not settle after subscriber drained"
+            );
+
+            // AgentDone is now readable on the subscriber.
+            assert!(matches!(rx.recv().await, Ok(Response::AgentDone)));
+        });
+    }
+
+    /// Two consecutive awaited broadcasts of `AgentDone` are both delivered
+    /// in order, with no coalescing or drops.
+    #[test]
+    fn two_consecutive_agent_done_events_are_both_delivered() {
+        smol::block_on(async {
+            let state = mk_state();
+            let sid = "s-test";
+            let (tx, rx) = smol::channel::bounded::<Response>(4);
+            {
+                let mut st = lock_state(&state);
+                st.subscribers.insert(sid.into(), vec![tx]);
+            }
+
+            broadcast_to_subscribers_and_wait(&state, sid, &Response::AgentDone).await;
+            broadcast_to_subscribers_and_wait(&state, sid, &Response::AgentDone).await;
+
+            assert!(matches!(rx.recv().await, Ok(Response::AgentDone)));
+            assert!(matches!(rx.recv().await, Ok(Response::AgentDone)));
+        });
+    }
+
+    /// A closed subscriber (receiver dropped) is pruned by the awaiting
+    /// broadcast and does not prevent delivery to other subscribers.
+    #[test]
+    fn awaiting_broadcast_prunes_closed_subscriber() {
+        smol::block_on(async {
+            let state = mk_state();
+            let sid = "s-test";
+
+            let (tx_closed, rx_closed) = smol::channel::bounded::<Response>(1);
+            let (tx_live, rx_live) = smol::channel::bounded::<Response>(1);
+            {
+                let mut st = lock_state(&state);
+                st.subscribers.insert(sid.into(), vec![tx_closed, tx_live]);
+            }
+
+            // Close the first subscriber by dropping its receiver.
+            drop(rx_closed);
+
+            broadcast_to_subscribers_and_wait(&state, sid, &Response::AgentDone).await;
+
+            // The live subscriber received the message.
+            assert!(matches!(rx_live.recv().await, Ok(Response::AgentDone)));
+
+            // The closed subscriber was pruned; only the live sender remains.
+            let st = lock_state(&state);
+            let subs = st.subscribers.get(sid).expect("subs present");
+            assert_eq!(subs.len(), 1, "closed subscriber should be pruned");
+        });
+    }
+
+    /// The fire-and-forget variant drops the message if the channel is full
+    /// but keeps the subscriber (historical behaviour, preserved for
+    /// high-frequency streaming deltas).
+    #[test]
+    fn fire_and_forget_drops_when_full_but_keeps_subscriber() {
+        let state = mk_state();
+        let sid = "s-test";
+        let (tx, rx) = smol::channel::bounded::<Response>(1);
+        {
+            let mut st = lock_state(&state);
+            st.subscribers.insert(sid.into(), vec![tx]);
+        }
+        // Fill the channel.
+        let st = lock_state(&state);
+        st.subscribers[sid][0].try_send(Response::Ok).unwrap();
+        drop(st);
+
+        // Best-effort broadcast drops the second message silently.
+        broadcast_to_subscribers(&state, sid, &Response::AgentDone);
+
+        // Subscriber is still registered.
+        let st = lock_state(&state);
+        assert_eq!(st.subscribers[sid].len(), 1);
+        drop(st);
+
+        // Only the first message is present.
+        assert!(matches!(rx.try_recv(), Ok(Response::Ok)));
+        assert!(rx.try_recv().is_err());
     }
 }

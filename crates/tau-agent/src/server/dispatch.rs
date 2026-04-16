@@ -8,9 +8,9 @@ use std::os::unix::net::UnixStream;
 
 use super::agent_runner::{run_agent_turn, run_compaction, send};
 use super::notifications::{
-    auto_archive_done_sessions, broadcast_to_subscribers, emit_phase, last_assistant_text,
-    notify_session_done_waiters, queue_and_maybe_resume, queue_info_to_session,
-    queue_message_to_session,
+    auto_archive_done_sessions, broadcast_to_subscribers, broadcast_to_subscribers_and_wait,
+    emit_phase, emit_phase_and_wait, last_assistant_text, notify_session_done_waiters,
+    queue_and_maybe_resume, queue_info_to_session, queue_message_to_session,
 };
 use super::registry::{
     maybe_respawn_for_queued, model_info, session_info, session_info_from_db_stats,
@@ -700,6 +700,10 @@ pub(super) async fn handle_client(
 
                 // Always broadcast a terminal response so subscribers
                 // (especially the TUI) never get stuck in Streaming mode.
+                // Terminal broadcasts (Cancelled, AgentDone, final Phase(Idle))
+                // use the awaiting variant so the TUI observes them before the
+                // session can appear idle via another code path. See the
+                // module-level comment in notifications.rs.
                 match chat_result {
                     Ok((true, _)) => {
                         // Cancelled
@@ -708,7 +712,7 @@ pub(super) async fn handle_client(
                             let _ = st.db.update_exit_status(&session_id, "cancelled");
                         }
                         let resp = Response::Cancelled;
-                        broadcast_to_subscribers(&state, &session_id, &resp);
+                        broadcast_to_subscribers_and_wait(&state, &session_id, &resp).await;
                         send(&mut writer, &resp).await.ok();
                     }
                     Ok((false, max_turns_reached)) => {
@@ -729,11 +733,12 @@ pub(super) async fn handle_client(
                                         .to_string(),
                                 }),
                             };
+                            // Status is best-effort but must precede AgentDone.
                             broadcast_to_subscribers(&state, &session_id, &status_resp);
                             send(&mut writer, &status_resp).await.ok();
                         }
                         let resp = Response::AgentDone;
-                        broadcast_to_subscribers(&state, &session_id, &resp);
+                        broadcast_to_subscribers_and_wait(&state, &session_id, &resp).await;
                         send(&mut writer, &resp).await.ok();
                     }
                     Err(e) => {
@@ -746,13 +751,13 @@ pub(super) async fn handle_client(
                         };
                         let done_resp = Response::AgentDone;
                         broadcast_to_subscribers(&state, &session_id, &err_resp);
-                        broadcast_to_subscribers(&state, &session_id, &done_resp);
+                        broadcast_to_subscribers_and_wait(&state, &session_id, &done_resp).await;
                         send(&mut writer, &err_resp).await.ok();
                         send(&mut writer, &done_resp).await.ok();
                     }
                 }
 
-                emit_phase(&state, &session_id, crate::types::AgentPhase::Idle);
+                emit_phase_and_wait(&state, &session_id, crate::types::AgentPhase::Idle).await;
                 // Mark session as no longer live.
                 {
                     let mut st = lock_state(&state);
