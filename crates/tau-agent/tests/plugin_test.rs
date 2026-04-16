@@ -638,3 +638,128 @@ no_default_worker = true
     let config: PluginsConfig = toml::from_str(toml_str).unwrap();
     assert_eq!(config.idle_timeout_secs, 30);
 }
+
+/// Regression test for task 481:
+///
+/// After `PluginManager::setup_background_io` is called, the sync stdin /
+/// stdout pipes on the global `PluginHandle` have been handed over to
+/// background reader/writer tasks, leaving the sync handle without pipes.
+///
+/// `notify_session_start_once` and `call_hook` are both invoked from sync
+/// call sites that still reach these global plugins. The commit that
+/// introduced background I/O (5d0ae31) inadvertently broke those paths
+/// because the sync `send`/`read_message` looked only at the (now absent)
+/// sync pipes.
+///
+/// This test wires up a real background reader/writer for a global plugin
+/// and verifies that both `notify_session_start_once` and `call_hook`
+/// still deliver the request and receive the response.
+#[test]
+fn global_plugin_hooks_work_through_background_io() {
+    use tau_agent::plugin::PluginMessage;
+
+    let cmd = test_plugin_command();
+    let config = PluginsConfig {
+        session_prefix: None,
+        global: [(
+            "test".into(),
+            PluginEntry {
+                command: cmd,
+                env: HashMap::new(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        session: Default::default(),
+        no_default_worker: true,
+        idle_timeout_secs: 30,
+    };
+
+    let mut manager = PluginManager::new(config);
+    manager.load_global_plugins("/tmp");
+
+    // Install background I/O channels. This upgrades pipes to async and
+    // hands them over to the caller, who is expected to spawn reader/writer
+    // tasks. We mimic what `server::registry` does in production.
+    let io_pairs = manager.setup_background_io();
+    assert_eq!(io_pairs.len(), 1);
+
+    for (_plugin_name, mut reader, mut writer, msg_tx, write_rx) in io_pairs {
+        // Writer task: drain write_rx → stdin.
+        smol::spawn(async move {
+            use futures::io::AsyncWriteExt;
+            while let Ok(req) = write_rx.recv().await {
+                let mut line = serde_json::to_vec(&req).expect("serialize");
+                line.push(b'\n');
+                if writer.write_all(&line).await.is_err() {
+                    break;
+                }
+                if writer.flush().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // Reader task: stdout → msg_tx.
+        smol::spawn(async move {
+            use futures::io::AsyncBufReadExt;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let trimmed = line.trim_end();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<PluginMessage>(trimmed) {
+                            Ok(msg) => {
+                                if msg_tx.send(msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    let session_id = "bg-io-session";
+
+    // notify_session_start_once must reach the plugin via the bg channels.
+    // This call would silently fail before the fix — we verify it below
+    // by observing that the plugin's state advanced and subsequent hook
+    // invocations still round-trip.
+    manager.notify_session_start_once("/tmp", session_id, Some("proj"));
+
+    // call_hook on a global plugin must also work. Before the fix, the
+    // sync send() returned `plugin ... is not running` immediately and the
+    // HookResult was never received, so the manager returned an empty
+    // results vec. After the fix, we get the real hook result from the
+    // test plugin (which injects a context message for before_agent_start).
+    let results = manager.call_hook(
+        session_id,
+        "before_agent_start",
+        &serde_json::json!({"prompt": "hello"}),
+    );
+    assert_eq!(
+        results.len(),
+        1,
+        "expected one hook result from global plugin"
+    );
+    let msg = results[0]
+        .message
+        .as_ref()
+        .expect("global plugin should have returned a context message");
+    assert!(
+        msg.content.contains("[TEST PLUGIN]"),
+        "unexpected hook message: {:?}",
+        msg
+    );
+}

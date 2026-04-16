@@ -262,8 +262,26 @@ impl PluginHandle {
     }
 
     /// Send a request to the plugin.
+    ///
+    /// When the handle has been upgraded to background I/O (global plugins
+    /// after `PluginManager::setup_background_io`), the sync stdin pipe is
+    /// no longer held by this handle. In that case, forward the request
+    /// through the background writer channel so that hooks / session_start
+    /// notifications sent from sync call sites still reach the plugin.
     pub fn send(&mut self, req: &PluginRequest) -> crate::Result<()> {
         self.last_activity = Instant::now();
+
+        // Prefer the background writer channel when sync pipes have been
+        // handed over to the background I/O tasks.
+        if let Some(ref tx) = self.bg_write_tx {
+            return smol::block_on(tx.send(req.clone())).map_err(|e| {
+                crate::Error::Io(format!(
+                    "plugin {} background write channel closed: {}",
+                    self.name, e
+                ))
+            });
+        }
+
         let stdin = self
             .stdin
             .as_mut()
@@ -273,7 +291,22 @@ impl PluginHandle {
     }
 
     /// Read a single message from the plugin.
+    ///
+    /// When background I/O is installed, read from the background message
+    /// channel instead of the sync stdout pipe (which has been handed over
+    /// to the background reader task).
     pub fn read_message(&mut self) -> crate::Result<PluginMessage> {
+        // Prefer the background message channel for global plugins whose
+        // stdout has been handed over to a background reader task.
+        if let Some(ref rx) = self.bg_msg_rx {
+            return smol::block_on(rx.recv()).map_err(|_| {
+                crate::Error::Io(format!(
+                    "plugin {} background message channel closed",
+                    self.name
+                ))
+            });
+        }
+
         let stdout = self
             .stdout
             .as_mut()
