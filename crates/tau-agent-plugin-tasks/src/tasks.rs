@@ -1546,6 +1546,7 @@ fn handle_task_status(
     db: &TasksDb,
     args: &serde_json::Value,
     project_name: &str,
+    resolver: &ProjectResolver,
     tool_call_id: &str,
 ) -> PluginToolResult {
     let project_name = args
@@ -1553,7 +1554,8 @@ fn handle_task_status(
         .and_then(|v| v.as_str())
         .unwrap_or(project_name);
 
-    match tasks_scheduler::get_status(db, project_name) {
+    let project_path = resolver.resolve(project_name).ok();
+    match tasks_scheduler::get_status(db, project_name, project_path.as_deref()) {
         Ok(status) => tool_ok(tool_call_id, &tasks_scheduler::format_status(&status)),
         Err(e) => tool_err(tool_call_id, &format!("scheduler status: {}", e)),
     }
@@ -1982,7 +1984,7 @@ pub fn run_tasks_plugin() {
                     }
                     "task_status" => {
                         let pn = project_name.unwrap_or("unknown");
-                        handle_task_status(&db, &arguments, pn, &tool_call_id)
+                        handle_task_status(&db, &arguments, pn, &resolver, &tool_call_id)
                     }
                     "task_schedule" => {
                         let pn = project_name.unwrap_or("unknown");

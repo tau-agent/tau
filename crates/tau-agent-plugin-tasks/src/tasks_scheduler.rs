@@ -199,6 +199,12 @@ pub fn schedule(
                     Err(e) => {
                         // Log but don't fail the whole batch.
                         eprintln!("tasks scheduler: failed to prepare task {}: {}", task.id, e);
+                        // Add a visible message to the task so the error is discoverable.
+                        let _ = db.add_message(
+                            task.id,
+                            &format!("⚠️ Scheduling failed: {}", e),
+                            Some("system"),
+                        );
                     }
                 }
             }
@@ -225,6 +231,14 @@ fn prepare_task(
 
     // Create branch (skip if it already exists — idempotent).
     if !tasks_git::branch_exists(repo_root, &branch)? {
+        // Validate that the base branch exists before trying to create a new branch from it.
+        if !tasks_git::branch_exists(repo_root, &base_branch)? {
+            return Err(tau_agent_plugin::Error::Io(format!(
+                "task #{}: merge_target branch '{}' does not exist. \
+                 Set the correct merge_target with: task_update {{\"id\": {}, \"merge_target\": \"<branch>\"}}",
+                task.id, base_branch, task.id
+            )));
+        }
         tasks_git::create_branch(repo_root, &branch, &base_branch)?;
     }
 
@@ -1486,6 +1500,8 @@ pub enum WaitReason {
     },
     /// Concurrent task budget exhausted.
     BudgetExhausted { used: usize, max: usize },
+    /// The merge_target branch does not exist in the repository.
+    MergeTargetNotFound { branch: String },
     /// In ready/planning state but not yet scheduled.
     NotScheduled,
 }
@@ -1510,7 +1526,15 @@ pub struct SchedulerStatus {
 }
 
 /// Compute the current scheduler status: active, queued, and blocked tasks.
-pub fn get_status(db: &TasksDb, project_name: &str) -> tau_agent_plugin::Result<SchedulerStatus> {
+///
+/// When `project_path` is provided, additionally validates that each ready
+/// task's `merge_target` branch exists in the repository — surfacing a
+/// `MergeTargetNotFound` wait reason when it doesn't.
+pub fn get_status(
+    db: &TasksDb,
+    project_name: &str,
+    project_path: Option<&str>,
+) -> tau_agent_plugin::Result<SchedulerStatus> {
     let inflight_count = db.count_inflight_tasks(project_name)?;
     let max_concurrent = MAX_CONCURRENT_TASKS;
 
@@ -1591,6 +1615,22 @@ pub fn get_status(db: &TasksDb, project_name: &str) -> tau_agent_plugin::Result<
                                 wait_reasons.push(WaitReason::FileConflict {
                                     files: overlapping,
                                     with_task_id: *active_id,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                // Check merge_target branch existence (only for ready tasks).
+                if task.state == "ready" {
+                    if let Some(path) = project_path {
+                        let merge_target = db
+                            .get_merge_target(task.id)
+                            .unwrap_or_else(|_| "main".into());
+                        if let Ok(repo_root) = tasks_git::get_repo_root(path) {
+                            if let Ok(false) = tasks_git::branch_exists(&repo_root, &merge_target) {
+                                wait_reasons.push(WaitReason::MergeTargetNotFound {
+                                    branch: merge_target,
                                 });
                             }
                         }
@@ -1755,6 +1795,9 @@ fn format_task_line(out: &mut String, ts: &TaskStatus) {
             }
             WaitReason::BudgetExhausted { used, max } => {
                 let _ = write!(out, "  ⏳ budget ({}/{} sessions used)", used, max);
+            }
+            WaitReason::MergeTargetNotFound { branch } => {
+                let _ = write!(out, "  ⚠️ merge_target branch '{}' not found", branch);
             }
             WaitReason::NotScheduled => {
                 let _ = write!(out, "  ⏳ not yet scheduled");
@@ -3163,7 +3206,7 @@ mod tests {
     #[test]
     fn test_get_status_empty() {
         let db = TasksDb::open_memory().unwrap();
-        let status = get_status(&db, "test-project").unwrap();
+        let status = get_status(&db, "test-project", None).unwrap();
         assert!(status.active.is_empty());
         assert!(status.queued_planning.is_empty());
         assert!(status.queued_ready.is_empty());
@@ -3179,7 +3222,7 @@ mod tests {
         db.assign_task(task.id, "s1").unwrap();
         // task is now active
 
-        let status = get_status(&db, "test-project").unwrap();
+        let status = get_status(&db, "test-project", None).unwrap();
         assert_eq!(status.active.len(), 1);
         assert_eq!(status.active[0].task.id, task.id);
         assert_eq!(status.inflight_count, 1);
@@ -3192,7 +3235,7 @@ mod tests {
         let task = create_ready_task(&db, "test-project", "Blocked task", 3, None);
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
 
-        let status = get_status(&db, "test-project").unwrap();
+        let status = get_status(&db, "test-project", None).unwrap();
         assert_eq!(status.blocked.len(), 1);
         assert_eq!(status.blocked[0].task.id, task.id);
         assert!(matches!(
@@ -3213,7 +3256,7 @@ mod tests {
 
         let queued_task = create_ready_task(&db, "test-project", "Queued", 3, Some(&files));
 
-        let status = get_status(&db, "test-project").unwrap();
+        let status = get_status(&db, "test-project", None).unwrap();
         assert_eq!(status.active.len(), 1);
         assert_eq!(status.queued_ready.len(), 1);
         assert_eq!(status.queued_ready[0].task.id, queued_task.id);
@@ -3256,7 +3299,7 @@ mod tests {
             .unwrap();
         assert_eq!(child.state, "planning");
 
-        let status = get_status(&db, "test-project").unwrap();
+        let status = get_status(&db, "test-project", None).unwrap();
         // child should be in queued_planning
         assert!(
             status
@@ -3304,7 +3347,7 @@ mod tests {
         let task = create_ready_task(&db, "project-a", "Blocked task", 3, None);
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
 
-        let status = get_status(&db, "project-a").unwrap();
+        let status = get_status(&db, "project-a", None).unwrap();
         assert_eq!(status.blocked.len(), 1);
         assert_eq!(status.blocked[0].task.id, task.id);
         assert!(matches!(
@@ -3362,5 +3405,25 @@ mod tests {
             "same-project dep should not show project name, got: {}",
             out
         );
+    }
+
+    #[test]
+    fn test_format_task_line_merge_target_not_found() {
+        let ts = TaskStatus {
+            task: make_task(10, 5, None),
+            session_id: None,
+            wait_reasons: vec![WaitReason::MergeTargetNotFound {
+                branch: "main".into(),
+            }],
+        };
+        let mut out = String::new();
+        format_task_line(&mut out, &ts);
+        assert!(
+            out.contains("merge_target branch 'main' not found"),
+            "expected merge_target not found warning, got: {}",
+            out
+        );
+        // Should use ⚠️ not ⏳ to signal it's an error
+        assert!(out.contains("⚠️"), "expected warning emoji, got: {}", out);
     }
 }

@@ -240,7 +240,7 @@ pub fn handle_task_status(project: &str) -> Response {
         Ok(db) => db,
         Err(resp) => return resp,
     };
-    match crate::tasks_scheduler::get_status(&db, project) {
+    match crate::tasks_scheduler::get_status(&db, project, None) {
         Ok(status) => {
             let text = crate::tasks_scheduler::format_status(&status);
             Response::TaskStatus { text }

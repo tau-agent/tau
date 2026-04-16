@@ -2440,7 +2440,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
         }
         TaskAction::Status => {
             let project = project_key()?;
-            let status = tau_agent::tasks_scheduler::get_status(&db, &project)?;
+            let status = tau_agent::tasks_scheduler::get_status(&db, &project, None)?;
             print!("{}", tau_agent::tasks_scheduler::format_status(&status));
         }
     }
