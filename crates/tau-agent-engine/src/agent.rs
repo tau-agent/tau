@@ -880,6 +880,7 @@ pub fn is_context_overflow(err_msg: &str) -> bool {
         || lower.contains("too many tokens")
         || lower.contains("prompt is too long")
         || lower.contains("prompt too long")
+        || lower.contains("request_too_large")
         || lower.contains("exceeded max context length")
         || lower.contains("exceeded context length")
         || lower.contains("token limit exceeded")
@@ -1347,6 +1348,11 @@ mod tests {
         assert!(is_context_overflow("too many tokens in the prompt"));
         assert!(is_context_overflow("token limit exceeded"));
         assert!(is_context_overflow("model_context_window_exceeded"));
+        // Anthropic HTTP 413 request_too_large — byte-size overflow, not token count.
+        assert!(is_context_overflow(
+            "HTTP 413: {\"type\":\"error\",\"error\":{\"type\":\"request_too_large\",\"message\":\"Request body is too large\"}}"
+        ));
+        assert!(is_context_overflow("Request_Too_Large"));
         // Negative
         assert!(!is_context_overflow("invalid request"));
         assert!(!is_context_overflow("rate limit exceeded"));
