@@ -525,17 +525,23 @@ fn build_request_body(
     let tools = if context.tools.is_empty() {
         None
     } else {
-        Some(
-            context
-                .tools
-                .iter()
-                .map(|t| ToolDef {
-                    name: t.name.clone(),
-                    description: t.description.clone(),
-                    input_schema: t.parameters.clone(),
-                })
-                .collect(),
-        )
+        let mut defs: Vec<ToolDef> = context
+            .tools
+            .iter()
+            .map(|t| ToolDef {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                input_schema: t.parameters.clone(),
+                cache_control: None,
+            })
+            .collect();
+        // Place a cache breakpoint on the last tool so tool-list changes
+        // don't invalidate the transcript cache and vice versa. Mirrors
+        // the upstream pi-ai behavior (commit 1c016cb0).
+        if let Some(last) = defs.last_mut() {
+            last.cache_control = cc.clone();
+        }
+        Some(defs)
     };
 
     let thinking = options.thinking_budget.map(|budget| ThinkingConfig {
@@ -962,6 +968,47 @@ mod tests {
         assert!(
             system.is_none() || system.unwrap().is_null(),
             "system should be absent or null"
+        );
+    }
+
+    #[test]
+    fn last_tool_has_cache_control_only() {
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage::text("hi"))],
+            tools: vec![
+                Tool {
+                    name: "first".into(),
+                    description: "first tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                Tool {
+                    name: "second".into(),
+                    description: "second tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                Tool {
+                    name: "third".into(),
+                    description: "third tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            ],
+        };
+        let body = build(&ctx, &StreamOptions::default());
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 3);
+        assert!(tools[0].get("cache_control").is_none());
+        assert!(tools[1].get("cache_control").is_none());
+        assert_eq!(tools[2]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn no_tools_omits_tools_field() {
+        let body = build(&simple_context(None, "hi"), &StreamOptions::default());
+        let tools = body.get("tools");
+        assert!(
+            tools.is_none() || tools.unwrap().is_null(),
+            "tools should be absent when empty"
         );
     }
 }
