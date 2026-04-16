@@ -597,15 +597,25 @@ fn handle_task_create(
                 ));
             }
 
+            let mut dispatch_warnings: Vec<String> = Vec::new();
+
             // Interactive tasks get a fresh session for the user to drive
-            if task.state == "interactive"
-                && let Some(new_sid) =
-                    create_interactive_session(db, &task, resolver, session_id, writer, reader)
-            {
-                let _ = db.set_session_id(task.id, &new_sid);
-                let _ = db.record_session(task.id, &new_sid, "interactive");
-                if let Some(creator_sid) = session_id {
-                    let _ = db.record_session(task.id, creator_sid, "creator");
+            if task.state == "interactive" {
+                match create_interactive_session(db, &task, resolver, session_id, writer, reader) {
+                    Some(new_sid) => {
+                        let _ = db.set_session_id(task.id, &new_sid);
+                        let _ = db.record_session(task.id, &new_sid, "interactive");
+                        if let Some(creator_sid) = session_id {
+                            let _ = db.record_session(task.id, creator_sid, "creator");
+                        }
+                    }
+                    None => {
+                        dispatch_warnings.push(
+                            "⚠️ Failed to create interactive session. \
+                             Task is in interactive state but has no session."
+                                .to_string(),
+                        );
+                    }
                 }
             }
 
@@ -627,7 +637,17 @@ fn handle_task_create(
                             "task_create: #{} \"{}\"",
                             updated_task.id, updated_task.title
                         );
-                        tool_ok_summary(tool_call_id, &json, summary)
+                        let mut result = tool_ok_summary(tool_call_id, &json, summary);
+                        if !dispatch_warnings.is_empty() {
+                            let warning_text = format!("\n{}", dispatch_warnings.join("\n"));
+                            result.content.push(ToolResultContent::Text(
+                                tau_agent_plugin::TextContent {
+                                    text: warning_text,
+                                    text_signature: None,
+                                },
+                            ));
+                        }
+                        result
                     }
                     Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
                 },
@@ -1093,6 +1113,8 @@ fn handle_task_update(
 
     match db.update_task(id, &update, session_id) {
         Ok(task) => {
+            let mut dispatch_warnings: Vec<String> = Vec::new();
+
             // Trigger scheduler events based on the new state.
             match task.state.as_str() {
                 "approved" => pending_events.push(SchedulerEvent::MergeNeeded),
@@ -1154,15 +1176,13 @@ fn handle_task_update(
                                     "tasks: failed to auto-dispatch review for task {}: {}",
                                     task.id, e
                                 );
-                                let _ = db.add_message(
-                                    task.id,
-                                    &format!(
-                                        "⚠️ Auto-dispatch of review session failed: {}. \
-                                         Task is in review state but has no reviewer session.",
-                                        e
-                                    ),
-                                    Some("system"),
+                                let warn = format!(
+                                    "⚠️ Auto-dispatch of review session failed: {}. \
+                                     Task is in review state but has no reviewer session.",
+                                    e
                                 );
+                                let _ = db.add_message(task.id, &warn, Some("system"));
+                                dispatch_warnings.push(warn);
                             }
                         }
                     }
@@ -1202,15 +1222,13 @@ fn handle_task_update(
                                     "tasks: failed to auto-dispatch refining for task {}: {}",
                                     task.id, e
                                 );
-                                let _ = db.add_message(
-                                    task.id,
-                                    &format!(
-                                        "⚠️ Auto-dispatch of refining session failed: {}. \
-                                         Task is in refining state but has no refiner session.",
-                                        e
-                                    ),
-                                    Some("system"),
+                                let warn = format!(
+                                    "⚠️ Auto-dispatch of refining session failed: {}. \
+                                     Task is in refining state but has no refiner session.",
+                                    e
                                 );
+                                let _ = db.add_message(task.id, &warn, Some("system"));
+                                dispatch_warnings.push(warn);
                             }
                         }
                     }
@@ -1267,14 +1285,24 @@ fn handle_task_update(
                         }
                     }
                 };
-                if needs_session
-                    && let Some(new_sid) =
-                        create_interactive_session(db, &task, resolver, session_id, writer, reader)
-                {
-                    let _ = db.set_session_id(task.id, &new_sid);
-                    let _ = db.record_session(task.id, &new_sid, "interactive");
-                    if let Some(creator_sid) = session_id {
-                        let _ = db.record_session(task.id, creator_sid, "creator");
+                if needs_session {
+                    match create_interactive_session(
+                        db, &task, resolver, session_id, writer, reader,
+                    ) {
+                        Some(new_sid) => {
+                            let _ = db.set_session_id(task.id, &new_sid);
+                            let _ = db.record_session(task.id, &new_sid, "interactive");
+                            if let Some(creator_sid) = session_id {
+                                let _ = db.record_session(task.id, creator_sid, "creator");
+                            }
+                        }
+                        None => {
+                            dispatch_warnings.push(
+                                "⚠️ Failed to create interactive session. \
+                                 Task is in interactive state but has no session."
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
 
@@ -1365,7 +1393,19 @@ fn handle_task_update(
             };
 
             match serde_json::to_string_pretty(&final_task) {
-                Ok(json) => tool_ok_summary(tool_call_id, &json, summary),
+                Ok(json) => {
+                    let mut result = tool_ok_summary(tool_call_id, &json, summary);
+                    if !dispatch_warnings.is_empty() {
+                        let warning_text = format!("\n{}", dispatch_warnings.join("\n"));
+                        result.content.push(ToolResultContent::Text(
+                            tau_agent_plugin::TextContent {
+                                text: warning_text,
+                                text_signature: None,
+                            },
+                        ));
+                    }
+                    result
+                }
                 Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
             }
         }
@@ -1938,7 +1978,7 @@ pub fn run_tasks_plugin() {
                 let project_name = project_name.as_deref();
                 let session = session_id.as_deref();
 
-                let result = match name.as_str() {
+                let mut result = match name.as_str() {
                     "task_create" => handle_task_create(
                         &db,
                         &arguments,
@@ -2011,17 +2051,28 @@ pub fn run_tasks_plugin() {
                     _ => tool_err(&tool_call_id, &format!("unknown tool: {}", name)),
                 };
 
-                send_message(&mut writer, &PluginMessage::ToolResult(result));
-
                 // Drain pending scheduler events and run the
-                // corresponding passes immediately.
-                drain_scheduler_events(
+                // corresponding passes immediately. Collect warnings
+                // (e.g. dispatch failures) and append them to the tool
+                // result so the LLM can surface them to the user.
+                let dispatch_warnings = drain_scheduler_events(
                     &mut pending_events,
                     &db,
                     &resolver,
                     &mut writer,
                     &mut chan_reader,
                 );
+                if !dispatch_warnings.is_empty() {
+                    let warning_text = format!("\n{}", dispatch_warnings.join("\n"));
+                    result
+                        .content
+                        .push(ToolResultContent::Text(tau_agent_plugin::TextContent {
+                            text: warning_text,
+                            text_signature: None,
+                        }));
+                }
+
+                send_message(&mut writer, &PluginMessage::ToolResult(result));
             }
             PluginRequest::Init { .. } | PluginRequest::SessionStart { .. } => {
                 send_message(
@@ -2048,7 +2099,7 @@ pub fn run_tasks_plugin() {
                         }
                         _ => {}
                     }
-                    drain_scheduler_events(
+                    let _ = drain_scheduler_events(
                         &mut pending_events,
                         &db,
                         &resolver,
@@ -2172,9 +2223,9 @@ fn drain_scheduler_events(
     resolver: &ProjectResolver,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) {
+) -> Vec<String> {
     if events.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let batch = std::mem::take(events);
@@ -2199,16 +2250,18 @@ fn drain_scheduler_events(
         run_merge_pass(db, resolver, writer, reader);
     }
 
+    let mut warnings = Vec::new();
     for (project_name, session_id) in &schedule_projects {
-        run_schedule_pass(
+        warnings.extend(run_schedule_pass(
             db,
             project_name,
             resolver,
             session_id.as_deref(),
             writer,
             reader,
-        );
+        ));
     }
+    warnings
 }
 
 // ---------------------------------------------------------------------------
@@ -2258,7 +2311,7 @@ fn run_schedule_pass(
     session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-) {
+) -> Vec<String> {
     let project_path = match resolver.resolve(project_name) {
         Ok(p) => p,
         Err(e) => {
@@ -2266,9 +2319,10 @@ fn run_schedule_pass(
                 "tasks scheduler: cannot resolve project '{}': {}",
                 project_name, e
             );
-            return;
+            return Vec::new();
         }
     };
+    let mut warnings: Vec<String> = Vec::new();
 
     match tasks_scheduler::schedule(db, project_name, &project_path) {
         Ok(scheduled) => {
@@ -2317,6 +2371,7 @@ fn run_schedule_pass(
                         st.id, st.title, e, revert_note
                     );
                     let _ = db.add_message(st.id, &warn_msg, Some("system"));
+                    warnings.push(warn_msg.clone());
 
                     // Notify the triggering session so the user/agent that
                     // created the task sees the failure inline.
@@ -2340,6 +2395,7 @@ fn run_schedule_pass(
             eprintln!("tasks scheduler: schedule pass error: {}", e);
         }
     }
+    warnings
 }
 
 // ---------------------------------------------------------------------------
@@ -6582,13 +6638,24 @@ mod tests {
             .unwrap();
         assert_eq!(task.state, "planning");
 
-        run_schedule_pass(
+        let warnings = run_schedule_pass(
             &db,
             "test-project",
             &resolver,
             Some("trigger-session"),
             &mut writer,
             &mut reader,
+        );
+
+        // run_schedule_pass should return warnings for dispatch failures.
+        assert!(
+            !warnings.is_empty(),
+            "expected dispatch failure warnings from run_schedule_pass"
+        );
+        assert!(
+            warnings[0].contains("Auto-dispatch of session failed"),
+            "warning should mention dispatch failure, got: {}",
+            warnings[0]
         );
 
         // Task should still be in planning state (planning tasks don't get
@@ -6628,6 +6695,255 @@ mod tests {
             all_written.contains("queue_message") && all_written.contains("trigger-session"),
             "expected QueueMessage to trigger-session in:\n{}",
             all_written
+        );
+    }
+
+    // ----- dispatch warning in tool result tests -----
+
+    #[test]
+    fn test_review_dispatch_failure_warning_in_tool_result() {
+        // When auto-dispatch of the review session fails, the tool result
+        // returned by handle_task_update should contain a warning.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 0 active children, budget is 0");
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Review warning test",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-session").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-worktree").unwrap();
+
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("worker-session"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error, "task_update should succeed");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("Auto-dispatch of review session failed"),
+            "tool result should contain review dispatch warning, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_refining_dispatch_failure_warning_in_tool_result() {
+        // When auto-dispatch of the refining session fails, the tool result
+        // returned by handle_task_update should contain a warning.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 0 active children, budget is 0");
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Refining warning test",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        // planning -> refining transition triggers dispatch
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "refining"}),
+            Some("planner-session"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error, "task_update should succeed");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("Auto-dispatch of refining session failed"),
+            "tool result should contain refining dispatch warning, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_interactive_session_failure_warning_in_task_create() {
+        // When creating an interactive task and session creation fails,
+        // the tool result should contain a warning.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 0 active children, budget is 0");
+
+        let ctx = ToolCtx {
+            tool_call_id: "tc1",
+            session_id: Some("parent-session"),
+            project_name: Some("test-project"),
+        };
+        let mut events = Vec::new();
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Interactive warning test"}),
+            &ctx,
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error, "task_create should succeed");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("Failed to create interactive session"),
+            "tool result should contain interactive session warning, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_interactive_transition_failure_warning_in_task_update() {
+        // When transitioning to interactive and session creation fails,
+        // the tool result should contain a warning.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 0 active children, budget is 0");
+
+        // Create a task in planning state (subtask), then transition to
+        // interactive which should trigger session creation.
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Interactive transition warning test",
+                None,
+                Some(parent.id),
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "interactive"}),
+            Some("planner-session"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error, "task_update should succeed");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("Failed to create interactive session"),
+            "tool result should contain interactive session warning, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_no_warnings_when_dispatch_succeeds() {
+        // Verify that successful dispatch adds no warnings to tool results.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "No warning test",
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-session").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-worktree").unwrap();
+
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("worker-session"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error, "task_update should succeed");
+        let text = extract_text(&result);
+        // Should only have the JSON task blob, no warnings
+        assert!(
+            !text.contains("⚠️"),
+            "successful dispatch should not produce warnings, got: {}",
+            text
         );
     }
 
