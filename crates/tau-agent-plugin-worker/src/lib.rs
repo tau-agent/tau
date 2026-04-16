@@ -76,7 +76,7 @@ pub fn build_default_prompt(cwd: Option<&str>) -> String {
         }
     }
     add("Be concise in your responses".into());
-    add("Show file paths clearly when working with files".into());
+    add("When referring to files, use paths relative to the current working directory (e.g. crates/foo/src/lib.rs). Use absolute paths only when the file is outside the project.".into());
 
     let guidelines_str = guidelines
         .iter()
@@ -98,7 +98,10 @@ Current date: {date}"#
     );
 
     if let Some(cwd) = cwd {
-        prompt.push_str(&format!("\nCurrent working directory: {}", cwd));
+        prompt.push_str(&format!(
+            "\nCurrent working directory: {cwd}\n\
+             Bash commands already run in this directory — do not prefix them with `cd {cwd} && ...`.",
+        ));
     }
 
     prompt

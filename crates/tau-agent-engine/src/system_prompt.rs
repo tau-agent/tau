@@ -72,7 +72,7 @@ pub fn build(options: &PromptOptions) -> String {
         &mut general_bullets,
     );
     add_general(
-        "Show file paths clearly when working with files".into(),
+        "When referring to files, use paths relative to the current working directory (e.g. crates/foo/src/lib.rs). Use absolute paths only when the file is outside the project.".into(),
         &mut seen,
         &mut general_bullets,
     );
@@ -99,7 +99,10 @@ Current date: {date}"#
     );
 
     if let Some(cwd) = &options.cwd {
-        prompt.push_str(&format!("\nCurrent working directory: {}", cwd));
+        prompt.push_str(&format!(
+            "\nCurrent working directory: {cwd}\n\
+             Bash commands already run in this directory — do not prefix them with `cd {cwd} && ...`.",
+        ));
     }
 
     if let Some(append) = &options.append {
@@ -172,6 +175,42 @@ mod tests {
     fn prompt_without_cwd() {
         let prompt = build_default(None);
         assert!(!prompt.contains("Current working directory:"));
+    }
+
+    #[test]
+    fn prompt_cwd_includes_no_cd_nudge() {
+        let prompt = build_default(Some("/tmp"));
+        assert!(
+            prompt.contains("already run in this directory"),
+            "expected cwd nudge in prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("do not prefix them with `cd /tmp && ...`"),
+            "expected concrete cd example in prompt:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn prompt_without_cwd_has_no_nudge() {
+        let prompt = build_default(None);
+        assert!(!prompt.contains("Current working directory"));
+        assert!(!prompt.contains("already run in this directory"));
+        assert!(!prompt.contains("do not prefix them with `cd"));
+    }
+
+    #[test]
+    fn file_path_guideline_is_concrete() {
+        let prompt = build_default(None);
+        assert!(
+            prompt.contains(
+                "When referring to files, use paths relative to the current working directory"
+            ),
+            "expected concrete file-path guideline:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("Show file paths clearly when working with files"),
+            "old vague guideline should be gone:\n{prompt}"
+        );
     }
 
     #[test]
@@ -304,7 +343,9 @@ mod tests {
         assert_eq!(prompt.matches("Be concise in your responses").count(), 1);
         assert_eq!(
             prompt
-                .matches("Show file paths clearly when working with files")
+                .matches(
+                    "When referring to files, use paths relative to the current working directory"
+                )
                 .count(),
             1
         );
