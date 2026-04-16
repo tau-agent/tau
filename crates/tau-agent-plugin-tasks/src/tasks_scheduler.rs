@@ -1795,6 +1795,36 @@ pub fn format_status(status: &SchedulerStatus) -> String {
     out
 }
 
+/// Return, for each input path, the shortest suffix (joined by `/`) that is
+/// unique among all paths in the list. A path whose basename is already
+/// unique collapses to that basename; otherwise enough leading components
+/// are retained to disambiguate. Used purely for display.
+fn shortest_unique_suffixes(paths: &[String]) -> Vec<String> {
+    fn suffix_of(parts: &[&str], n: usize) -> String {
+        let start = parts.len().saturating_sub(n);
+        parts[start..].join("/")
+    }
+
+    let parts: Vec<Vec<&str>> = paths.iter().map(|p| p.split('/').collect()).collect();
+    let mut out = Vec::with_capacity(paths.len());
+    for i in 0..parts.len() {
+        let mut n = 1usize;
+        loop {
+            let suffix_i = suffix_of(&parts[i], n);
+            let unique = parts
+                .iter()
+                .enumerate()
+                .all(|(j, p)| j == i || suffix_of(p, n) != suffix_i);
+            if unique || n >= parts[i].len() {
+                out.push(suffix_i);
+                break;
+            }
+            n += 1;
+        }
+    }
+    out
+}
+
 fn format_task_line(out: &mut String, ts: &TaskStatus) {
     use std::fmt::Write;
 
@@ -1803,11 +1833,9 @@ fn format_task_line(out: &mut String, ts: &TaskStatus) {
     let files_str = if files.is_empty() {
         String::new()
     } else {
-        // Show abbreviated file names (just filename, not full path).
-        let abbrev: Vec<&str> = files
-            .iter()
-            .map(|f| f.rsplit('/').next().unwrap_or(f.as_str()))
-            .collect();
+        // Show minimal unique path suffixes so same-basename files in
+        // different directories remain distinguishable.
+        let abbrev = shortest_unique_suffixes(&files);
         format!("  [{}]", abbrev.join(", "))
     };
 
@@ -1844,10 +1872,7 @@ fn format_task_line(out: &mut String, ts: &TaskStatus) {
                 files,
                 with_task_id,
             } => {
-                let abbrev: Vec<&str> = files
-                    .iter()
-                    .map(|f| f.rsplit('/').next().unwrap_or(f.as_str()))
-                    .collect();
+                let abbrev = shortest_unique_suffixes(files);
                 let _ = write!(
                     out,
                     "  ⏳ file conflict [{}] with #{}",
@@ -3486,6 +3511,71 @@ mod tests {
         assert!(output.contains("QUEUED - READY"));
         assert!(output.contains("#2"));
         assert!(output.contains("file conflict"));
+    }
+
+    #[test]
+    fn shortest_unique_suffixes_basics() {
+        let r = shortest_unique_suffixes(&[
+            "chanapi/Cargo.toml".into(),
+            "chanapi-macros/Cargo.toml".into(),
+        ]);
+        assert_eq!(r, vec!["chanapi/Cargo.toml", "chanapi-macros/Cargo.toml"]);
+
+        let r = shortest_unique_suffixes(&["a/x/foo.rs".into(), "b/x/foo.rs".into()]);
+        assert_eq!(r, vec!["a/x/foo.rs", "b/x/foo.rs"]);
+
+        let r = shortest_unique_suffixes(&["src/app.rs".into(), "src/tasks.rs".into()]);
+        assert_eq!(r, vec!["app.rs", "tasks.rs"]);
+
+        let r = shortest_unique_suffixes(&["only/one.rs".into()]);
+        assert_eq!(r, vec!["one.rs"]);
+
+        let r: Vec<String> = shortest_unique_suffixes(&[]);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn shortest_unique_suffixes_mixed_depths() {
+        // Three paths sharing basename; minimal unique suffix differs per path.
+        let r = shortest_unique_suffixes(&[
+            "a/b/foo.rs".into(),
+            "c/d/foo.rs".into(),
+            "e/foo.rs".into(),
+        ]);
+        assert_eq!(r, vec!["b/foo.rs", "d/foo.rs", "e/foo.rs"]);
+    }
+
+    #[test]
+    fn test_format_status_uses_unique_suffixes() {
+        let status = SchedulerStatus {
+            active: vec![TaskStatus {
+                task: make_task(
+                    1,
+                    5,
+                    Some(vec!["a/Cargo.toml", "b/Cargo.toml", "c/main.rs"]),
+                ),
+                session_id: Some("s100".into()),
+                wait_reasons: vec![],
+            }],
+            queued_planning: vec![],
+            queued_ready: vec![],
+            blocked: vec![],
+            inflight_count: 1,
+            max_concurrent: 8,
+        };
+        let output = format_status(&status);
+        // Duplicated basenames must be disambiguated by their parent dir;
+        // unique basenames (main.rs) collapse to just the filename.
+        assert!(
+            output.contains("a/Cargo.toml, b/Cargo.toml, main.rs"),
+            "expected unique suffixes in output, got:\n{}",
+            output
+        );
+        assert!(
+            !output.contains("Cargo.toml, Cargo.toml"),
+            "bare basenames should not repeat in output:\n{}",
+            output
+        );
     }
 
     #[test]
