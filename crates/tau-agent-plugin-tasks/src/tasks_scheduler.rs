@@ -886,27 +886,33 @@ fn build_review_message(
         String::new()
     };
 
-    // Build the checklist line for the review list + optional run block.
-    let (checklist_line, checklist_run_block) = if checklist.is_empty() {
-        (String::new(), String::new())
+    // Build the checklist sections for the review message.
+    // When non-empty: item 5 in the numbered list + a run-checks block.
+    // When empty: nothing — no extra lines, preserving the original spacing.
+    let checklist_item = if checklist.is_empty() {
+        String::new()
     } else {
-        let line = format!(
-            "5. Run these project checks and verify they pass:\n{}",
+        format!(
+            "\n5. Run these project checks and verify they pass:\n{}",
             checklist
                 .iter()
                 .map(|c| format!("   - `{}` ({})", c.command, c.name))
                 .collect::<Vec<_>>()
                 .join("\n")
-        );
-        let block = format!(
+        )
+    };
+
+    let checklist_run_block = if checklist.is_empty() {
+        String::new()
+    } else {
+        format!(
             "Run these checks before making your decision:\n{}\n\n",
             checklist
                 .iter()
                 .map(|c| format!("- `{}`", c.command))
                 .collect::<Vec<_>>()
                 .join("\n")
-        );
-        (line, block)
+        )
     };
 
     let mut msg = format!(
@@ -925,8 +931,8 @@ fn build_review_message(
          1. Does the implementation match the spec?\n\
          2. Code quality, correctness, and completeness\n\
          3. Are there any bugs or edge cases missed?\n\
-         4. Does the code follow project conventions?\n\
-         {checklist_line}\n\
+         4. Does the code follow project conventions?\
+         {checklist_item}\n\
          \n\
          {checklist_run_block}\
          Examine the changes using git diff and read the modified files.\n\
@@ -942,7 +948,7 @@ fn build_review_message(
         worktree = worktree,
         target = merge_target,
         nested = nested_warning,
-        checklist_line = checklist_line,
+        checklist_item = checklist_item,
         checklist_run_block = checklist_run_block,
     );
 
@@ -1465,21 +1471,20 @@ fn build_initial_message(
         String::new()
     };
 
-    // Build checklist block and transition label.
-    let (checklist_block, when_done_label) = if checklist.is_empty() {
-        (String::new(), "When done, mark the task:".to_string())
+    // Build the "when done" block.
+    // When checklist is non-empty: concrete check commands + "Then mark the task:".
+    // When empty: just "When done, mark the task:".
+    let when_done_block = if checklist.is_empty() {
+        "When done, mark the task:".to_string()
     } else {
         let checks = checklist
             .iter()
             .map(|c| format!("- `{}`", c.command))
             .collect::<Vec<_>>()
             .join("\n");
-        (
-            format!(
-                "When done, run these checks:\n{}\nThen mark the task:\n",
-                checks
-            ),
-            String::new(),
+        format!(
+            "When done, run these checks:\n{}\nThen mark the task:",
+            checks
         )
     };
 
@@ -1494,8 +1499,7 @@ fn build_initial_message(
          - Call the `task_get` tool with arguments: {{\"id\": {id}}}\n\
          \n\
          Do the work in this worktree. Commit your changes on the current branch — do NOT merge into {target}.\n\
-         {checklist_block}\
-         {when_done_label}\n\
+         {when_done_block}\n\
          {review}\n\
          \n\
          Note: task_get and task_update are agent tools (like bash or edit), not CLI commands.",
@@ -1506,8 +1510,7 @@ fn build_initial_message(
         target = merge_target,
         nested = nested_warning,
         review = review_instruction,
-        checklist_block = checklist_block,
-        when_done_label = when_done_label,
+        when_done_block = when_done_block,
     );
 
     let trimmed = project_instructions.trim();
@@ -2136,6 +2139,11 @@ mod tests {
         assert!(msg.contains("When done, mark the task:"));
         assert!(!msg.contains("run the project checklist"));
         assert!(!msg.contains("run these checks"));
+        // No extra blank lines: the message should not contain triple newlines.
+        assert!(
+            !msg.contains("\n\n\n"),
+            "extra blank line in empty-checklist worker message"
+        );
     }
 
     #[test]
@@ -2158,8 +2166,15 @@ mod tests {
         assert!(msg.contains("cargo fmt --check"));
         assert!(msg.contains("cargo clippy --all-targets"));
         assert!(msg.contains("run these checks"));
+        // "Then mark the task:" should be immediately followed by the review instruction.
+        assert!(msg.contains("Then mark the task:\n"));
         // Should NOT contain the old vague text.
         assert!(!msg.contains("run the project checklist"));
+        // No extra blank lines.
+        assert!(
+            !msg.contains("\n\n\n"),
+            "extra blank line in non-empty-checklist worker message"
+        );
     }
 
     #[test]
@@ -2171,6 +2186,11 @@ mod tests {
         // No checklist: should not mention any checklist or checks item 5.
         assert!(!msg.contains("run the project checklist"));
         assert!(!msg.contains("Run these project checks"));
+        // No extra blank lines.
+        assert!(
+            !msg.contains("\n\n\n"),
+            "extra blank line in empty-checklist review message"
+        );
     }
 
     #[test]
@@ -2188,6 +2208,11 @@ mod tests {
         assert!(msg.contains("Run these project checks"));
         // Should NOT contain the old vague text.
         assert!(!msg.contains("run the project checklist"));
+        // No extra blank lines.
+        assert!(
+            !msg.contains("\n\n\n"),
+            "extra blank line in non-empty-checklist review message"
+        );
     }
 
     #[test]
