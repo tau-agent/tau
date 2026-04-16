@@ -571,10 +571,12 @@ fn build_request_body(
         Some(defs)
     };
 
-    let thinking = options.thinking_budget.map(|budget| ThinkingConfig {
-        thinking_type: "enabled",
-        budget_tokens: budget,
-    });
+    let thinking_enabled = thinking_requested(model, options);
+    let (thinking, output_config) = if thinking_enabled {
+        build_thinking_config(model, options)
+    } else {
+        (None, None)
+    };
 
     Ok(MessagesRequest {
         model: model.id.clone(),
@@ -591,7 +593,110 @@ fn build_request_body(
         temperature: options.temperature,
         tools,
         thinking,
+        output_config,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Thinking / adaptive thinking
+// ---------------------------------------------------------------------------
+
+/// Whether a model supports Anthropic "adaptive" thinking.
+///
+/// Substring checks match both the hyphen- and dot-form model IDs (e.g.
+/// `claude-opus-4-6` and `claude-opus-4.6`). Ports `supportsAdaptiveThinking`
+/// from pi-mono (d1c6cb1e).
+fn supports_adaptive_thinking(model_id: &str) -> bool {
+    model_id.contains("opus-4-6")
+        || model_id.contains("opus-4.6")
+        || model_id.contains("opus-4-7")
+        || model_id.contains("opus-4.7")
+        || model_id.contains("sonnet-4-6")
+        || model_id.contains("sonnet-4.6")
+}
+
+/// Map tau's `ThinkingEffort` to Anthropic's effort string, taking the
+/// model into account. Mirrors pi-mono's `mapThinkingLevelToEffort`:
+/// * `XHigh` on `opus-4-6` → `"max"`
+/// * `XHigh` on `opus-4-7` → `"xhigh"`
+/// * `XHigh` on other adaptive models → `"high"`
+/// * everything else maps identity.
+fn map_effort(effort: ThinkingEffort, model_id: &str) -> &'static str {
+    match effort {
+        ThinkingEffort::Low => "low",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::Max => "max",
+        ThinkingEffort::XHigh => {
+            if model_id.contains("opus-4-6") || model_id.contains("opus-4.6") {
+                "max"
+            } else if model_id.contains("opus-4-7") || model_id.contains("opus-4.7") {
+                "xhigh"
+            } else {
+                "high"
+            }
+        }
+    }
+}
+
+/// Is thinking on for this request? `thinking_enabled` always wins; otherwise
+/// we infer from whether the caller passed a budget or (on adaptive-capable
+/// models) an effort. Models without `ThinkingStyle::Anthropic` never get a
+/// thinking block.
+fn thinking_requested(model: &Model, options: &StreamOptions) -> bool {
+    if model.thinking != ThinkingStyle::Anthropic {
+        return false;
+    }
+    match options.thinking_enabled {
+        Some(v) => v,
+        None => {
+            options.thinking_budget.is_some()
+                || (supports_adaptive_thinking(&model.id) && options.thinking_effort.is_some())
+        }
+    }
+}
+
+/// Build the `thinking` and (optional) `output_config` fields.
+///
+/// Callers must only invoke this once they've decided thinking is on — see
+/// `thinking_requested`. Branches:
+/// * adaptive model → `{type: "adaptive", display}` + optional `output_config`
+/// * other reasoning model → `{type: "enabled", budget_tokens, display}`
+fn build_thinking_config(
+    model: &Model,
+    options: &StreamOptions,
+) -> (Option<ThinkingConfig>, Option<OutputConfig>) {
+    let display = match options
+        .thinking_display
+        .unwrap_or(ThinkingDisplay::Summarized)
+    {
+        ThinkingDisplay::Summarized => "summarized",
+        ThinkingDisplay::Omitted => "omitted",
+    };
+
+    if supports_adaptive_thinking(&model.id) {
+        let output_config = options.thinking_effort.map(|e| OutputConfig {
+            effort: map_effort(e, &model.id),
+        });
+        (
+            Some(ThinkingConfig {
+                thinking_type: "adaptive",
+                budget_tokens: None,
+                display: Some(display),
+            }),
+            output_config,
+        )
+    } else {
+        let budget = options.thinking_budget.unwrap_or(1024);
+        (
+            Some(ThinkingConfig {
+                thinking_type: "enabled",
+                budget_tokens: Some(budget),
+                display: Some(display),
+            }),
+            None,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

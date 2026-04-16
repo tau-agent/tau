@@ -534,6 +534,9 @@ async fn run_loop_review(
         max_tokens: Some(16),
         temperature: Some(0.0),
         thinking_budget: None,
+        thinking_enabled: Some(false),
+        thinking_effort: None,
+        thinking_display: None,
     };
 
     // Single-shot LLM call with retry.

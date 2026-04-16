@@ -23,6 +23,8 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<ToolDef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 #[derive(Serialize)]
@@ -67,7 +69,20 @@ pub struct ToolDef {
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
     pub thinking_type: &'static str,
-    pub budget_tokens: u64,
+    /// Only sent for the non-adaptive (`"enabled"`) path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u64>,
+    /// How thinking content is returned: `"summarized"` (default when
+    /// thinking is on in tau) or `"omitted"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<&'static str>,
+}
+
+/// `output_config` sidecar used with adaptive thinking to pin the effort
+/// level. Only the `effort` field is serialized.
+#[derive(Serialize)]
+pub struct OutputConfig {
+    pub effort: &'static str,
 }
 
 // ---------------------------------------------------------------------------
