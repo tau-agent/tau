@@ -400,6 +400,11 @@ fn run_stream(
                             .map(|s| s.to_string())
                     })
                     .unwrap_or_else(|| format!("SSE error: {}", data));
+                // Drop any in-flight partial-JSON scratch buffers and reset the
+                // arguments of any tool-call block that had not yet completed,
+                // so the emitted error AssistantMessage never carries
+                // stale/partial tool arguments. Mirrors pi-mono commit e2b40dfc.
+                strip_partial_tool_state(&mut output, &mut tool_json_accum, &block_index_map);
                 output.stop_reason = StopReason::Error;
                 output.error_message = Some(error_msg);
                 send_event(
@@ -415,6 +420,10 @@ fn run_stream(
         }
     }
 
+    // Premature stream close (no message_stop and no SSE error). Treat as an
+    // error and scrub any partial-JSON scratch state so the emitted error
+    // AssistantMessage never carries half-parsed tool arguments.
+    strip_partial_tool_state(&mut output, &mut tool_json_accum, &block_index_map);
     output.stop_reason = StopReason::Error;
     output.error_message = Some("Stream ended unexpectedly".into());
     send_event(
@@ -425,6 +434,24 @@ fn run_stream(
         },
     )?;
     Ok(())
+}
+
+/// Drop the streaming partial-JSON scratch buffer and reset any tool-call
+/// block whose arguments were still being accumulated to an empty object.
+/// Used on error paths so callers replaying/persisting the error response
+/// never see stale partial tool arguments.
+fn strip_partial_tool_state(
+    output: &mut AssistantMessage,
+    tool_json_accum: &mut std::collections::HashMap<u64, String>,
+    block_index_map: &[(u64, usize)],
+) {
+    for (block_index, _) in tool_json_accum.drain() {
+        if let Some((_, ci)) = block_index_map.iter().find(|(bi, _)| *bi == block_index)
+            && let Some(AssistantContent::ToolCall(tc)) = output.content.get_mut(*ci)
+        {
+            tc.arguments = serde_json::Value::Object(Default::default());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,5 +1037,56 @@ mod tests {
             tools.is_none() || tools.unwrap().is_null(),
             "tools should be absent when empty"
         );
+    }
+
+    #[test]
+    fn strip_partial_tool_state_resets_in_progress_arguments() {
+        // Simulate the state mid-stream: one completed tool call (with real
+        // arguments) and one whose partial JSON is still in the scratch buffer.
+        let mut output = AssistantMessage::empty("anthropic-messages", "anthropic", "claude");
+        output.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc_complete".into(),
+            name: "done".into(),
+            arguments: serde_json::json!({"ok": true}),
+        }));
+        output.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc_in_flight".into(),
+            name: "in_flight".into(),
+            // Block_start always initializes arguments to {}; callers only
+            // assign a parsed value on content_block_stop.
+            arguments: serde_json::Value::Object(Default::default()),
+        }));
+        let block_index_map: Vec<(u64, usize)> = vec![(0, 0), (1, 1)];
+        let mut tool_json_accum: std::collections::HashMap<u64, String> =
+            std::collections::HashMap::new();
+        // Scratch buffer has a half-finished JSON fragment for block index 1.
+        tool_json_accum.insert(1, "{\"partial\": \"val".to_string());
+
+        strip_partial_tool_state(&mut output, &mut tool_json_accum, &block_index_map);
+
+        // Scratch buffer is drained.
+        assert!(tool_json_accum.is_empty());
+        // Completed tool call is untouched.
+        if let AssistantContent::ToolCall(tc) = &output.content[0] {
+            assert_eq!(tc.arguments, serde_json::json!({"ok": true}));
+        } else {
+            panic!("expected ToolCall at index 0");
+        }
+        // In-flight tool call has empty arguments (no partial-JSON residue).
+        if let AssistantContent::ToolCall(tc) = &output.content[1] {
+            assert_eq!(tc.arguments, serde_json::Value::Object(Default::default()));
+        } else {
+            panic!("expected ToolCall at index 1");
+        }
+
+        // Re-serializing the error message must not expose any partial-JSON
+        // scratch fields (our wire type has none, but assert the shape).
+        let wire = serde_json::to_value(&output).expect("serialize");
+        let content = wire["content"].as_array().expect("content array");
+        for block in content {
+            let obj = block.as_object().expect("object");
+            assert!(!obj.contains_key("partial_json"));
+            assert!(!obj.contains_key("partialJson"));
+        }
     }
 }
