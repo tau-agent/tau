@@ -321,13 +321,45 @@ async fn run_inner(
         .draw(|f| ui::draw(f, &app, &app.theme))
         .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
 
+    // Render throttling: under streaming load (one event per token) the
+    // naive "draw on every event" approach redraws hundreds of times per
+    // second, wasting CPU and producing visible flicker. Coalesce draw
+    // requests to ~30 FPS while streaming; in Input/picker modes always
+    // draw immediately so keystrokes and resizes remain snappy.
+    // Ref: pi-mono 6f5f37f8.
+    const MIN_DRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+    let mut last_draw = std::time::Instant::now();
+    // `dirty` is always flipped true by every event we receive and reset
+    // false after a successful draw.  In the current design every loop
+    // iteration starts with an event which marks it dirty, so the flag is
+    // effectively always true when checked — but keeping it explicit
+    // makes the throttling logic easier to reason about and matches the
+    // upstream pi-mono pattern.
+    #[allow(unused_assignments)]
+    let mut dirty = false;
+
     // Main loop
     loop {
         let Some(event) = event_loop.next().await else {
             break;
         };
 
+        // Terminal resize and user keystrokes must redraw immediately —
+        // throttling them makes the TUI feel laggy. Stream deltas and
+        // server responses participate in throttling.
+        let force_draw = matches!(
+            &event,
+            crate::events::Event::Terminal(crossterm::event::Event::Resize(_, _))
+                | crate::events::Event::Terminal(crossterm::event::Event::Key(_))
+                | crate::events::Event::Terminal(crossterm::event::Event::Paste(_))
+        );
+
         let action = app.handle_event(event);
+
+        // Every event is potentially visually relevant. Instead of trying
+        // to classify events, mark dirty unconditionally and rely on the
+        // throttle below to coalesce during streaming.
+        dirty = true;
 
         // Execute action
         if let Some(action) = action {
@@ -756,7 +788,7 @@ async fn run_inner(
             break;
         }
 
-        // Only tick when streaming (spinner animation)
+        // Only tick when streaming (spinner animation + throttled redraws).
         event_loop.set_ticking(app.mode == AppMode::Streaming);
 
         // Periodic subscription usage refresh (every 60s)
@@ -767,10 +799,19 @@ async fn run_inner(
             send_request_and_recv(Request::GetSubscriptionUsage, server_tx.clone()).await?;
         }
 
-        // Draw
-        terminal
-            .draw(|f| ui::draw(f, &app, &app.theme))
-            .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+        // Draw, with streaming-mode throttling.
+        let throttle_active = app.mode == AppMode::Streaming;
+        let interval_ok = last_draw.elapsed() >= MIN_DRAW_INTERVAL;
+        if dirty && (force_draw || !throttle_active || interval_ok) {
+            terminal
+                .draw(|f| ui::draw(f, &app, &app.theme))
+                .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+            last_draw = std::time::Instant::now();
+            #[allow(unused_assignments)]
+            {
+                dirty = false;
+            }
+        }
     }
 
     // Cancel any in-flight agent turn so it doesn't keep running after exit
