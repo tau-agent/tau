@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter};
+use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
@@ -127,6 +128,34 @@ pub struct PluginHandle {
     bg_write_tx: Option<smol::channel::Sender<PluginRequest>>,
 }
 
+/// Resolve a cwd path, falling back to the nearest existing ancestor if the
+/// original directory has been removed (e.g. a cleaned-up worktree).
+fn resolve_cwd(cwd: &str) -> String {
+    let path = Path::new(cwd);
+    if path.is_dir() {
+        return cwd.to_string();
+    }
+    // Walk up to find the nearest existing ancestor.
+    let mut ancestor = path.parent();
+    while let Some(p) = ancestor {
+        if p.is_dir() {
+            eprintln!(
+                "plugin: cwd '{}' does not exist, falling back to '{}'",
+                cwd,
+                p.display()
+            );
+            return p.to_string_lossy().to_string();
+        }
+        ancestor = p.parent();
+    }
+    // Last resort.
+    eprintln!(
+        "plugin: cwd '{}' does not exist and no ancestor found, falling back to /tmp",
+        cwd
+    );
+    "/tmp".to_string()
+}
+
 impl PluginHandle {
     /// Spawn a plugin process and read its registration.
     pub fn spawn(
@@ -138,9 +167,10 @@ impl PluginHandle {
             return Err(crate::Error::Io("empty plugin command".into()));
         }
 
+        let effective_cwd = resolve_cwd(cwd);
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..])
-            .current_dir(cwd)
+            .current_dir(&effective_cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -596,12 +626,12 @@ impl PluginHandle {
         }
 
         let cmd = &self.spawn_command;
-        let cwd = &self.spawn_cwd;
+        let effective_cwd = resolve_cwd(&self.spawn_cwd);
 
         let mut cmd_proc = Command::new(&cmd[0]);
         cmd_proc
             .args(&cmd[1..])
-            .current_dir(cwd)
+            .current_dir(&effective_cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

@@ -386,6 +386,22 @@ pub fn merge_task(
     }
     let _ = db.clear_worktree(task_id);
 
+    // 7a'. Update session cwds: any session still pointing at the removed
+    // worktree should be moved back to the project root so that plugin
+    // respawns don't fail with "No such file or directory".
+    if let Ok(sessions) = db.get_sessions(task_id) {
+        for ts in &sessions {
+            let _ = server_request(
+                writer,
+                reader,
+                Request::SetCwd {
+                    session_id: ts.session_id.clone(),
+                    cwd: project_dir.to_string(),
+                },
+            );
+        }
+    }
+
     // 7b. Delete the task branch (no longer needed after merge)
     let (output, br_err) = execute_bash(
         writer,

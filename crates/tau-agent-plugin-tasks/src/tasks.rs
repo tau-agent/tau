@@ -1460,6 +1460,19 @@ fn auto_archive_task_session(
                     let _ = crate::tasks_git::remove_worktree(&repo_root, wt_path);
                     let _ = crate::tasks_git::delete_branch(&repo_root, branch);
                 }
+                // Update session cwds so plugin respawns don't fail.
+                if let Ok(sessions) = db.get_sessions(task.id) {
+                    for ts in &sessions {
+                        let _ = crate::tasks_scheduler::server_request(
+                            writer,
+                            reader,
+                            tau_agent_plugin::Request::SetCwd {
+                                session_id: ts.session_id.clone(),
+                                cwd: project_path.clone(),
+                            },
+                        );
+                    }
+                }
             }
         }
         let _ = db.clear_worktree(task.id);
@@ -1925,6 +1938,19 @@ pub fn run_tasks_plugin() {
                                 eprintln!(
                                     "tasks: startup cleanup: failed to delete branch for task {}: {}",
                                     task.id, e
+                                );
+                            }
+                        }
+                        // Update session cwds so plugin respawns don't fail.
+                        if let Ok(sessions) = db.get_sessions(task.id) {
+                            for ts in &sessions {
+                                let _ = crate::tasks_scheduler::server_request(
+                                    &mut writer,
+                                    &mut chan_reader,
+                                    tau_agent_plugin::Request::SetCwd {
+                                        session_id: ts.session_id.clone(),
+                                        cwd: project_path.clone(),
+                                    },
                                 );
                             }
                         }
