@@ -870,6 +870,7 @@ fn is_retryable(err_msg: &str) -> bool {
         || lower.contains("503")
         || lower.contains("service unavailable")
         || lower.contains("internal server error")
+        || lower.contains("ended without")
 }
 
 /// Check if an error indicates context window overflow.
@@ -1298,6 +1299,10 @@ mod tests {
         assert!(is_retryable("HTTP 529 overloaded"));
         assert!(is_retryable("rate limit exceeded (429)"));
         assert!(is_retryable("503 Service Unavailable"));
+        // Provider-agnostic premature-close ("ended without sending chunks") —
+        // observed on both Anthropic and OpenAI streams.
+        assert!(is_retryable("request ended without sending chunks"));
+        assert!(is_retryable("stream Ended Without response"));
         assert!(!is_retryable("invalid api key"));
         // Timeouts are NOT matched by is_retryable (separate function)
         assert!(!is_retryable("timeout: connect timed out"));
