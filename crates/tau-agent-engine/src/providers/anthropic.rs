@@ -1194,4 +1194,219 @@ mod tests {
             assert!(!obj.contains_key("partialJson"));
         }
     }
+
+    // -----------------------------------------------------------------
+    // Adaptive thinking / thinkingDisplay
+    // -----------------------------------------------------------------
+
+    fn model_by_id(id: &str) -> Model {
+        models()
+            .into_iter()
+            .find(|m| m.id == id)
+            .unwrap_or_else(|| panic!("model {id} not in predefined list"))
+    }
+
+    fn build_for(model: &Model, options: &StreamOptions) -> serde_json::Value {
+        let ctx = simple_context(None, "hi");
+        let req = build_request_body(model, &ctx, options).expect("build_request_body");
+        serde_json::to_value(req).expect("serialize")
+    }
+
+    #[test]
+    fn supports_adaptive_thinking_matches_known_models() {
+        assert!(supports_adaptive_thinking("claude-opus-4-6"));
+        assert!(supports_adaptive_thinking("claude-opus-4.6"));
+        assert!(supports_adaptive_thinking("claude-opus-4-7"));
+        assert!(supports_adaptive_thinking("claude-opus-4.7"));
+        assert!(supports_adaptive_thinking("claude-sonnet-4-6"));
+        assert!(supports_adaptive_thinking("claude-sonnet-4.6"));
+        // Variants with date suffixes still match on substring.
+        assert!(supports_adaptive_thinking("claude-opus-4-7-20260101"));
+
+        assert!(!supports_adaptive_thinking("claude-opus-4-5"));
+        assert!(!supports_adaptive_thinking("claude-sonnet-4-5"));
+        assert!(!supports_adaptive_thinking("claude-sonnet-3-5"));
+        assert!(!supports_adaptive_thinking("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn opus_4_7_xhigh_emits_adaptive_with_xhigh_effort() {
+        let model = model_by_id("claude-opus-4-7");
+        let opts = StreamOptions {
+            thinking_enabled: Some(true),
+            thinking_effort: Some(ThinkingEffort::XHigh),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        assert!(
+            body["thinking"].get("budget_tokens").is_none(),
+            "adaptive mode must not send budget_tokens: {body}"
+        );
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn opus_4_6_xhigh_maps_to_max_effort() {
+        let model = model_by_id("claude-opus-4-6");
+        let opts = StreamOptions {
+            thinking_enabled: Some(true),
+            thinking_effort: Some(ThinkingEffort::XHigh),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    #[test]
+    fn sonnet_4_6_xhigh_falls_back_to_high() {
+        let model = model_by_id("claude-sonnet-4-6");
+        let opts = StreamOptions {
+            thinking_enabled: Some(true),
+            thinking_effort: Some(ThinkingEffort::XHigh),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn adaptive_model_without_effort_omits_output_config() {
+        let model = model_by_id("claude-opus-4-7");
+        let opts = StreamOptions {
+            thinking_enabled: Some(true),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+        let output_config = body.get("output_config");
+        assert!(
+            output_config.is_none() || output_config.unwrap().is_null(),
+            "output_config should be absent when no effort set: {body}"
+        );
+    }
+
+    #[test]
+    fn older_model_with_budget_uses_enabled_branch() {
+        let model = model_by_id("claude-opus-4-5");
+        let opts = StreamOptions {
+            thinking_enabled: Some(true),
+            thinking_budget: Some(1024),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 1024);
+        assert_eq!(body["thinking"]["display"], "summarized");
+        let output_config = body.get("output_config");
+        assert!(output_config.is_none() || output_config.unwrap().is_null());
+    }
+
+    #[test]
+    fn thinking_enabled_false_omits_thinking_field() {
+        let model = model_by_id("claude-opus-4-7");
+        let opts = StreamOptions {
+            thinking_enabled: Some(false),
+            thinking_effort: Some(ThinkingEffort::High),
+            thinking_budget: Some(1024),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert!(
+            body.get("thinking").map_or(true, |v| v.is_null()),
+            "thinking must be absent when thinking_enabled=Some(false): {body}"
+        );
+        assert!(
+            body.get("output_config").map_or(true, |v| v.is_null()),
+            "output_config must be absent when thinking_enabled=Some(false): {body}"
+        );
+    }
+
+    #[test]
+    fn thinking_display_omitted_serializes_as_omitted() {
+        let model = model_by_id("claude-opus-4-7");
+        let opts = StreamOptions {
+            thinking_enabled: Some(true),
+            thinking_display: Some(ThinkingDisplay::Omitted),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert_eq!(body["thinking"]["display"], "omitted");
+    }
+
+    #[test]
+    fn thinking_budget_without_enabled_still_triggers_on_legacy_model() {
+        // Backward-compat: existing callers that only pass thinking_budget
+        // should still get thinking enabled.
+        let model = model_by_id("claude-opus-4-5");
+        let opts = StreamOptions {
+            thinking_budget: Some(2048),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 2048);
+    }
+
+    #[test]
+    fn thinking_budget_on_adaptive_model_promotes_to_adaptive() {
+        // thinking_budget is ignored in adaptive mode; a budget alone must
+        // not emit the legacy `{type: "enabled"}` shape on an adaptive model.
+        let model = model_by_id("claude-opus-4-7");
+        let opts = StreamOptions {
+            thinking_budget: Some(2048),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert!(body["thinking"].get("budget_tokens").is_none());
+    }
+
+    #[test]
+    fn non_anthropic_thinking_style_suppresses_thinking() {
+        // Even with thinking_enabled=true, a model whose ThinkingStyle isn't
+        // Anthropic must not emit a thinking block (e.g. for OpenAI-compat
+        // models routed through this provider in theory).
+        let mut model = model_by_id("claude-opus-4-7");
+        model.thinking = ThinkingStyle::None;
+        let opts = StreamOptions {
+            thinking_enabled: Some(true),
+            thinking_effort: Some(ThinkingEffort::High),
+            ..Default::default()
+        };
+        let body = build_for(&model, &opts);
+        assert!(
+            body.get("thinking").map_or(true, |v| v.is_null()),
+            "non-anthropic ThinkingStyle must suppress thinking: {body}"
+        );
+    }
+
+    #[test]
+    fn no_thinking_options_omits_thinking_field() {
+        let model = model_by_id("claude-opus-4-7");
+        let body = build_for(&model, &StreamOptions::default());
+        assert!(
+            body.get("thinking").map_or(true, |v| v.is_null()),
+            "default StreamOptions must not emit thinking: {body}"
+        );
+        assert!(body.get("output_config").map_or(true, |v| v.is_null()));
+    }
+
+    #[test]
+    fn opus_4_7_model_entry_matches_pi_mono() {
+        // Sanity: cost + context-window + max_tokens should match pi-mono
+        // a91978cf (Anthropic override for Opus 4.7).
+        let m = model_by_id("claude-opus-4-7");
+        assert_eq!(m.cost.input, 5.0);
+        assert_eq!(m.cost.output, 25.0);
+        assert_eq!(m.cost.cache_read, 0.5);
+        assert_eq!(m.cost.cache_write, 6.25);
+        assert_eq!(m.context_window, 1_000_000);
+        assert_eq!(m.max_tokens, 128_000);
+        assert_eq!(m.thinking, ThinkingStyle::Anthropic);
+    }
 }
