@@ -210,10 +210,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Create a new task in the project task board".into()),
             prompt_guidelines: vec![
-                "Top-level tasks start in 'interactive' state for spec refinement".into(),
-                "Subtasks (with parent_id) start in 'planning' state by default, or 'ready' if skip_planning=true".into(),
-                "WARNING: subtasks are AUTO-DISPATCHED immediately on creation. A planning subtask gets a planning session right away; a ready subtask gets a worker session. Do NOT create subtasks unless you want them to start working immediately.".into(),
-                "Valid states: interactive, planning, refining, ready, active, review, approved, merging, failed, merged, closed".into(),
+                "Top-level tasks start in 'interactive' for spec refinement; subtasks start in 'planning' (or 'ready' with skip_planning=true) and are auto-dispatched immediately on creation — a planning subtask gets a planning session, a ready subtask gets a worker session.".into(),
             ],
         },
         PluginToolDef {
@@ -343,14 +340,9 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Update task fields (title, state, priority, tags, etc.)".into()),
             prompt_guidelines: vec![
-                "State transitions are validated: interactive->planning->refining->ready->active->review->approved->merging->merged".into(),
-                "WARNING: some transitions AUTO-DISPATCH sessions: planning->refining launches a refining session, active->review launches a review session. Wait for these sessions to complete before taking further action on the task.".into(),
-                "Shortcuts: interactive->ready (skip planning), interactive->approved, active->approved (skip_review only)".into(),
-                "Planning cycle: planning->refining, refining->planning (revise), refining->ready (approved), refining->interactive (scope expansion)".into(),
-                "Backward (error recovery): review->active, approved->active/ready/interactive, merging->active (recoverable), merging->failed (terminal), failed->active (manual retry)".into(),
-                "Universal overrides: any state->closed (manual close), any state->interactive (human takes over, except from merged), any state->failed".into(),
-                "active -> approved is only allowed if skip_review=true on the task".into(),
-                "When working in an interactive task session and the user wants to start implementation, transition the task to 'ready' state. Do NOT edit project files directly — the scheduler will create an isolated branch/worktree and dispatch a worker session. Make sure affected_files is set before transitioning.".into(),
+                "State transitions are validated — invalid attempts are rejected with a clear error (active→approved additionally requires skip_review=true).".into(),
+                "Some transitions auto-dispatch sessions (planning→refining, active→review); don't take further action on the task until that session completes.".into(),
+                "When working in an interactive task session and the user wants to start implementation, transition the task to 'ready' (with affected_files set) — do NOT edit project files directly. The scheduler creates an isolated branch/worktree and dispatches a worker session.".into(),
             ],
         },
         PluginToolDef {
@@ -455,11 +447,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 }
             }),
             prompt_snippet: Some("Run a scheduling pass to prepare ready tasks for dispatch".into()),
-            prompt_guidelines: vec![
-                "Finds all ready and planning tasks, selects a non-conflicting batch based on affected_files, creates branches/worktrees for ready tasks, transitions them.".into(),
-                "Planning tasks are dispatched without worktrees (read-only sessions).".into(),
-                "After scheduling, use task_dispatch to create sessions and start work.".into(),
-            ],
+            prompt_guidelines: vec![],
         },
         PluginToolDef {
             name: "task_merge".into(),
@@ -475,10 +463,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "required": ["id"]
             }),
             prompt_snippet: Some("Merge an approved task into its target branch".into()),
-            prompt_guidelines: vec![
-                "Task must be in 'approved' state. Transitions to 'merging', then 'merged' on success, back to 'active' on recoverable error (rebase/checklist), or 'failed' on terminal error.".into(),
-                "Runs: rebase onto target, project checklist, fast-forward merge.".into(),
-            ],
+            prompt_guidelines: vec![],
         },
         PluginToolDef {
             name: "task_dispatch".into(),
@@ -494,11 +479,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "required": ["id"]
             }),
             prompt_snippet: Some("Dispatch a task: create a session and start work on it".into()),
-            prompt_guidelines: vec![
-                "Creates a new session with cwd set to the task's worktree.".into(),
-                "Sends an initial chat message with instructions to read the task spec and do the work.".into(),
-                "The task must be active (prepared by task_schedule) or ready (will be prepared inline).".into(),
-            ],
+            prompt_guidelines: vec![],
         },
         PluginToolDef {
             name: "task_status".into(),
@@ -514,8 +495,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Show active/queued/blocked tasks with wait reasons".into()),
             prompt_guidelines: vec![
-                "Shows what's running, what's queued, and why queued tasks are waiting.".into(),
-                "Wait reasons include: dependency not met, file conflict with active task, budget exhausted, not yet scheduled.".into(),
+                "Wait reasons: dependency not met, file conflict with an active task, budget exhausted, not yet scheduled.".into(),
             ],
         },
     ]
@@ -3380,6 +3360,43 @@ mod tests {
                 .unwrap()
                 .contains("claim")
         );
+    }
+
+    #[test]
+    fn test_task_prompt_guidelines_trimmed() {
+        // Regression test for the prompt-guideline trim (task #493).
+        // The task_* tools collectively contribute a bounded number of
+        // guideline strings to the system prompt. Keep this tight so that
+        // future additions are a deliberate choice rather than drift.
+        let tools = tasks_tools();
+        let total: usize = tools
+            .iter()
+            .filter(|t| t.name.starts_with("task_"))
+            .map(|t| t.prompt_guidelines.len())
+            .sum();
+        assert!(
+            total < 12,
+            "task_* prompt_guidelines total should stay small; got {}",
+            total
+        );
+
+        // task_update's state-machine enumerations were folded into three bullets.
+        let task_update = tools.iter().find(|t| t.name == "task_update").unwrap();
+        assert_eq!(
+            task_update.prompt_guidelines.len(),
+            3,
+            "task_update should have exactly 3 guidelines after the trim"
+        );
+
+        // Tools whose description fully covers behaviour should carry no guidelines.
+        for name in ["task_schedule", "task_merge", "task_dispatch"] {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            assert!(
+                tool.prompt_guidelines.is_empty(),
+                "{} should have no prompt_guidelines",
+                name
+            );
+        }
     }
 
     // ----- dependency enforcement tests (plugin layer) -----
