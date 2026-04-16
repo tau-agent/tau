@@ -691,6 +691,23 @@ fn map_stop_reason(reason: &str) -> StopReason {
 pub fn models() -> Vec<Model> {
     vec![
         Model {
+            id: "claude-opus-4-7".into(),
+            name: "Claude Opus 4.7".into(),
+            api: API_ID.into(),
+            provider: "anthropic".into(),
+            base_url: DEFAULT_BASE_URL.into(),
+            thinking: ThinkingStyle::Anthropic,
+            cost: ModelCost {
+                input: 5.0,
+                output: 25.0,
+                cache_read: 0.5,
+                cache_write: 6.25,
+            },
+            context_window: 1_000_000,
+            max_tokens: 128_000,
+            headers: Default::default(),
+        },
+        Model {
             id: "claude-sonnet-4-6".into(),
             name: "Claude Sonnet 4.6".into(),
             api: API_ID.into(),
