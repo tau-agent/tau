@@ -2697,7 +2697,17 @@ impl App {
                 self.turn_text_finalized = false;
             }
             StreamEvent::Status { message } => {
-                self.messages.push(MessageItem::Status { text: message });
+                // Live retry countdown: consecutive "Retrying ..." status
+                // messages replace-in-place so the user sees a single line
+                // that ticks down rather than N stale lines stacking up.
+                if message.starts_with("Retrying ")
+                    && let Some(MessageItem::Status { text }) = self.messages.last_mut()
+                    && text.starts_with("Retrying ")
+                {
+                    *text = message;
+                } else {
+                    self.messages.push(MessageItem::Status { text: message });
+                }
             }
             _ => {}
         }
@@ -4157,5 +4167,81 @@ mod tests {
         app.restore_messages(&messages);
 
         assert_eq!(app.input_history, vec!["first message", "second message"]);
+    }
+
+    // ---- retry countdown replace-in-place tests ----
+
+    /// A series of "Retrying ..." status events must collapse into a single
+    /// message that gets overwritten in place, so the user sees one live
+    /// countdown line rather than N stacked stale lines.
+    #[test]
+    fn retry_status_replaces_in_place() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+
+        for secs in [5u64, 4, 3, 2, 1] {
+            app.handle_stream_event(StreamEvent::Status {
+                message: format!("Retrying (attempt 1/3) in {secs}s... (timeout: boom)"),
+            });
+        }
+
+        let retry_statuses: Vec<&str> = app
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                MessageItem::Status { text } if text.starts_with("Retrying ") => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            retry_statuses.len(),
+            1,
+            "5 consecutive retry status events should collapse to 1, got {retry_statuses:?}"
+        );
+        assert!(
+            retry_statuses[0].contains("in 1s"),
+            "final status should carry the last countdown value, got {:?}",
+            retry_statuses[0]
+        );
+    }
+
+    /// A non-retry status following a retry status must not overwrite the
+    /// retry line — only consecutive retry messages collapse.
+    #[test]
+    fn non_retry_status_does_not_replace_retry() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+
+        app.handle_stream_event(StreamEvent::Status {
+            message: "Retrying (attempt 1/3) in 3s... (timeout: boom)".into(),
+        });
+        app.handle_stream_event(StreamEvent::Status {
+            message: "some other status".into(),
+        });
+        app.handle_stream_event(StreamEvent::Status {
+            message: "Retrying (attempt 1/3) in 2s... (timeout: boom)".into(),
+        });
+
+        let statuses: Vec<&str> = app
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                MessageItem::Status { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // We expect three status items: retry(3s), other, retry(2s).
+        assert_eq!(
+            statuses.len(),
+            3,
+            "expected 3 distinct status items, got {statuses:?}"
+        );
+        assert!(statuses[0].contains("in 3s"));
+        assert_eq!(statuses[1], "some other status");
+        assert!(statuses[2].contains("in 2s"));
     }
 }

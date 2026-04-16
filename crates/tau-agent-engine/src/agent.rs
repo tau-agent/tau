@@ -152,13 +152,25 @@ pub fn repair_messages(messages: &[Message]) -> Vec<Message> {
     stubs
 }
 
-/// Async cancellable sleep.
-/// Returns `Err(Cancelled)` if should_stop returns true during the sleep.
-async fn cancellable_sleep(
+/// Cancellable retry sleep with a live per-second countdown.
+///
+/// Emits a `StreamEvent::Status` message once per second with a decrementing
+/// "Retrying in Xs..." text. The TUI treats consecutive Status messages that
+/// start with "Retrying " as replace-in-place (see `app.rs`), so the user sees
+/// a single status line that counts down rather than many stale lines.
+///
+/// Returns `Err(Cancelled)` if `should_stop` fires during the countdown.
+async fn retry_countdown(
     delay: std::time::Duration,
+    attempt: usize,
+    max_attempts: usize,
+    kind: &str,
+    err_msg: &str,
+    event_tx: &EventSender,
     should_stop: Option<&(dyn Fn() -> bool + Send + Sync)>,
 ) -> tau_agent_base::Result<()> {
     let deadline = std::time::Instant::now() + delay;
+    let mut last_seconds_shown: Option<u64> = None;
     loop {
         if should_stop.is_some_and(|f| f()) {
             return Err(tau_agent_base::Error::Cancelled);
@@ -167,6 +179,20 @@ async fn cancellable_sleep(
         if remaining.is_zero() {
             return Ok(());
         }
+        // Round up so the user sees e.g. "8s" for 7.4s remaining.
+        let remaining_secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+        if last_seconds_shown != Some(remaining_secs) {
+            let _ = event_tx.try_send(StreamEvent::Status {
+                message: format!(
+                    "Retrying (attempt {}/{}) in {}s... ({}: {})",
+                    attempt, max_attempts, remaining_secs, kind, err_msg
+                ),
+            });
+            last_seconds_shown = Some(remaining_secs);
+        }
+        // Sleep in small chunks so cancellation and countdown updates both
+        // stay responsive. 100 ms is fast enough that the "Xs" display is
+        // always current within a tenth of a second.
         let chunk = remaining.min(std::time::Duration::from_millis(100));
         smol::Timer::after(chunk).await;
     }
@@ -690,33 +716,43 @@ async fn stream_with_retry(
                         })
                 };
 
-                let delay_human = if delay_ms == 0 {
-                    "immediately".to_string()
+                let kind = if timeout {
+                    "timeout"
                 } else {
-                    format!("in {}", format_duration_human(delay_ms))
+                    "retryable error"
                 };
-                let status_msg = format!(
-                    "{} (attempt {}/{}), retrying {}: {}",
-                    if timeout {
-                        "timeout"
-                    } else {
-                        "retryable error"
-                    },
+                eprintln!(
+                    "{} (attempt {}/{}), retrying in {}: {}",
+                    kind,
                     attempt + 1,
                     max_retries_for_error,
-                    delay_human,
+                    if delay_ms == 0 {
+                        "0s".to_string()
+                    } else {
+                        format_duration_human(delay_ms)
+                    },
                     err_msg
                 );
-                eprintln!("{}", status_msg);
-                let _ = event_tx.try_send(StreamEvent::Status {
-                    message: status_msg,
-                });
                 let _ = event_tx.try_send(StreamEvent::Phase {
                     phase: tau_agent_base::types::AgentPhase::RateLimited,
                 });
-                if delay_ms > 0 {
-                    cancellable_sleep(
+                if delay_ms == 0 {
+                    let _ = event_tx.try_send(StreamEvent::Status {
+                        message: format!(
+                            "Retrying (attempt {}/{}) immediately: {}",
+                            attempt + 1,
+                            max_retries_for_error,
+                            err_msg
+                        ),
+                    });
+                } else {
+                    retry_countdown(
                         std::time::Duration::from_millis(delay_ms),
+                        attempt + 1,
+                        max_retries_for_error,
+                        kind,
+                        err_msg,
+                        event_tx,
                         config.should_stop.as_deref(),
                     )
                     .await?;
@@ -2100,5 +2136,162 @@ mod tests {
             }),
         ];
         assert!(repair_messages(&messages).is_empty());
+    }
+
+    // ---- retry_countdown tests ----
+
+    #[test]
+    fn retry_countdown_emits_one_status_per_second() {
+        smol::block_on(async {
+            let (tx, rx) = smol::channel::unbounded();
+            // 3s delay should yield at least 3 distinct countdown values
+            // (3s, 2s, 1s) — the final "0s" never renders because the loop
+            // exits once remaining hits zero.
+            retry_countdown(
+                std::time::Duration::from_secs(3),
+                2,
+                5,
+                "timeout",
+                "stream stalled",
+                &tx,
+                None,
+            )
+            .await
+            .expect("countdown should complete");
+
+            let mut messages = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let StreamEvent::Status { message } = ev {
+                    messages.push(message);
+                }
+            }
+
+            // At minimum we should see countdown messages for 3s, 2s, 1s —
+            // one each (consecutive duplicates are suppressed).
+            assert!(
+                messages.len() >= 3,
+                "expected >=3 countdown status messages, got {}: {:?}",
+                messages.len(),
+                messages
+            );
+            // All must start with the standard prefix so the TUI replaces
+            // them in place.
+            for m in &messages {
+                assert!(
+                    m.starts_with("Retrying "),
+                    "status should start with 'Retrying ', got: {m:?}"
+                );
+                assert!(
+                    m.contains("attempt 2/5"),
+                    "status should carry attempt info, got: {m:?}"
+                );
+                assert!(
+                    m.contains("timeout: stream stalled"),
+                    "status should carry the error context, got: {m:?}"
+                );
+            }
+            // The seconds number should be monotonically non-increasing.
+            let secs: Vec<u64> = messages
+                .iter()
+                .filter_map(|m| {
+                    let after = m.split_once(" in ")?.1;
+                    let num = after.split_once('s').map(|(n, _)| n)?;
+                    num.parse().ok()
+                })
+                .collect();
+            assert!(!secs.is_empty(), "failed to parse any seconds values");
+            for w in secs.windows(2) {
+                assert!(
+                    w[0] >= w[1],
+                    "countdown should be non-increasing, got {secs:?}"
+                );
+            }
+            // No duplicate consecutive seconds.
+            for w in secs.windows(2) {
+                assert!(w[0] != w[1], "consecutive duplicates: {secs:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn retry_countdown_cancels_early() {
+        smol::block_on(async {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let cancelled_clone = cancelled.clone();
+
+            // Trip cancellation after a short delay.
+            let flipper = smol::spawn(async move {
+                smol::Timer::after(std::time::Duration::from_millis(150)).await;
+                cancelled_clone.store(true, Ordering::Relaxed);
+            });
+
+            let (tx, _rx) = smol::channel::unbounded();
+            let cancelled_fn = cancelled.clone();
+            let should_stop: Box<dyn Fn() -> bool + Send + Sync> =
+                Box::new(move || cancelled_fn.load(Ordering::Relaxed));
+
+            let start = std::time::Instant::now();
+            // Ask for a 30 s sleep; it must abort well before that.
+            let result = retry_countdown(
+                std::time::Duration::from_secs(30),
+                1,
+                3,
+                "rate limit",
+                "429",
+                &tx,
+                Some(should_stop.as_ref()),
+            )
+            .await;
+            let elapsed = start.elapsed();
+
+            flipper.await;
+
+            assert!(
+                matches!(result, Err(tau_agent_base::Error::Cancelled)),
+                "expected Err(Cancelled), got {result:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "cancellation should be prompt, took {elapsed:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn retry_countdown_short_delay_emits_at_least_one_status() {
+        smol::block_on(async {
+            let (tx, rx) = smol::channel::unbounded();
+            // Sub-second delay still counts as "1s remaining" on first poll.
+            retry_countdown(
+                std::time::Duration::from_millis(300),
+                1,
+                3,
+                "timeout",
+                "short",
+                &tx,
+                None,
+            )
+            .await
+            .expect("countdown should complete");
+
+            let messages: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter_map(|e| match e {
+                    StreamEvent::Status { message } => Some(message),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !messages.is_empty(),
+                "expected at least one status message for sub-second delay"
+            );
+            assert!(
+                messages[0].starts_with("Retrying "),
+                "status should use standard prefix, got: {:?}",
+                messages[0]
+            );
+        });
     }
 }
