@@ -58,16 +58,30 @@ impl ToolOutput {
 
 /// A registered tool with its definition and executor.
 /// The executor receives (arguments, cwd).
+///
+/// `prepare_arguments` is an optional pre-validation hook that runs before
+/// `execute`. It lets a tool silently accept legacy argument shapes from
+/// resumed old sessions without polluting the public JSON schema (analogous
+/// to pi-mono's `prepareArguments`).
 pub struct ToolDef {
     pub tool: Tool,
     #[allow(clippy::type_complexity)]
     pub execute: Box<dyn Fn(serde_json::Value, &str) -> ToolOutput + Send + Sync>,
+    #[allow(clippy::type_complexity)]
+    pub prepare_arguments:
+        Option<Box<dyn Fn(serde_json::Value) -> serde_json::Value + Send + Sync>>,
 }
 
 /// Execute a tool call against the registered tools.
 pub fn execute_tool(tools: &[ToolDef], tool_call: &ToolCall, cwd: &str) -> ToolResultMessage {
     let result = match tools.iter().find(|t| t.tool.name == tool_call.name) {
-        Some(def) => (def.execute)(tool_call.arguments.clone(), cwd),
+        Some(def) => {
+            let args = match &def.prepare_arguments {
+                Some(prepare) => prepare(tool_call.arguments.clone()),
+                None => tool_call.arguments.clone(),
+            };
+            (def.execute)(args, cwd)
+        }
         None => ToolOutput::error(format!("unknown tool: {}", tool_call.name)),
     };
 

@@ -26,6 +26,7 @@ pub fn tool_def() -> ToolDef {
             }),
         },
         execute: Box::new(execute),
+        prepare_arguments: None,
     }
 }
 
