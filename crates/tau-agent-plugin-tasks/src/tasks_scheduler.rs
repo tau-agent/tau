@@ -461,7 +461,8 @@ pub fn dispatch(
     let project_instructions =
         tasks_config::load_project_instructions(project_path, Some(&task.project_name), "worker")
             .unwrap_or_default();
-    let chat_msg = build_initial_message(&task, &merge_target, &project_instructions);
+    let checklist = crate::tasks_merge::load_checklist(project_path, Some(&task.project_name));
+    let chat_msg = build_initial_message(&task, &merge_target, &project_instructions, &checklist);
     let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
@@ -830,7 +831,8 @@ pub fn dispatch_review(
     let merge_target = db
         .get_merge_target(task.id)
         .unwrap_or_else(|_| "main".into());
-    let chat_msg = build_review_message(task, &project_instructions, &merge_target);
+    let checklist = crate::tasks_merge::load_checklist(project_path, Some(&task.project_name));
+    let chat_msg = build_review_message(task, &project_instructions, &merge_target, &checklist);
     let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.clone(),
         text: chat_msg,
@@ -864,7 +866,12 @@ pub fn dispatch_review(
 }
 
 /// Build the initial message for a review session.
-fn build_review_message(task: &Task, project_instructions: &str, merge_target: &str) -> String {
+fn build_review_message(
+    task: &Task,
+    project_instructions: &str,
+    merge_target: &str,
+    checklist: &[crate::tasks_merge::CheckItem],
+) -> String {
     let branch = task.branch.as_deref().unwrap_or("(unknown)");
     let worktree = task.worktree_path.as_deref().unwrap_or("(unknown)");
 
@@ -877,6 +884,29 @@ fn build_review_message(task: &Task, project_instructions: &str, merge_target: &
         )
     } else {
         String::new()
+    };
+
+    // Build the checklist line for the review list + optional run block.
+    let (checklist_line, checklist_run_block) = if checklist.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let line = format!(
+            "5. Run these project checks and verify they pass:\n{}",
+            checklist
+                .iter()
+                .map(|c| format!("   - `{}` ({})", c.command, c.name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let block = format!(
+            "Run these checks before making your decision:\n{}\n\n",
+            checklist
+                .iter()
+                .map(|c| format!("- `{}`", c.command))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        (line, block)
     };
 
     let mut msg = format!(
@@ -896,8 +926,9 @@ fn build_review_message(task: &Task, project_instructions: &str, merge_target: &
          2. Code quality, correctness, and completeness\n\
          3. Are there any bugs or edge cases missed?\n\
          4. Does the code follow project conventions?\n\
-         5. Run the project checklist if available\n\
+         {checklist_line}\n\
          \n\
+         {checklist_run_block}\
          Examine the changes using git diff and read the modified files.\n\
          Use `bash` with `git diff {target}...HEAD` or similar to see all changes.\n\
          \n\
@@ -911,6 +942,8 @@ fn build_review_message(task: &Task, project_instructions: &str, merge_target: &
         worktree = worktree,
         target = merge_target,
         nested = nested_warning,
+        checklist_line = checklist_line,
+        checklist_run_block = checklist_run_block,
     );
 
     if !project_instructions.is_empty() {
@@ -1399,7 +1432,12 @@ fn merge_one_task(
 /// [`tasks_config::load_project_instructions`]) for the `"worker"` phase.
 /// When non-empty it is appended as a dedicated section so the worker sees
 /// project-specific guidance in addition to the generic boilerplate.
-fn build_initial_message(task: &Task, merge_target: &str, project_instructions: &str) -> String {
+fn build_initial_message(
+    task: &Task,
+    merge_target: &str,
+    project_instructions: &str,
+    checklist: &[crate::tasks_merge::CheckItem],
+) -> String {
     let review_instruction = if task.skip_review {
         format!(
             "- Call the `task_update` tool with arguments: {{\"id\": {id}, \"state\": \"approved\"}}  (skip_review is true for this task)",
@@ -1427,6 +1465,24 @@ fn build_initial_message(task: &Task, merge_target: &str, project_instructions: 
         String::new()
     };
 
+    // Build checklist block and transition label.
+    let (checklist_block, when_done_label) = if checklist.is_empty() {
+        (String::new(), "When done, mark the task:".to_string())
+    } else {
+        let checks = checklist
+            .iter()
+            .map(|c| format!("- `{}`", c.command))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (
+            format!(
+                "When done, run these checks:\n{}\nThen mark the task:\n",
+                checks
+            ),
+            String::new(),
+        )
+    };
+
     let mut msg = format!(
         "You are working on task {id}: {title}\n\
          \n\
@@ -1438,7 +1494,8 @@ fn build_initial_message(task: &Task, merge_target: &str, project_instructions: 
          - Call the `task_get` tool with arguments: {{\"id\": {id}}}\n\
          \n\
          Do the work in this worktree. Commit your changes on the current branch — do NOT merge into {target}.\n\
-         When done, run the project checklist, then mark the task:\n\
+         {checklist_block}\
+         {when_done_label}\n\
          {review}\n\
          \n\
          Note: task_get and task_update are agent tools (like bash or edit), not CLI commands.",
@@ -1449,6 +1506,8 @@ fn build_initial_message(task: &Task, merge_target: &str, project_instructions: 
         target = merge_target,
         nested = nested_warning,
         review = review_instruction,
+        checklist_block = checklist_block,
+        when_done_label = when_done_label,
     );
 
     let trimmed = project_instructions.trim();
@@ -1977,7 +2036,7 @@ mod tests {
         let mut task = make_task(5, 0, None);
         task.branch = Some("task-1-5".into());
         task.worktree_path = Some("/tmp/wt-5".into());
-        let msg = build_initial_message(&task, "main", "");
+        let msg = build_initial_message(&task, "main", "", &[]);
         assert!(msg.contains("task 5"));
         assert!(msg.contains("task_get"));
         assert!(!msg.contains("task_assign"));
@@ -2005,7 +2064,7 @@ mod tests {
         task.skip_review = true;
         task.branch = Some("task-1-7".into());
         task.worktree_path = Some("/tmp/wt-7".into());
-        let msg = build_initial_message(&task, "main", "");
+        let msg = build_initial_message(&task, "main", "", &[]);
         assert!(msg.contains("\"state\": \"approved\""));
         assert!(msg.contains("skip_review is true"));
     }
@@ -2015,7 +2074,7 @@ mod tests {
         let mut task = make_task(42, 0, None);
         task.branch = Some("task-1-42".into());
         task.worktree_path = Some("/tmp/wt-42".into());
-        let msg = build_initial_message(&task, "main", "");
+        let msg = build_initial_message(&task, "main", "", &[]);
         // Should include JSON argument hint so agent knows the invocation format
         assert!(msg.contains(r#"{"id": 42}"#));
         // task_update should also use JSON format, not CLI-style positional args
@@ -2032,7 +2091,7 @@ mod tests {
         let mut task = make_task(42, 0, None);
         task.branch = Some("task-14-42".into());
         task.worktree_path = Some("/tmp/wt-42".into());
-        let msg = build_initial_message(&task, "task-1-5", "");
+        let msg = build_initial_message(&task, "task-1-5", "", &[]);
         assert!(msg.contains("do NOT merge into task-1-5"));
         assert!(!msg.contains("merge into main"));
         // Rebase instruction removed — merge queue handles it.
@@ -2051,7 +2110,7 @@ mod tests {
         task.branch = Some("task-1-9".into());
         task.worktree_path = Some("/tmp/wt-9".into());
         let instructions = "- Follow project style\n- Keep diffs minimal";
-        let msg = build_initial_message(&task, "main", instructions);
+        let msg = build_initial_message(&task, "main", instructions, &[]);
         assert!(msg.contains("Project-specific worker instructions"));
         assert!(msg.contains("Follow project style"));
         assert!(msg.contains("Keep diffs minimal"));
@@ -2063,8 +2122,72 @@ mod tests {
         task.branch = Some("task-1-11".into());
         task.worktree_path = Some("/tmp/wt-11".into());
         // Whitespace-only should be treated as empty — no section header.
-        let msg = build_initial_message(&task, "main", "   \n\n  ");
+        let msg = build_initial_message(&task, "main", "   \n\n  ", &[]);
         assert!(!msg.contains("Project-specific worker instructions"));
+    }
+
+    #[test]
+    fn test_build_initial_message_empty_checklist() {
+        let mut task = make_task(20, 0, None);
+        task.branch = Some("task-1-20".into());
+        task.worktree_path = Some("/tmp/wt-20".into());
+        let msg = build_initial_message(&task, "main", "", &[]);
+        // No checklist: should say "When done, mark the task:" without mentioning checks.
+        assert!(msg.contains("When done, mark the task:"));
+        assert!(!msg.contains("run the project checklist"));
+        assert!(!msg.contains("run these checks"));
+    }
+
+    #[test]
+    fn test_build_initial_message_with_checklist() {
+        let mut task = make_task(21, 0, None);
+        task.branch = Some("task-1-21".into());
+        task.worktree_path = Some("/tmp/wt-21".into());
+        let checklist = vec![
+            crate::tasks_merge::CheckItem {
+                name: "format".into(),
+                command: "cargo fmt --check".into(),
+            },
+            crate::tasks_merge::CheckItem {
+                name: "lint".into(),
+                command: "cargo clippy --all-targets".into(),
+            },
+        ];
+        let msg = build_initial_message(&task, "main", "", &checklist);
+        // Should include concrete commands.
+        assert!(msg.contains("cargo fmt --check"));
+        assert!(msg.contains("cargo clippy --all-targets"));
+        assert!(msg.contains("run these checks"));
+        // Should NOT contain the old vague text.
+        assert!(!msg.contains("run the project checklist"));
+    }
+
+    #[test]
+    fn test_build_review_message_empty_checklist() {
+        let mut task = make_task(22, 0, None);
+        task.branch = Some("task-1-22".into());
+        task.worktree_path = Some("/tmp/wt-22".into());
+        let msg = build_review_message(&task, "", "main", &[]);
+        // No checklist: should not mention any checklist or checks item 5.
+        assert!(!msg.contains("run the project checklist"));
+        assert!(!msg.contains("Run these project checks"));
+    }
+
+    #[test]
+    fn test_build_review_message_with_checklist() {
+        let mut task = make_task(23, 0, None);
+        task.branch = Some("task-1-23".into());
+        task.worktree_path = Some("/tmp/wt-23".into());
+        let checklist = vec![crate::tasks_merge::CheckItem {
+            name: "test".into(),
+            command: "cargo test --workspace".into(),
+        }];
+        let msg = build_review_message(&task, "", "main", &checklist);
+        // Should include concrete check.
+        assert!(msg.contains("cargo test --workspace"));
+        assert!(msg.contains("Run these project checks"));
+        // Should NOT contain the old vague text.
+        assert!(!msg.contains("run the project checklist"));
     }
 
     #[test]
@@ -2072,7 +2195,7 @@ mod tests {
         let mut task = make_task(10, 0, None);
         task.branch = Some("task-14-10".into());
         task.worktree_path = Some("/tmp/wt-10".into());
-        let msg = build_review_message(&task, "", "task-1-5");
+        let msg = build_review_message(&task, "", "task-1-5", &[]);
         assert!(msg.contains("git diff task-1-5...HEAD"));
         assert!(!msg.contains("git diff main...HEAD"));
         // Branch and worktree must be stated.
@@ -3037,7 +3160,7 @@ mod tests {
         let mut task = make_task(10, 0, None);
         task.branch = Some("task-1-10".into());
         task.worktree_path = Some("/tmp/wt-10".into());
-        let msg = build_review_message(&task, "", "main");
+        let msg = build_review_message(&task, "", "main", &[]);
         assert!(msg.contains("REVIEWING task 10"));
         assert!(msg.contains("task_get"));
         assert!(msg.contains("git diff main...HEAD"));
@@ -3056,7 +3179,7 @@ mod tests {
         let mut task = make_task(10, 0, None);
         task.branch = Some("task-1-10".into());
         task.worktree_path = Some("/tmp/wt-10".into());
-        let msg = build_review_message(&task, "Check for SQL injection.", "main");
+        let msg = build_review_message(&task, "Check for SQL injection.", "main", &[]);
         assert!(msg.contains("Check for SQL injection"));
         assert!(msg.contains("Project-specific review instructions"));
     }
