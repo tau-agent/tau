@@ -34,33 +34,55 @@ pub fn build(options: &PromptOptions) -> String {
             .join("\n")
     };
 
-    // Guidelines: collect from tools, then extras, then always-on
-    let mut guidelines: Vec<String> = Vec::new();
+    // Guidelines: group by tool, then a General section for extras + always-on.
+    // Dedup globally so the same line never appears twice.
     let mut seen = std::collections::HashSet::new();
-    let mut add = |g: String| {
+
+    // Per-tool sections (order matches options.tools).
+    let mut tool_sections: Vec<String> = Vec::new();
+    for tool in &options.tools {
+        let mut bullets: Vec<String> = Vec::new();
+        for g in &tool.guidelines {
+            if seen.insert(g.clone()) {
+                bullets.push(format!("- {}", g));
+            }
+        }
+        if !bullets.is_empty() {
+            let mut section = format!("{}:\n", tool.name);
+            section.push_str(&bullets.join("\n"));
+            tool_sections.push(section);
+        }
+    }
+
+    // General section: extras + always-on, minus anything already placed under a tool.
+    let mut general_bullets: Vec<String> = Vec::new();
+    let add_general = |g: String,
+                       seen: &mut std::collections::HashSet<String>,
+                       general_bullets: &mut Vec<String>| {
         if seen.insert(g.clone()) {
-            guidelines.push(g);
+            general_bullets.push(format!("- {}", g));
         }
     };
-
-    for tool in &options.tools {
-        for g in &tool.guidelines {
-            add(g.clone());
-        }
-    }
     for g in &options.extra_guidelines {
-        add(g.clone());
+        add_general(g.clone(), &mut seen, &mut general_bullets);
     }
+    add_general(
+        "Be concise in your responses".into(),
+        &mut seen,
+        &mut general_bullets,
+    );
+    add_general(
+        "Show file paths clearly when working with files".into(),
+        &mut seen,
+        &mut general_bullets,
+    );
 
-    // Always-on guidelines
-    add("Be concise in your responses".into());
-    add("Show file paths clearly when working with files".into());
-
-    let guidelines_str = guidelines
-        .iter()
-        .map(|g| format!("- {}", g))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let mut sections: Vec<String> = Vec::new();
+    if !general_bullets.is_empty() {
+        sections.push(general_bullets.join("\n"));
+    }
+    sections.extend(tool_sections);
+    let guidelines_str = sections.join("\n\n");
 
     let mut prompt = format!(
         r#"You are an expert coding assistant operating inside tau, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
@@ -72,6 +94,7 @@ In addition to the tools above, you may have access to other custom tools depend
 
 Guidelines:
 {guidelines_str}
+
 Current date: {date}"#
     );
 
@@ -183,5 +206,134 @@ mod tests {
         // Should only appear once
         let count = prompt.matches("Be concise in your responses").count();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn grouped_guidelines_section_per_tool() {
+        let prompt = build(&PromptOptions {
+            tools: vec![
+                ToolPrompt {
+                    name: "toolA".into(),
+                    snippet: "A".into(),
+                    guidelines: vec!["guidance A".into()],
+                },
+                ToolPrompt {
+                    name: "toolB".into(),
+                    snippet: "B".into(),
+                    guidelines: vec!["guidance B".into()],
+                },
+            ],
+            ..Default::default()
+        });
+        let guidelines = prompt
+            .split("Guidelines:")
+            .nth(1)
+            .expect("Guidelines section");
+        assert!(
+            guidelines.contains("toolA:\n- guidance A"),
+            "guidelines section:\n{guidelines}"
+        );
+        assert!(
+            guidelines.contains("toolB:\n- guidance B"),
+            "guidelines section:\n{guidelines}"
+        );
+        // toolA section appears before toolB section within the guidelines.
+        let idx_a = guidelines.find("toolA:").expect("toolA heading");
+        let idx_b = guidelines.find("toolB:").expect("toolB heading");
+        assert!(idx_a < idx_b);
+    }
+
+    #[test]
+    fn grouped_guidelines_empty_tool_has_no_heading() {
+        let prompt = build(&PromptOptions {
+            tools: vec![ToolPrompt {
+                name: "silent".into(),
+                snippet: "no guidance".into(),
+                guidelines: vec![],
+            }],
+            ..Default::default()
+        });
+        // Tool still appears in the "Available tools:" list...
+        assert!(prompt.contains("- silent: no guidance"));
+        // ...but there should be no "silent:" heading in the Guidelines section.
+        let guidelines_section = prompt
+            .split("Guidelines:")
+            .nth(1)
+            .expect("Guidelines section");
+        assert!(
+            !guidelines_section.contains("silent:"),
+            "guidelines section unexpectedly contained 'silent:' heading:\n{guidelines_section}"
+        );
+    }
+
+    #[test]
+    fn extra_guidelines_grouped_under_general() {
+        let prompt = build(&PromptOptions {
+            tools: vec![ToolPrompt {
+                name: "toolA".into(),
+                snippet: "A".into(),
+                guidelines: vec!["guidance A".into()],
+            }],
+            extra_guidelines: vec!["Use cargo fmt before committing".into()],
+            ..Default::default()
+        });
+        let guidelines = prompt
+            .split("Guidelines:")
+            .nth(1)
+            .expect("Guidelines section");
+        let idx_extra = guidelines
+            .find("Use cargo fmt before committing")
+            .expect("extra guideline present");
+        let idx_tool = guidelines.find("toolA:").expect("toolA heading");
+        assert!(
+            idx_extra < idx_tool,
+            "expected extra guideline to appear before tool section; guidelines:\n{guidelines}"
+        );
+    }
+
+    #[test]
+    fn always_on_guidelines_always_present() {
+        let prompt = build(&PromptOptions {
+            tools: vec![ToolPrompt {
+                name: "toolA".into(),
+                snippet: "A".into(),
+                guidelines: vec!["guidance A".into()],
+            }],
+            ..Default::default()
+        });
+        assert_eq!(prompt.matches("Be concise in your responses").count(), 1);
+        assert_eq!(
+            prompt
+                .matches("Show file paths clearly when working with files")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tool_section_wins_dedup_over_general() {
+        // A guideline appearing both under a tool and in extra_guidelines is
+        // emitted exactly once, under the tool heading.
+        let shared = "Shared guideline";
+        let prompt = build(&PromptOptions {
+            tools: vec![ToolPrompt {
+                name: "toolA".into(),
+                snippet: "A".into(),
+                guidelines: vec![shared.into()],
+            }],
+            extra_guidelines: vec![shared.into()],
+            ..Default::default()
+        });
+        assert_eq!(prompt.matches(shared).count(), 1);
+        // It should appear under the toolA heading (in the Guidelines section).
+        let guidelines = prompt
+            .split("Guidelines:")
+            .nth(1)
+            .expect("Guidelines section");
+        let after_heading = guidelines
+            .split("toolA:")
+            .nth(1)
+            .expect("toolA section present");
+        assert!(after_heading.contains(shared));
     }
 }
