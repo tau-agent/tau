@@ -53,6 +53,12 @@ pub struct AgentConfig {
     /// result. Called immediately after the tool result is persisted to
     /// the caller's session history, so actions (e.g. self-recipient info
     /// messages) render textually after the tool result.
+    ///
+    /// The callback intentionally does not receive the caller's session
+    /// id: each action already carries a `target_session_id` (see
+    /// `PostPersistAction::EmitInfoMessage`), which may be the caller or
+    /// any other session.  The server wires up dispatch by inspecting the
+    /// per-action target, not by assuming "always the caller".
     #[allow(clippy::type_complexity)]
     pub post_persist_callback: Option<Box<dyn Fn(&[PostPersistAction]) + Send + Sync>>,
 }
@@ -1219,6 +1225,81 @@ mod tests {
             .expect("run");
 
             assert_eq!(*hits.lock().expect("hits lock"), 0);
+        });
+    }
+
+    /// Tier-2 cross-session: `EmitInfoMessage { target_session_id: "other" }`
+    /// passes the target through the callback unchanged, so the server-side
+    /// dispatcher can route it to a non-caller session.  The engine itself
+    /// doesn't interpret the target — it just hands the action list to the
+    /// callback — but this guards against a future refactor accidentally
+    /// filtering or rewriting the target.
+    #[test]
+    fn tier2_post_persist_passes_through_cross_session_target() {
+        smol::block_on(async {
+            let registry = setup_registry(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "mock".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                MockResponse::Text("done".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let mut worker = MockToolExecutor::new();
+            let actions = vec![
+                PostPersistAction::EmitInfoMessage {
+                    target_session_id: "caller".into(),
+                    text: "to-caller".into(),
+                },
+                PostPersistAction::EmitInfoMessage {
+                    target_session_id: "other-session".into(),
+                    text: "to-other".into(),
+                },
+            ];
+            worker.handle().on_tool(
+                "mock",
+                MockToolResponse::SuccessWithActions("ok".into(), actions.clone()),
+            );
+
+            let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+            let seen_cb = seen.clone();
+            let config = AgentConfig {
+                post_persist_callback: Some(Box::new(move |actions: &[PostPersistAction]| {
+                    let mut s = seen_cb.lock().expect("seen lock");
+                    for a in actions {
+                        match a {
+                            PostPersistAction::EmitInfoMessage {
+                                target_session_id,
+                                text,
+                            } => {
+                                s.push((target_session_id.clone(), text.clone()));
+                            }
+                        }
+                    }
+                })),
+                ..Default::default()
+            };
+
+            let (tx, _rx) = smol::channel::unbounded();
+            run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .expect("run");
+
+            let got = seen.lock().expect("seen lock").clone();
+            assert_eq!(got.len(), 2, "both actions delivered: {:?}", got);
+            assert_eq!(got[0], ("caller".into(), "to-caller".into()));
+            assert_eq!(got[1], ("other-session".into(), "to-other".into()));
         });
     }
 

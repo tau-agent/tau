@@ -268,11 +268,6 @@ pub enum PostIdleAction {
     /// reviewer, log roles). Retries up to 20 times on "session busy"
     /// errors, 1s apart, before giving up.
     ArchiveTaskSessions { task_id: i64 },
-    /// Run the merge pass for an approved task. One-shot; failure transitions
-    /// the task to `failed` state and notifies the root session. Used for
-    /// merges triggered by a tool call where the caller is part of the task
-    /// being merged.
-    MergeTask { task_id: i64 },
 }
 
 impl ToolResultMessage {

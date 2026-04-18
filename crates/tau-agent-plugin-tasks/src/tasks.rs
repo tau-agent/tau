@@ -2581,6 +2581,10 @@ fn drain_scheduler_events(
         match ev {
             SchedulerEvent::MergeNeeded(caller) => {
                 need_merge = true;
+                // A single tool-call batch can only originate from one
+                // caller session, so we keep the first non-None caller
+                // we see.  In practice every batch contains at most one
+                // `MergeNeeded` event; the dedup is defensive.
                 if merge_caller.is_none() {
                     merge_caller = caller;
                 }
