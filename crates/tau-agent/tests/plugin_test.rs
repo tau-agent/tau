@@ -763,3 +763,95 @@ fn global_plugin_hooks_work_through_background_io() {
         msg
     );
 }
+
+/// Verify that plugin stderr lines are forwarded to `tracing` with the
+/// expected target / plugin field.
+///
+/// The forwarder runs on a dedicated thread, so a thread-scoped subscriber
+/// (`with_default`) wouldn't see its events. We install the capture
+/// subscriber globally via `try_init`; if another test already installed
+/// a global subscriber, we skip the assertion gracefully rather than
+/// fighting over the global.
+#[test]
+fn plugin_stderr_is_forwarded_to_tracing() {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Default)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("buf lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buf = BufWriter::default();
+    let buf_clone = buf.0.clone();
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(buf)
+        .with_ansi(false)
+        .with_target(true);
+    let filter = tracing_subscriber::EnvFilter::new("info");
+    let installed = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .try_init()
+        .is_ok();
+    if !installed {
+        // Another test already installed a subscriber. We can't install a
+        // second one, so we can't capture here — skip without failing.
+        eprintln!("skipping: global tracing subscriber already installed");
+        return;
+    }
+
+    let cmd = vec![
+        "python3".to_string(),
+        "-c".to_string(),
+        r#"
+import sys, json
+sys.stderr.write("HELLO-FROM-PLUGIN-STDERR\n")
+sys.stderr.flush()
+sys.stdout.write(json.dumps({
+    "type": "register",
+    "name": "stderr-test",
+    "tools": [],
+    "hooks": [],
+    "commands": []
+}) + "\n")
+sys.stdout.flush()
+import time; time.sleep(0.3)
+"#
+        .to_string(),
+    ];
+
+    let handle =
+        PluginHandle::spawn(&cmd, "/tmp", &HashMap::new()).expect("spawn stderr test plugin");
+    // Give the background forwarder thread time to drain the stderr line.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    drop(handle);
+
+    let output =
+        String::from_utf8(buf_clone.lock().expect("buf read").clone()).expect("valid utf-8");
+    assert!(
+        output.contains("HELLO-FROM-PLUGIN-STDERR"),
+        "plugin stderr line not forwarded to tracing; got:\n{output}"
+    );
+    assert!(
+        output.contains("plugin"),
+        "expected `target=plugin` or `plugin=...` field in output; got:\n{output}"
+    );
+}

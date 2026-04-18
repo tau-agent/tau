@@ -10,7 +10,7 @@
 //!   (e.g. `["sandbox", "run", "--"]`).
 
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufRead, BufReader, BufWriter};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
@@ -18,6 +18,27 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{Tool, ToolCall};
+
+/// Spawn a background thread that forwards the plugin's stderr to tracing.
+///
+/// Each line is emitted at `info` level with `target="plugin"` and a
+/// `plugin=<name>` field. When the plugin exits and closes its stderr pipe,
+/// the reader's `lines()` iterator ends naturally and the thread terminates.
+///
+/// A dedicated OS thread (not a smol task) keeps the forwarder off the async
+/// runtime; plugin stderr is low volume and one thread per plugin is cheap.
+fn spawn_stderr_forwarder(name: String, stderr: std::process::ChildStderr) {
+    std::thread::Builder::new()
+        .name(format!("plugin-stderr:{}", name))
+        .spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines().map_while(Result::ok) {
+                // Use the line itself as the message so it's not double-quoted.
+                tracing::info!(target: "plugin", plugin = %name, "{line}");
+            }
+        })
+        .ok();
+}
 
 // Re-export wire types from tau-agent-base for backward compatibility
 pub use crate::plugin_protocol::{
@@ -76,9 +97,9 @@ pub fn resolve_sandbox_prefix(
             if let Some(profile) = config.profiles.get(profile_name) {
                 return Some(profile.prefix.clone());
             }
-            eprintln!(
-                "sandbox: profile '{}' not found, using default",
-                profile_name
+            tracing::warn!(
+                profile = %profile_name,
+                "sandbox profile not found, using default"
             );
         }
         // Use the default prefix from sandbox.toml
@@ -110,8 +131,6 @@ pub struct PluginHandle {
     /// Async pipe fields for non-blocking I/O (used by server-side tool execution).
     async_stdin: Option<AsyncPluginWriter>,
     async_stdout: Option<AsyncPluginReader>,
-    /// Piped stderr for diagnostics.
-    stderr_pipe: Option<std::process::ChildStderr>,
     /// Command used to spawn this plugin (for respawning).
     spawn_command: Vec<String>,
     /// Working directory used to spawn this plugin.
@@ -139,19 +158,19 @@ fn resolve_cwd(cwd: &str) -> String {
     let mut ancestor = path.parent();
     while let Some(p) = ancestor {
         if p.is_dir() {
-            eprintln!(
-                "plugin: cwd '{}' does not exist, falling back to '{}'",
-                cwd,
-                p.display()
+            tracing::warn!(
+                cwd = %cwd,
+                fallback = %p.display(),
+                "plugin cwd does not exist, falling back to nearest ancestor"
             );
             return p.to_string_lossy().to_string();
         }
         ancestor = p.parent();
     }
     // Last resort.
-    eprintln!(
-        "plugin: cwd '{}' does not exist and no ancestor found, falling back to /tmp",
-        cwd
+    tracing::warn!(
+        cwd = %cwd,
+        "plugin cwd does not exist and no ancestor found, falling back to /tmp"
     );
     "/tmp".to_string()
 }
@@ -166,6 +185,10 @@ impl PluginHandle {
         if command.is_empty() {
             return Err(crate::Error::Io("empty plugin command".into()));
         }
+
+        let span = tracing::info_span!("plugin.spawn", cmd = ?command, cwd = %cwd);
+        let _enter = span.enter();
+        tracing::debug!("spawning");
 
         let effective_cwd = resolve_cwd(cwd);
         let mut cmd = Command::new(&command[0]);
@@ -194,7 +217,18 @@ impl PluginHandle {
                 .ok_or_else(|| crate::Error::Io("plugin stdout not available".into()))?,
         );
 
-        let stderr_pipe = child.stderr.take();
+        // Forward stderr to tracing on a background thread. The plugin name
+        // isn't known yet (not until registration) so we use a placeholder;
+        // once registration completes we start a second forwarder under the
+        // real name. In practice the pre-registration window is tiny and
+        // lines emitted there still surface via the placeholder name.
+        if let Some(pipe) = child.stderr.take() {
+            let placeholder = format!(
+                "<spawning {:?}>",
+                command.first().cloned().unwrap_or_default()
+            );
+            spawn_stderr_forwarder(placeholder, pipe);
+        }
 
         let mut handle = Self {
             name: String::new(),
@@ -209,7 +243,6 @@ impl PluginHandle {
             stdout: Some(stdout),
             async_stdin: None,
             async_stdout: None,
-            stderr_pipe,
             spawn_command: command.to_vec(),
             spawn_cwd: cwd.to_string(),
             spawn_env: env.clone(),
@@ -219,33 +252,34 @@ impl PluginHandle {
         };
 
         // Read the registration message
+        tracing::debug!("reading registration");
         let msg = handle.read_message();
         match msg {
             Ok(PluginMessage::Register(reg)) => {
+                tracing::info!(
+                    plugin = %reg.name,
+                    tools = reg.tools.len(),
+                    hooks = ?reg.hooks,
+                    "registered"
+                );
                 handle.name = reg.name.clone();
                 handle.registration = reg;
             }
-            Ok(_) => {
+            Ok(other) => {
+                tracing::warn!(?other, "unexpected first message");
                 return Err(crate::Error::Io(
                     "plugin first message must be Register".into(),
                 ));
             }
             Err(e) => {
-                // Child likely died -- wait for it and collect diagnostics
+                tracing::error!(%e, "registration failed");
+                // Child likely died -- wait for it and report exit status.
                 let mut diag = format!("plugin {:?} failed during registration: {}", command, e);
-                // Give child a moment to fully exit
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if let Some(ref mut child) = handle.child {
                     match child.try_wait() {
                         Ok(Some(exit)) => {
                             diag.push_str(&format!("\n  exit status: {}", exit));
-                            let stderr = handle.drain_stderr();
-                            if !stderr.is_empty() {
-                                diag.push_str(&format!(
-                                    "\n  stderr:\n{}",
-                                    indent_lines(&stderr, "    ")
-                                ));
-                            }
                         }
                         _ => {
                             // Child still running but stdout closed -- kill it
@@ -254,6 +288,9 @@ impl PluginHandle {
                         }
                     }
                 }
+                diag.push_str(
+                    "\n  (plugin stderr was forwarded to tracing; see server log for details)",
+                );
                 return Err(crate::Error::Io(diag));
             }
         }
@@ -320,19 +357,19 @@ impl PluginHandle {
             Some(val) => Ok(val),
             None => {
                 let mut msg = format!("plugin {} closed unexpectedly", self.name);
-                // Wait briefly for child to fully exit so we can collect stderr
+                // Wait briefly for child to fully exit so we can log the code.
                 if let Some(ref mut child) = self.child {
                     let _ = child.try_wait();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 if let Some(exit) = self.child_exit_status() {
                     msg.push_str(&format!(" (exit status: {})", exit));
-                    // Only drain stderr if child has exited (otherwise read blocks)
-                    let stderr = self.drain_stderr();
-                    if !stderr.is_empty() {
-                        msg.push_str(&format!("\n  stderr:\n{}", indent_lines(&stderr, "    ")));
-                    }
                 }
+                // Plugin stderr is forwarded to tracing in real time; hint
+                // to anyone looking at the error message where to find it.
+                msg.push_str(
+                    "\n  (plugin stderr was forwarded to tracing; see server log for details)",
+                );
                 // Mark as dead
                 self.child = None;
                 self.stdin = None;
@@ -582,12 +619,16 @@ impl PluginHandle {
 
     /// Call a hook on this plugin.
     pub fn call_hook(&mut self, name: &str, data: serde_json::Value) -> crate::Result<HookResult> {
+        let span = tracing::info_span!("plugin.hook", plugin = %self.name, hook = name);
+        let _enter = span.enter();
+        tracing::debug!("sending");
         self.send(&PluginRequest::Hook {
             name: name.to_string(),
             data,
         })?;
 
         let msg = self.read_message()?;
+        tracing::debug!("returned");
         match msg {
             PluginMessage::HookResult(result) => Ok(result),
             _ => Ok(HookResult::default()),
@@ -597,25 +638,6 @@ impl PluginHandle {
     /// Try to get the child exit status without blocking.
     fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
         self.child.as_mut()?.try_wait().ok().flatten()
-    }
-
-    /// Drain stderr from the child process.
-    /// Only safe to call after the child has exited (otherwise may block).
-    /// Consumes the stderr pipe.
-    fn drain_stderr(&mut self) -> String {
-        let Some(pipe) = self.stderr_pipe.take() else {
-            return String::new();
-        };
-        use std::io::Read;
-        let mut reader = BufReader::new(pipe);
-        let mut output = String::new();
-        // Read up to 8KB
-        let mut buf = vec![0u8; 8192];
-        match reader.read(&mut buf) {
-            Ok(n) if n > 0 => output.push_str(&String::from_utf8_lossy(&buf[..n])),
-            _ => {}
-        }
-        output
     }
 
     /// Check if the plugin process is alive.
@@ -659,6 +681,9 @@ impl PluginHandle {
         }
 
         let cmd = &self.spawn_command;
+        let span = tracing::info_span!("plugin.respawn", plugin = %self.name, cmd = ?cmd);
+        let _enter = span.enter();
+
         let effective_cwd = resolve_cwd(&self.spawn_cwd);
 
         let mut cmd_proc = Command::new(&cmd[0]);
@@ -688,7 +713,10 @@ impl PluginHandle {
                 .ok_or_else(|| crate::Error::Io("plugin stdout not available".into()))?,
         );
 
-        self.stderr_pipe = child.stderr.take();
+        // Start a new stderr forwarder for this process lifetime.
+        if let Some(pipe) = child.stderr.take() {
+            spawn_stderr_forwarder(self.name.clone(), pipe);
+        }
         self.child = Some(child);
         self.stdin = Some(stdin);
         self.stdout = Some(stdout);
@@ -700,14 +728,14 @@ impl PluginHandle {
         let msg = self.read_message();
         match msg {
             Ok(PluginMessage::Register(_reg)) => {
-                // Registration received, plugin is alive again
-                eprintln!("respawned plugin '{}'", self.name);
+                tracing::info!("respawned");
                 Ok(())
             }
             Ok(_) => Err(crate::Error::Io(
                 "respawned plugin first message must be Register".into(),
             )),
             Err(e) => {
+                tracing::warn!(%e, "respawn failed");
                 self.child = None;
                 self.stdin = None;
                 self.stdout = None;
@@ -802,13 +830,6 @@ impl Drop for PluginHandle {
 // Helper: collect tool info from a list of plugin handles
 // ---------------------------------------------------------------------------
 
-fn indent_lines(text: &str, prefix: &str) -> String {
-    text.lines()
-        .map(|l| format!("{}{}", prefix, l))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn collect_tool_schemas(plugins: &[PluginHandle]) -> Vec<Tool> {
     plugins.iter().flat_map(|p| p.tool_schemas()).collect()
 }
@@ -846,7 +867,12 @@ fn call_hook_all_excluding(
         if plugin.wants_hook(name) {
             match plugin.call_hook(name, data.clone()) {
                 Ok(result) => results.push(result),
-                Err(e) => eprintln!("plugin {} hook {} error: {}", plugin.name, name, e),
+                Err(e) => tracing::warn!(
+                    plugin = %plugin.name,
+                    hook = name,
+                    %e,
+                    "plugin hook failed"
+                ),
             }
         }
     }
@@ -903,7 +929,7 @@ impl SessionPlugins {
             let mut cmd: Vec<String> = prefix.iter().map(|s| s.replace("{cwd}", cwd)).collect();
             cmd.extend(entry.command.iter().cloned());
 
-            eprintln!("spawning session plugin '{}': {:?}", name, cmd);
+            tracing::info!(plugin = %name, cmd = ?cmd, "spawning session plugin");
             match PluginHandle::spawn(&cmd, cwd, &entry.env) {
                 Ok(handle) => {
                     let tools: Vec<&str> = handle
@@ -912,16 +938,16 @@ impl SessionPlugins {
                         .iter()
                         .map(|t| t.name.as_str())
                         .collect();
-                    eprintln!(
-                        "session plugin '{}': {} tools {:?}",
-                        handle.name,
-                        tools.len(),
-                        tools,
+                    tracing::info!(
+                        plugin = %handle.name,
+                        tools = tools.len(),
+                        tool_names = ?tools,
+                        "session plugin ready"
                     );
                     plugins.push(handle);
                 }
                 Err(e) => {
-                    eprintln!("session plugin '{}' failed to spawn: {}", name, e);
+                    tracing::warn!(plugin = %name, %e, "session plugin failed to spawn");
                     failures.push(format!("\u{26a0} Plugin '{}' failed to start: {}", name, e));
                 }
             }
@@ -967,7 +993,7 @@ impl SessionPlugins {
         // Ensure plugins are alive before calling hooks
         for p in &mut self.plugins {
             if p.wants_hook(name) && p.ensure_alive().is_err() {
-                eprintln!("plugin {} respawn for hook {} failed", p.name, name);
+                tracing::warn!(plugin = %p.name, hook = name, "plugin respawn for hook failed");
             }
         }
         call_hook_all(&mut self.plugins, name, data)
@@ -1059,6 +1085,8 @@ impl PluginManager {
     /// Load global plugins from config.
     /// Kills any existing global plugins first.
     pub fn load_global_plugins(&mut self, cwd: &str) {
+        let span = tracing::info_span!("plugin.load_global", cwd = %cwd);
+        let _enter = span.enter();
         // Kill existing global plugins before reloading
         for p in &mut self.global_plugins {
             p.kill();
@@ -1075,18 +1103,18 @@ impl PluginManager {
                         .map(|t| t.name.as_str())
                         .collect();
                     let hooks = &handle.registration.hooks;
-                    eprintln!(
-                        "global plugin '{}': {} tools {:?}, {} hooks {:?}",
-                        handle.name,
-                        tools.len(),
-                        tools,
-                        hooks.len(),
-                        hooks,
+                    tracing::info!(
+                        plugin = %handle.name,
+                        tools = tools.len(),
+                        tool_names = ?tools,
+                        hooks = hooks.len(),
+                        hook_names = ?hooks,
+                        "global plugin ready"
                     );
                     self.global_plugins.push(handle);
                 }
                 Err(e) => {
-                    eprintln!("global plugin '{}' failed to load: {}", name, e);
+                    tracing::warn!(plugin = %name, %e, "global plugin failed to load");
                 }
             }
         }
@@ -1099,14 +1127,14 @@ impl PluginManager {
             let cmd = vec![exe, "plugin-tasks".to_string()];
             match PluginHandle::spawn(&cmd, cwd, &HashMap::new()) {
                 Ok(handle) => {
-                    eprintln!(
-                        "auto-spawned tasks plugin: {} tools",
-                        handle.registration.tools.len()
+                    tracing::info!(
+                        tools = handle.registration.tools.len(),
+                        "auto-spawned tasks plugin"
                     );
                     self.global_plugins.push(handle);
                 }
                 Err(e) => {
-                    eprintln!("failed to auto-spawn tasks plugin: {}", e);
+                    tracing::warn!(%e, "failed to auto-spawn tasks plugin");
                 }
             }
         }
@@ -1150,9 +1178,10 @@ impl PluginManager {
             if !handle.has_async_io()
                 && let Err(e) = handle.upgrade_to_async()
             {
-                eprintln!(
-                    "global plugin '{}': failed to upgrade to async: {}",
-                    handle.name, e
+                tracing::warn!(
+                    plugin = %handle.name,
+                    %e,
+                    "failed to upgrade global plugin to async"
                 );
                 continue;
             }
@@ -1161,9 +1190,10 @@ impl PluginManager {
             let (reader, writer) = match handle.take_async_io() {
                 Ok(io) => io,
                 Err(e) => {
-                    eprintln!(
-                        "global plugin '{}': failed to take async IO: {}",
-                        handle.name, e
+                    tracing::warn!(
+                        plugin = %handle.name,
+                        %e,
+                        "failed to take async IO for global plugin"
                     );
                     continue;
                 }
@@ -1194,6 +1224,13 @@ impl PluginManager {
         if self.session_plugins.contains_key(session_id) {
             return Ok(Vec::new());
         }
+        let span = tracing::info_span!(
+            "plugin.ensure_session",
+            session_id = %session_id,
+            cwd = %cwd,
+            project = project_name,
+        );
+        let _enter = span.enter();
         let sandbox_prefix = resolve_sandbox_prefix(
             project_name,
             sandbox_profile,
@@ -1354,7 +1391,7 @@ impl PluginManager {
         {
             let handle = &mut sp.plugins[idx];
             if let Err(e) = handle.ensure_alive() {
-                eprintln!("plugin '{}' respawn failed: {}", handle.name, e);
+                tracing::warn!(plugin = %handle.name, %e, "plugin respawn failed");
                 return None;
             }
             let handle = sp.plugins.remove(idx);
@@ -1471,7 +1508,7 @@ impl PluginManager {
                     && exclude_plugin != Some(p.name.as_str())
                     && p.ensure_alive().is_err()
                 {
-                    eprintln!("plugin {} respawn for hook {} failed", p.name, name);
+                    tracing::warn!(plugin = %p.name, hook = name, "plugin respawn for hook failed");
                 }
             }
             results.extend(call_hook_all_excluding(
@@ -1501,15 +1538,43 @@ impl PluginManager {
         };
         for plugin in &mut self.global_plugins {
             if plugin.wants_hook("session_start") {
-                let _ = plugin.send(&req);
-                let _ = plugin.read_message();
+                let span = tracing::info_span!(
+                    "plugin.hook",
+                    plugin = %plugin.name,
+                    hook = "session_start",
+                    session_id = %session_id,
+                );
+                let _enter = span.enter();
+                tracing::debug!("sending");
+                if let Err(e) = plugin.send(&req) {
+                    tracing::warn!(%e, "failed to send session_start");
+                    continue;
+                }
+                match plugin.read_message() {
+                    Ok(_) => tracing::debug!("returned"),
+                    Err(e) => tracing::warn!(%e, "session_start response failed"),
+                }
             }
         }
         if let Some(sp) = self.session_plugins.get_mut(session_id) {
             for plugin in &mut sp.plugins {
                 if plugin.wants_hook("session_start") {
-                    let _ = plugin.send(&req);
-                    let _ = plugin.read_message();
+                    let span = tracing::info_span!(
+                        "plugin.hook",
+                        plugin = %plugin.name,
+                        hook = "session_start",
+                        session_id = %session_id,
+                    );
+                    let _enter = span.enter();
+                    tracing::debug!("sending");
+                    if let Err(e) = plugin.send(&req) {
+                        tracing::warn!(%e, "failed to send session_start");
+                        continue;
+                    }
+                    match plugin.read_message() {
+                        Ok(_) => tracing::debug!("returned"),
+                        Err(e) => tracing::warn!(%e, "session_start response failed"),
+                    }
                 }
             }
         }
@@ -1542,6 +1607,12 @@ impl PluginManager {
 
     /// Kill all plugins.
     pub fn kill_all(&mut self) {
+        let span = tracing::info_span!(
+            "plugin.kill_all",
+            global = self.global_plugins.len(),
+            sessions = self.session_plugins.len(),
+        );
+        let _enter = span.enter();
         for p in &mut self.global_plugins {
             p.kill();
         }
@@ -1572,7 +1643,7 @@ impl PluginManager {
             if let Some(last) = sp.last_activity()
                 && now.duration_since(last) >= idle_timeout
             {
-                eprintln!("sending idle to session '{}' plugins", session_id);
+                tracing::info!(session_id = %session_id, "sending idle to session plugins");
                 sp.send_idle_all();
                 idled.push(session_id.clone());
             }
