@@ -979,33 +979,6 @@ fn live_indicator(task: &tau_agent::protocol::TaskInfo, theme: &Theme) -> (&'sta
     }
 }
 
-/// Determine `is_last` sibling for each item in a pre-ordered depth list.
-///
-/// A task at depth D is the last sibling if no later filtered task shares
-/// the same depth without an intervening task at a shallower depth.
-#[cfg(test)]
-fn compute_is_last_flags(
-    tasks: &[(usize, tau_agent::protocol::TaskInfo)],
-    filtered: &[usize],
-) -> Vec<bool> {
-    filtered
-        .iter()
-        .enumerate()
-        .map(|(pos, &idx)| {
-            let (depth, _) = &tasks[idx];
-            for &next_idx in &filtered[pos + 1..] {
-                let (next_depth, _) = &tasks[next_idx];
-                if *next_depth <= *depth {
-                    // Same or shallower depth → this is last only if shallower
-                    return *next_depth < *depth;
-                }
-            }
-            // No sibling found → this is the last
-            true
-        })
-        .collect()
-}
-
 fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     use ratatui::widgets::Clear;
 
@@ -1923,53 +1896,5 @@ mod tests {
                 col
             );
         }
-    }
-
-    #[test]
-    fn compute_is_last_flags_simple_tree() {
-        use tau_agent::protocol::TaskInfo;
-
-        let make_task = |id: i64| TaskInfo {
-            id,
-            project_name: String::new(),
-            title: format!("Task {}", id),
-            state: "active".to_string(),
-            priority: 0,
-            parent_id: None,
-            tags: None,
-            affected_files: None,
-            branch: None,
-            worktree_path: None,
-            session_id: None,
-            skip_review: false,
-            require_approval: false,
-            sandbox_profile: None,
-            held: false,
-            has_live_session: false,
-            created_at: 0,
-            updated_at: 0,
-        };
-
-        // Tree structure:
-        // depth 0: task 1
-        //   depth 1: task 2
-        //   depth 1: task 3
-        // depth 0: task 4
-        let tasks: Vec<(usize, TaskInfo)> = vec![
-            (0, make_task(1)),
-            (1, make_task(2)),
-            (1, make_task(3)),
-            (0, make_task(4)),
-        ];
-        let filtered: Vec<usize> = vec![0, 1, 2, 3];
-        let flags = compute_is_last_flags(&tasks, &filtered);
-        // task 1 (depth 0): not last (task 4 follows at depth 0)
-        assert!(!flags[0], "task 1 should not be last sibling");
-        // task 2 (depth 1): not last (task 3 follows at depth 1)
-        assert!(!flags[1], "task 2 should not be last sibling");
-        // task 3 (depth 1): last (task 4 follows at depth 0 < 1)
-        assert!(flags[2], "task 3 should be last sibling");
-        // task 4 (depth 0): last (no more tasks)
-        assert!(flags[3], "task 4 should be last sibling");
     }
 }
