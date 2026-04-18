@@ -527,6 +527,30 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "Wait reasons: dependency not met, file conflict with an active task, budget exhausted, not yet scheduled.".into(),
             ],
         },
+        PluginToolDef {
+            name: "task_overview".into(),
+            description: "Return the structured scheduler overview as JSON: active, queued-ready, queued-planning, blocked, held, plus the most recent merged/closed tasks. Useful for programmatic inspection; the `/task` picker in the TUI renders the same data.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project name (defaults to session's project)"
+                    },
+                    "recent_limit": {
+                        "type": "integer",
+                        "description": "Max number of recently-merged and recently-closed tasks to include per bucket (default 10).",
+                        "minimum": 0,
+                        "maximum": 100
+                    }
+                }
+            }),
+            prompt_snippet: Some("Structured scheduler overview (JSON) grouped by lifecycle position".into()),
+            prompt_guidelines: vec![
+                "Buckets returned: active, queued_ready, queued_planning, blocked, held, recently_merged, recently_closed. Each entry is a full TaskInfo object.".into(),
+                "`recent_limit` applies per bucket, so the tail length is up to 2×recent_limit.".into(),
+            ],
+        },
     ]
 }
 
@@ -1771,6 +1795,35 @@ fn handle_task_status(
     }
 }
 
+fn handle_task_overview(
+    db: &TasksDb,
+    args: &serde_json::Value,
+    project_name: &str,
+    tool_call_id: &str,
+) -> PluginToolResult {
+    let project_name = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_name);
+    let recent_limit = args
+        .get("recent_limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(10);
+
+    // The plugin doesn't track live sessions — pass an empty set.  The
+    // server-side RPC wrapper fills `has_live_session` when it gets the
+    // structured response over the wire.
+    let live = std::collections::HashSet::new();
+    match tasks_scheduler::task_overview_response(db, project_name, recent_limit, &live) {
+        Ok(resp) => match serde_json::to_string_pretty(&resp) {
+            Ok(json) => tool_ok(tool_call_id, &json),
+            Err(e) => tool_err(tool_call_id, &format!("serialize overview: {}", e)),
+        },
+        Err(e) => tool_err(tool_call_id, &format!("task overview: {}", e)),
+    }
+}
+
 fn handle_task_schedule(
     db: &TasksDb,
     args: &serde_json::Value,
@@ -2252,6 +2305,10 @@ pub fn run_tasks_plugin() {
                     "task_status" => {
                         let pn = project_name.unwrap_or("unknown");
                         handle_task_status(&db, &arguments, pn, &resolver, &tool_call_id)
+                    }
+                    "task_overview" => {
+                        let pn = project_name.unwrap_or("unknown");
+                        handle_task_overview(&db, &arguments, pn, &tool_call_id)
                     }
                     "task_schedule" => {
                         let pn = project_name.unwrap_or("unknown");
@@ -2898,7 +2955,7 @@ mod tests {
     #[test]
     fn test_tasks_tools_defined() {
         let tools = tasks_tools();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"task_create"));
         assert!(names.contains(&"task_get"));
@@ -2912,6 +2969,7 @@ mod tests {
         assert!(names.contains(&"task_schedule"));
         assert!(names.contains(&"task_dispatch"));
         assert!(names.contains(&"task_status"));
+        assert!(names.contains(&"task_overview"));
         assert!(names.contains(&"task_merge"));
     }
 
@@ -3135,7 +3193,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "register");
         assert_eq!(parsed["name"], "tasks");
-        assert_eq!(parsed["tools"].as_array().unwrap().len(), 13);
+        assert_eq!(parsed["tools"].as_array().unwrap().len(), 14);
     }
 
     fn extract_text(result: &PluginToolResult) -> String {
@@ -4143,7 +4201,7 @@ mod tests {
             .map(|t| t.prompt_guidelines.len())
             .sum();
         assert!(
-            total < 16,
+            total < 18,
             "task_* prompt_guidelines total should stay small; got {}",
             total
         );

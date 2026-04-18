@@ -355,78 +355,16 @@ pub(super) fn handle_task_overview(
     project: &str,
     recent_limit: usize,
 ) -> Response {
-    use crate::protocol::TaskBlockedOn;
-    use crate::tasks_scheduler::WaitReason;
-
     let db = match open_tasks_db() {
         Ok(db) => db,
         Err(resp) => return resp,
     };
-    let status = match crate::tasks_scheduler::get_status(&db, project, None) {
-        Ok(s) => s,
-        Err(e) => {
-            return Response::Error {
-                message: e.to_string(),
-            };
-        }
-    };
-
     let live = live_task_ids_for_project(state, project);
-    let to_infos = |rows: Vec<crate::tasks_scheduler::TaskStatus>| -> Vec<TaskInfo> {
-        rows.into_iter()
-            .map(|ts| task_to_info_with_live(ts.task, &live))
-            .collect()
-    };
-
-    // Collect dep wait-reasons for blocked (and any active waiting on deps).
-    let mut blocked_on: Vec<TaskBlockedOn> = Vec::new();
-    for ts in status.blocked.iter().chain(status.active.iter()) {
-        let waits_on: Vec<i64> = ts
-            .wait_reasons
-            .iter()
-            .filter_map(|r| match r {
-                WaitReason::Dependency { task_id, .. } => Some(*task_id),
-                _ => None,
-            })
-            .collect();
-        if !waits_on.is_empty() {
-            blocked_on.push(TaskBlockedOn {
-                task_id: ts.task.id,
-                waits_on,
-            });
-        }
-    }
-
-    let active = to_infos(status.active);
-    let queued_ready = to_infos(status.queued_ready);
-    let queued_planning = to_infos(status.queued_planning);
-    let blocked = to_infos(status.blocked);
-    let held = to_infos(status.held);
-
-    let recently_merged: Vec<TaskInfo> = db
-        .list_recent_by_state(project, "merged", recent_limit)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| task_to_info_with_live(t, &live))
-        .collect();
-    let recently_closed: Vec<TaskInfo> = db
-        .list_recent_by_state(project, "closed", recent_limit)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|t| task_to_info_with_live(t, &live))
-        .collect();
-
-    Response::TaskOverview {
-        active,
-        queued_ready,
-        queued_planning,
-        blocked,
-        held,
-        recently_merged,
-        recently_closed,
-        inflight_count: status.inflight_count,
-        max_concurrent: status.max_concurrent,
-        blocked_on,
+    match crate::tasks_scheduler::task_overview_response(&db, project, recent_limit, &live) {
+        Ok(resp) => resp,
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
     }
 }
 

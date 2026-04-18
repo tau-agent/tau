@@ -2099,6 +2099,118 @@ fn format_task_line(out: &mut String, ts: &TaskStatus) {
 }
 
 // ---------------------------------------------------------------------------
+// Structured overview (for TaskOverview RPC + task_overview tool)
+// ---------------------------------------------------------------------------
+
+/// Convert a DB `Task` to its wire form, setting `has_live_session` from
+/// the caller-supplied set of live task ids.
+fn task_to_info_with_live(
+    t: crate::tasks_db::Task,
+    live_task_ids: &HashSet<i64>,
+) -> tau_agent_base::protocol::TaskInfo {
+    tau_agent_base::protocol::TaskInfo {
+        has_live_session: live_task_ids.contains(&t.id),
+        id: t.id,
+        project_name: t.project_name,
+        title: t.title,
+        state: t.state,
+        priority: t.priority,
+        parent_id: t.parent_id,
+        tags: t.tags,
+        affected_files: t.affected_files,
+        branch: t.branch,
+        worktree_path: t.worktree_path,
+        session_id: t.session_id,
+        skip_review: t.skip_review,
+        require_approval: t.require_approval,
+        sandbox_profile: t.sandbox_profile,
+        held: t.held,
+        created_at: t.created_at,
+        updated_at: t.updated_at,
+    }
+}
+
+/// Build a structured [`tau_agent_base::protocol::Response::TaskOverview`]
+/// for `project`, with `recent_limit` applied per bucket to the recently-
+/// completed tail.
+///
+/// `live_task_ids` lets the caller stamp `has_live_session` based on its
+/// own view of running sessions (the plugin has no access to the server's
+/// `live_sessions` set). Callers without that information can pass an
+/// empty set.
+///
+/// All classification (active / queued_ready / queued_planning / blocked /
+/// held) is delegated to [`get_status`]; this function just converts the
+/// scheduler `TaskStatus` entries into wire `TaskInfo`s, collects the
+/// `TaskBlockedOn` side table from dependency wait reasons, and queries the
+/// DB for the recent tail.
+pub fn task_overview_response(
+    db: &TasksDb,
+    project: &str,
+    recent_limit: usize,
+    live_task_ids: &HashSet<i64>,
+) -> tau_agent_plugin::Result<tau_agent_base::protocol::Response> {
+    use tau_agent_base::protocol::{Response, TaskBlockedOn, TaskInfo};
+
+    let status = get_status(db, project, None)?;
+
+    let to_infos = |rows: Vec<TaskStatus>| -> Vec<TaskInfo> {
+        rows.into_iter()
+            .map(|ts| task_to_info_with_live(ts.task, live_task_ids))
+            .collect()
+    };
+
+    // Collect dep wait-reasons for blocked (and any active waiting on deps).
+    let mut blocked_on: Vec<TaskBlockedOn> = Vec::new();
+    for ts in status.blocked.iter().chain(status.active.iter()) {
+        let waits_on: Vec<i64> = ts
+            .wait_reasons
+            .iter()
+            .filter_map(|r| match r {
+                WaitReason::Dependency { task_id, .. } => Some(*task_id),
+                _ => None,
+            })
+            .collect();
+        if !waits_on.is_empty() {
+            blocked_on.push(TaskBlockedOn {
+                task_id: ts.task.id,
+                waits_on,
+            });
+        }
+    }
+
+    let active = to_infos(status.active);
+    let queued_ready = to_infos(status.queued_ready);
+    let queued_planning = to_infos(status.queued_planning);
+    let blocked = to_infos(status.blocked);
+    let held = to_infos(status.held);
+
+    let recently_merged: Vec<TaskInfo> = db
+        .list_recent_by_state(project, "merged", recent_limit)?
+        .into_iter()
+        .map(|t| task_to_info_with_live(t, live_task_ids))
+        .collect();
+    let recently_closed: Vec<TaskInfo> = db
+        .list_recent_by_state(project, "closed", recent_limit)?
+        .into_iter()
+        .map(|t| task_to_info_with_live(t, live_task_ids))
+        .collect();
+
+    Ok(Response::TaskOverview {
+        active,
+        queued_ready,
+        queued_planning,
+        blocked,
+        held,
+        recently_merged,
+        recently_closed,
+        inflight_count: status.inflight_count,
+        max_concurrent: status.max_concurrent,
+        blocked_on,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4143,5 +4255,135 @@ mod tests {
         let leaf = session_info("leaf", Some("a"), false);
         let a = session_info("a", Some("b-unreachable"), false);
         assert_eq!(run_find_root("leaf", vec![leaf, a]), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // task_overview_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_overview_response_classifies_each_bucket() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // 1. An active task.
+        let active = create_ready_task(&db, "proj", "active one", 5, None);
+        db.assign_task(active.id, "s-worker").unwrap();
+
+        // 2. A ready task with no blocker -> queued_ready.
+        let ready = create_ready_task(&db, "proj", "ready one", 3, None);
+
+        // 3. A ready task blocked by a dependency -> blocked.
+        let blocked = create_ready_task(&db, "proj", "waiting", 2, None);
+        db.add_relation(blocked.id, ready.id, "depends_on").unwrap();
+
+        // 4. A held task -> held.
+        let held = db
+            .create_task(
+                "proj",
+                "parked",
+                Some(1),
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                /* held */ true,
+            )
+            .unwrap();
+
+        // 5. A merged task -> recently_merged (and NOT in the live buckets).
+        let merge_me = create_ready_task(&db, "proj", "done", 1, None);
+        move_to_merged(&db, merge_me.id);
+
+        // 6. A task in a different project must not leak.
+        let _other = create_ready_task(&db, "other-proj", "other", 1, None);
+
+        let live = HashSet::new();
+        let resp = task_overview_response(&db, "proj", 10, &live).unwrap();
+        let (active_ids, queued_ready_ids, blocked_ids, held_ids, merged_ids, inflight, blocked_on) =
+            match resp {
+                tau_agent_base::protocol::Response::TaskOverview {
+                    active,
+                    queued_ready,
+                    blocked,
+                    held,
+                    recently_merged,
+                    inflight_count,
+                    blocked_on,
+                    ..
+                } => (
+                    active.iter().map(|t| t.id).collect::<Vec<_>>(),
+                    queued_ready.iter().map(|t| t.id).collect::<Vec<_>>(),
+                    blocked.iter().map(|t| t.id).collect::<Vec<_>>(),
+                    held.iter().map(|t| t.id).collect::<Vec<_>>(),
+                    recently_merged.iter().map(|t| t.id).collect::<Vec<_>>(),
+                    inflight_count,
+                    blocked_on,
+                ),
+                other => panic!("expected TaskOverview, got {:?}", other),
+            };
+        assert_eq!(active_ids, vec![active.id]);
+        assert_eq!(queued_ready_ids, vec![ready.id]);
+        assert_eq!(blocked_ids, vec![blocked.id]);
+        assert_eq!(held_ids, vec![held.id]);
+        assert_eq!(merged_ids, vec![merge_me.id]);
+        assert_eq!(inflight, 1);
+        // Dependency wait-reason surfaces in `blocked_on`.
+        let entry = blocked_on
+            .iter()
+            .find(|b| b.task_id == blocked.id)
+            .expect("blocked task should have an entry");
+        assert_eq!(entry.waits_on, vec![ready.id]);
+    }
+
+    #[test]
+    fn task_overview_response_recent_limit_truncates_and_orders() {
+        let db = TasksDb::open_memory().unwrap();
+        // Seed 20 merged tasks with distinct updated_at.
+        let mut ids = Vec::new();
+        for i in 0..20 {
+            let t = create_ready_task(&db, "proj", &format!("m{}", i), 0, None);
+            db.conn
+                .execute(
+                    "UPDATE tasks SET state = 'merged', updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![1_000_000_i64 + i as i64 * 1000, t.id],
+                )
+                .unwrap();
+            ids.push(t.id);
+        }
+
+        let resp = task_overview_response(&db, "proj", 5, &HashSet::new()).unwrap();
+        let merged = match resp {
+            tau_agent_base::protocol::Response::TaskOverview {
+                recently_merged, ..
+            } => recently_merged,
+            other => panic!("expected TaskOverview, got {:?}", other),
+        };
+        assert_eq!(merged.len(), 5);
+        // Newest first.
+        let merged_ids: Vec<i64> = merged.iter().map(|t| t.id).collect();
+        assert_eq!(
+            merged_ids,
+            vec![ids[19], ids[18], ids[17], ids[16], ids[15]]
+        );
+    }
+
+    #[test]
+    fn task_overview_response_live_ids_stamp_has_live_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let active = create_ready_task(&db, "proj", "a", 0, None);
+        db.assign_task(active.id, "s-worker").unwrap();
+
+        let mut live = HashSet::new();
+        live.insert(active.id);
+        let resp = task_overview_response(&db, "proj", 10, &live).unwrap();
+        let got = match resp {
+            tau_agent_base::protocol::Response::TaskOverview { active, .. } => active,
+            other => panic!("expected TaskOverview, got {:?}", other),
+        };
+        assert_eq!(got.len(), 1);
+        assert!(got[0].has_live_session, "live_ids should set the flag");
     }
 }

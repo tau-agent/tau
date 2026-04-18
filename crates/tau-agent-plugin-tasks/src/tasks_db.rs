@@ -321,7 +321,7 @@ CREATE INDEX IF NOT EXISTS idx_task_history_task ON task_history(task_id);
 ";
 
 pub struct TasksDb {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl TasksDb {

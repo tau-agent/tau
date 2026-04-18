@@ -241,10 +241,14 @@ pub enum Request {
     /// recently-terminated (`merged` / `closed`) tasks, all as `TaskInfo`
     /// rather than pre-formatted text.  Consumers (the TUI task picker)
     /// render the overview grouped by scheduler position.
+    ///
+    /// `recent_limit` applies **per bucket** — up to `recent_limit` merged
+    /// tasks **plus** up to `recent_limit` closed tasks, so the tail length
+    /// is at most `2 * recent_limit`.
     TaskOverview {
         project: String,
-        /// Max number of recently-terminated tasks to include per bucket.
-        /// Defaults to 10.
+        /// Max number of recently-terminated tasks to include *per bucket*
+        /// (merged and closed are capped separately).  Defaults to 10.
         #[serde(default = "default_recent_limit")]
         recent_limit: usize,
     },
@@ -357,9 +361,11 @@ pub enum Response {
         blocked: Vec<TaskInfo>,
         /// Tasks held (state=ready or planning, held=true).
         held: Vec<TaskInfo>,
-        /// Most recently merged tasks, newest first, capped at `recent_limit`.
+        /// Most recently merged tasks, newest first, capped at `recent_limit`
+        /// (the request's per-bucket limit).
         recently_merged: Vec<TaskInfo>,
-        /// Most recently closed tasks, newest first, capped at `recent_limit`.
+        /// Most recently closed tasks, newest first, capped at `recent_limit`
+        /// (the request's per-bucket limit; merged and closed are independent).
         recently_closed: Vec<TaskInfo>,
         /// Current in-flight count (active/review/merging/refining).
         inflight_count: usize,
