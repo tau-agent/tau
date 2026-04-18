@@ -1770,7 +1770,7 @@ pub(super) async fn handle_client(
                 send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::TaskGet { id } => {
-                let resp = super::task_handlers::handle_task_get(id);
+                let resp = super::task_handlers::handle_task_get(&state, id);
                 send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::TaskCreate {

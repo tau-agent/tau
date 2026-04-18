@@ -60,6 +60,21 @@ pub struct TaskSession {
     pub created_at: i64,
 }
 
+/// A single row from `task_history` — one update event (state transition,
+/// priority bump, etc.) recorded by `update_task`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskHistoryEntry {
+    /// Field that was updated: "state", "priority", "held", "affected_files",
+    /// "title", ...
+    pub field: String,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    /// Session that performed the update, if known.
+    pub session_id: Option<String>,
+    /// Unix millis.
+    pub created_at: i64,
+}
+
 /// Fields that can be updated on a task.
 #[derive(Debug, Clone, Default)]
 pub struct TaskUpdate {
@@ -1575,6 +1590,44 @@ impl TasksDb {
             );
         }
         Ok(sessions)
+    }
+
+    /// Get the task history log for a task — every recorded update in
+    /// chronological order (oldest first).  Limited to the most recent
+    /// 200 entries to bound payload size; most tasks have far fewer.
+    pub fn get_history(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<TaskHistoryEntry>> {
+        // Grab the most recent 200 entries (ORDER BY id DESC LIMIT 200), then
+        // flip to chronological before returning.  `id` is monotonic per-row,
+        // so this is equivalent to ORDER BY created_at in practice.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT field, old_value, new_value, session_id, created_at \
+                 FROM task_history WHERE task_id = ?1 \
+                 ORDER BY id DESC LIMIT 200",
+            )
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get history: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![task_id], |row| {
+                Ok(TaskHistoryEntry {
+                    field: row.get(0)?,
+                    old_value: row.get(1)?,
+                    new_value: row.get(2)?,
+                    session_id: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("get history: {}", e)))?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(
+                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read history row: {}", e)))?,
+            );
+        }
+        entries.reverse();
+        Ok(entries)
     }
 
     /// Find the most recent session for a task with the given role.
@@ -3142,6 +3195,96 @@ mod tests {
         assert!(roles.contains(&"worker"));
         assert!(roles.contains(&"reviewer"));
         assert!(roles.contains(&"contributor"));
+    }
+
+    #[test]
+    fn test_get_history_returns_updates_in_chronological_order() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Original",
+                Some(3),
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        // Apply a few updates; each one records a row in task_history.
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                priority: Some(7),
+                ..Default::default()
+            },
+            Some("s1"),
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            Some("s2"),
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                title: Some("Renamed".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let history = db.get_history(task.id).unwrap();
+        assert_eq!(history.len(), 3, "three updates expected");
+
+        assert_eq!(history[0].field, "priority");
+        assert_eq!(history[0].old_value.as_deref(), Some("3"));
+        assert_eq!(history[0].new_value.as_deref(), Some("7"));
+        assert_eq!(history[0].session_id.as_deref(), Some("s1"));
+
+        assert_eq!(history[1].field, "state");
+        assert_eq!(history[1].old_value.as_deref(), Some("ready"));
+        assert_eq!(history[1].new_value.as_deref(), Some("active"));
+        assert_eq!(history[1].session_id.as_deref(), Some("s2"));
+
+        assert_eq!(history[2].field, "title");
+        assert_eq!(history[2].new_value.as_deref(), Some("Renamed"));
+        assert!(history[2].session_id.is_none());
+    }
+
+    #[test]
+    fn test_get_history_empty_for_untouched_task() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Test",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+
+        // create_task does not write to task_history.
+        let history = db.get_history(task.id).unwrap();
+        assert!(history.is_empty());
     }
 
     #[test]

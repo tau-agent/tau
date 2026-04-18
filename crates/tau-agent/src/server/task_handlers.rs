@@ -1,6 +1,11 @@
 //! Task protocol handlers — used by both client dispatch and plugin dispatch.
 
-use crate::protocol::{Response, TaskInfo, TaskMessageInfo, TaskRelationInfo};
+use crate::protocol::{
+    Response, TaskHistoryInfo, TaskInfo, TaskMessageInfo, TaskRelationInfo, TaskSessionInfo,
+};
+
+use super::dispatch::get_session_info_impl;
+use super::state::SharedState;
 
 fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
     TaskInfo {
@@ -74,7 +79,7 @@ pub fn handle_task_list(
     }
 }
 
-pub fn handle_task_get(id: i64) -> Response {
+pub(super) fn handle_task_get(state: &SharedState, id: i64) -> Response {
     let db = match open_tasks_db() {
         Ok(db) => db,
         Err(resp) => return resp,
@@ -116,11 +121,51 @@ pub fn handle_task_get(id: i64) -> Response {
             };
         }
     };
+    let task_sessions = db.get_sessions(id).unwrap_or_default();
+    let mut sessions: Vec<TaskSessionInfo> = Vec::with_capacity(task_sessions.len());
+    for ts in task_sessions {
+        // Enrich with a best-effort GetSessionInfo-style lookup.  Sessions
+        // that can't be resolved (deleted, other store, etc.) are dropped
+        // from the enriched view — callers that want the raw row can query
+        // `get_sessions` directly.
+        match get_session_info_impl(state, &ts.session_id) {
+            Response::SessionInfo { info } => {
+                sessions.push(TaskSessionInfo {
+                    session_id: ts.session_id,
+                    role: ts.role,
+                    created_at: ts.created_at,
+                    message_count: Some(info.message_count),
+                    archived: Some(info.archived),
+                    last_activity: Some(info.last_activity),
+                    last_phase: Some(info.state),
+                    last_exit_status: info.last_exit_status,
+                    is_live: info.is_live,
+                });
+            }
+            _ => {
+                // Session no longer exists — drop the row, per spec.
+            }
+        }
+    }
+    let history: Vec<TaskHistoryInfo> = db
+        .get_history(id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|h| TaskHistoryInfo {
+            field: h.field,
+            old_value: h.old_value,
+            new_value: h.new_value,
+            session_id: h.session_id,
+            created_at: h.created_at,
+        })
+        .collect();
     Response::TaskDetail {
         task: task_to_info(task),
         messages: messages.into_iter().map(msg_to_info).collect(),
         relations: relations.into_iter().map(rel_to_info).collect(),
         subtasks: subtasks.into_iter().map(task_to_info).collect(),
+        sessions,
+        history,
     }
 }
 

@@ -1357,6 +1357,91 @@ fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         lines.push(Line::from(""));
     }
 
+    // Sessions
+    if !detail.sessions.is_empty() {
+        let now = crate::app::now_secs();
+        let live = detail.sessions.iter().filter(|s| s.is_live).count();
+        let header = if live > 0 {
+            format!("  Sessions ({}, {} live)", detail.sessions.len(), live)
+        } else {
+            format!("  Sessions ({})", detail.sessions.len())
+        };
+        lines.push(Line::from(Span::styled(header, theme.bold_fg(theme.text))));
+        for s in &detail.sessions {
+            let msgs = s
+                .message_count
+                .map(|n| format!("{} msgs", n))
+                .unwrap_or_else(|| "-".to_string());
+            let phase_or_exit = if s.is_live {
+                s.last_phase
+                    .as_deref()
+                    .map(|p| format!("live({})", p))
+                    .unwrap_or_else(|| "live".to_string())
+            } else if s.archived == Some(true) {
+                "archived".to_string()
+            } else if let Some(ref ex) = s.last_exit_status {
+                format!("idle({})", ex)
+            } else {
+                "idle".to_string()
+            };
+            let age = s
+                .last_activity
+                .map(|t| crate::app::format_age_since(now, t))
+                .unwrap_or_else(|| "-".to_string());
+            let row_style = if s.archived == Some(true) {
+                theme.fg(theme.dim)
+            } else {
+                theme.fg(theme.text)
+            };
+            let live_marker = if s.is_live { "\u{25CF} " } else { "  " };
+            lines.push(Line::from(vec![
+                Span::styled("    ", theme.fg(theme.text)),
+                Span::styled(
+                    live_marker.to_string(),
+                    if s.is_live {
+                        theme.fg(theme.accent)
+                    } else {
+                        theme.fg(theme.dim)
+                    },
+                ),
+                Span::styled(format!("{:<10} ", s.role), row_style),
+                Span::styled(format!("{:<7} ", s.session_id), theme.fg(theme.muted)),
+                Span::styled(format!("{:<18} ", phase_or_exit), row_style),
+                Span::styled(format!("{:<10} ", msgs), row_style),
+                Span::styled(format!("last: {}", age), theme.fg(theme.dim)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // History (recent activity) — reverse chronological, up to 8 entries.
+    if !detail.history.is_empty() {
+        let total = detail.history.len();
+        let shown = total.min(8);
+        let header = if total > shown {
+            format!("  Recent history ({} of {})", shown, total)
+        } else {
+            format!("  Recent history ({})", total)
+        };
+        lines.push(Line::from(Span::styled(header, theme.bold_fg(theme.text))));
+        let now_ms = crate::app::now_secs() * 1000;
+        for entry in detail.history.iter().rev().take(shown) {
+            let age = crate::app::format_age_since_ms(now_ms, entry.created_at);
+            let body = crate::app::render_history_entry(entry);
+            let sid = entry
+                .session_id
+                .as_deref()
+                .map(|s| format!(" ({})", s))
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(format!("    {:<7}", age), theme.fg(theme.dim)),
+                Span::styled(body, theme.fg(theme.text)),
+                Span::styled(sid, theme.fg(theme.muted)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+
     // Messages
     if !detail.messages.is_empty() {
         lines.push(Line::from(Span::styled(
@@ -1426,7 +1511,7 @@ fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     let hint = if app.task_picker_confirm.is_some() {
         " y/enter confirm  any key cancel"
     } else {
-        " a approve  r ready  d dispatch  g goto session  j/k scroll  esc back"
+        " a approve  r ready  d dispatch  enter/g switch  j/k scroll  esc back"
     };
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()

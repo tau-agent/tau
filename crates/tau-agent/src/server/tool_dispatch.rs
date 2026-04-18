@@ -646,7 +646,7 @@ pub(super) async fn handle_server_request(
             state: state_filter,
             parent_id,
         } => super::task_handlers::handle_task_list(project, state_filter.as_deref(), *parent_id),
-        Request::TaskGet { id } => super::task_handlers::handle_task_get(*id),
+        Request::TaskGet { id } => super::task_handlers::handle_task_get(state, *id),
         Request::TaskCreate {
             project,
             title,

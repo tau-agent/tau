@@ -4,7 +4,10 @@ use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyMod
 use ratatui_textarea::TextArea;
 
 use tau_agent::auth::SubscriptionUsage;
-use tau_agent::protocol::{Response, SessionInfo, TaskInfo, TaskMessageInfo, TaskRelationInfo};
+use tau_agent::protocol::{
+    Response, SessionInfo, TaskHistoryInfo, TaskInfo, TaskMessageInfo, TaskRelationInfo,
+    TaskSessionInfo,
+};
 use tau_agent::types::{
     AgentPhase, AssistantContent, Message, StopReason, StreamEvent, ToolResultMessage, UserContent,
 };
@@ -66,6 +69,8 @@ pub struct TaskPickerDetail {
     pub messages: Vec<TaskMessageInfo>,
     pub relations: Vec<TaskRelationInfo>,
     pub subtasks: Vec<TaskInfo>,
+    pub sessions: Vec<TaskSessionInfo>,
+    pub history: Vec<TaskHistoryInfo>,
     pub scroll: usize,
 }
 
@@ -165,6 +170,14 @@ pub struct App {
     pub task_picker_confirm: Option<(usize, String, TaskPickerConfirmAction)>,
     /// Task detail view data (when Enter is pressed on a task).
     pub task_picker_detail: Option<Box<TaskPickerDetail>>,
+    /// Pending `/task switch <id>` — set when the user ran the command and the
+    /// TaskDetail response hasn't come back yet.  When the response arrives we
+    /// resolve the primary session and emit `Action::SwitchSession`.
+    pub pending_task_switch: Option<i64>,
+    /// Pending `/task active` — set when the user ran the command and we're
+    /// waiting for the TaskList response before emitting `Action::SwitchSession`
+    /// for the top-priority active task.
+    pub pending_task_active_switch: bool,
     /// Task ID and title assigned to the current session (if any), for footer display.
     pub current_task_id: Option<(i64, String)>,
     /// Whether a text block in the current turn has already been
@@ -261,6 +274,8 @@ impl App {
             task_picker_create_mode: false,
             task_picker_confirm: None,
             task_picker_detail: None,
+            pending_task_switch: None,
+            pending_task_active_switch: false,
             current_task_id: None,
             turn_text_finalized: false,
             pending_steer: None,
@@ -1242,15 +1257,12 @@ impl App {
                     ));
                     return None;
                 }
-                KeyCode::Char('g') => {
-                    if let Some(ref session_id) = self
+                KeyCode::Char('g') | KeyCode::Enter => {
+                    let detail = self
                         .task_picker_detail
                         .as_ref()
-                        .expect("detail should be Some in detail mode")
-                        .task
-                        .session_id
-                    {
-                        let session_id = session_id.clone();
+                        .expect("detail should be Some in detail mode");
+                    if let Some(session_id) = primary_session_id(&detail.task, &detail.sessions) {
                         self.mode = self.task_picker_previous_mode;
                         self.task_picker_reset_transient();
                         return Some(Action::SwitchSession(session_id));
@@ -1936,10 +1948,36 @@ impl App {
             "mq" => Some(Action::TaskMergeQueue {
                 project: self.task_project(),
             }),
+            "switch" => {
+                let Some(id_str) = parts.get(1) else {
+                    self.messages.push(MessageItem::Error {
+                        text: "usage: /task switch <id>".into(),
+                    });
+                    return None;
+                };
+                let Ok(id) = id_str.parse::<i64>() else {
+                    self.messages.push(MessageItem::Error {
+                        text: format!("invalid task id: {}", id_str),
+                    });
+                    return None;
+                };
+                // Ask the server for the task detail; the response handler
+                // resolves the primary session and emits SwitchSession.
+                self.pending_task_switch = Some(id);
+                Some(Action::TaskGet { id })
+            }
+            "active" => {
+                // List active tasks, then switch to the most relevant one.
+                self.pending_task_active_switch = true;
+                Some(Action::TaskList {
+                    project: self.task_project(),
+                    state: Some("active".into()),
+                })
+            }
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!(
-                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, claim <id>, approve <id>, ready <id>, status, mq",
+                        "unknown task command: {}. Use: list [state], get <id>, create <title>, search <query>, claim <id>, approve <id>, ready <id>, switch <id>, active, status, mq",
                         subcmd
                     ),
                 });
@@ -2008,8 +2046,11 @@ impl App {
         task: &TaskInfo,
         messages: &[TaskMessageInfo],
         subtasks: &[TaskInfo],
+        sessions: &[TaskSessionInfo],
+        history: &[TaskHistoryInfo],
     ) {
         let skip = if task.skip_review { "yes" } else { "no" };
+        let held = if task.held { "yes \u{1F512}" } else { "no" };
         let branch = task.branch.as_deref().unwrap_or("none");
         let parent = task
             .parent_id
@@ -2021,13 +2062,83 @@ impl App {
         });
         self.messages.push(MessageItem::Status {
             text: format!(
-                "State: {} | Priority: {} | Skip review: {}",
+                "  State: {:<12} Priority: {:<3} Skip review: {}",
                 task.state, task.priority, skip
             ),
         });
         self.messages.push(MessageItem::Status {
-            text: format!("Branch: {} | Parent: {}", branch, parent),
+            text: format!(
+                "  Branch: {:<16} Parent: {:<8} Held: {}",
+                branch, parent, held
+            ),
         });
+
+        // Sessions block.
+        if !sessions.is_empty() {
+            let now = now_secs();
+            let live_count = sessions.iter().filter(|s| s.is_live).count();
+            let total = sessions.len();
+            let badge = if live_count > 0 {
+                format!("Sessions ({}, {} live)", total, live_count)
+            } else {
+                format!("Sessions ({})", total)
+            };
+            self.messages.push(MessageItem::Status { text: badge });
+            for s in sessions {
+                let msgs = s
+                    .message_count
+                    .map(|n| format!("{} msgs", n))
+                    .unwrap_or_else(|| "-".to_string());
+                let phase_or_exit = if s.is_live {
+                    s.last_phase
+                        .as_deref()
+                        .map(|p| format!("live({})", p))
+                        .unwrap_or_else(|| "live".to_string())
+                } else if s.archived == Some(true) {
+                    "archived".to_string()
+                } else if let Some(ref ex) = s.last_exit_status {
+                    format!("idle ({})", ex)
+                } else {
+                    "idle".to_string()
+                };
+                let age = s
+                    .last_activity
+                    .map(|t| format_age_since(now, t))
+                    .unwrap_or_else(|| "-".to_string());
+                let text = format!(
+                    "  {:<10} {:<7} {:<20} {:<10} last: {}",
+                    s.role, s.session_id, phase_or_exit, msgs, age
+                );
+                self.messages.push(MessageItem::Status { text });
+            }
+        }
+
+        // History block — reverse-chronological (most recent first), capped
+        // at 10 visible entries.
+        if !history.is_empty() {
+            let total = history.len();
+            let shown = total.min(10);
+            let header = if total > shown {
+                format!("History ({} entries, last {})", total, shown)
+            } else {
+                format!("History ({} entries)", total)
+            };
+            self.messages.push(MessageItem::Status { text: header });
+            let now_ms = now_secs() * 1000;
+            // History is chronological; walk in reverse.
+            for entry in history.iter().rev().take(shown) {
+                let age = format_age_since_ms(now_ms, entry.created_at);
+                let body = render_history_entry(entry);
+                let sid = entry
+                    .session_id
+                    .as_deref()
+                    .map(|s| format!(" ({})", s))
+                    .unwrap_or_default();
+                self.messages.push(MessageItem::Status {
+                    text: format!("  {:<6} {}{}", age, body, sid),
+                });
+            }
+        }
 
         if !messages.is_empty() {
             self.messages.push(MessageItem::Status {
@@ -2055,6 +2166,16 @@ impl App {
                     self.messages.push(MessageItem::Status { text });
                 }
             }
+        }
+
+        // Footer hint for quick session switch.
+        if let Some(primary) = primary_session_id(task, sessions) {
+            self.messages.push(MessageItem::Status {
+                text: format!(
+                    "  Use `/task switch {}` to jump to session {}.",
+                    task.id, primary
+                ),
+            });
         }
     }
 
@@ -2351,6 +2472,45 @@ impl App {
                         break;
                     }
                 }
+                // Pending /task active: pick the top active task and resolve
+                // its primary session via a follow-up TaskGet.
+                if self.pending_task_active_switch {
+                    self.pending_task_active_switch = false;
+                    // Active tasks from the filtered list; sort by priority desc,
+                    // then by updated_at desc.
+                    let mut actives: Vec<&TaskInfo> = tasks
+                        .iter()
+                        .filter(|(_, t)| t.state == "active")
+                        .map(|(_, t)| t)
+                        .collect();
+                    actives.sort_by(|a, b| {
+                        b.priority
+                            .cmp(&a.priority)
+                            .then_with(|| b.updated_at.cmp(&a.updated_at))
+                    });
+                    if let Some(top) = actives.first() {
+                        self.messages.push(MessageItem::Status {
+                            text: format!(
+                                "Active tasks ({}), switching to #{}: {}",
+                                actives.len(),
+                                top.id,
+                                top.title
+                            ),
+                        });
+                        // Walk the rest as a mini list.
+                        for t in actives.iter().skip(1).take(9) {
+                            self.messages.push(MessageItem::Status {
+                                text: format!("  #{:<4} prio {:<3} {}", t.id, t.priority, t.title),
+                            });
+                        }
+                        self.pending_task_switch = Some(top.id);
+                        return Some(Action::TaskGet { id: top.id });
+                    }
+                    self.messages.push(MessageItem::Status {
+                        text: "no active tasks".into(),
+                    });
+                    return None;
+                }
                 // If in task picker mode, populate picker state
                 if self.mode == AppMode::TaskPicker {
                     self.picker_tasks = tasks;
@@ -2389,7 +2549,23 @@ impl App {
                 messages,
                 relations,
                 subtasks,
+                sessions,
+                history,
             } => {
+                // Pending /task switch <id>: resolve primary session and
+                // jump.  Consume the flag regardless so a missing session
+                // doesn't leave us stuck in pending state.
+                if let Some(pending_id) = self.pending_task_switch.take()
+                    && pending_id == task.id
+                {
+                    if let Some(sid) = primary_session_id(&task, &sessions) {
+                        return Some(Action::SwitchSession(sid));
+                    }
+                    self.messages.push(MessageItem::Error {
+                        text: format!("task #{} has no session to switch to", task.id),
+                    });
+                    return None;
+                }
                 // If in task picker mode, populate detail view
                 if self.mode == AppMode::TaskPicker {
                     self.task_picker_detail = Some(Box::new(TaskPickerDetail {
@@ -2397,11 +2573,13 @@ impl App {
                         messages,
                         relations,
                         subtasks,
+                        sessions,
+                        history,
                         scroll: 0,
                     }));
                     return None;
                 }
-                self.render_task_detail(&task, &messages, &subtasks);
+                self.render_task_detail(&task, &messages, &subtasks, &sessions, &history);
             }
             Response::TaskUpdated { task } => {
                 let state = task.state.clone();
@@ -2819,6 +2997,120 @@ pub enum Action {
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.
 fn event_to_tui_textarea(key: &KeyEvent) -> crossterm::event::Event {
     crossterm::event::Event::Key(*key)
+}
+
+/// Current unix timestamp in seconds, clamped to 0 on clock skew.
+pub(crate) fn now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Format a "time since then" delta as a short human string.
+///
+/// `now_secs` and `then_secs` are both unix seconds.  Returns
+/// `"now"` / `"Nm ago"` / `"Nh ago"` / `"Nd ago"`; returns
+/// `"in the future"` if `then` is after `now`, or `"?"` if `then <= 0`.
+pub(crate) fn format_age_since(now_secs: i64, then_secs: i64) -> String {
+    if then_secs <= 0 {
+        return "?".into();
+    }
+    let delta = now_secs - then_secs;
+    if delta < 0 {
+        return "in the future".into();
+    }
+    if delta < 45 {
+        return "now".into();
+    }
+    let m = delta / 60;
+    if m < 60 {
+        return format!("{}m ago", m);
+    }
+    let h = delta / 3600;
+    if h < 24 {
+        return format!("{}h ago", h);
+    }
+    let d = delta / 86400;
+    format!("{}d ago", d)
+}
+
+/// Same as [`format_age_since`] but both inputs are unix milliseconds.
+pub(crate) fn format_age_since_ms(now_ms: i64, then_ms: i64) -> String {
+    format_age_since(now_ms / 1000, then_ms / 1000)
+}
+
+/// Render one `task_history` entry as a compact human-readable string.
+///
+/// State transitions are formatted as `state  old → new`; other fields use
+/// `field: old → new` (falling back to `field: new` when `old` is unknown).
+pub(crate) fn render_history_entry(entry: &TaskHistoryInfo) -> String {
+    let old = entry.old_value.as_deref().unwrap_or("");
+    let new = entry.new_value.as_deref().unwrap_or("");
+    match entry.field.as_str() {
+        "state" => format!("state    {} \u{2192} {}", old, new),
+        other => {
+            if old.is_empty() {
+                format!("{}: {}", other, new)
+            } else {
+                format!("{}: {} \u{2192} {}", other, old, new)
+            }
+        }
+    }
+}
+
+/// Preference order for resolving a task's "primary" session: worker beats
+/// reviewer beats refiner beats planner beats interactive beats creator.
+/// Unknown roles sort last.
+fn role_priority(role: &str) -> u8 {
+    match role {
+        "worker" => 0,
+        "reviewer" => 1,
+        "refiner" => 2,
+        "planner" => 3,
+        "interactive" => 4,
+        "creator" => 5,
+        _ => 99,
+    }
+}
+
+/// Pick the most useful session to jump to for a task.
+///
+/// Preference:
+///   1. any live non-archived session (prefer higher role_priority, then
+///      most recent activity);
+///   2. any non-archived session;
+///   3. `task.session_id` (the task's canonical assigned session).
+pub(crate) fn primary_session_id(task: &TaskInfo, sessions: &[TaskSessionInfo]) -> Option<String> {
+    // Candidates that are non-archived.
+    let mut live: Vec<&TaskSessionInfo> = sessions
+        .iter()
+        .filter(|s| s.is_live && s.archived != Some(true))
+        .collect();
+    live.sort_by(|a, b| {
+        role_priority(&a.role)
+            .cmp(&role_priority(&b.role))
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+    });
+    if let Some(s) = live.first() {
+        return Some(s.session_id.clone());
+    }
+
+    let mut ok: Vec<&TaskSessionInfo> = sessions
+        .iter()
+        .filter(|s| s.archived != Some(true))
+        .collect();
+    ok.sort_by(|a, b| {
+        role_priority(&a.role)
+            .cmp(&role_priority(&b.role))
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+    });
+    if let Some(s) = ok.first() {
+        return Some(s.session_id.clone());
+    }
+
+    task.session_id.clone()
 }
 
 /// Sort sessions into tree order: roots first (by last_activity desc),
@@ -3740,6 +4032,8 @@ mod tests {
             messages: vec![],
             relations: vec![],
             subtasks: vec![],
+            sessions: vec![],
+            history: vec![],
             scroll: 0,
         }));
         assert!(app.task_picker_detail.is_some());
@@ -3809,6 +4103,8 @@ mod tests {
             messages: vec![],
             relations: vec![],
             subtasks: vec![],
+            sessions: vec![],
+            history: vec![],
         });
         assert!(action.is_none());
         assert!(app.task_picker_detail.is_some());
@@ -4243,5 +4539,227 @@ mod tests {
         assert!(statuses[0].contains("in 3s"));
         assert_eq!(statuses[1], "some other status");
         assert!(statuses[2].contains("in 2s"));
+    }
+
+    // ---- Enriched task detail tests ----
+
+    fn make_task_session(role: &str, sid: &str) -> TaskSessionInfo {
+        TaskSessionInfo {
+            session_id: sid.into(),
+            role: role.into(),
+            created_at: 1_000_000,
+            message_count: Some(42),
+            archived: Some(false),
+            last_activity: Some(now_secs() - 120),
+            last_phase: Some("idle".into()),
+            last_exit_status: Some("completed".into()),
+            is_live: false,
+        }
+    }
+
+    #[test]
+    fn format_age_since_human_buckets() {
+        assert_eq!(format_age_since(1000, 0), "?");
+        assert_eq!(format_age_since(1000, 1010), "in the future");
+        assert_eq!(format_age_since(1000, 990), "now");
+        assert_eq!(format_age_since(1000, 900), "1m ago");
+        // 10 minutes.
+        assert_eq!(format_age_since(10_000, 9_400), "10m ago");
+        // 2h ago
+        assert_eq!(format_age_since(7200, 1), "1h ago");
+        // 2d ago
+        assert_eq!(format_age_since(3 * 86400, 86400), "2d ago");
+    }
+
+    #[test]
+    fn render_history_entry_formats_state_transitions() {
+        let entry = TaskHistoryInfo {
+            field: "state".into(),
+            old_value: Some("ready".into()),
+            new_value: Some("active".into()),
+            session_id: Some("s1".into()),
+            created_at: 1,
+        };
+        let s = render_history_entry(&entry);
+        assert!(s.contains("state"));
+        assert!(s.contains("ready"));
+        assert!(s.contains("active"));
+        assert!(s.contains("\u{2192}"));
+    }
+
+    #[test]
+    fn render_history_entry_formats_other_fields() {
+        let entry = TaskHistoryInfo {
+            field: "priority".into(),
+            old_value: Some("3".into()),
+            new_value: Some("7".into()),
+            session_id: None,
+            created_at: 1,
+        };
+        let s = render_history_entry(&entry);
+        assert!(s.starts_with("priority:"));
+        assert!(s.contains("3"));
+        assert!(s.contains("7"));
+    }
+
+    #[test]
+    fn primary_session_prefers_live_worker() {
+        let task = make_task_info(1, "t", "active");
+        let mut worker = make_task_session("worker", "s-worker");
+        worker.is_live = true;
+        let mut reviewer = make_task_session("reviewer", "s-rev");
+        reviewer.is_live = true;
+        let creator = make_task_session("creator", "s-creator");
+        let picked = primary_session_id(&task, &[creator, reviewer, worker]);
+        assert_eq!(picked.as_deref(), Some("s-worker"));
+    }
+
+    #[test]
+    fn primary_session_falls_back_to_non_archived() {
+        let task = make_task_info(1, "t", "active");
+        let mut archived = make_task_session("worker", "s-archived");
+        archived.archived = Some(true);
+        let creator = make_task_session("creator", "s-creator");
+        let picked = primary_session_id(&task, &[archived, creator]);
+        assert_eq!(picked.as_deref(), Some("s-creator"));
+    }
+
+    #[test]
+    fn primary_session_falls_back_to_task_session_id() {
+        let task = make_task_info(1, "t", "active");
+        // All sessions archived — fall back to task.session_id.
+        let mut a = make_task_session("worker", "s-a");
+        a.archived = Some(true);
+        let picked = primary_session_id(&task, &[a]);
+        // task.session_id = Some("s100") in make_task_info.
+        assert_eq!(picked.as_deref(), Some("s100"));
+    }
+
+    #[test]
+    fn render_task_detail_includes_sessions_and_history() {
+        let mut app = make_app();
+        let task = make_task_info(5, "Detail test", "active");
+        let sessions = vec![
+            make_task_session("worker", "s-w"),
+            make_task_session("reviewer", "s-r"),
+        ];
+        let history = vec![TaskHistoryInfo {
+            field: "state".into(),
+            old_value: Some("ready".into()),
+            new_value: Some("active".into()),
+            session_id: Some("s-w".into()),
+            created_at: now_secs() * 1000 - 60_000,
+        }];
+        app.render_task_detail(&task, &[], &[], &sessions, &history);
+        let joined: String = app
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                MessageItem::Status { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("Sessions (2"));
+        assert!(joined.contains("History (1"));
+        assert!(joined.contains("worker"));
+        assert!(joined.contains("reviewer"));
+        // State transition rendered.
+        assert!(joined.contains("ready"));
+        assert!(joined.contains("active"));
+        // Age formatting present (should be "Nm ago" or "now").
+        assert!(
+            joined.contains(" ago") || joined.contains("now"),
+            "joined: {joined}"
+        );
+    }
+
+    #[test]
+    fn task_switch_slash_command_sets_pending_and_requests_task_get() {
+        let mut app = make_app();
+        let action = app.handle_task_slash_command("switch 42");
+        match action {
+            Some(Action::TaskGet { id }) => assert_eq!(id, 42),
+            other => panic!("expected TaskGet, got {other:?}"),
+        }
+        assert_eq!(app.pending_task_switch, Some(42));
+    }
+
+    #[test]
+    fn task_switch_response_emits_switch_session() {
+        let mut app = make_app();
+        app.pending_task_switch = Some(7);
+        let task = make_task_info(7, "t", "active");
+        let mut worker = make_task_session("worker", "s-worker");
+        worker.is_live = true;
+        let action = app.handle_server_response(Response::TaskDetail {
+            task,
+            messages: vec![],
+            relations: vec![],
+            subtasks: vec![],
+            sessions: vec![worker],
+            history: vec![],
+        });
+        match action {
+            Some(Action::SwitchSession(sid)) => assert_eq!(sid, "s-worker"),
+            other => panic!("expected SwitchSession, got {other:?}"),
+        }
+        assert!(app.pending_task_switch.is_none());
+    }
+
+    #[test]
+    fn task_switch_usage_error_on_missing_id() {
+        let mut app = make_app();
+        let action = app.handle_task_slash_command("switch");
+        assert!(action.is_none());
+        assert!(app.pending_task_switch.is_none());
+        assert!(
+            app.messages.iter().any(|m| matches!(
+                m,
+                MessageItem::Error { text } if text.contains("usage")
+            )),
+            "expected usage error"
+        );
+    }
+
+    #[test]
+    fn task_active_lists_active_tasks_and_switches_to_top() {
+        let mut app = make_app();
+        // Initiate /task active.
+        let action = app.handle_task_slash_command("active");
+        match action {
+            Some(Action::TaskList { state, .. }) => {
+                assert_eq!(state.as_deref(), Some("active"))
+            }
+            other => panic!("expected TaskList, got {other:?}"),
+        }
+        assert!(app.pending_task_active_switch);
+
+        // Server replies with two active tasks and an extra non-active one.
+        let mut hi = make_task_info(10, "hi prio", "active");
+        hi.priority = 9;
+        let mut lo = make_task_info(11, "lo prio", "active");
+        lo.priority = 1;
+        let other = make_task_info(12, "merged", "merged");
+        let tree = vec![(0, hi.clone()), (0, lo), (0, other)];
+        let action = app.handle_server_response(Response::TaskTree { tasks: tree });
+        // Expect a follow-up TaskGet for the top-priority active task.
+        match action {
+            Some(Action::TaskGet { id }) => assert_eq!(id, hi.id),
+            other => panic!("expected TaskGet, got {other:?}"),
+        }
+        assert!(!app.pending_task_active_switch);
+        assert_eq!(app.pending_task_switch, Some(hi.id));
+    }
+
+    #[test]
+    fn task_active_no_active_tasks() {
+        let mut app = make_app();
+        app.handle_task_slash_command("active");
+        let action = app.handle_server_response(Response::TaskTree {
+            tasks: vec![(0, make_task_info(1, "m", "merged"))],
+        });
+        assert!(action.is_none());
+        assert!(!app.pending_task_active_switch);
     }
 }

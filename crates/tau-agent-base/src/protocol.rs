@@ -318,6 +318,15 @@ pub enum Response {
         messages: Vec<TaskMessageInfo>,
         relations: Vec<TaskRelationInfo>,
         subtasks: Vec<TaskInfo>,
+        /// Every `(session_id, role)` pair recorded for this task, enriched
+        /// with best-effort session state.  Missing / deleted / cross-project
+        /// sessions are dropped silently.  Back-compat: older clients that
+        /// don't know about this field ignore it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sessions: Vec<TaskSessionInfo>,
+        /// State transitions and other task updates in chronological order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        history: Vec<TaskHistoryInfo>,
     },
     /// Task created or updated (response to TaskCreate, TaskUpdate, TaskAssign).
     TaskUpdated { task: TaskInfo },
@@ -461,6 +470,58 @@ pub struct TaskRelationInfo {
     pub from_task: i64,
     pub to_task: i64,
     pub relation: String,
+}
+
+/// Session recorded against a task, enriched with best-effort live state.
+///
+/// One `TaskSessionInfo` per `(task_id, session_id, role)` row in
+/// `task_sessions`.  Enrichment fields are `Option<T>` because a session may
+/// have been deleted, archived to a different store, or be otherwise
+/// unreadable — we still want to surface the bare `(session_id, role)` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskSessionInfo {
+    /// Session ID.
+    pub session_id: String,
+    /// Role: "creator" | "interactive" | "planner" | "refiner" | "worker" | "reviewer".
+    pub role: String,
+    /// When this session was recorded on the task (unix millis).
+    pub created_at: i64,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    /// Unix seconds of the session's last activity (any message append).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<i64>,
+    /// Last known phase ("idle" | "thinking" | "responding" | "tool_exec" | ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_phase: Option<String>,
+    /// Exit status if the session has finished a turn:
+    /// "completed" | "error" | "cancelled" | "max_turns".  None while live or
+    /// if the session has never run a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_status: Option<String>,
+    /// True when a chat turn is actively running for this session right now.
+    #[serde(default)]
+    pub is_live: bool,
+}
+
+/// Entry in the task history log (`task_history` table).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskHistoryInfo {
+    /// Field that was updated: "state", "priority", "held", "affected_files",
+    /// "title", ...
+    pub field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_value: Option<String>,
+    /// Session that performed the update, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Unix millis.
+    pub created_at: i64,
 }
 
 /// Cumulative session usage statistics.
@@ -900,6 +961,8 @@ mod tests {
                 messages: vec![msg],
                 relations: vec![rel],
                 subtasks: vec![task.clone()],
+                sessions: Vec::new(),
+                history: Vec::new(),
             },
             Response::TaskUpdated { task: task.clone() },
             Response::TaskStatus {
