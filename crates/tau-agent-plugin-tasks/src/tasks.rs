@@ -219,7 +219,9 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Create a new task in the project task board".into()),
             prompt_guidelines: vec![
-                "Top-level tasks start in 'interactive' for spec refinement; subtasks start in 'planning' (or 'ready' with skip_planning=true) and are auto-dispatched immediately on creation — a planning subtask gets a planning session, a ready subtask gets a worker session.".into(),
+                "Top-level tasks start in 'interactive' state and immediately spawn a session intended for the user to drive refinement of the spec. Only create a top-level task when the user will participate in that refinement.".into(),
+                "If you already have a complete spec and want to queue work yourself, create a subtask of an existing top-level task with skip_planning=true (starts in 'ready', no interactive session, auto-dispatches a worker). Do NOT create a top-level task and then immediately transition it to 'ready' — the interactive session that was already dispatched becomes orphaned.".into(),
+                "Subtasks are auto-dispatched on creation: skip_planning=true → worker session on a worktree; skip_planning=false → planning session (read-only, no worktree). Only create a subtask when you want work to start immediately.".into(),
             ],
         },
         PluginToolDef {
@@ -3406,6 +3408,35 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn test_task_create_guidelines_explain_interactive_session() {
+        // Regression test for task #511. The task_create guidelines must make
+        // three things explicit:
+        //   1. Top-level tasks spawn an interactive session for the user.
+        //   2. Self-specified work should use a skip_planning=true subtask,
+        //      NOT a top-level task immediately bumped to 'ready' (which
+        //      leaves an orphaned interactive session behind).
+        //   3. Subtasks auto-dispatch on creation.
+        let tools = tasks_tools();
+        let task_create = tools
+            .iter()
+            .find(|t| t.name == "task_create")
+            .expect("task_create tool def");
+        assert!(
+            task_create.prompt_guidelines.len() >= 3,
+            "task_create should have at least 3 guidelines; got {}",
+            task_create.prompt_guidelines.len()
+        );
+        assert!(
+            task_create
+                .prompt_guidelines
+                .iter()
+                .any(|g| g.contains("orphaned") || g.contains("for the user to drive")),
+            "task_create guidelines should warn about the orphaned interactive session / \
+             user-driven refinement pattern"
+        );
     }
 
     // ----- dependency enforcement tests (plugin layer) -----
