@@ -1179,19 +1179,14 @@ fn handle_task_update(
                 _ => {}
             }
 
-            // Emit a state-change InfoMessage to every involved session
-            // (and, for terminal/interactive transitions, the user's root
-            // session).  Observational only — does not wake the agent.
-            if let Some(ref old) = old_state
-                && &task.state != old
-            {
-                let context = match (old.as_str(), task.state.as_str()) {
-                    ("review", "active") => Some("rework requested"),
-                    ("refining", "interactive") => Some("scope expansion"),
-                    _ => None,
-                };
-                crate::tasks_notify::notify_state_change(db, &task, old, context, writer, reader);
-            }
+            // Note: the observational `notify_state_change` call is deferred
+            // until after any session-creating dispatches below
+            // (`dispatch_review`, `dispatch_refining`,
+            // `create_interactive_session`).  The spec requires the newly
+            // created session be recorded in `task_sessions` BEFORE we
+            // emit the info message, so the new session sees the
+            // transition that created it in its own history.  See
+            // `deferred_notify` at the end of this match arm.
 
             // When a task transitions from review back to active (changes
             // requested), notify the worker session so it knows to resume.
@@ -1409,9 +1404,50 @@ fn handle_task_update(
                 }
             }
 
+            // Deferred observational broadcast for non-terminal transitions.
+            //
+            // The review/refining/interactive dispatch blocks above may
+            // have CREATED a new session (reviewer, refiner, or
+            // interactive) and recorded it in `task_sessions`.  By
+            // emitting the info message here — after those
+            // `record_session` calls — the newly created session
+            // participates in the recipient set and sees the transition
+            // that spawned it in its own history.
+            //
+            // Terminal transitions (merged / closed) are handled inside
+            // their dedicated block below: they must fire BEFORE
+            // `auto_archive_task_session`, otherwise the soon-to-be
+            // archived worker/reviewer sessions would be filtered out of
+            // the recipient set.
+            if let Some(ref old) = old_state
+                && &task.state != old
+                && task.state != "merged"
+                && task.state != "closed"
+            {
+                let context = match (old.as_str(), task.state.as_str()) {
+                    ("review", "active") => Some("rework requested"),
+                    ("refining", "interactive") => Some("scope expansion"),
+                    _ => None,
+                };
+                // Re-fetch so newly set session_id (interactive case) is
+                // visible to the recipient collector.
+                let fresh = db.get_task(task.id).ok().flatten().unwrap_or(task.clone());
+                crate::tasks_notify::notify_state_change(db, &fresh, old, context, writer, reader);
+            }
+
             // When a task transitions to a terminal state, auto-archive its session
             // and notify the parent task's session.
             if task.state == "merged" || task.state == "closed" {
+                // Emit observational state-change broadcast BEFORE archiving
+                // so the still-live worker/reviewer/... sessions receive the
+                // terminal info-message in their own history.  (Archived
+                // filtering in notify_state_change would otherwise drop them.)
+                if let Some(ref old) = old_state
+                    && &task.state != old
+                {
+                    crate::tasks_notify::notify_state_change(db, &task, old, None, writer, reader);
+                }
+
                 auto_archive_task_session(db, &task, resolver, writer, reader);
 
                 // Notify parent session that this individual subtask completed
@@ -3622,6 +3658,342 @@ mod tests {
             !written.contains("\"queue_info\""),
             "title-only update should not emit QueueInfo:\n{}",
             written
+        );
+    }
+
+    /// Helper for the ordering regression tests: pull out every
+    /// (target_session_id, text) pair from written QueueInfo lines.
+    fn captured_queue_info(
+        shared: &std::sync::Arc<std::sync::Mutex<MockShared>>,
+    ) -> Vec<(String, String)> {
+        let mut shared = shared.lock().unwrap();
+        shared.process_pending();
+        let mut out = Vec::new();
+        for line in &shared.written_lines {
+            let msg: PluginMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if let PluginMessage::ServerRequest { request, .. } = msg {
+                if let tau_agent_plugin::Request::QueueInfo {
+                    target_session_id,
+                    text,
+                } = request
+                {
+                    out.push((target_session_id, text));
+                }
+            }
+        }
+        out
+    }
+
+    /// Ordering regression: `active → review` dispatches a new reviewer
+    /// session; that session MUST appear in the QueueInfo recipient set
+    /// so it sees the transition that created it in its own history.
+    ///
+    /// Regression for the review feedback on task #514: the old wiring
+    /// fired `notify_state_change` before `dispatch_review` recorded the
+    /// reviewer session, so the reviewer never saw the message.
+    #[test]
+    fn test_handle_task_update_review_dispatch_includes_new_reviewer_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "RevOrd",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        // Move through ready -> active (avoid the auto-review dispatch
+        // side-effects of going directly via the handler).
+        db.assign_task(task.id, "s-worker").unwrap();
+
+        // Transition active -> review via the handler.  This triggers
+        // `dispatch_review`, which CreateSession-s a reviewer session
+        // (mock returns "mock-s1") and records it before (per the fix)
+        // notify_state_change fires.
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "review"}),
+            Some("s-worker"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "handler error: {:?}",
+            extract_text(&result)
+        );
+
+        // Sanity: the reviewer session was in fact recorded against the
+        // task.  (If this fails the test can't distinguish between
+        // "dispatch_review never ran" and "ordering is wrong".)
+        let recorded: Vec<String> = db
+            .get_sessions(task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|ts| ts.role == "reviewer")
+            .map(|ts| ts.session_id)
+            .collect();
+        assert!(
+            !recorded.is_empty(),
+            "dispatch_review did not record a reviewer session"
+        );
+
+        let calls = captured_queue_info(&writer.shared);
+        let expected_text = format!("[task #{}] RevOrd: active → review", task.id);
+
+        // The new reviewer session must be on the recipient list.
+        let reviewer_sid = &recorded[0];
+        assert!(
+            calls
+                .iter()
+                .any(|(sid, text)| sid == reviewer_sid && text == &expected_text),
+            "reviewer session {:?} missing from QueueInfo recipients.  calls: {:?}",
+            reviewer_sid,
+            calls
+        );
+        // The worker session still receives the message too.
+        assert!(
+            calls
+                .iter()
+                .any(|(sid, text)| sid == "s-worker" && text == &expected_text),
+            "worker session missing from recipients. calls: {:?}",
+            calls
+        );
+    }
+
+    /// Ordering regression: `planning → refining` dispatches a new
+    /// refiner session; that session MUST appear in the QueueInfo
+    /// recipient set.
+    #[test]
+    fn test_handle_task_update_refining_dispatch_includes_new_refiner_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "RefOrd",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        db.record_session(task.id, "s-planner", "planner").unwrap();
+        db.set_session_id(task.id, "s-planner").unwrap();
+
+        // Transition planning -> refining via the handler.  This triggers
+        // `dispatch_refining`, which CreateSession-s a refiner session and
+        // records it with role "refiner" before notify_state_change fires.
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "refining"}),
+            Some("s-planner"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "handler error: {:?}",
+            extract_text(&result)
+        );
+
+        let recorded: Vec<String> = db
+            .get_sessions(task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|ts| ts.role == "refiner")
+            .map(|ts| ts.session_id)
+            .collect();
+        assert!(
+            !recorded.is_empty(),
+            "dispatch_refining did not record a refiner session"
+        );
+
+        let calls = captured_queue_info(&writer.shared);
+        let expected_text = format!("[task #{}] RefOrd: planning → refining", task.id);
+
+        let refiner_sid = &recorded[0];
+        assert!(
+            calls
+                .iter()
+                .any(|(sid, text)| sid == refiner_sid && text == &expected_text),
+            "refiner session {:?} missing from QueueInfo recipients.  calls: {:?}",
+            refiner_sid,
+            calls
+        );
+    }
+
+    /// Ordering regression: `ready → interactive` creates a new
+    /// interactive session via `create_interactive_session`; that new
+    /// session MUST see the transition info message in its own history.
+    #[test]
+    fn test_handle_task_update_interactive_creation_includes_new_session() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Start from a `ready` task with no session of its own.  The
+        // universal `* → interactive` override should create one.
+        let task = db
+            .create_task(
+                "test-project",
+                "IAOrd",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "interactive"}),
+            Some("s-caller"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "handler error: {:?}",
+            extract_text(&result)
+        );
+
+        // `create_interactive_session` records the new session with role
+        // "interactive" (and the caller with role "creator").
+        let recorded: Vec<(String, String)> = db
+            .get_sessions(task.id)
+            .unwrap()
+            .into_iter()
+            .map(|ts| (ts.session_id, ts.role))
+            .collect();
+        let interactive_sid: String = recorded
+            .iter()
+            .find(|(_, r)| r == "interactive")
+            .map(|(s, _)| s.clone())
+            .expect("dispatch created no interactive session");
+
+        let calls = captured_queue_info(&writer.shared);
+        let expected_text = format!("[task #{}] IAOrd: ready → interactive", task.id);
+        assert!(
+            calls
+                .iter()
+                .any(|(sid, text)| sid == &interactive_sid && text == &expected_text),
+            "new interactive session {:?} missing from QueueInfo recipients. calls: {:?}",
+            interactive_sid,
+            calls
+        );
+    }
+
+    /// Regression for the scope-expansion path: a task in `refining`
+    /// transitioning to `interactive` reuses the live refiner session
+    /// (no new session is created when the refiner is still alive).
+    /// The existing refiner session must still receive the
+    /// "refining → interactive (scope expansion)" info-message.
+    #[test]
+    fn test_handle_task_update_refining_to_interactive_scope_expansion() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Scope",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        // Move planning -> refining directly in the DB (bypass the
+        // handler so we isolate the refining -> interactive step under
+        // test; the planning->refining path dispatches a refiner and is
+        // already covered by an earlier test).
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.record_session(task.id, "s-refiner", "refiner").unwrap();
+        db.set_session_id(task.id, "s-refiner").unwrap();
+
+        // Drain any existing writes so we only inspect the
+        // refining->interactive step below.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.process_pending();
+            shared.written_lines.clear();
+        }
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "interactive"}),
+            Some("s-caller"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "handler error: {:?}",
+            extract_text(&result)
+        );
+
+        // The refiner session is alive per the mock's default
+        // `GetSessionInfo` response, so no new interactive session is
+        // created — the refiner itself becomes the interactive owner.
+        let calls = captured_queue_info(&writer.shared);
+        let expected_text = format!(
+            "[task #{}] Scope: refining → interactive (scope expansion)",
+            task.id
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(sid, text)| sid == "s-refiner" && text == &expected_text),
+            "refiner session missing from scope-expansion QueueInfo. calls: {:?}",
+            calls
         );
     }
 
