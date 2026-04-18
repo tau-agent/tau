@@ -103,10 +103,13 @@ pub fn is_running() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Tests in this module mutate process-global env vars; serialize them.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Tests in this module mutate process-global env vars. We share the
+    // crate-level `TEST_ENV_MUTEX` with `config_chain` and `project` so
+    // env-var mutations stay serialized across sibling test modules —
+    // otherwise e.g. config_chain's HOME/XDG_CONFIG_HOME flip can race
+    // with paths::state_dir_falls_back_to_tmp_when_neither_set.
+    use crate::TEST_ENV_MUTEX as ENV_LOCK;
 
     struct EnvSnapshot {
         xdg_state: Option<String>,
