@@ -13,13 +13,16 @@
 //! these calls to `tracing::*!` would make them no-ops.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
 
 use crate::tasks_db::{TaskUpdate, TasksDb};
 use crate::tasks_merge;
+use crate::tasks_merge_worker::{MergeJob, MergeWorker};
 use crate::tasks_scheduler;
 use tau_agent_plugin::ToolResultContent;
+use tau_agent_plugin::tunnel::SharedStdout;
 use tau_agent_plugin::{
     HookResult, PluginMessage, PluginRegistration, PluginRequest, PluginToolDef, PluginToolResult,
 };
@@ -47,7 +50,7 @@ pub(crate) struct ProjectResolver {
 impl ProjectResolver {
     /// Open `tau.db` read-only. Returns `Err` if the file doesn't exist or
     /// can't be opened.
-    fn open() -> tau_agent_plugin::Result<Self> {
+    pub(crate) fn open() -> tau_agent_plugin::Result<Self> {
         let path = tau_agent_plugin::data_dir().join("tau.db");
         let conn = rusqlite::Connection::open_with_flags(
             &path,
@@ -75,7 +78,7 @@ impl ProjectResolver {
 
     /// Create a resolver for testing with an in-memory database.
     #[cfg(test)]
-    fn test(entries: &[(&str, &str)]) -> Self {
+    pub(crate) fn test(entries: &[(&str, &str)]) -> Self {
         let conn =
             rusqlite::Connection::open_in_memory().expect("open in-memory db for test resolver");
         conn.execute_batch(
@@ -2165,8 +2168,15 @@ pub fn run_tasks_plugin() {
         }
     };
 
+    // ---- Writer setup: shared, mutex-protected BufWriter<Stdout> ----
+    //
+    // Both the main loop and the merge worker thread write to stdout.
+    // SharedStdout serialises each JSON line under an Arc<Mutex<_>> so
+    // writes never interleave.
     let stdout = std::io::stdout();
-    let mut writer = BufWriter::new(stdout.lock());
+    let stdout_writer = Arc::new(Mutex::new(BufWriter::new(stdout)));
+    let mut writer = SharedStdout::from_arc(Arc::clone(&stdout_writer));
+    let worker_writer = SharedStdout::from_arc(Arc::clone(&stdout_writer));
 
     // Send registration
     let registration = PluginRegistration {
@@ -2177,29 +2187,99 @@ pub fn run_tasks_plugin() {
     };
     send_message(&mut writer, &PluginMessage::Register(registration));
 
-    // Spawn a reader thread that sends lines through a channel.
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut reader = BufReader::new(stdin.lock());
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    if line_tx.send(line).is_err() {
-                        break; // Main thread dropped the receiver
+    // ---- Line router ----
+    //
+    // A dedicated thread reads every line from stdin, parses it once,
+    // and dispatches:
+    //
+    //   * `ServerResponse` lines whose `request_id` starts with
+    //     `merge-sr-` go to `worker_resp_tx`.
+    //   * Other `ServerResponse` lines go to `main_resp_tx` (e.g. the
+    //     main loop's own tool-handler RPCs, tagged `task-sr-...`).
+    //   * All other `PluginRequest` variants (ToolCall, Hook, Init,
+    //     SessionStart, Idle, CancelToolCall) go to `main_req_tx` for
+    //     the main event loop to dispatch.
+    //
+    // This is what lets the merge worker's ServerRequest round-trips
+    // sit blocked on their own response channel without stopping the
+    // main loop from picking up new ToolCalls. See #540 for context.
+    let (main_req_tx, main_req_rx) = std::sync::mpsc::channel::<PluginRequest>();
+    let (main_resp_tx, main_resp_rx) = std::sync::mpsc::channel::<String>();
+    let (worker_resp_tx, worker_resp_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::Builder::new()
+        .name("tau-tasks-stdin-router".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut reader = BufReader::new(stdin.lock());
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                if line.trim().is_empty() {
+                    continue;
+                }
+                // Parse once. On malformed input, log and drop the
+                // line — neither the main loop nor the worker should
+                // see garbage.
+                let req: PluginRequest = match serde_json::from_str(&line) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("tasks router: bad request: {}", e);
+                        continue;
+                    }
+                };
+                match &req {
+                    PluginRequest::ServerResponse { request_id, .. } => {
+                        // Ensure the forwarded line ends with a newline
+                        // so the downstream `BufRead::read_line` caller
+                        // sees a line-terminated JSON object.
+                        let mut forward = line;
+                        if !forward.ends_with('\n') {
+                            forward.push('\n');
+                        }
+                        if request_id.starts_with("merge-sr") {
+                            if worker_resp_tx.send(forward).is_err() {
+                                // Worker side gone; the plugin is on the
+                                // way down. Stop routing.
+                                break;
+                            }
+                        } else if main_resp_tx.send(forward).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {
+                        if main_req_tx.send(req).is_err() {
+                            break;
+                        }
                     }
                 }
-                Err(_) => break,
             }
-        }
-    });
+        })
+        .expect("spawn tasks stdin router");
 
-    // Wrap line_rx in a ChannelLineReader so tool handlers (and the merge
-    // pass) can use it as a `BufRead`.  Since tool calls and the merge pass
-    // are never concurrent (both run on the main thread), sharing is safe.
-    let mut chan_reader = ChannelLineReader::new(line_rx);
+    // Main loop's reader: only yields server-response lines routed to it.
+    let mut chan_reader = ChannelLineReader::new(main_resp_rx);
+
+    // Worker reader: only yields merge-sr ServerResponse lines.
+    let worker_reader = ChannelLineReader::new(worker_resp_rx);
+
+    // Spawn the merge worker. Holding it in scope here ties its
+    // lifetime to `run_tasks_plugin`'s stack frame; on shutdown the
+    // handle is dropped, which closes the job channel, which lets the
+    // worker thread drain and exit.
+    let merge_worker = match MergeWorker::spawn(worker_writer, worker_reader) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            eprintln!(
+                "tasks plugin: failed to spawn merge worker: {} — merges will run inline",
+                e
+            );
+            None
+        }
+    };
 
     // Pending scheduler events, populated by tool handlers and drained
     // after each tool call completes.
@@ -2263,20 +2343,9 @@ pub fn run_tasks_plugin() {
         }
     }
 
-    // Handle requests — blocks on recv() until a line arrives or EOF.
-    while let Some(line) = chan_reader.recv() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let req: PluginRequest = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("tasks: bad request: {}", e);
-                continue;
-            }
-        };
-
+    // Handle requests — blocks on recv() until the router forwards
+    // the next PluginRequest or closes the channel on EOF / router shutdown.
+    while let Ok(req) = main_req_rx.recv() {
         match req {
             PluginRequest::ToolCall {
                 tool_call_id,
@@ -2387,6 +2456,7 @@ pub fn run_tasks_plugin() {
                     &mut pending_events,
                     &db,
                     &resolver,
+                    merge_worker.as_ref(),
                     &mut writer,
                     &mut chan_reader,
                 );
@@ -2439,6 +2509,7 @@ pub fn run_tasks_plugin() {
                         &mut pending_events,
                         &db,
                         &resolver,
+                        merge_worker.as_ref(),
                         &mut writer,
                         &mut chan_reader,
                     );
@@ -2475,7 +2546,7 @@ pub fn run_tasks_plugin() {
 /// `read_line` blocks until a line is available or the channel closes.
 ///
 /// Provides `recv` for blocking reads (used by the main event loop).
-struct ChannelLineReader {
+pub(crate) struct ChannelLineReader {
     rx: std::sync::mpsc::Receiver<String>,
     /// Leftover bytes from the current line that haven't been consumed yet.
     buf: Vec<u8>,
@@ -2483,7 +2554,7 @@ struct ChannelLineReader {
 }
 
 impl ChannelLineReader {
-    fn new(rx: std::sync::mpsc::Receiver<String>) -> Self {
+    pub(crate) fn new(rx: std::sync::mpsc::Receiver<String>) -> Self {
         Self {
             rx,
             buf: Vec::new(),
@@ -2493,7 +2564,8 @@ impl ChannelLineReader {
 
     /// Receive the next line, blocking until available. Returns `None`
     /// on channel close (EOF).
-    fn recv(&mut self) -> Option<String> {
+    #[allow(dead_code)]
+    pub(crate) fn recv(&mut self) -> Option<String> {
         match self.rx.recv() {
             Ok(line) => Some(line),
             Err(std::sync::mpsc::RecvError) => {
@@ -2552,7 +2624,9 @@ impl BufRead for ChannelLineReader {
     }
 }
 
-// ---------------------------------------------------------------------------\n// Scheduler event processing\n// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Scheduler event processing
+// ---------------------------------------------------------------------------
 
 /// Drain pending scheduler events and run the corresponding passes.
 ///
@@ -2560,10 +2634,18 @@ impl BufRead for ChannelLineReader {
 /// `MergeNeeded` events collapse into a single merge pass, and multiple
 /// `ScheduleNeeded` events for the same project collapse into one schedule
 /// pass.
+///
+/// `merge_worker` is threaded through so that when a merge is needed, the
+/// main loop can enqueue merge jobs onto the worker thread rather than
+/// running the merge inline. When `merge_worker` is `None` (tests or
+/// degraded startup paths) the code falls back to running merges inline on
+/// the current thread — this preserves the pre-#540 behaviour for unit
+/// tests that drive `drain_scheduler_events` directly.
 fn drain_scheduler_events(
     events: &mut Vec<SchedulerEvent>,
     db: &TasksDb,
     resolver: &ProjectResolver,
+    merge_worker: Option<&MergeWorker>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> Vec<String> {
@@ -2600,7 +2682,14 @@ fn drain_scheduler_events(
     // Run merge pass first (merging may unblock dependencies that become
     // ready, but schedule passes are triggered by explicit events anyway).
     if need_merge {
-        run_merge_pass(db, resolver, merge_caller.as_deref(), writer, reader);
+        run_merge_pass(
+            db,
+            resolver,
+            merge_worker,
+            merge_caller.as_deref(),
+            writer,
+            reader,
+        );
     }
 
     let mut warnings = Vec::new();
@@ -2621,19 +2710,62 @@ fn drain_scheduler_events(
 // Merge pass
 // ---------------------------------------------------------------------------
 
-/// Run a merge pass: find approved tasks and merge them.
+/// Run a merge pass.
 ///
-/// Triggered when a task transitions to `approved`. Shares the same
-/// writer (stdout) and reader (channel from stdin) as tool handlers —
-/// this is safe because the merge pass and tool handling are never
-/// concurrent (both run on the main thread).
+/// Finds every approved task and either
+///
+/// * enqueues one [`MergeJob`] per task onto the supplied worker thread
+///   (the normal plugin path), or
+/// * if no worker is available, falls back to the legacy inline path via
+///   [`tasks_scheduler::merge_approved_for_caller`].
+///
+/// This is called from the plugin main loop after each tool call completes;
+/// enqueuing is cheap and returns immediately, so the main loop stays
+/// responsive even while the worker is mid-`just test`. See #540.
 fn run_merge_pass(
     db: &TasksDb,
     resolver: &ProjectResolver,
+    merge_worker: Option<&MergeWorker>,
     caller_session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) {
+    if let Some(worker) = merge_worker {
+        // Fast path: enumerate approved tasks and enqueue one job per
+        // task. The worker will re-read each task from the DB before
+        // merging, so we don't need to snapshot any other state here.
+        match db.get_approved_tasks(None) {
+            Ok(approved) => {
+                if approved.is_empty() {
+                    return;
+                }
+                for task in approved {
+                    eprintln!(
+                        "tasks scheduler: enqueuing merge job for task {} ({})",
+                        task.id, task.title
+                    );
+                    let job = MergeJob {
+                        task_id: task.id,
+                        caller_session_id: caller_session_id.map(|s| s.to_string()),
+                    };
+                    if let Err(e) = worker.enqueue(job) {
+                        eprintln!(
+                            "tasks scheduler: merge worker channel closed for task {}: {}",
+                            e.0.task_id, e
+                        );
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("tasks scheduler: failed to list approved tasks: {}", e);
+            }
+        }
+        return;
+    }
+
+    // Fallback: inline merge (used only when the worker failed to spawn
+    // or in tests). Mirrors the pre-#540 behaviour.
     let resolve_fn = |name: &str| resolver.resolve(name);
     match tasks_scheduler::merge_approved_for_caller(
         db,

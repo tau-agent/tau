@@ -126,7 +126,10 @@ fn server_request(
     reader: &mut impl BufRead,
     request: Request,
 ) -> tau_agent_plugin::Result<Response> {
-    tau_agent_plugin::tunnel::server_request(writer, reader, request, "merge-sr")
+    // Route to the thread-local prefix so the plugin's line router
+    // delivers the response to the correct channel (main loop vs.
+    // merge worker). See `tasks_scheduler::RPC_PREFIX`.
+    crate::tasks_scheduler::server_request(writer, reader, request)
 }
 
 // ---------------------------------------------------------------------------

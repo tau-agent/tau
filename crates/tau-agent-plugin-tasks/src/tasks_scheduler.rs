@@ -1737,12 +1737,39 @@ pub(crate) fn send_message(writer: &mut impl Write, msg: &PluginMessage) {
     tau_agent_plugin::tunnel::send_message(writer, msg);
 }
 
+thread_local! {
+    /// Request-id prefix for `server_request` calls made on the current
+    /// thread. Defaults to `"task-sr"` (the plugin main loop); the merge
+    /// worker overrides this to `"merge-sr"` at thread start via
+    /// [`set_thread_rpc_prefix`] so its outgoing RPCs are routed to its
+    /// own response channel.
+    ///
+    /// See `crates/tau-agent-plugin/src/tunnel.rs` for the wire format
+    /// and `crate::tasks::run_tasks_plugin` for the line router that
+    /// dispatches `ServerResponse`s based on this prefix.
+    static RPC_PREFIX: std::cell::RefCell<&'static str> = const { std::cell::RefCell::new("task-sr") };
+}
+
+/// Set the per-thread RPC prefix used by [`server_request`] below. Call
+/// this once at the top of a worker thread's entry point.
+pub(crate) fn set_thread_rpc_prefix(prefix: &'static str) {
+    RPC_PREFIX.with(|p| *p.borrow_mut() = prefix);
+}
+
+/// Read the current thread's RPC prefix. Useful in tests that want to
+/// assert the worker thread is using the merge-sr prefix.
+#[allow(dead_code)]
+pub(crate) fn current_rpc_prefix() -> &'static str {
+    RPC_PREFIX.with(|p| *p.borrow())
+}
+
 pub fn server_request(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     request: tau_agent_plugin::Request,
 ) -> tau_agent_plugin::Result<tau_agent_plugin::Response> {
-    tau_agent_plugin::tunnel::server_request(writer, reader, request, "task-sr")
+    let prefix = RPC_PREFIX.with(|p| *p.borrow());
+    tau_agent_plugin::tunnel::server_request(writer, reader, request, prefix)
 }
 
 // ---------------------------------------------------------------------------
