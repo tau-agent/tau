@@ -69,7 +69,12 @@ pub fn load_first<T: serde::de::DeserializeOwned>(
         match toml::from_str::<T>(&content) {
             Ok(val) => return Some(val),
             Err(e) => {
-                tracing::warn!(path = %path.display(), %e, "config_chain: failed to parse");
+                // Use eprintln! here rather than tracing: config_chain is a
+                // shared utility called from subprocesses (tasks plugin) and
+                // CLI commands that don't install a tracing subscriber. In
+                // the server process, stderr is captured by the parent
+                // daemon.stderr.log so the warning still lands somewhere.
+                eprintln!("config_chain: failed to parse {}: {}", path.display(), e);
             }
         }
     }
@@ -98,7 +103,8 @@ pub fn load_all<T: serde::de::DeserializeOwned>(
         match toml::from_str::<T>(&content) {
             Ok(val) => results.push((path, val)),
             Err(e) => {
-                tracing::warn!(path = %path.display(), %e, "config_chain: failed to parse");
+                // See comment above about eprintln! vs tracing here.
+                eprintln!("config_chain: failed to parse {}: {}", path.display(), e);
             }
         }
     }
