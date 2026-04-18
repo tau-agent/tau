@@ -1836,6 +1836,14 @@ pub(super) async fn handle_client(
                 let resp = super::task_handlers::handle_task_status(&project);
                 send(&mut writer, &resp).await?;
             }
+            crate::protocol::Request::TaskOverview {
+                project,
+                recent_limit,
+            } => {
+                let resp =
+                    super::task_handlers::handle_task_overview(&state, &project, recent_limit);
+                send(&mut writer, &resp).await?;
+            }
             crate::protocol::Request::TaskMergeQueue { project } => {
                 let resp = super::task_handlers::handle_task_merge_queue(&project);
                 send(&mut writer, &resp).await?;

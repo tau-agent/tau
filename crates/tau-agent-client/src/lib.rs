@@ -101,6 +101,7 @@ impl Client {
                 | Response::TaskDetail { .. }
                 | Response::TaskUpdated { .. }
                 | Response::TaskStatus { .. }
+                | Response::TaskOverview { .. }
                 | Response::TaskTree { .. }
                 | Response::TaskMergeQueue { .. }
                 | Response::ServerShutdown { .. } => true,

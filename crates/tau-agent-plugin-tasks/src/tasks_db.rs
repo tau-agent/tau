@@ -664,6 +664,41 @@ impl TasksDb {
         Ok(tasks)
     }
 
+    /// List the most recently-updated tasks in a terminal state.
+    ///
+    /// Intended for the task-overview "recently completed" tail: pass
+    /// `state = "merged"` or `state = "closed"` and a small `limit`.
+    /// Rows are ordered by `updated_at DESC` (newest first).
+    pub fn list_recent_by_state(
+        &self,
+        project_name: &str,
+        state: &str,
+        limit: usize,
+    ) -> tau_agent_plugin::Result<Vec<Task>> {
+        let sql = "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
+                          branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                          created_at, updated_at
+                   FROM tasks
+                   WHERE project_name = ?1 AND state = ?2
+                   ORDER BY updated_at DESC, id DESC
+                   LIMIT ?3";
+
+        let mut stmt = self.conn.prepare(sql).map_err(|e| {
+            tau_agent_plugin::Error::Io(format!("prepare list_recent_by_state: {}", e))
+        })?;
+        let rows = stmt
+            .query_map(params![project_name, state, limit as i64], row_to_task)
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("list_recent_by_state: {}", e)))?;
+
+        let mut tasks = Vec::with_capacity(limit);
+        for row in rows {
+            tasks.push(
+                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read task row: {}", e)))?,
+            );
+        }
+        Ok(tasks)
+    }
+
     /// Update a task. Records changes in task_history.
     /// Validates state transitions if state is being changed.
     pub fn update_task(
@@ -6771,5 +6806,95 @@ mod tests {
             .map(|c| c > 0)
             .unwrap();
         assert!(has_held, "migrate() should add the held column");
+    }
+
+    #[test]
+    fn test_list_recent_by_state_orders_newest_first_and_limits() {
+        let db = TasksDb::open_memory().unwrap();
+
+        // Seed 4 merged tasks with distinct updated_at.
+        let mut ids = Vec::new();
+        for i in 0..4 {
+            let t = db
+                .create_task(
+                    "proj",
+                    &format!("merged #{}", i),
+                    None,
+                    None,
+                    None,
+                    false,
+                    "ready",
+                    false,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+            // Directly set state + updated_at to sidestep state-machine checks.
+            db.conn
+                .execute(
+                    "UPDATE tasks SET state = 'merged', updated_at = ?1 WHERE id = ?2",
+                    params![1_000_000i64 + i as i64 * 1000, t.id],
+                )
+                .unwrap();
+            ids.push(t.id);
+        }
+
+        // Add a non-merged task that should NOT appear.
+        let _other = db
+            .create_task(
+                "proj",
+                "still ready",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        // And a merged task in a different project that should be excluded.
+        let other_proj = db
+            .create_task(
+                "other",
+                "other merged",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET state = 'merged' WHERE id = ?1",
+                params![other_proj.id],
+            )
+            .unwrap();
+
+        let recent = db.list_recent_by_state("proj", "merged", 10).unwrap();
+        assert_eq!(recent.len(), 4);
+        // Newest first -> last inserted id first.
+        assert_eq!(recent[0].id, ids[3]);
+        assert_eq!(recent[1].id, ids[2]);
+        assert_eq!(recent[2].id, ids[1]);
+        assert_eq!(recent[3].id, ids[0]);
+
+        // Limit is applied.
+        let limited = db.list_recent_by_state("proj", "merged", 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].id, ids[3]);
+        assert_eq!(limited[1].id, ids[2]);
+
+        // Other project is isolated.
+        let other_recent = db.list_recent_by_state("other", "merged", 10).unwrap();
+        assert_eq!(other_recent.len(), 1);
     }
 }

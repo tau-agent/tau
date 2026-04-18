@@ -235,6 +235,19 @@ pub enum Request {
     TaskAssign { id: i64, session_id: String },
     /// Get scheduler status.
     TaskStatus { project: String },
+    /// Structured task overview for interactive rendering.
+    ///
+    /// Returns active/queued/blocked/held tasks plus a bounded tail of
+    /// recently-terminated (`merged` / `closed`) tasks, all as `TaskInfo`
+    /// rather than pre-formatted text.  Consumers (the TUI task picker)
+    /// render the overview grouped by scheduler position.
+    TaskOverview {
+        project: String,
+        /// Max number of recently-terminated tasks to include per bucket.
+        /// Defaults to 10.
+        #[serde(default = "default_recent_limit")]
+        recent_limit: usize,
+    },
     /// Get merge queue (approved + merging tasks).
     TaskMergeQueue { project: String },
     /// Shut down the server.
@@ -332,6 +345,31 @@ pub enum Response {
     TaskUpdated { task: TaskInfo },
     /// Scheduler status text (response to TaskStatus).
     TaskStatus { text: String },
+    /// Structured scheduler overview (response to TaskOverview).
+    TaskOverview {
+        /// Tasks in active lifecycle states (active, review, merging, refining).
+        active: Vec<TaskInfo>,
+        /// Tasks ready to dispatch (state=ready, not held, deps satisfied).
+        queued_ready: Vec<TaskInfo>,
+        /// Tasks queued for planning (state=planning, deps satisfied).
+        queued_planning: Vec<TaskInfo>,
+        /// Tasks blocked by unmet dependencies (state=ready or planning).
+        blocked: Vec<TaskInfo>,
+        /// Tasks held (state=ready or planning, held=true).
+        held: Vec<TaskInfo>,
+        /// Most recently merged tasks, newest first, capped at `recent_limit`.
+        recently_merged: Vec<TaskInfo>,
+        /// Most recently closed tasks, newest first, capped at `recent_limit`.
+        recently_closed: Vec<TaskInfo>,
+        /// Current in-flight count (active/review/merging/refining).
+        inflight_count: usize,
+        /// Scheduler's max-concurrent budget.
+        max_concurrent: usize,
+        /// For each blocked task id, the ids it is waiting on. Used by the
+        /// TUI to render `⏳ #N` suffixes without re-issuing a TaskGet.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocked_on: Vec<TaskBlockedOn>,
+    },
     /// Task list with tree depth info (response to TaskList).
     TaskTree { tasks: Vec<(usize, TaskInfo)> },
     /// Merge queue (approved + merging tasks, response to TaskMergeQueue).
@@ -404,6 +442,10 @@ fn default_true() -> bool {
 
 fn default_state() -> String {
     "idle".into()
+}
+
+fn default_recent_limit() -> usize {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,7 +555,18 @@ pub struct TaskSessionInfo {
     pub is_live: bool,
 }
 
+/// Relationship info attached to a `TaskOverview` response: for each blocked
+/// task id, the dependency ids it is waiting on.  A task with no entry here
+/// has no unmet dependencies (though it may still be blocked for other
+/// reasons such as budget exhaustion).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskBlockedOn {
+    pub task_id: i64,
+    pub waits_on: Vec<i64>,
+}
+
 /// Entry in the task history log (`task_history` table).
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskHistoryInfo {
     /// Field that was updated: "state", "priority", "held", "affected_files",
@@ -949,6 +1002,10 @@ mod tests {
             Request::TaskStatus {
                 project: "/tmp".into(),
             },
+            Request::TaskOverview {
+                project: "/tmp".into(),
+                recent_limit: 5,
+            },
             Request::TaskMergeQueue {
                 project: "/tmp".into(),
             },
@@ -974,6 +1031,21 @@ mod tests {
             Response::TaskUpdated { task: task.clone() },
             Response::TaskStatus {
                 text: "status text".into(),
+            },
+            Response::TaskOverview {
+                active: vec![task.clone()],
+                queued_ready: Vec::new(),
+                queued_planning: Vec::new(),
+                blocked: Vec::new(),
+                held: Vec::new(),
+                recently_merged: Vec::new(),
+                recently_closed: Vec::new(),
+                inflight_count: 1,
+                max_concurrent: 8,
+                blocked_on: vec![TaskBlockedOn {
+                    task_id: 99,
+                    waits_on: vec![42, 43],
+                }],
             },
             Response::TaskTree {
                 tasks: vec![(0, task.clone())],

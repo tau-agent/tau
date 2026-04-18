@@ -698,6 +698,10 @@ pub(super) async fn handle_server_request(
             session_id: assign_session_id,
         } => super::task_handlers::handle_task_assign(*id, assign_session_id),
         Request::TaskStatus { project } => super::task_handlers::handle_task_status(project),
+        Request::TaskOverview {
+            project,
+            recent_limit,
+        } => super::task_handlers::handle_task_overview(state, project, *recent_limit),
         Request::TaskMergeQueue { project } => {
             super::task_handlers::handle_task_merge_queue(project)
         }
