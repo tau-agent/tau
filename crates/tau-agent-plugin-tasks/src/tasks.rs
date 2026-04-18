@@ -3571,6 +3571,91 @@ mod tests {
         );
     }
 
+    /// Spec-required regression test (task #512): `handle_task_create`
+    /// must reject the removed `skip_planning` parameter with a specific
+    /// error message that points callers at the new `initial_state` arg.
+    ///
+    /// Pins the full helpful string so future drift is caught.
+    #[test]
+    fn test_handle_task_create_rejects_skip_planning() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Legacy caller", "skip_planning": true}),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc1",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+
+        assert!(result.is_error, "skip_planning should be rejected");
+        let text = extract_text(&result);
+        let expected = "'skip_planning' has been removed; use 'initial_state' instead \
+             ('ready' is the former skip_planning=true behavior, 'planning' the default).";
+        assert!(
+            text.contains(expected),
+            "error text should contain the full spec message.\n  expected substring: {}\n  got: {}",
+            expected,
+            text,
+        );
+    }
+
+    /// Companion regression test: `handle_task_update` also rejects
+    /// `skip_planning` (nice-to-have per reviewer feedback on #512).
+    #[test]
+    fn test_handle_task_update_rejects_skip_planning() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a task so there's something to "update".
+        let task = db
+            .create_task(
+                "test-project",
+                "x",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "skip_planning": false}),
+            Some("s1"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+
+        assert!(
+            result.is_error,
+            "skip_planning should be rejected on update"
+        );
+        let text = extract_text(&result);
+        assert!(
+            text.contains("'skip_planning' has been removed")
+                && text.contains("use 'initial_state'"),
+            "update error should mention skip_planning removal and point at initial_state: {}",
+            text
+        );
+    }
+
     // ----- dependency enforcement tests (plugin layer) -----
 
     #[test]

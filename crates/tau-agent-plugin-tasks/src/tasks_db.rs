@@ -390,13 +390,11 @@ impl TasksDb {
             .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate assigned_session: {}", e)))?;
         }
 
-        // Add skip_planning column if it doesn't exist. Historical: this
-        // column used to control whether a subtask skipped the planning
-        // phase. Task #512 replaced it with an explicit `initial_state`
-        // argument on `task_create`. We still ADD the column here for
-        // forward-compat with older DBs that predate both the column and
-        // its removal — otherwise the DROP COLUMN below would fail on a
-        // very old schema. The subsequent DROP COLUMN removes it.
+        // Drop the legacy `skip_planning` column if an older schema still
+        // has it. Task #512 replaced the column with the `initial_state`
+        // argument on `task_create`; fresh DBs never create it (see SCHEMA
+        // above), so the `if has_skip_planning` guard makes this a no-op
+        // on new installs.
         let has_skip_planning: bool = conn
             .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'skip_planning'")
             .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
@@ -404,7 +402,6 @@ impl TasksDb {
             .unwrap_or(false);
 
         if has_skip_planning {
-            // Drop the legacy skip_planning column (task #512).
             conn.execute_batch("ALTER TABLE tasks DROP COLUMN skip_planning;")
                 .map_err(|e| {
                     tau_agent_plugin::Error::Io(format!("migrate drop skip_planning: {}", e))
