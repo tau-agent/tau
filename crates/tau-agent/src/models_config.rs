@@ -109,21 +109,21 @@ pub fn load_global_aliases() -> HashMap<String, String> {
         (true, true) => HashMap::new(),
         (false, true) => new_aliases,
         (true, false) => {
-            eprintln!(
-                "warning: [aliases] in {} is deprecated; move it to {}",
-                legacy_path.display(),
-                new_path.display(),
+            tracing::warn!(
+                legacy = %legacy_path.display(),
+                new = %new_path.display(),
+                "[aliases] section is deprecated; move it to the new file"
             );
             legacy_aliases
         }
         (false, false) => {
             // Both present: new file wins, but still warn about the
             // stale legacy entries so the user cleans them up.
-            eprintln!(
-                "warning: [aliases] in {} is deprecated and shadowed by {}; \
-                 remove the legacy section to silence this warning",
-                legacy_path.display(),
-                new_path.display(),
+            tracing::warn!(
+                legacy = %legacy_path.display(),
+                new = %new_path.display(),
+                "[aliases] in legacy file is shadowed by new location; \
+                 remove the legacy section to silence this warning"
             );
             new_aliases
         }
@@ -183,7 +183,7 @@ fn read_models_toml(path: &Path) -> HashMap<String, String> {
     match toml::from_str::<ModelsConfig>(&content) {
         Ok(c) => c.aliases,
         Err(e) => {
-            eprintln!("models_config: failed to parse {}: {}", path.display(), e);
+            tracing::warn!(path = %path.display(), %e, "models_config: failed to parse");
             HashMap::new()
         }
     }

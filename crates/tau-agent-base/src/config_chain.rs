@@ -69,7 +69,7 @@ pub fn load_first<T: serde::de::DeserializeOwned>(
         match toml::from_str::<T>(&content) {
             Ok(val) => return Some(val),
             Err(e) => {
-                eprintln!("config_chain: failed to parse {}: {}", path.display(), e);
+                tracing::warn!(path = %path.display(), %e, "config_chain: failed to parse");
             }
         }
     }
@@ -98,7 +98,7 @@ pub fn load_all<T: serde::de::DeserializeOwned>(
         match toml::from_str::<T>(&content) {
             Ok(val) => results.push((path, val)),
             Err(e) => {
-                eprintln!("config_chain: failed to parse {}: {}", path.display(), e);
+                tracing::warn!(path = %path.display(), %e, "config_chain: failed to parse");
             }
         }
     }

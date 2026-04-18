@@ -59,7 +59,7 @@ pub(super) async fn execute_tool_impl(
                     queue_info_to_session(state, session_id, msg);
                 }
             }
-            Err(e) => eprintln!("execute_tool: failed to spawn session plugins: {}", e),
+            Err(e) => tracing::warn!(%e, "execute_tool: failed to spawn session plugins"),
         }
     }
 
@@ -85,7 +85,7 @@ pub(super) async fn execute_tool_impl(
     {
         let st = lock_state(state);
         if let Err(e) = st.db.append_message(session_id, &assistant_msg) {
-            eprintln!("execute_tool: db error persisting assistant message: {}", e);
+            tracing::warn!(%e, "execute_tool: db error persisting assistant message");
         }
     }
 
@@ -146,7 +146,7 @@ pub(super) async fn execute_tool_impl(
             .db
             .append_message(session_id, &Message::ToolResult(tool_result_msg))
         {
-            eprintln!("execute_tool: db error persisting tool result: {}", e);
+            tracing::warn!(%e, "execute_tool: db error persisting tool result");
         }
     }
 
@@ -593,7 +593,7 @@ pub(super) async fn handle_server_request(
             let subtree_ids = match st.db.get_subtree_ids(session_id) {
                 Ok(ids) => ids,
                 Err(e) => {
-                    eprintln!("failed to get subtree IDs for restore info: {}", e);
+                    tracing::warn!(%e, "failed to get subtree IDs for restore info");
                     vec![session_id.to_string()]
                 }
             };

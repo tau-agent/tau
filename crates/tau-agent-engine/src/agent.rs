@@ -593,7 +593,7 @@ async fn run_loop_review(
         }
         Err(e) => {
             // If the review call fails, log and assume progress (don't block the loop).
-            eprintln!("loop review failed, assuming progress: {}", e);
+            tracing::warn!(%e, "loop review failed, assuming progress");
             false
         }
     }
@@ -671,7 +671,12 @@ async fn stream_with_retry(
                     "auth error, refreshed token, retrying ({}/{}): {}",
                     auth_retry_count, MAX_AUTH_RETRIES, err_msg
                 );
-                eprintln!("{}", status_msg);
+                tracing::info!(
+                    attempt = auth_retry_count,
+                    max = MAX_AUTH_RETRIES,
+                    err = %err_msg,
+                    "auth error, refreshed token, retrying"
+                );
                 let _ = event_tx.try_send(StreamEvent::Status {
                     message: status_msg,
                 });
@@ -721,17 +726,17 @@ async fn stream_with_retry(
                 } else {
                     "retryable error"
                 };
-                eprintln!(
-                    "{} (attempt {}/{}), retrying in {}: {}",
-                    kind,
-                    attempt + 1,
-                    max_retries_for_error,
-                    if delay_ms == 0 {
+                tracing::info!(
+                    kind = kind,
+                    attempt = attempt + 1,
+                    max = max_retries_for_error,
+                    delay = %if delay_ms == 0 {
                         "0s".to_string()
                     } else {
                         format_duration_human(delay_ms)
                     },
-                    err_msg
+                    err = %err_msg,
+                    "retryable error, retrying"
                 );
                 let _ = event_tx.try_send(StreamEvent::Phase {
                     phase: tau_agent_base::types::AgentPhase::RateLimited,

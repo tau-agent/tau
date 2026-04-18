@@ -53,6 +53,10 @@ fn next_request_id() -> String {
 
 /// Run the worker. Called from `tau worker`.
 pub fn run() {
+    // The worker runs as a subprocess (plugin); its stderr is captured and
+    // forwarded to the server's tracing layer, so `eprintln!` here still
+    // surfaces in the server log file.
+
     // Install signal handlers: on SIGTERM/SIGHUP/SIGINT, kill any tracked
     // bash process groups and exit.  Without this, an orphaned `tau worker`
     // (e.g. its parent server died) would leave `sleep`-style children

@@ -194,7 +194,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     // Check provider throttle — sleep if rate limited
     if let Some(remaining) = throttle.check(&model.provider) {
         let human = crate::agent::format_duration_human(remaining.as_millis() as u64);
-        eprintln!("provider '{}' throttled, waiting {}", model.provider, human);
+        tracing::info!(provider = %model.provider, wait = %human, "provider throttled");
         let msg = format!(
             "provider '{}' rate limited, retrying in {}...",
             model.provider, human
@@ -273,7 +273,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
             let st = state_clone_persist.lock().expect("state mutex poisoned");
             if let Err(e) = st.db.append_message(&session_id_persist, msg) {
-                eprintln!("db error persisting agent message: {}", e);
+                tracing::warn!(%e, "db error persisting agent message");
             }
         }))),
         refresh_api_key: {
@@ -350,7 +350,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             smol::spawn(async move {
                 let sid = child_session_id;
                 if let Err(e) = run_child_chat(s, p, sh, sl, th, sid.clone(), text, ov).await {
-                    eprintln!("child chat {} error: {}", sid, e);
+                    tracing::warn!(session_id = %sid, %e, "child chat error");
                 }
             })
             .detach();
@@ -455,7 +455,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
 
     let (agent_result, forward_result) = futures::future::join(agent_handle, forward_handle).await;
     if let Err(e) = forward_result {
-        eprintln!("event forward error: {}", e);
+        tracing::warn!(%e, "event forward error");
     }
 
     let agent_result = agent_result?;
@@ -525,7 +525,11 @@ pub(super) async fn run_child_chat(
                         queue_info_to_session(&state, &session_id, msg);
                     }
                 }
-                Err(e) => eprintln!("child session {} plugin spawn error: {}", session_id, e),
+                Err(e) => tracing::warn!(
+                    session_id = %session_id,
+                    %e,
+                    "child session plugin spawn error"
+                ),
             }
             pm.notify_session_start_once(&cwd, &session_id, stored.project_name.as_deref());
         }
@@ -772,7 +776,11 @@ pub(super) async fn resume_child_session(
                         queue_info_to_session(&state, &session_id, msg);
                     }
                 }
-                Err(e) => eprintln!("resume session {} plugin spawn error: {}", session_id, e),
+                Err(e) => tracing::warn!(
+                    session_id = %session_id,
+                    %e,
+                    "resume session plugin spawn error"
+                ),
             }
             pm.notify_session_start_once(&cwd, &session_id, stored.project_name.as_deref());
         }
@@ -780,15 +788,15 @@ pub(super) async fn resume_child_session(
         // Repair any corrupted message history
         let repair_stubs = crate::agent::repair_messages(&messages);
         if !repair_stubs.is_empty() {
-            eprintln!(
-                "session {}: repaired {} missing tool_result message(s)",
-                session_id,
-                repair_stubs.len()
+            tracing::warn!(
+                session_id = %session_id,
+                stubs = repair_stubs.len(),
+                "repaired missing tool_result messages"
             );
             let st = lock_state(&state);
             for stub in &repair_stubs {
                 if let Err(e) = st.db.append_message(&session_id, stub) {
-                    eprintln!("db error persisting repair stub: {}", e);
+                    tracing::warn!(%e, "db error persisting repair stub");
                 }
             }
             messages.extend(repair_stubs);

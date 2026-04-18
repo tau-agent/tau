@@ -72,10 +72,7 @@ impl ProviderThrottle {
         if lower.contains("rate limit") || lower.contains("429") {
             // Use retry-after if available, otherwise default to 60s
             let secs = retry_after.unwrap_or(60);
-            eprintln!(
-                "provider '{}' rate limited, blocking for {}s",
-                provider, secs
-            );
+            tracing::info!(provider = %provider, secs, "provider rate limited, blocking");
             self.block_for_secs(provider, secs);
             return true;
         }

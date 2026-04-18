@@ -463,7 +463,7 @@ pub(super) async fn handle_client(
                                 queue_info_to_session(&state, &id, msg);
                             }
                         }
-                        Err(e) => eprintln!("failed to spawn session plugins: {}", e),
+                        Err(e) => tracing::warn!(%e, "failed to spawn session plugins"),
                     }
                     let tool_prompts = pm.tool_prompts(&id, child_budget);
                     let prompt =
@@ -474,7 +474,7 @@ pub(super) async fn handle_client(
                         });
                     let st = lock_state(&state);
                     if let Err(e) = st.db.update_system_prompt(&id, &prompt) {
-                        eprintln!("failed to update system prompt: {}", e);
+                        tracing::warn!(%e, "failed to update system prompt");
                     }
                 }
 
@@ -568,7 +568,7 @@ pub(super) async fn handle_client(
                                     queue_info_to_session(&state, &session_id, msg);
                                 }
                             }
-                            Err(e) => eprintln!("failed to spawn session plugins: {}", e),
+                            Err(e) => tracing::warn!(%e, "failed to spawn session plugins"),
                         }
                         pm.notify_session_start_once(
                             &cwd,
@@ -581,15 +581,15 @@ pub(super) async fn handle_client(
                     // mid-tool-execution, leaving tool_use without tool_result).
                     let repair_stubs = crate::agent::repair_messages(&messages);
                     if !repair_stubs.is_empty() {
-                        eprintln!(
-                            "session {}: repaired {} missing tool_result message(s)",
-                            session_id,
-                            repair_stubs.len()
+                        tracing::warn!(
+                            session_id = %session_id,
+                            stubs = repair_stubs.len(),
+                            "repaired missing tool_result messages"
                         );
                         let st = lock_state(&state);
                         for stub in &repair_stubs {
                             if let Err(e) = st.db.append_message(&session_id, stub) {
-                                eprintln!("db error persisting repair stub: {}", e);
+                                tracing::warn!(%e, "db error persisting repair stub");
                             }
                         }
                         messages.extend(repair_stubs);
@@ -624,7 +624,7 @@ pub(super) async fn handle_client(
                                 messages = st.db.get_messages(&session_id)?;
                             }
                             Err(e) => {
-                                eprintln!("continuation error: {}", e);
+                                tracing::warn!(%e, "continuation error");
                             }
                         }
                     }
@@ -646,7 +646,7 @@ pub(super) async fn handle_client(
                                 {
                                     let st = lock_state(&state);
                                     if let Err(e) = st.db.append_message(&session_id, &ctx_msg) {
-                                        eprintln!("db error persisting hook context: {}", e);
+                                        tracing::warn!(%e, "db error persisting hook context");
                                     }
                                 }
                                 messages.push(ctx_msg);
@@ -740,7 +740,7 @@ pub(super) async fn handle_client(
                             && let Err(e) =
                                 run_compaction(&state, &session_id, &model, &mut writer).await
                         {
-                            eprintln!("compaction error: {}", e);
+                            tracing::warn!(%e, "compaction error");
                         }
                     }
 

@@ -54,7 +54,7 @@ pub(super) type SharedState = Arc<Mutex<State>>;
 
 pub(super) fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(|e| {
-        eprintln!("warning: recovering from poisoned mutex");
+        tracing::warn!("recovering from poisoned mutex");
         e.into_inner()
     })
 }
@@ -82,7 +82,7 @@ pub(super) fn log_stale_phases_at_startup(state: &SharedState) {
     let sessions = match st.db.list_sessions(false) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("warning: failed to load sessions for phase check: {}", e);
+            tracing::warn!(%e, "failed to load sessions for phase check");
             return;
         }
     };
@@ -95,11 +95,10 @@ pub(super) fn log_stale_phases_at_startup(state: &SharedState) {
             .iter()
             .map(|s| format!("{} ({})", s.id, s.last_phase.as_deref().unwrap_or("?")))
             .collect();
-        eprintln!(
-            "warning: {} session(s) had non-idle persisted phases at startup \
-             (possibly unclean previous shutdown): {}",
-            stale.len(),
-            ids.join(", ")
+        tracing::warn!(
+            count = stale.len(),
+            sessions = %ids.join(", "),
+            "sessions had non-idle persisted phases at startup (possibly unclean previous shutdown)"
         );
     }
 }

@@ -59,7 +59,7 @@ where
     if let Some(slot) = HANDLER.get() {
         *slot.lock().expect("signal handler mutex poisoned") = Box::new(on_signal);
     } else if let Err(e) = install(on_signal) {
-        eprintln!("set_handler: install failed: {}", e);
+        tracing::warn!(%e, "set_handler: install failed");
     }
 }
 
@@ -113,14 +113,14 @@ where
                             if e == nix::errno::Errno::EINTR {
                                 continue;
                             }
-                            eprintln!("signal-waiter thread: sigwait failed: {}", e);
+                            tracing::warn!(%e, "signal-waiter thread: sigwait failed");
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                     }
                 }
             })
             .map_err(|e| {
-                eprintln!("failed to spawn signal-waiter thread: {}", e);
+                tracing::warn!(%e, "failed to spawn signal-waiter thread");
                 nix::errno::Errno::EAGAIN
             })?;
     } else {

@@ -62,7 +62,7 @@ pub(super) fn queue_info_to_session(state: &SharedState, target: &str, text: &st
     let info_msg = Message::Info(crate::types::InfoMessage::new(text));
     let st = lock_state(state);
     if let Err(e) = st.db.append_message(target, &info_msg) {
-        eprintln!("failed to persist info message: {}", e);
+        tracing::warn!(%e, "failed to persist info message");
     }
 }
 
@@ -96,7 +96,7 @@ pub(super) fn queue_and_maybe_resume(
         let sid = target.to_string();
         smol::spawn(async move {
             if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
-                eprintln!("resume session {} after queued message: {}", sid, e);
+                tracing::warn!(session_id = %sid, %e, "resume session after queued message failed");
             }
         })
         .detach();
@@ -238,7 +238,7 @@ fn persist_phase(
         // Persist meaningful phase transitions to DB.
         let label = phase.label().trim_end_matches("...");
         if let Err(e) = st.db.update_phase(session_id, label) {
-            eprintln!("warning: failed to persist phase for {}: {}", session_id, e);
+            tracing::warn!(session_id = %session_id, %e, "failed to persist phase");
         }
     }
     Response::Stream {
@@ -269,7 +269,7 @@ pub(super) fn broadcast_to_subscribers(state: &SharedState, session_id: &str, re
                 Ok(()) => true,
                 Err(smol::channel::TrySendError::Closed(_)) => false,
                 Err(smol::channel::TrySendError::Full(_)) => {
-                    eprintln!("warning: subscriber channel full, dropping message");
+                    tracing::warn!("subscriber channel full, dropping message");
                     true // keep subscriber, just drop this message
                 }
             }
@@ -365,7 +365,7 @@ pub(super) fn auto_archive_done_sessions(
         }
         let st = lock_state(state);
         if let Err(e) = st.db.archive_session_tree(sid) {
-            eprintln!("auto-archive session {} failed: {}", sid, e);
+            tracing::warn!(session_id = %sid, %e, "auto-archive session failed");
         }
     }
 }

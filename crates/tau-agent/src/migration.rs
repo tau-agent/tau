@@ -21,7 +21,7 @@ pub fn run_project_migration(db: &Db, tasks_db_path: &Path) -> crate::Result<()>
         return Ok(());
     }
 
-    eprintln!("project migration: starting one-time migration...");
+    tracing::info!("project migration: starting one-time migration");
 
     // Step 0: Back up databases
     let tau_db_path = crate::paths::data_dir().join("tau.db");
@@ -34,16 +34,16 @@ pub fn run_project_migration(db: &Db, tasks_db_path: &Path) -> crate::Result<()>
 
     // Step 1: Delete orphaned sessions
     let deleted = delete_orphaned_sessions(db)?;
-    eprintln!("project migration: deleted {} orphaned sessions", deleted);
+    tracing::info!(deleted, "project migration: deleted orphaned sessions");
 
     // Step 2: Collect all paths, identify project roots
     let task_paths = collect_task_project_paths(tasks_db_path)?;
     let session_cwds = db.get_all_session_cwds()?;
     let all_paths = collect_all_paths(&session_cwds, &task_paths);
     let project_roots = identify_project_roots(&all_paths)?;
-    eprintln!(
-        "project migration: identified {} project roots",
-        project_roots.len()
+    tracing::info!(
+        project_roots = project_roots.len(),
+        "project migration: identified project roots"
     );
 
     // Step 3: Create projects (filesystem + DB)
@@ -51,20 +51,20 @@ pub fn run_project_migration(db: &Db, tasks_db_path: &Path) -> crate::Result<()>
 
     // Step 4: Rewrite sessions (set project_name)
     let sessions_updated = rewrite_sessions(db, &session_cwds, &path_to_name)?;
-    eprintln!("project migration: updated {} sessions", sessions_updated);
+    tracing::info!(sessions_updated, "project migration: updated sessions");
 
     // Step 5: Rewrite tasks (update values, rename column, recreate index, delete /tmp)
     if tasks_db_path.exists() {
         let tasks_updated = rewrite_tasks(tasks_db_path, &path_to_name)?;
-        eprintln!(
-            "project migration: updated {} task project values",
-            tasks_updated
+        tracing::info!(
+            tasks_updated,
+            "project migration: updated task project values"
         );
     }
 
     // Step 6: Record migration as complete
     db.record_migration(MIGRATION_NAME)?;
-    eprintln!("project migration: complete");
+    tracing::info!("project migration: complete");
 
     Ok(())
 }
@@ -80,9 +80,9 @@ pub fn run_project_migration(db: &Db, tasks_db_path: &Path) -> crate::Result<()>
 fn backup_database(path: &Path) -> crate::Result<()> {
     let backup_path = path.with_extension("db.pre-project-migration.bak");
     if backup_path.exists() {
-        eprintln!(
-            "project migration: backup already exists: {}",
-            backup_path.display()
+        tracing::info!(
+            backup = %backup_path.display(),
+            "project migration: backup already exists"
         );
         return Ok(());
     }
@@ -94,7 +94,7 @@ fn backup_database(path: &Path) -> crate::Result<()> {
             e
         ))
     })?;
-    eprintln!("project migration: backed up {}", path.display());
+    tracing::info!(backed_up = %path.display(), "project migration: backed up database");
     Ok(())
 }
 

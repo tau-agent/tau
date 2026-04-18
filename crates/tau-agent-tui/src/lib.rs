@@ -939,6 +939,10 @@ async fn send_request_and_recv(req: Request, tx: Sender<Response>) -> tau_agent:
         let _ = client
             .recv_streaming(|resp| {
                 if tx.try_send(resp.clone()).is_err() {
+                    // Kept as eprintln! deliberately: the TUI owns the
+                    // alternate screen, so diagnostic output is swallowed
+                    // anyway and routing through tracing would require
+                    // initialising the subscriber in the TUI process.
                     eprintln!("warning: try_send failed in send_request_and_recv");
                 }
             })

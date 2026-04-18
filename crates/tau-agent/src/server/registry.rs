@@ -301,7 +301,7 @@ pub(super) fn spawn_bg_chat_receiver(
             smol::spawn(async move {
                 let sid = child_session_id;
                 if let Err(e) = run_child_chat(s, p, sh, sl, th, sid.clone(), text, ov).await {
-                    eprintln!("bg child chat {} error: {}", sid, e);
+                    tracing::warn!(session_id = %sid, %e, "bg child chat error");
                 }
             })
             .detach();
@@ -346,9 +346,10 @@ pub(super) fn spawn_global_plugin_background_tasks(
         smol::spawn(async move {
             while let Ok(req) = write_rx.recv().await {
                 if let Err(e) = write_plugin_request(&mut writer, &req).await {
-                    eprintln!(
-                        "global plugin '{}' background writer error: {}",
-                        writer_plugin_name, e
+                    tracing::warn!(
+                        plugin = %writer_plugin_name,
+                        %e,
+                        "global plugin background writer error"
                     );
                     break;
                 }
@@ -373,9 +374,9 @@ pub(super) fn spawn_global_plugin_background_tasks(
         let resp_tx = match resp_tx {
             Some(tx) => tx,
             None => {
-                eprintln!(
-                    "global plugin '{}': no write channel for background reader",
-                    plugin_name
+                tracing::warn!(
+                    plugin = %plugin_name,
+                    "global plugin: no write channel for background reader"
                 );
                 continue;
             }
@@ -388,7 +389,11 @@ pub(super) fn spawn_global_plugin_background_tasks(
                     Err(e) => {
                         // Don't log during shutdown — plugin may have been killed.
                         if !reader_shutdown.is_shutting_down() {
-                            eprintln!("global plugin '{}' background reader: {}", plugin_name, e);
+                            tracing::warn!(
+                                plugin = %plugin_name,
+                                %e,
+                                "global plugin background reader error"
+                            );
                         }
                         break;
                     }
@@ -418,9 +423,9 @@ pub(super) fn spawn_global_plugin_background_tasks(
                             response,
                         };
                         if resp_tx.send(resp_req).await.is_err() {
-                            eprintln!(
-                                "global plugin '{}' background reader: write channel closed",
-                                plugin_name
+                            tracing::warn!(
+                                plugin = %plugin_name,
+                                "global plugin background reader: write channel closed"
                             );
                             break;
                         }
@@ -467,7 +472,7 @@ pub(super) fn maybe_respawn_for_queued(
         let sid = session_id.to_string();
         smol::spawn(async move {
             if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
-                eprintln!("resume session {} for late-queued message: {}", sid, e);
+                tracing::warn!(session_id = %sid, %e, "resume session for late-queued message failed");
             }
         })
         .detach();

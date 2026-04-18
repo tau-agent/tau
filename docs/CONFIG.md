@@ -129,3 +129,51 @@ same information.
 Unrelated but adjacent: `{project}/.tau/instructions.toml` lets you
 inject prompt fragments into task lifecycle phases. See
 `crates/tau-agent-plugin-tasks/src/tasks_config.rs` for the format.
+
+## Logging
+
+The tau server daemon writes all diagnostic output to a rolling log file
+under the XDG state directory:
+
+```
+~/.local/state/tau/logs/server.log           # current day
+~/.local/state/tau/logs/server.log.YYYY-MM-DD # rotated daily
+~/.local/state/tau/logs/daemon.stderr.log    # catch-all for panics / raw stderr
+```
+
+(The state directory honours `$XDG_STATE_HOME`; falls back to
+`~/.local/state/tau`, then `/tmp/tau-state`.)
+
+Files older than 14 days are deleted automatically at server startup.
+
+### Adjusting verbosity
+
+The log level is controlled by the `TAU_LOG` environment variable.
+Standard [`tracing-subscriber` filter syntax][filter-syntax] is supported
+— set module paths to the desired level, comma-separated:
+
+```sh
+TAU_LOG=info                                       # default
+TAU_LOG=warn                                       # quieter
+TAU_LOG=debug                                      # very chatty
+TAU_LOG=tau_agent::plugin=debug,tau_agent=info     # per-module
+```
+
+`TAU_LOG` takes precedence. If it's unset, tau falls back to `RUST_LOG`,
+and otherwise defaults to `info`.
+
+[filter-syntax]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
+
+### Debugging a hung plugin
+
+Plugins (global or per-session) have their stderr forwarded into the
+server log in real time. If `tau chat` appears to hang, tail the log:
+
+```sh
+tail -f ~/.local/state/tau/logs/server.log
+```
+
+Look for the last `plugin.hook` span with no matching completion — that
+plugin is the culprit. `TAU_LOG=tau_agent::plugin=debug` enables the
+`sending` / `returned` traces inside each hook span, making it obvious
+where in the round-trip the plugin got stuck.
