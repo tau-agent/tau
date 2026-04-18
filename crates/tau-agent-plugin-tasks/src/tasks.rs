@@ -2523,7 +2523,17 @@ pub fn run_tasks_plugin() {
                 break;
             }
             PluginRequest::ServerResponse { .. } => {
-                // Not expected outside of tool/merge passes — ignore
+                // Unreachable in the current wiring: the stdin router
+                // (see earlier in this function) intercepts every
+                // `ServerResponse` and dispatches it to either the
+                // main-loop response channel or the worker's response
+                // channel based on the request-id prefix — it never
+                // forwards them to `main_req_tx`. We keep this arm as
+                // a defensive no-op in case the router's dispatch
+                // logic is ever relaxed (e.g. unknown prefix falls
+                // through to the main request stream); swallowing
+                // such a stray response is strictly safer than
+                // panicking.
             }
             PluginRequest::CancelToolCall { .. } => {
                 // Tasks plugin tools are short-lived (in-memory task-board

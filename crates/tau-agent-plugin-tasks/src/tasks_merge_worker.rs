@@ -54,7 +54,6 @@
 //! still running under it, unblocking the worker from its RPC wait.
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::mpsc;
 
 use crate::tasks::{ChannelLineReader, ProjectResolver};
@@ -65,6 +64,25 @@ use crate::tasks_db::{TaskUpdate, TasksDb};
 ///
 /// The job captures everything the worker needs. It does not borrow
 /// from the main loop so the worker thread stays self-contained.
+///
+/// # Divergence from the #540 spec
+///
+/// The spec sketched a fatter `MergeJob` carrying `project_path` and
+/// `project_name` alongside `task_id`. We keep only `task_id` and
+/// re-derive everything else from the DB on the worker side. Two
+/// reasons:
+///
+/// * It closes a small time-of-check-to-time-of-use window: if the
+///   project is renamed (or its path changes) between enqueue and
+///   pickup, re-resolving picks up the fresh value. Capturing the
+///   path at enqueue time would merge against stale state.
+/// * It also handles the case where the user reverted `approved`
+///   before the worker got to the job — we re-read the task state
+///   and silently skip non-approved tasks.
+///
+/// If the worker ever needs more fields (priority hints,
+/// merge-target overrides) they go on this struct alongside
+/// `task_id`.
 pub struct MergeJob {
     /// Task id to merge. The worker re-reads the task from the DB to
     /// guard against state changes that happened between enqueue and
@@ -423,14 +441,6 @@ fn finish_failure<W>(
     eprintln!("tasks merge worker: task {} merge failed", task_id);
 }
 
-// Keep PathBuf in scope so future iterations of MergeJob can carry it.
-// Currently the worker derives project_dir from the DB + resolver, but
-// we leave this import in place so that shifting to a captured path
-// (pre-resolved at enqueue time, to guard against project renames)
-// remains a one-line change.
-#[allow(dead_code)]
-fn _path_marker(_p: PathBuf) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,8 +517,14 @@ mod tests {
     /// worker. We simulate a slow merge by giving the worker a reader
     /// that will never produce a response (so `merge_task_for_caller`
     /// blocks forever on its first `ServerRequest`), then time the
-    /// enqueue + return path and assert it completes in milliseconds
-    /// — not the full merge duration.
+    /// Regression for #540: the main-loop merge-pass entry point must
+    /// return without blocking when it enqueues a job onto a live
+    /// worker. We simulate a slow merge by giving the worker a reader
+    /// whose sender we hold briefly — long enough to prove the
+    /// enqueue timing — then drop to let the worker unwind. Without
+    /// the sender, every ServerRequest inside `merge_task_for_caller`
+    /// sees EOF, returns `Err`, and the worker loop drops back to
+    /// `rx.recv()`, which also sees EOF once the job-sender closes.
     ///
     /// This is the critical invariant behind the task: the plugin main
     /// loop stays responsive while a merge is in flight on the worker.
@@ -550,10 +566,14 @@ mod tests {
             .expect("transition");
         }
 
-        // Worker reader: channel with no sender. Any read blocks forever.
-        let (_resp_tx, resp_rx) = mpsc::channel::<String>();
+        // Worker reader: channel whose sender we keep alive across the
+        // timing window, then close. While the sender is alive,
+        // `read_line` on the reader blocks (no line ever arrives), so
+        // the first RPC inside the merge hangs and the worker is
+        // genuinely "busy". Once we drop `resp_tx`, subsequent reads
+        // see EOF and the worker unwinds cleanly.
+        let (resp_tx, resp_rx) = mpsc::channel::<String>();
         let worker_reader = ChannelLineReader::new(resp_rx);
-        // Worker writer: byte sink.
         let worker_writer: Vec<u8> = Vec::new();
 
         // Spawn the worker against the same file-backed DB.
@@ -563,13 +583,8 @@ mod tests {
             MergeWorker::spawn_with(worker_db, worker_resolver, worker_writer, worker_reader)
                 .expect("spawn worker");
 
-        // Main-loop simulator: dummy writer/reader since the worker
-        // branch of `run_merge_pass` doesn't use them.
-        let resolver = ProjectResolver::test(&[("test-project", "/tmp/nonexistent")]);
-
-        // Build MergeJob directly since `run_merge_pass` lives in tasks.rs;
-        // here we exercise the same invariant at a lower level: enqueue
-        // must return in milliseconds even when the worker is busy.
+        // The actual invariant: enqueue must return promptly even
+        // when the worker is in the middle of a merge.
         let start = Instant::now();
         worker
             .enqueue(MergeJob {
@@ -585,18 +600,15 @@ mod tests {
             elapsed
         );
 
-        // Silence the unused-resolver warning; we fetched it to prove
-        // it's cheap to construct.
-        let _ = resolver;
-
-        // Drop the worker handle to signal shutdown. The worker thread
-        // may still be parked inside the merge (its reader has no
-        // sender and will never wake) — that's OK for this test: the
-        // handle's Drop doesn't join, it only closes the channel, and
-        // the process-level teardown of the test harness reaps the
-        // thread. To avoid a detached thread warning we std::mem::forget
-        // the worker — the test only cares that enqueue was fast.
-        std::mem::forget(worker);
+        // Shutdown sequence: close the response channel first so any
+        // in-flight RPC the worker issued fails with EOF and the
+        // worker loop can complete the job. Then drop the worker,
+        // which closes the job channel, makes `rx.recv()` return
+        // `Err`, and the thread exits. `MergeWorker::drop` joins the
+        // thread, so by the time we return from this test the thread
+        // is fully reaped — no leaks across test runs.
+        drop(resp_tx);
+        drop(worker);
 
         // Clean up the temp DB file.
         let _ = std::fs::remove_file(&db_path);
