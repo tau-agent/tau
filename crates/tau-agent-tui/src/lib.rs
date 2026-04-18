@@ -723,6 +723,19 @@ async fn run_inner(
                     send_request_and_recv(Request::TaskStatus { project }, server_tx.clone())
                         .await?;
                 }
+                Action::TaskOverview {
+                    project,
+                    recent_limit,
+                } => {
+                    send_request_and_recv(
+                        Request::TaskOverview {
+                            project,
+                            recent_limit,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
                 Action::TaskMergeQueue { project } => {
                     send_request_and_recv(Request::TaskMergeQueue { project }, server_tx.clone())
                         .await?;
@@ -731,17 +744,19 @@ async fn run_inner(
                     app.task_picker_previous_mode = app.mode;
                     app.mode = AppMode::TaskPicker;
                     app.picker_tasks.clear();
+                    app.picker_groups = crate::app::PickerGroups::default();
+                    app.picker_view = crate::app::PickerView::SchedulerState;
                     app.task_picker_confirm = None;
                     app.task_picker_detail = None;
                     app.task_picker_filter.clear();
                     app.task_picker_filter_mode = false;
                     app.task_picker_create_mode = false;
+                    app.task_picker_scroll_offset = 0;
                     let project = app.task_project();
                     send_request_and_recv(
-                        Request::TaskList {
+                        Request::TaskOverview {
                             project,
-                            state: None,
-                            parent_id: None,
+                            recent_limit: 10,
                         },
                         server_tx.clone(),
                     )

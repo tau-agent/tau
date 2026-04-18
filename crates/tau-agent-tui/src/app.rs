@@ -63,6 +63,80 @@ pub enum TaskPickerConfirmAction {
     Merge,
 }
 
+/// Which axis the task picker groups by.
+///
+/// - `SchedulerState` is the default: buckets tasks by their lifecycle
+///   position (active, queued-ready, queued-planning, blocked, held) with a
+///   bounded recently-completed tail.
+/// - `Ancestry` is the legacy pure parent-child tree across all non-terminal
+///   states; retained behind the `g` toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerView {
+    SchedulerState,
+    Ancestry,
+}
+
+impl Default for PickerView {
+    fn default() -> Self {
+        Self::SchedulerState
+    }
+}
+
+/// Scheduler-grouped task data for the task picker.
+///
+/// Each in-flight bucket carries `(depth, task)` tuples where depth is
+/// computed relative to the parent-child tree restricted to that same
+/// bucket.  Tasks whose parent lives in a different bucket render at depth 0
+/// (the UI surfaces their parent via a `(parent: #N)` suffix — see
+/// `ui::render_task_row_scheduler`).
+#[derive(Debug, Clone, Default)]
+pub struct PickerGroups {
+    pub active: Vec<(usize, TaskInfo)>,
+    pub queued_ready: Vec<(usize, TaskInfo)>,
+    pub queued_planning: Vec<(usize, TaskInfo)>,
+    pub blocked: Vec<(usize, TaskInfo)>,
+    pub held: Vec<(usize, TaskInfo)>,
+    pub recently_merged: Vec<TaskInfo>,
+    pub recently_closed: Vec<TaskInfo>,
+    pub inflight_count: usize,
+    pub max_concurrent: usize,
+    /// For each blocked task id, the ids it is waiting on (to render `⏳ #N`).
+    pub blocked_on: std::collections::HashMap<i64, Vec<i64>>,
+}
+
+/// One row in the scheduler-grouped task picker.
+///
+/// Headers are non-selectable group dividers that still count toward
+/// vertical space (so scrolling logic treats them like a real line).
+#[derive(Debug, Clone)]
+pub enum PickerRow {
+    /// Non-selectable section header.
+    Header(String),
+    /// A selectable task at a given visual depth.  `parent_out_of_group`
+    /// signals that the task's parent isn't in the same bucket — the renderer
+    /// appends a `(parent: #N)` suffix and pins depth at 0.
+    Task {
+        depth: usize,
+        task: TaskInfo,
+        parent_out_of_group: bool,
+        /// Group-local hint: when true, omit the redundant state label for
+        /// rows rendered inside their own state's bucket (e.g. don't print
+        /// "active" again inside the ACTIVE group).
+        suppress_state_label: bool,
+        /// Optional dependency wait-reason overlay (blocked-on task ids).
+        blocked_on: Vec<i64>,
+        /// "age suffix" — formatted `updated_at` delta for the recently-completed tail.
+        /// None for live-group rows.
+        age_hint: Option<String>,
+    },
+}
+
+impl PickerRow {
+    pub fn is_selectable(&self) -> bool {
+        matches!(self, PickerRow::Task { .. })
+    }
+}
+
 /// Detailed view of a single task in the task picker.
 pub struct TaskPickerDetail {
     pub task: TaskInfo,
@@ -156,6 +230,15 @@ pub struct App {
     pub picker_show_all_projects: bool,
     /// Task list for the picker overlay (tree-ordered with depth).
     pub picker_tasks: Vec<(usize, TaskInfo)>,
+    /// Scheduler-grouped task data (new default picker view).  When
+    /// `picker_view == PickerView::SchedulerState` rendering reads from here
+    /// instead of `picker_tasks`.
+    pub picker_groups: PickerGroups,
+    /// Which axis the task picker groups by.  Reset to `SchedulerState`
+    /// every time the picker is opened.
+    pub picker_view: PickerView,
+    /// Scroll offset (index of the topmost visible row) for the picker.
+    pub task_picker_scroll_offset: usize,
     /// Cursor position in the task picker (into filtered indices).
     pub task_picker_cursor: usize,
     /// Mode to restore when the task picker is closed.
@@ -263,6 +346,9 @@ impl App {
             picker_project_filter: None,
             picker_show_all_projects: false,
             picker_tasks: Vec::new(),
+            picker_groups: PickerGroups::default(),
+            picker_view: PickerView::SchedulerState,
+            task_picker_scroll_offset: 0,
             task_picker_cursor: 0,
             task_picker_previous_mode: AppMode::Input,
             task_picker_filter: String::new(),
@@ -1097,48 +1183,192 @@ impl App {
         self.picker_tasks
             .iter()
             .enumerate()
-            .filter(|(_, (_, t))| {
-                if filter_empty {
-                    return true;
-                }
-                // Match against task title
-                if t.title.to_lowercase().contains(&needle) {
-                    return true;
-                }
-                // Match against task ID (prefix match)
-                if t.id.to_string().starts_with(&needle) {
-                    return true;
-                }
-                // Match against state name
-                if t.state.to_lowercase().contains(&needle) {
-                    return true;
-                }
-                // Match against session_id
-                if let Some(ref sid) = t.session_id {
-                    if sid.to_lowercase().contains(&needle) {
-                        return true;
-                    }
-                }
-                // Match against tags
-                if let Some(ref tags) = t.tags {
-                    if let Some(arr) = tags.as_array() {
-                        for tag in arr {
-                            if let Some(s) = tag.as_str() {
-                                if s.to_lowercase().contains(&needle) {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-                false
-            })
+            .filter(|(_, (_, t))| filter_empty || task_matches_filter(t, &needle))
             .map(|(i, _)| i)
             .collect()
     }
 
+    /// Return the task-picker filter needle lowercased, or `None` if the
+    /// filter is empty.  Shared helper for both picker views.
+    fn task_picker_needle(&self) -> Option<String> {
+        if self.task_picker_filter.is_empty() {
+            None
+        } else {
+            Some(self.task_picker_filter.to_lowercase())
+        }
+    }
+
+    /// Build the list of picker rows for the current view.  The returned
+    /// vector already has the filter applied; group headers are kept even
+    /// when their bucket ends up empty *after* filtering, so the user can
+    /// tell which buckets exist.
+    pub fn task_picker_rows(&self) -> Vec<PickerRow> {
+        match self.picker_view {
+            PickerView::SchedulerState => self.scheduler_view_rows(),
+            PickerView::Ancestry => self.ancestry_view_rows(),
+        }
+    }
+
+    fn ancestry_view_rows(&self) -> Vec<PickerRow> {
+        let needle = self.task_picker_needle();
+        self.picker_tasks
+            .iter()
+            .filter(|(_, t)| match needle.as_deref() {
+                Some(n) => task_matches_filter(t, n),
+                None => true,
+            })
+            .map(|(d, t)| PickerRow::Task {
+                depth: *d,
+                task: t.clone(),
+                parent_out_of_group: false,
+                suppress_state_label: false,
+                blocked_on: Vec::new(),
+                age_hint: None,
+            })
+            .collect()
+    }
+
+    fn scheduler_view_rows(&self) -> Vec<PickerRow> {
+        let needle = self.task_picker_needle();
+        let g = &self.picker_groups;
+        let now_ms = now_secs().saturating_mul(1000);
+
+        let mut rows: Vec<PickerRow> = Vec::new();
+
+        // ACTIVE (count of N slots)
+        rows.push(PickerRow::Header(format!(
+            "ACTIVE ({} of {} slots)",
+            g.inflight_count, g.max_concurrent,
+        )));
+        push_group_rows(
+            &mut rows,
+            &g.active,
+            needle.as_deref(),
+            /* suppress_state_label */
+            false, // active group contains mixed states (active/review/refining/merging)
+            Some(&g.blocked_on),
+            /* age_hint */ None,
+        );
+
+        rows.push(PickerRow::Header(format!(
+            "QUEUED — READY ({})",
+            g.queued_ready.len()
+        )));
+        push_group_rows(
+            &mut rows,
+            &g.queued_ready,
+            needle.as_deref(),
+            /* suppress_state_label */ true,
+            Some(&g.blocked_on),
+            None,
+        );
+
+        rows.push(PickerRow::Header(format!(
+            "QUEUED — PLANNING ({})",
+            g.queued_planning.len()
+        )));
+        push_group_rows(
+            &mut rows,
+            &g.queued_planning,
+            needle.as_deref(),
+            true,
+            Some(&g.blocked_on),
+            None,
+        );
+
+        rows.push(PickerRow::Header(format!("BLOCKED ({})", g.blocked.len())));
+        push_group_rows(
+            &mut rows,
+            &g.blocked,
+            needle.as_deref(),
+            false,
+            Some(&g.blocked_on),
+            None,
+        );
+
+        rows.push(PickerRow::Header(format!("HELD ({})", g.held.len())));
+        push_group_rows(
+            &mut rows,
+            &g.held,
+            needle.as_deref(),
+            false,
+            Some(&g.blocked_on),
+            None,
+        );
+
+        // Recently completed tail — flat, no tree indent, dim age hint.
+        let recent_total = g.recently_merged.len() + g.recently_closed.len();
+        if recent_total > 0 || needle.is_none() {
+            rows.push(PickerRow::Header(format!(
+                "RECENTLY COMPLETED ({})",
+                recent_total
+            )));
+            for t in &g.recently_merged {
+                if let Some(n) = needle.as_deref() {
+                    if !task_matches_filter(t, n) {
+                        continue;
+                    }
+                }
+                let age = format_age_since_ms(now_ms, t.updated_at);
+                rows.push(PickerRow::Task {
+                    depth: 0,
+                    task: t.clone(),
+                    parent_out_of_group: false,
+                    suppress_state_label: false,
+                    blocked_on: Vec::new(),
+                    age_hint: Some(age),
+                });
+            }
+            for t in &g.recently_closed {
+                if let Some(n) = needle.as_deref() {
+                    if !task_matches_filter(t, n) {
+                        continue;
+                    }
+                }
+                let age = format_age_since_ms(now_ms, t.updated_at);
+                rows.push(PickerRow::Task {
+                    depth: 0,
+                    task: t.clone(),
+                    parent_out_of_group: false,
+                    suppress_state_label: false,
+                    blocked_on: Vec::new(),
+                    age_hint: Some(age),
+                });
+            }
+        }
+
+        rows
+    }
+
+    /// Index into the row list of the currently-selected task.
+    /// `task_picker_cursor` is measured in *selectable* rows — this maps it
+    /// back to the full-rows index used by the renderer.
+    pub fn task_picker_selected_row_index(&self) -> Option<usize> {
+        let rows = self.task_picker_rows();
+        selectable_row_index_for_cursor(&rows, self.task_picker_cursor)
+    }
+
+    /// The currently-selected `TaskInfo`, or `None` if no selection.
+    pub fn task_picker_selected_task(&self) -> Option<TaskInfo> {
+        let rows = self.task_picker_rows();
+        let row_idx = selectable_row_index_for_cursor(&rows, self.task_picker_cursor)?;
+        match rows.get(row_idx) {
+            Some(PickerRow::Task { task, .. }) => Some(task.clone()),
+            _ => None,
+        }
+    }
+
+    /// Count of selectable rows across the current view (excludes headers).
+    pub fn task_picker_selectable_count(&self) -> usize {
+        self.task_picker_rows()
+            .iter()
+            .filter(|r| r.is_selectable())
+            .count()
+    }
+
     /// Resolve the task picker cursor to an index in `picker_tasks`.
     /// Returns `None` if no matching tasks or cursor is out of range.
+    /// Only meaningful in `PickerView::Ancestry`.
     pub fn task_picker_selected_task_idx(&self) -> Option<usize> {
         let filtered = self.task_picker_filtered_indices();
         filtered.get(self.task_picker_cursor).copied()
@@ -1151,15 +1381,62 @@ impl App {
         self.task_picker_filter_mode = false;
         self.task_picker_create_mode = false;
         self.task_picker_detail = None;
+        self.task_picker_scroll_offset = 0;
     }
 
-    /// Clamp task picker cursor to valid range within filtered results.
+    /// Clamp task picker cursor to valid range within current view.
     fn task_picker_clamp_cursor(&mut self) {
-        let filtered = self.task_picker_filtered_indices();
-        if filtered.is_empty() {
+        let count = self.task_picker_selectable_count();
+        if count == 0 {
             self.task_picker_cursor = 0;
-        } else if self.task_picker_cursor >= filtered.len() {
-            self.task_picker_cursor = filtered.len() - 1;
+        } else if self.task_picker_cursor >= count {
+            self.task_picker_cursor = count - 1;
+        }
+    }
+
+    /// Refresh action for the task picker: fires a `TaskOverview` in the
+    /// scheduler view and a `TaskList` (tree) in the ancestry view.
+    pub(crate) fn task_picker_refresh_action(&self) -> Action {
+        let project = self.task_project();
+        match self.picker_view {
+            PickerView::SchedulerState => Action::TaskOverview {
+                project,
+                recent_limit: 10,
+            },
+            PickerView::Ancestry => Action::TaskList {
+                project,
+                state: None,
+            },
+        }
+    }
+
+    /// Adjust `task_picker_scroll_offset` so the cursor stays in-view.
+    /// `viewport_rows` is the number of body rows we can show (excluding
+    /// the footer hint).  Called by the renderer before draw and by
+    /// navigation handlers when the viewport height is known.
+    pub fn task_picker_adjust_scroll(&mut self, viewport_rows: usize) {
+        let rows = self.task_picker_rows();
+        let total = rows.len();
+        if total == 0 || viewport_rows == 0 {
+            self.task_picker_scroll_offset = 0;
+            return;
+        }
+        let cursor_row =
+            selectable_row_index_for_cursor(&rows, self.task_picker_cursor).unwrap_or(0);
+        // Keep a 1-row margin where possible.
+        let margin = if viewport_rows >= 4 { 1 } else { 0 };
+
+        if cursor_row < self.task_picker_scroll_offset + margin {
+            self.task_picker_scroll_offset = cursor_row.saturating_sub(margin);
+        }
+        let bottom = self.task_picker_scroll_offset + viewport_rows;
+        if cursor_row + margin >= bottom {
+            self.task_picker_scroll_offset =
+                cursor_row + margin + 1 - viewport_rows.min(cursor_row + margin + 1);
+        }
+        // Clamp so we don't scroll past the end.
+        if self.task_picker_scroll_offset + viewport_rows > total {
+            self.task_picker_scroll_offset = total.saturating_sub(viewport_rows);
         }
     }
 
@@ -2458,6 +2735,62 @@ impl App {
                 // Update child count from fresh data
                 self.child_count = children.len();
             }
+            Response::TaskOverview {
+                active,
+                queued_ready,
+                queued_planning,
+                blocked,
+                held,
+                recently_merged,
+                recently_closed,
+                inflight_count,
+                max_concurrent,
+                blocked_on,
+            } => {
+                // Piggyback: note any task assigned to our session.
+                let check_assignment = |ti: &TaskInfo| {
+                    if ti.session_id.as_deref() == Some(&self.session_id) {
+                        Some((ti.id, ti.title.clone()))
+                    } else {
+                        None
+                    }
+                };
+                for group in [&active, &queued_ready, &queued_planning, &blocked, &held] {
+                    for t in group.iter() {
+                        if let Some(pair) = check_assignment(t) {
+                            self.current_task_id = Some(pair);
+                            break;
+                        }
+                    }
+                }
+
+                if self.mode == AppMode::TaskPicker {
+                    let mut bo_map: std::collections::HashMap<i64, Vec<i64>> =
+                        std::collections::HashMap::new();
+                    for entry in blocked_on {
+                        bo_map.insert(entry.task_id, entry.waits_on);
+                    }
+                    self.picker_groups = PickerGroups {
+                        active: compute_group_depths(active),
+                        queued_ready: compute_group_depths(queued_ready),
+                        queued_planning: compute_group_depths(queued_planning),
+                        blocked: compute_group_depths(blocked),
+                        held: compute_group_depths(held),
+                        recently_merged,
+                        recently_closed,
+                        inflight_count,
+                        max_concurrent,
+                        blocked_on: bo_map,
+                    };
+                    self.task_picker_cursor = 0;
+                    self.task_picker_scroll_offset = 0;
+                    self.task_picker_confirm = None;
+                    return None;
+                }
+                // Out-of-picker consumers currently fall back to the plain-text
+                // status view.  The TUI overview is picker-only today.
+                return None;
+            }
             Response::TaskTree { tasks } => {
                 // Scan for a task assigned to the current session (piggyback discovery)
                 for (_depth, t) in &tasks {
@@ -2548,10 +2881,7 @@ impl App {
                 }
                 // If in task picker mode, re-fetch task list to refresh
                 if self.mode == AppMode::TaskPicker {
-                    return Some(Action::TaskList {
-                        project: self.task_project(),
-                        state: None,
-                    });
+                    return Some(self.task_picker_refresh_action());
                 }
                 // Fire hook for state changes that need scheduler notification
                 if state == "approved" || state == "ready" {
@@ -2569,10 +2899,7 @@ impl App {
                 }
                 // If in task picker mode, re-fetch task list after tool execution
                 if self.mode == AppMode::TaskPicker {
-                    return Some(Action::TaskList {
-                        project: self.task_project(),
-                        state: None,
-                    });
+                    return Some(self.task_picker_refresh_action());
                 }
             }
             Response::TaskStatus { text } => {
@@ -2930,6 +3257,11 @@ pub enum Action {
     TaskStatus {
         project: String,
     },
+    /// Fetch the structured scheduler overview for the picker.
+    TaskOverview {
+        project: String,
+        recent_limit: usize,
+    },
     TaskMergeQueue {
         project: String,
     },
@@ -2957,6 +3289,159 @@ pub enum Action {
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.
 fn event_to_tui_textarea(key: &KeyEvent) -> crossterm::event::Event {
     crossterm::event::Event::Key(*key)
+}
+
+/// Compute tree-ordered `(depth, task)` tuples for a single scheduler
+/// bucket.  Tasks whose `parent_id` sits outside the bucket become roots.
+/// Children preserve the order returned by the server (priority DESC,
+/// created_at ASC).
+pub(crate) fn compute_group_depths(tasks: Vec<TaskInfo>) -> Vec<(usize, TaskInfo)> {
+    use std::collections::{HashMap, HashSet};
+    let ids: HashSet<i64> = tasks.iter().map(|t| t.id).collect();
+
+    // Children lookup: parent_id -> list of task indices (preserve order).
+    let mut children_of: HashMap<i64, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, t) in tasks.iter().enumerate() {
+        match t.parent_id {
+            Some(pid) if ids.contains(&pid) => {
+                children_of.entry(pid).or_default().push(i);
+            }
+            _ => roots.push(i),
+        }
+    }
+
+    // DFS from each root.  Use a stack of (index, depth).
+    let mut out = Vec::with_capacity(tasks.len());
+    let tasks_opt: Vec<Option<TaskInfo>> = tasks.into_iter().map(Some).collect();
+    let mut tasks_opt = tasks_opt;
+    fn dfs(
+        idx: usize,
+        depth: usize,
+        tasks: &mut [Option<TaskInfo>],
+        children_of: &std::collections::HashMap<i64, Vec<usize>>,
+        out: &mut Vec<(usize, TaskInfo)>,
+    ) {
+        let Some(t) = tasks[idx].take() else { return };
+        let id = t.id;
+        out.push((depth, t));
+        if let Some(kids) = children_of.get(&id) {
+            for k in kids {
+                dfs(*k, depth + 1, tasks, children_of, out);
+            }
+        }
+    }
+    for r in roots {
+        dfs(r, 0, &mut tasks_opt, &children_of, &mut out);
+    }
+    // Any leftover (shouldn't happen if bucket is closed under parent chain)
+    // fall through as depth-0 roots.
+    for (_, remaining) in tasks_opt
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, t)| t.map(|t| (i, t)))
+    {
+        out.push((0, remaining));
+    }
+    out
+}
+
+/// Predicate for the picker filter: case-insensitive substring match across
+/// title / id prefix / state / session id / tags.  Used by both picker views.
+pub(crate) fn task_matches_filter(t: &TaskInfo, needle: &str) -> bool {
+    if t.title.to_lowercase().contains(needle) {
+        return true;
+    }
+    if t.id.to_string().starts_with(needle) {
+        return true;
+    }
+    if t.state.to_lowercase().contains(needle) {
+        return true;
+    }
+    if let Some(ref sid) = t.session_id {
+        if sid.to_lowercase().contains(needle) {
+            return true;
+        }
+    }
+    if let Some(ref tags) = t.tags {
+        if let Some(arr) = tags.as_array() {
+            for tag in arr {
+                if let Some(s) = tag.as_str() {
+                    if s.to_lowercase().contains(needle) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Emit one `PickerRow::Task` per `(depth, task)` tuple in `rows`, filtered
+/// by `needle` and annotated with scheduler bucket metadata.  Tasks whose
+/// `parent_id` points outside the bucket get `parent_out_of_group = true`
+/// and `depth = 0`, matching the spec requirement that cross-bucket parents
+/// render at depth 0 with a `(parent: #N)` suffix.
+pub(crate) fn push_group_rows(
+    out: &mut Vec<PickerRow>,
+    group: &[(usize, TaskInfo)],
+    needle: Option<&str>,
+    suppress_state_label: bool,
+    blocked_on: Option<&std::collections::HashMap<i64, Vec<i64>>>,
+    age_hint: Option<String>,
+) {
+    // Tasks in this bucket, keyed by id, so we can detect cross-bucket parents.
+    let ids: std::collections::HashSet<i64> = group.iter().map(|(_, t)| t.id).collect();
+
+    for (depth, t) in group {
+        if let Some(n) = needle {
+            if !task_matches_filter(t, n) {
+                continue;
+            }
+        }
+        let parent_out = match t.parent_id {
+            Some(pid) => !ids.contains(&pid),
+            None => false,
+        };
+        let blocked = blocked_on
+            .and_then(|m| m.get(&t.id).cloned())
+            .unwrap_or_default();
+        // Cross-group parent pins visual depth at 0, per spec.
+        let visual_depth = if parent_out { 0 } else { *depth };
+        out.push(PickerRow::Task {
+            depth: visual_depth,
+            task: t.clone(),
+            parent_out_of_group: parent_out,
+            suppress_state_label,
+            blocked_on: blocked,
+            age_hint: age_hint.clone(),
+        });
+    }
+}
+
+/// Map a cursor position (measured in *selectable* rows) to an index into
+/// the full picker row list (including headers).
+pub(crate) fn selectable_row_index_for_cursor(rows: &[PickerRow], cursor: usize) -> Option<usize> {
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_selectable())
+        .nth(cursor)
+        .map(|(i, _)| i)
+}
+
+/// Inverse of [`selectable_row_index_for_cursor`]: given a row index, return
+/// the cursor position of the *nearest* selectable row at or after it.
+pub(crate) fn cursor_for_row_index(rows: &[PickerRow], row_index: usize) -> usize {
+    let mut cursor = 0;
+    for (i, r) in rows.iter().enumerate() {
+        if i >= row_index && r.is_selectable() {
+            return cursor;
+        }
+        if r.is_selectable() {
+            cursor += 1;
+        }
+    }
+    cursor.saturating_sub(1)
 }
 
 /// Current unix timestamp in seconds, clamped to 0 on clock skew.
