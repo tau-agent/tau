@@ -386,6 +386,7 @@ fn full_task_lifecycle_pipeline() {
         serde_json::json!({
             "title": "Parent lifecycle test",
             "message": "Test the full lifecycle",
+            "initial_state": "interactive",
         }),
     );
     let parent_id = parent["id"].as_i64().unwrap();
@@ -674,6 +675,7 @@ fn skip_planning_subtask_starts_ready() {
         "task_create",
         serde_json::json!({
             "title": "Parent for skip_planning test",
+            "initial_state": "interactive",
         }),
     );
     let parent_id = parent["id"].as_i64().unwrap();
@@ -736,7 +738,7 @@ fn affected_files_guard_on_refining_to_ready() {
         &server,
         &sid,
         "task_create",
-        serde_json::json!({"title": "Parent"}),
+        serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
     );
     let parent_id = parent["id"].as_i64().unwrap();
 
@@ -823,7 +825,7 @@ fn refining_to_planning_backward_transition() {
         &server,
         &sid,
         "task_create",
-        serde_json::json!({"title": "Parent"}),
+        serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
     );
     let parent_id = parent["id"].as_i64().unwrap();
 
@@ -914,7 +916,7 @@ fn refining_to_interactive_escalation() {
         &server,
         &sid,
         "task_create",
-        serde_json::json!({"title": "Parent"}),
+        serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
     );
     let parent_id = parent["id"].as_i64().unwrap();
 
@@ -985,7 +987,7 @@ fn review_transition_without_rebase() {
         &server,
         &sid,
         "task_create",
-        serde_json::json!({"title": "Parent"}),
+        serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
     );
     let parent_id = parent["id"].as_i64().unwrap();
 
@@ -1072,7 +1074,7 @@ fn active_to_approved_requires_skip_review() {
         &server,
         &sid,
         "task_create",
-        serde_json::json!({"title": "Parent"}),
+        serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
     );
     let parent_id = parent["id"].as_i64().unwrap();
 
