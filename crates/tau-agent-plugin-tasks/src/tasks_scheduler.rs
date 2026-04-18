@@ -1,5 +1,11 @@
 //! Scheduler logic for the task system.
 //!
+//! This module runs inside the `tau plugin-tasks` subprocess, which has no
+//! `tracing` subscriber. Diagnostics use `eprintln!`; the parent server
+//! forwards the plugin's stderr into its own tracing layer, so lines still
+//! end up in `~/.local/state/tau/logs/server.log`. See `tasks.rs` for the
+//! full rationale.
+//!
 //! Provides three synchronous operations called from tool handlers:
 //!
 //! - **schedule**: query `ready` tasks, pick a non-conflicting batch, and
@@ -223,7 +229,7 @@ pub fn schedule(
                     Ok(st) => scheduled.push(st),
                     Err(e) => {
                         // Log but don't fail the whole batch.
-                        tracing::warn!(task_id = task.id, %e, "failed to prepare task");
+                        eprintln!("tasks scheduler: failed to prepare task {}: {}", task.id, e);
                         // Add a visible message to the task so the error is discoverable.
                         let _ = db.add_message(
                             task.id,
@@ -471,7 +477,10 @@ pub fn dispatch(
     // failure, or via a manual task_dispatch call) will not spawn a second
     // session.
     if let Some(existing_sid) = find_reusable_session(db, task_id, "worker", writer, reader) {
-        tracing::info!(task_id, session_id = %existing_sid, "task already has a live worker session, reusing");
+        eprintln!(
+            "tasks scheduler: task {} already has a live worker session {}, reusing",
+            task_id, existing_sid
+        );
         crate::tasks_notify::set_session_tagline(
             &existing_sid,
             &crate::tasks_notify::task_session_tagline(&task, "worker"),
@@ -486,7 +495,10 @@ pub fn dispatch(
     // already recorded in the task_sessions table, and set_session_id below
     // will overwrite with the new worker session.
     if let Some(ref existing_sid) = task.session_id {
-        tracing::info!(task_id, session_id = %existing_sid, "replacing previous session with new worker dispatch");
+        eprintln!(
+            "tasks scheduler: task {} replacing previous session {} with new worker dispatch",
+            task_id, existing_sid
+        );
     }
 
     let cwd = task.worktree_path.clone();
@@ -615,7 +627,10 @@ fn dispatch_planning(
     // instead of creating a duplicate.  This makes dispatch idempotent when
     // the schedule pass runs more than once while the task is still planning.
     if let Some(existing_sid) = find_reusable_session(db, task_id, "planner", writer, reader) {
-        tracing::info!(task_id, session_id = %existing_sid, "planning task already has a live planner session, reusing");
+        eprintln!(
+            "tasks scheduler: planning task {} already has a live planner session {}, reusing",
+            task_id, existing_sid
+        );
         crate::tasks_notify::set_session_tagline(
             &existing_sid,
             &crate::tasks_notify::task_session_tagline(task, "planning"),
@@ -628,7 +643,10 @@ fn dispatch_planning(
     // If the task has a session_id from a previous lifecycle phase, log and
     // continue — the old session is already recorded in task_sessions.
     if let Some(ref existing_sid) = task.session_id {
-        tracing::info!(task_id, session_id = %existing_sid, "planning task replacing previous session with new dispatch");
+        eprintln!(
+            "tasks scheduler: planning task {} replacing previous session {} with new dispatch",
+            task_id, existing_sid
+        );
     }
 
     // Model inheritance: use the triggering session for model.
@@ -875,7 +893,10 @@ pub fn dispatch_review(
             task_id, task_id
         );
         resume_session(&existing_sid, task_id, &msg, writer, reader)?;
-        tracing::info!(task_id, session_id = %existing_sid, "reusing existing reviewer session for task");
+        eprintln!(
+            "tasks: reusing existing reviewer session {} for task {}",
+            existing_sid, task_id
+        );
         crate::tasks_notify::set_session_tagline(
             &existing_sid,
             &crate::tasks_notify::task_session_tagline(task, "review"),
@@ -1104,7 +1125,10 @@ pub fn dispatch_refining(
             task_id, task_id
         );
         resume_session(&existing_sid, task_id, &msg, writer, reader)?;
-        tracing::info!(task_id, session_id = %existing_sid, "reusing existing refiner session for task");
+        eprintln!(
+            "tasks: reusing existing refiner session {} for task {}",
+            existing_sid, task_id
+        );
         crate::tasks_notify::set_session_tagline(
             &existing_sid,
             &crate::tasks_notify::task_session_tagline(task, "refining"),
@@ -1427,7 +1451,7 @@ fn merge_one_task(
         crate::tasks_notify::notify_state_change(db, &t, "approved", None, writer, reader);
     }
 
-    tracing::info!(task_id, title = %title, "auto-merging task");
+    eprintln!("tasks scheduler: auto-merging task {} ({})", task_id, title);
 
     // Run the merge
     let project_dir = match resolve_path(&current.project_name) {
@@ -1453,7 +1477,10 @@ fn merge_one_task(
                     },
                     None,
                 ) {
-                    tracing::warn!(task_id, %e, "merge succeeded but transition to merged failed for task");
+                    eprintln!(
+                        "tasks scheduler: merge succeeded but transition to merged failed for task {}: {}",
+                        task_id, e
+                    );
                 }
 
                 // Broadcast merging -> merged (terminal).  Root session is
@@ -1477,10 +1504,13 @@ fn merge_one_task(
                 if let Err(e) =
                     crate::tasks_merge::notify_parent_if_all_done(db, task_id, writer, reader)
                 {
-                    tracing::warn!(task_id, %e, "parent notification failed for task");
+                    eprintln!(
+                        "tasks scheduler: parent notification failed for task {}: {}",
+                        task_id, e
+                    );
                 }
 
-                tracing::info!(task_id, "task merged successfully");
+                eprintln!("tasks scheduler: task {} merged successfully", task_id);
                 MergeAttempt {
                     task_id,
                     title,
@@ -1497,7 +1527,10 @@ fn merge_one_task(
                     },
                     None,
                 ) {
-                    tracing::warn!(task_id, %e, "failed to transition task back to active");
+                    eprintln!(
+                        "tasks scheduler: failed to transition task {} back to active: {}",
+                        task_id, e
+                    );
                 }
 
                 // Broadcast merging -> active (recoverable failure).
@@ -1530,7 +1563,7 @@ fn merge_one_task(
                     );
                 }
 
-                tracing::warn!(task_id, "task merge failed");
+                eprintln!("tasks scheduler: task {} merge failed", task_id);
                 MergeAttempt {
                     task_id,
                     title,
@@ -1549,7 +1582,10 @@ fn merge_one_task(
                 },
                 None,
             ) {
-                tracing::warn!(task_id, %te, "failed to transition task back to active");
+                eprintln!(
+                    "tasks scheduler: failed to transition task {} back to active: {}",
+                    task_id, te
+                );
             }
 
             // Broadcast merging -> active (unexpected error).
@@ -1566,7 +1602,7 @@ fn merge_one_task(
 
             let _ = db.add_message(task_id, &format!("Auto-merge error: {}", e), Some("system"));
 
-            tracing::warn!(task_id, %e, "task merge error");
+            eprintln!("tasks scheduler: task {} merge error: {}", task_id, e);
             MergeAttempt {
                 task_id,
                 title,

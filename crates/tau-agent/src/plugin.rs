@@ -19,6 +19,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::{Tool, ToolCall};
 
+/// Handle used to update the name a `spawn_stderr_forwarder` thread emits
+/// under. At spawn time we don't know the plugin's registered name yet,
+/// so the forwarder starts with a placeholder; once registration arrives
+/// we overwrite the shared name and all subsequent lines carry the real
+/// plugin name.
+type StderrPluginName = std::sync::Arc<std::sync::Mutex<String>>;
+
 /// Spawn a background thread that forwards the plugin's stderr to tracing.
 ///
 /// Each line is emitted at `info` level with `target="plugin"` and a
@@ -27,17 +34,29 @@ use crate::types::{Tool, ToolCall};
 ///
 /// A dedicated OS thread (not a smol task) keeps the forwarder off the async
 /// runtime; plugin stderr is low volume and one thread per plugin is cheap.
-fn spawn_stderr_forwarder(name: String, stderr: std::process::ChildStderr) {
+///
+/// Returns a handle that lets the caller update the name the forwarder
+/// emits under once registration completes.
+fn spawn_stderr_forwarder(
+    initial_name: String,
+    stderr: std::process::ChildStderr,
+) -> StderrPluginName {
+    let name: StderrPluginName = std::sync::Arc::new(std::sync::Mutex::new(initial_name));
+    let thread_name = name.clone();
     std::thread::Builder::new()
-        .name(format!("plugin-stderr:{}", name))
+        .name("plugin-stderr".to_string())
         .spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
-                // Use the line itself as the message so it's not double-quoted.
-                tracing::info!(target: "plugin", plugin = %name, "{line}");
+                let n = thread_name
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_else(|_| "<unknown>".to_string());
+                tracing::info!(target: "plugin", plugin = %n, "{line}");
             }
         })
         .ok();
+    name
 }
 
 // Re-export wire types from tau-agent-base for backward compatibility
@@ -217,18 +236,20 @@ impl PluginHandle {
                 .ok_or_else(|| crate::Error::Io("plugin stdout not available".into()))?,
         );
 
-        // Forward stderr to tracing on a background thread. The plugin name
-        // isn't known yet (not until registration) so we use a placeholder;
-        // once registration completes we start a second forwarder under the
-        // real name. In practice the pre-registration window is tiny and
-        // lines emitted there still surface via the placeholder name.
-        if let Some(pipe) = child.stderr.take() {
+        // Forward stderr to tracing on a background thread. We don't know
+        // the plugin's registered name yet, so start with a placeholder
+        // derived from the binary path; once registration completes below
+        // we overwrite the shared name so subsequent lines carry the real
+        // plugin name.
+        let stderr_name = if let Some(pipe) = child.stderr.take() {
             let placeholder = format!(
                 "<spawning {:?}>",
                 command.first().cloned().unwrap_or_default()
             );
-            spawn_stderr_forwarder(placeholder, pipe);
-        }
+            Some(spawn_stderr_forwarder(placeholder, pipe))
+        } else {
+            None
+        };
 
         let mut handle = Self {
             name: String::new(),
@@ -262,6 +283,13 @@ impl PluginHandle {
                     hooks = ?reg.hooks,
                     "registered"
                 );
+                // Update the stderr forwarder so subsequent lines carry
+                // the real plugin name instead of the placeholder.
+                if let Some(ref n) = stderr_name
+                    && let Ok(mut g) = n.lock()
+                {
+                    *g = reg.name.clone();
+                }
                 handle.name = reg.name.clone();
                 handle.registration = reg;
             }
@@ -714,8 +742,9 @@ impl PluginHandle {
         );
 
         // Start a new stderr forwarder for this process lifetime.
+        // The plugin name is already known here, so no placeholder dance.
         if let Some(pipe) = child.stderr.take() {
-            spawn_stderr_forwarder(self.name.clone(), pipe);
+            let _ = spawn_stderr_forwarder(self.name.clone(), pipe);
         }
         self.child = Some(child);
         self.stdin = Some(stdin);

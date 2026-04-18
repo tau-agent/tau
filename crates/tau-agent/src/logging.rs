@@ -47,8 +47,15 @@ pub fn init_tracing() -> WorkerGuard {
             .with_target(true),
     );
 
-    // Use `try_init` so that repeated calls in tests don't panic.
-    let _ = subscriber.try_init();
+    // Use `try_init` so that tests (which may instantiate multiple
+    // subscribers across runs) don't panic on a double-install. If this
+    // fails in production it means someone else already installed a
+    // subscriber — log that fact to stderr (which the parent daemon
+    // redirects to `daemon.stderr.log`) so the silent-logging regression
+    // is at least discoverable.
+    if let Err(e) = subscriber.try_init() {
+        eprintln!("tau: failed to install tracing subscriber: {e}");
+    }
 
     guard
 }

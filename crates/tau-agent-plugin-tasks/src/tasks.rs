@@ -2,6 +2,15 @@
 //!
 //! Speaks the plugin protocol (JSON lines over stdin/stdout).
 //! Registers task management tools and handles them via TasksDb.
+//!
+//! ## Why `eprintln!` instead of `tracing::*!`
+//!
+//! This crate runs inside a dedicated subprocess (`tau plugin-tasks`)
+//! spawned by the server daemon; it has no `tracing` subscriber of its
+//! own. The parent server captures the subprocess's stderr via
+//! `spawn_stderr_forwarder` and re-emits each line as `tracing::info!`,
+//! so `eprintln!` output here still ends up in the server log. Migrating
+//! these calls to `tracing::*!` would make them no-ops.
 
 use std::io::{BufRead, BufReader, BufWriter, Write};
 
@@ -695,7 +704,10 @@ fn create_interactive_session(
     let project_path = match resolver.resolve(&task.project_name) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(task_id = task.id, project = %task.project_name, %e, "failed to resolve project for interactive session");
+            eprintln!(
+                "tasks: failed to resolve project '{}' for interactive session: {}",
+                task.project_name, e
+            );
             return None;
         }
     };
@@ -734,7 +746,10 @@ fn create_interactive_session(
     let new_sid = match crate::tasks_scheduler::server_request(writer, reader, create_req) {
         Ok(Response::SessionCreated { session_id }) => session_id,
         Ok(Response::Error { message }) => {
-            tracing::warn!(task_id = task.id, %message, "failed to create interactive session for task");
+            eprintln!(
+                "tasks: failed to create interactive session for task {}: {}",
+                task.id, message
+            );
             let _ = db.add_message(
                 task.id,
                 &format!(
@@ -747,9 +762,9 @@ fn create_interactive_session(
             return None;
         }
         Ok(_) => {
-            tracing::warn!(
-                task_id = task.id,
-                "unexpected response creating session for task"
+            eprintln!(
+                "tasks: unexpected response creating session for task {}",
+                task.id
             );
             let _ = db.add_message(
                 task.id,
@@ -760,7 +775,7 @@ fn create_interactive_session(
             return None;
         }
         Err(e) => {
-            tracing::warn!(task_id = task.id, %e, "failed to create session for task");
+            eprintln!("tasks: error creating session for task {}: {}", task.id, e);
             let _ = db.add_message(
                 task.id,
                 &format!(
@@ -822,7 +837,10 @@ fn create_interactive_session(
     };
 
     if let Err(e) = crate::tasks_scheduler::server_request(writer, reader, queue_req) {
-        tracing::warn!(session_id = %new_sid, task_id = task.id, %e, "session created for task but failed to queue initial message");
+        eprintln!(
+            "tasks: session {} created for task {} but failed to queue initial message: {}",
+            new_sid, task.id, e
+        );
     }
 
     Some(new_sid)
@@ -879,7 +897,10 @@ fn handle_task_assign(
                     new_parent_id: sid.to_string(),
                 };
                 if let Err(e) = crate::tasks_scheduler::server_request(writer, reader, req) {
-                    tracing::warn!(old_session_id = %old_sid, new_session_id = sid, %e, "failed to reparent children");
+                    eprintln!(
+                        "warning: failed to reparent children from {} to {}: {}",
+                        old_sid, sid, e
+                    );
                 }
 
                 // Reparent descendant task sessions that were parented
@@ -894,7 +915,10 @@ fn handle_task_assign(
                         };
                         if let Err(e) = crate::tasks_scheduler::server_request(writer, reader, req)
                         {
-                            tracing::warn!(old_session_id = %desc_old_sid, new_session_id = sid, %e, "failed to reparent children of descendant");
+                            eprintln!(
+                                "warning: failed to reparent children of {} to {}: {}",
+                                desc_old_sid, sid, e
+                            );
                         }
                     }
                 }
@@ -1215,10 +1239,16 @@ fn handle_task_update(
                             reader,
                         ) {
                             Ok(review_sid) => {
-                                tracing::info!(review_session_id = %review_sid, task_id = task.id, "auto-dispatched review session");
+                                eprintln!(
+                                    "tasks: auto-dispatched review session {} for task {}",
+                                    review_sid, task.id
+                                );
                             }
                             Err(e) => {
-                                tracing::warn!(task_id = task.id, %e, "failed to auto-dispatch review for task");
+                                eprintln!(
+                                    "tasks: failed to auto-dispatch review for task {}: {}",
+                                    task.id, e
+                                );
                                 let warn = format!(
                                     "⚠️ Auto-dispatch of review session failed: {}. \
                                      Task is in review state but has no reviewer session.",
@@ -1230,7 +1260,10 @@ fn handle_task_update(
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(project = %task.project_name, %e, "cannot resolve project for review dispatch");
+                        eprintln!(
+                            "tasks: cannot resolve project '{}' for review dispatch: {}",
+                            task.project_name, e
+                        );
                     }
                 }
             }
@@ -1252,10 +1285,16 @@ fn handle_task_update(
                             reader,
                         ) {
                             Ok(refining_sid) => {
-                                tracing::info!(refining_session_id = %refining_sid, task_id = task.id, "auto-dispatched refining session");
+                                eprintln!(
+                                    "tasks: auto-dispatched refining session {} for task {}",
+                                    refining_sid, task.id
+                                );
                             }
                             Err(e) => {
-                                tracing::warn!(task_id = task.id, %e, "failed to auto-dispatch refining for task");
+                                eprintln!(
+                                    "tasks: failed to auto-dispatch refining for task {}: {}",
+                                    task.id, e
+                                );
                                 let warn = format!(
                                     "⚠️ Auto-dispatch of refining session failed: {}. \
                                      Task is in refining state but has no refiner session.",
@@ -1267,7 +1306,10 @@ fn handle_task_update(
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(project = %task.project_name, %e, "cannot resolve project for refining dispatch");
+                        eprintln!(
+                            "tasks: cannot resolve project '{}' for refining dispatch: {}",
+                            task.project_name, e
+                        );
                     }
                 }
             }
@@ -1426,7 +1468,10 @@ fn handle_task_update(
                 // Check if ALL subtasks are now in a terminal state and notify parent
                 if let Err(e) = tasks_merge::notify_parent_if_all_done(db, task.id, writer, reader)
                 {
-                    tracing::warn!(task_id = task.id, %e, "parent notification failed for task");
+                    eprintln!(
+                        "tasks: parent notification failed for task {}: {}",
+                        task.id, e
+                    );
                 }
             }
 
@@ -1848,7 +1893,7 @@ fn handle_task_merge(
 
                 // Check if ALL subtasks are now in a terminal state and notify parent
                 if let Err(e) = tasks_merge::notify_parent_if_all_done(db, id, writer, reader) {
-                    tracing::warn!(task_id = id, %e, "parent notification failed for task");
+                    eprintln!("tasks: parent notification failed for task {}: {}", id, e);
                 }
 
                 match serde_json::to_string_pretty(&result) {
@@ -1869,7 +1914,10 @@ fn handle_task_merge(
                     },
                     session_id,
                 ) {
-                    tracing::warn!(task_id = id, %e, "failed to transition task back to active");
+                    eprintln!(
+                        "tasks: failed to transition task {} back to active: {}",
+                        id, e
+                    );
                 }
 
                 // Broadcast merging -> active (recoverable failure).
@@ -1916,7 +1964,7 @@ fn handle_task_merge(
                 },
                 session_id,
             ) {
-                tracing::warn!(task_id = id, %te, "failed to transition task to failed");
+                eprintln!("tasks: failed to transition task {} to failed: {}", id, te);
             }
 
             // Broadcast merging -> failed (terminal).  Root session is
@@ -1971,7 +2019,7 @@ pub fn run_tasks_plugin() {
     let db = match TasksDb::open_default() {
         Ok(db) => db,
         Err(e) => {
-            tracing::warn!(%e, "tasks plugin: failed to open db");
+            eprintln!("tasks plugin: failed to open db: {}", e);
             std::process::exit(1);
         }
     };
@@ -1980,7 +2028,7 @@ pub fn run_tasks_plugin() {
     let resolver = match ProjectResolver::open() {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(%e, "tasks plugin: failed to open project resolver");
+            eprintln!("tasks plugin: failed to open project resolver: {}", e);
             std::process::exit(1);
         }
     };
@@ -2030,22 +2078,25 @@ pub fn run_tasks_plugin() {
     // or from tasks that were manually closed without going through merge.
     if let Ok(stale_tasks) = db.get_stale_worktree_tasks() {
         for task in &stale_tasks {
-            tracing::info!(
-                task_id = task.id,
-                title = %task.title,
-                state = %task.state,
-                worktree_path = ?task.worktree_path,
-                "startup cleanup: task has stale worktree"
+            eprintln!(
+                "tasks: startup cleanup: task {} ({}) in state '{}' has stale worktree at {:?}",
+                task.id, task.title, task.state, task.worktree_path
             );
             if let Some(ref wt_path) = task.worktree_path {
                 if let Some(ref branch) = task.branch {
                     if let Ok(project_path) = resolver.resolve(&task.project_name) {
                         if let Ok(repo_root) = crate::tasks_git::get_repo_root(&project_path) {
                             if let Err(e) = crate::tasks_git::remove_worktree(&repo_root, wt_path) {
-                                tracing::warn!(task_id = task.id, %e, "startup cleanup: failed to remove worktree for task");
+                                eprintln!(
+                                    "tasks: startup cleanup: failed to remove worktree for task {}: {}",
+                                    task.id, e
+                                );
                             }
                             if let Err(e) = crate::tasks_git::delete_branch(&repo_root, branch) {
-                                tracing::warn!(task_id = task.id, %e, "startup cleanup: failed to delete branch for task");
+                                eprintln!(
+                                    "tasks: startup cleanup: failed to delete branch for task {}: {}",
+                                    task.id, e
+                                );
                             }
                         }
                         // Update session cwds so plugin respawns don't fail.
@@ -2064,14 +2115,17 @@ pub fn run_tasks_plugin() {
                     }
                 }
                 if let Err(e) = db.clear_worktree(task.id) {
-                    tracing::warn!(task_id = task.id, %e, "startup cleanup: failed to clear worktree in DB for task");
+                    eprintln!(
+                        "tasks: startup cleanup: failed to clear worktree in DB for task {}: {}",
+                        task.id, e
+                    );
                 }
             }
         }
         if !stale_tasks.is_empty() {
-            tracing::info!(
-                count = stale_tasks.len(),
-                "startup cleanup: cleaned up stale worktree(s)"
+            eprintln!(
+                "tasks: startup cleanup: cleaned up {} stale worktree(s)",
+                stale_tasks.len()
             );
         }
     }
@@ -2085,7 +2139,7 @@ pub fn run_tasks_plugin() {
         let req: PluginRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(%e, "tasks: bad request");
+                eprintln!("tasks: bad request: {}", e);
                 continue;
             }
         };
@@ -2415,17 +2469,17 @@ fn run_merge_pass(
         Ok(attempts) => {
             for a in &attempts {
                 if !a.success {
-                    tracing::warn!(
-                        task_id = a.task_id,
-                        title = %a.title,
-                        detail = %a.log.lines().next().unwrap_or("(no details)"),
-                        "auto-merge failed for task"
+                    eprintln!(
+                        "tasks scheduler: auto-merge failed for task {} ({}): {}",
+                        a.task_id,
+                        a.title,
+                        a.log.lines().next().unwrap_or("(no details)")
                     );
                 }
             }
         }
         Err(e) => {
-            tracing::warn!(%e, "tasks scheduler: merge pass error");
+            eprintln!("tasks scheduler: merge pass error: {}", e);
         }
     }
 }
@@ -2445,7 +2499,10 @@ fn run_schedule_pass(
     let project_path = match resolver.resolve(project_name) {
         Ok(p) => p,
         Err(e) => {
-            tracing::warn!(project = %project_name, %e, "tasks scheduler: cannot resolve project");
+            eprintln!(
+                "tasks scheduler: cannot resolve project '{}': {}",
+                project_name, e
+            );
             return Vec::new();
         }
     };
@@ -2456,16 +2513,22 @@ fn run_schedule_pass(
             for st in &scheduled {
                 if st.branch.is_empty() {
                     // Planning task — dispatch planning session
-                    tracing::info!(task_id = st.id, title = %st.title, "dispatching planning for task");
+                    eprintln!(
+                        "tasks scheduler: dispatching planning for task {} ({})",
+                        st.id, st.title
+                    );
                 } else {
-                    tracing::info!(task_id = st.id, title = %st.title, branch = %st.branch, "scheduled task on branch");
+                    eprintln!(
+                        "tasks scheduler: scheduled task {} ({}) on branch {}",
+                        st.id, st.title, st.branch
+                    );
                 }
                 // Dispatch each scheduled task (create session + send initial message).
                 // Pass the triggering session_id so dispatch() can inherit its model.
                 if let Err(e) =
                     tasks_scheduler::dispatch(db, st.id, session_id, &project_path, writer, reader)
                 {
-                    tracing::warn!(task_id = st.id, %e, "tasks scheduler: dispatch failed for task");
+                    eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
 
                     // For non-planning tasks, schedule() already transitioned
                     // to active via prepare_task().  Revert to ready so the
@@ -2513,7 +2576,7 @@ fn run_schedule_pass(
             }
         }
         Err(e) => {
-            tracing::warn!(%e, "tasks scheduler: schedule pass error");
+            eprintln!("tasks scheduler: schedule pass error: {}", e);
         }
     }
     warnings

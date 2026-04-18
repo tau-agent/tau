@@ -1,5 +1,11 @@
 //! Merge queue for the task system.
 //!
+//! This module runs inside the `tau plugin-tasks` subprocess, which has no
+//! `tracing` subscriber. Diagnostics use `eprintln!`; the parent server
+//! forwards the plugin's stderr into its own tracing layer, so lines still
+//! end up in `~/.local/state/tau/logs/server.log`. See `tasks.rs` for the
+//! full rationale.
+//!
 //! Processes `merging` tasks: rebases onto the merge target, runs the project
 //! checklist, and performs a fast-forward merge.
 //!
@@ -363,7 +369,7 @@ pub fn merge_task(
             "refusing to remove main worktree for task {}: {} is the repo root\n",
             task_id, worktree_path
         );
-        tracing::warn!(task_id, worktree_path = %worktree_path, "refusing to remove main worktree for task");
+        eprintln!("tasks: warning: {}", msg.trim());
         log.push_str(&msg);
     } else {
         let (output, wt_err) = execute_bash(
@@ -377,7 +383,11 @@ pub fn merge_task(
         )?;
         log.push_str(&output);
         if wt_err {
-            tracing::warn!(task_id, output = %output.trim(), "failed to remove worktree for task");
+            eprintln!(
+                "tasks: warning: failed to remove worktree for task {}: {}",
+                task_id,
+                output.trim()
+            );
         }
     }
     let _ = db.clear_worktree(task_id);
@@ -407,7 +417,11 @@ pub fn merge_task(
     )?;
     log.push_str(&output);
     if br_err {
-        tracing::warn!(task_id, output = %output.trim(), "failed to delete branch for task");
+        eprintln!(
+            "tasks: warning: failed to delete branch for task {}: {}",
+            task_id,
+            output.trim()
+        );
     }
 
     // 7c. Archive task-spawned sessions (worker, planner, reviewer, refiner,

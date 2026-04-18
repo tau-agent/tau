@@ -938,13 +938,12 @@ async fn send_request_and_recv(req: Request, tx: Sender<Response>) -> tau_agent:
     smol::spawn(async move {
         let _ = client
             .recv_streaming(|resp| {
-                if tx.try_send(resp.clone()).is_err() {
-                    // Kept as eprintln! deliberately: the TUI owns the
-                    // alternate screen, so diagnostic output is swallowed
-                    // anyway and routing through tracing would require
-                    // initialising the subscriber in the TUI process.
-                    eprintln!("warning: try_send failed in send_request_and_recv");
-                }
+                // Best-effort forward into the TUI's event channel.
+                // If the TUI-side receiver is gone (closed/dropped), we
+                // silently drop the message — the TUI owns the alt-screen,
+                // so eprintln! would garble the UI, and tracing has no
+                // subscriber in the CLI/TUI process anyway.
+                let _ = tx.try_send(resp.clone());
             })
             .await;
     })
