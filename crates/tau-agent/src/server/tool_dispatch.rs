@@ -206,7 +206,15 @@ pub(super) async fn handle_server_request(
             include_archived,
             project_name,
         } => list_sessions_impl(state, *include_archived, project_name.as_deref()),
-        Request::CancelChat { session_id } => cancel_chat_impl(state, session_id, session_locks),
+        Request::CancelChat {
+            session_id,
+            caller_session_id,
+        } => cancel_chat_impl(
+            state,
+            session_id,
+            session_locks,
+            caller_session_id.as_deref(),
+        ),
         Request::Chat { session_id, text } => {
             match chat_spawn_tx.send((session_id.clone(), text.clone())).await {
                 Ok(()) => Response::Ok,

@@ -938,6 +938,7 @@ fn spawn_cancel_child() {
         &conn3,
         &Request::CancelChat {
             session_id: child_id,
+            caller_session_id: None,
         },
     ) {
         Response::Ok => {} // expected

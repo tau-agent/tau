@@ -1013,6 +1013,7 @@ async fn handle_session_tool(
             }
             let req = crate::protocol::Request::CancelChat {
                 session_id: sid.to_string(),
+                caller_session_id: session_id.map(String::from),
             };
             match server_request(msg_tx, pending, req).await {
                 Ok(crate::protocol::Response::Ok) => {

@@ -1658,6 +1658,7 @@ fn auto_archive_task_session(
                             tau_agent_plugin::Request::SetCwd {
                                 session_id: ts.session_id.clone(),
                                 cwd: project_path.clone(),
+                                caller_session_id: None,
                             },
                         );
                     }
@@ -2212,6 +2213,7 @@ pub fn run_tasks_plugin() {
                                     tau_agent_plugin::Request::SetCwd {
                                         session_id: ts.session_id.clone(),
                                         cwd: project_path.clone(),
+                                        caller_session_id: None,
                                     },
                                 );
                             }

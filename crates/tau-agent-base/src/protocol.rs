@@ -98,9 +98,20 @@ pub enum Request {
     SetModel {
         session_id: String,
         model_id: String,
+        /// Session id of the caller when invoked via an orchestration tool
+        /// (used to attribute the change in the session's info-message log).
+        /// `None` when invoked by the TUI/CLI/external API.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
     },
     /// Change working directory for a session.
-    SetCwd { session_id: String, cwd: String },
+    SetCwd {
+        session_id: String,
+        cwd: String,
+        /// Session id of the caller when invoked via an orchestration tool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+    },
     /// Re-parent all child sessions from one parent to another.
     ReparentChildren {
         old_parent_id: String,
@@ -130,7 +141,14 @@ pub enum Request {
         timeout_secs: u64,
     },
     /// Cancel an in-progress chat (agent loop) for a session.
-    CancelChat { session_id: String },
+    CancelChat {
+        session_id: String,
+        /// Session id of the caller when invoked via an orchestration tool
+        /// (e.g. `session_cancel` from another session). `None` when invoked
+        /// via the TUI/CLI/external API.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+    },
     /// Inject a steering message into a running agent loop.
     /// The message is inserted as a user message between tool results
     /// and the next LLM call. If no agent is running, treated as Chat.

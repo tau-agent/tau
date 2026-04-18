@@ -2931,6 +2931,7 @@ fn alias_set_model_routes_through_resolver() {
         &Request::SetModel {
             session_id: sid.clone(),
             model_id: "smart".into(),
+            caller_session_id: None,
         },
     );
     match resp {
@@ -3390,6 +3391,7 @@ fn cancel_chat_without_active_loop_emits_cancelled() {
         &cancel_conn,
         &Request::CancelChat {
             session_id: sid.clone(),
+            caller_session_id: None,
         },
     );
     assert!(matches!(resp, Response::Ok), "expected Ok, got {:?}", resp);

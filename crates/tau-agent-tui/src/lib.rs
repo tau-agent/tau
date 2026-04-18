@@ -391,6 +391,7 @@ async fn run_inner(
                     smol::spawn(async move {
                         send_fire_and_forget(Request::CancelChat {
                             session_id: sid_clone,
+                            caller_session_id: None,
                         })
                         .await
                         .ok();
@@ -413,6 +414,7 @@ async fn run_inner(
                         Request::SetModel {
                             session_id: sid,
                             model_id,
+                            caller_session_id: None,
                         },
                         server_tx.clone(),
                     )
@@ -433,6 +435,7 @@ async fn run_inner(
                         Request::SetCwd {
                             session_id: sid,
                             cwd,
+                            caller_session_id: None,
                         },
                         server_tx.clone(),
                     )
@@ -852,6 +855,7 @@ async fn run_inner(
     if app.mode == AppMode::Streaming {
         send_fire_and_forget(Request::CancelChat {
             session_id: app.session_id.clone(),
+            caller_session_id: None,
         })
         .await
         .ok();

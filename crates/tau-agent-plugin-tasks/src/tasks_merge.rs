@@ -403,6 +403,7 @@ pub fn merge_task(
                 Request::SetCwd {
                     session_id: ts.session_id.clone(),
                     cwd: project_dir.to_string(),
+                    caller_session_id: None,
                 },
             );
         }

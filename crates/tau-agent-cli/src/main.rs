@@ -375,6 +375,7 @@ fn fire_and_forget_cancel(session_id: &str) {
     use std::io::Write;
     let req = tau_agent::protocol::Request::CancelChat {
         session_id: session_id.to_string(),
+        caller_session_id: None,
     };
     let mut line = match serde_json::to_string(&req) {
         Ok(s) => s,
@@ -1117,6 +1118,7 @@ async fn send_and_print(
                                 eprintln!("\n[cancelling...]");
                                 let cancel_req = tau_agent::protocol::Request::CancelChat {
                                     session_id: session_id_clone.clone(),
+                                    caller_session_id: None,
                                 };
                                 if let Ok(stream) = std::os::unix::net::UnixStream::connect(
                                     tau_agent::server::socket_path(),
@@ -1525,6 +1527,7 @@ async fn handle_slash_command(
                     .send(&tau_agent::protocol::Request::SetModel {
                         session_id: session_id.to_string(),
                         model_id: args.to_string(),
+                        caller_session_id: None,
                     })
                     .await?;
                 client
@@ -1569,6 +1572,7 @@ async fn handle_slash_command(
                         .send(&tau_agent::protocol::Request::SetCwd {
                             session_id: session_id.to_string(),
                             cwd: new_cwd.clone(),
+                            caller_session_id: None,
                         })
                         .await?;
                     client.recv_streaming(|_| {}).await?;

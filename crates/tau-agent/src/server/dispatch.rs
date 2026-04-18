@@ -331,6 +331,7 @@ pub(super) fn cancel_chat_impl(
     state: &SharedState,
     session_id: &str,
     session_locks: &SessionLocks,
+    caller_session_id: Option<&str>,
 ) -> crate::protocol::Response {
     let mut st = lock_state(state);
     if let Some(flag) = st.cancel_flags.get(session_id) {
@@ -345,7 +346,20 @@ pub(super) fn cancel_chat_impl(
     // flag. Immediately emit Cancelled + Phase(Idle) so the TUI never gets
     // stuck, and clear the stale flag.
     let lock = session_lock(session_locks, session_id);
-    if let Some(_guard) = lock.try_lock() {
+    let was_idle = lock.try_lock().is_some();
+
+    // Persist the info message *before* broadcasting Cancelled so
+    // subscribers that re-fetch history on the event see the info line
+    // already present.
+    let info_text = match (caller_session_id, was_idle) {
+        (Some(caller), true) => format!("Session cancelled by {caller}. (was idle)"),
+        (Some(caller), false) => format!("Session cancelled by {caller}."),
+        (None, true) => "Session cancelled. (was idle)".to_string(),
+        (None, false) => "Session cancelled.".to_string(),
+    };
+    queue_info_to_session(state, session_id, &info_text);
+
+    if was_idle {
         broadcast_to_subscribers(state, session_id, &crate::protocol::Response::Cancelled);
         emit_phase(state, session_id, crate::types::AgentPhase::Idle);
         let mut st = lock_state(state);
@@ -891,8 +905,16 @@ pub(super) async fn handle_client(
                 let resp = get_messages_impl(&state, &session_id);
                 send(&mut writer, &resp).await?;
             }
-            crate::protocol::Request::CancelChat { session_id } => {
-                cancel_chat_impl(&state, &session_id, &session_locks);
+            crate::protocol::Request::CancelChat {
+                session_id,
+                caller_session_id,
+            } => {
+                cancel_chat_impl(
+                    &state,
+                    &session_id,
+                    &session_locks,
+                    caller_session_id.as_deref(),
+                );
                 send(&mut writer, &Response::Ok).await.ok();
             }
             crate::protocol::Request::Steer { session_id, text } => {
@@ -1151,13 +1173,22 @@ pub(super) async fn handle_client(
                 };
                 send(&mut writer, &Response::Aliases { global, project }).await?;
             }
-            crate::protocol::Request::SetCwd { session_id, cwd } => {
+            crate::protocol::Request::SetCwd {
+                session_id,
+                cwd,
+                caller_session_id,
+            } => {
                 let result = {
                     let st = lock_state(&state);
                     st.db.update_cwd(&session_id, &cwd)
                 };
                 match result {
                     Ok(()) => {
+                        let info = match caller_session_id.as_deref() {
+                            Some(caller) => format!("cwd changed by {caller} to {cwd}."),
+                            None => format!("cwd changed to {cwd}."),
+                        };
+                        queue_info_to_session(&state, &session_id, &info);
                         send(&mut writer, &Response::Ok).await?;
                     }
                     Err(e) => {
@@ -1175,12 +1206,31 @@ pub(super) async fn handle_client(
                 old_parent_id,
                 new_parent_id,
             } => {
+                // Capture the affected children *before* the DB update so we
+                // know which sessions to annotate (the reparent query changes
+                // the parent pointer in-place, so after it runs a lookup by
+                // `old_parent_id` would return nothing).
+                let children: Vec<String> = {
+                    let st = lock_state(&state);
+                    st.db
+                        .get_children(&old_parent_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|s| s.id)
+                        .collect()
+                };
                 let result = {
                     let st = lock_state(&state);
                     st.db.reparent_children(&old_parent_id, &new_parent_id)
                 };
                 match result {
                     Ok(()) => {
+                        let info = format!(
+                            "Parent session changed from {old_parent_id} to {new_parent_id}."
+                        );
+                        for child_id in &children {
+                            queue_info_to_session(&state, child_id, &info);
+                        }
                         send(&mut writer, &Response::Ok).await?;
                     }
                     Err(e) => {
@@ -1197,6 +1247,7 @@ pub(super) async fn handle_client(
             crate::protocol::Request::SetModel {
                 session_id,
                 model_id,
+                caller_session_id,
             } => {
                 let result = {
                     let st = lock_state(&state);
@@ -1240,6 +1291,14 @@ pub(super) async fn handle_client(
                 };
                 match result {
                     Ok(info) => {
+                        let info_text = match caller_session_id.as_deref() {
+                            Some(caller) => format!(
+                                "Model changed by {caller} to {} ({}).",
+                                info.name, info.provider
+                            ),
+                            None => format!("Model changed to {} ({}).", info.name, info.provider),
+                        };
+                        queue_info_to_session(&state, &session_id, &info_text);
                         send(&mut writer, &Response::ModelChanged { model: info }).await?;
                     }
                     Err(msg) => {
@@ -1645,6 +1704,9 @@ pub(super) async fn handle_client(
                     pm.destroy_session_plugins(&session_id);
                     pm.ensure_session_plugins(&session_id, &cwd, project_name.as_deref(), None)
                         .map(|failures| {
+                            // Emit the success/event line first so readers see
+                            // "reload happened; here's what broke" in order.
+                            queue_info_to_session(&state, &session_id, "Plugins reloaded.");
                             for msg in &failures {
                                 queue_info_to_session(&state, &session_id, msg);
                             }
