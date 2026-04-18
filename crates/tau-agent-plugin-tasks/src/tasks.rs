@@ -1229,6 +1229,14 @@ fn handle_task_update(
                         session_id.map(String::from),
                     ));
                 }
+                "merged" | "closed" => {
+                    // Dependents may have been blocked on this task — re-
+                    // evaluate schedulability on the next scheduler pass.
+                    pending_events.push(SchedulerEvent::ScheduleNeeded(
+                        task.project_name.clone(),
+                        session_id.map(String::from),
+                    ));
+                }
                 _ => {}
             }
 
@@ -2569,6 +2577,23 @@ fn run_merge_pass(
     let resolve_fn = |name: &str| resolver.resolve(name);
     match tasks_scheduler::merge_approved(db, &resolve_fn, writer, reader) {
         Ok(attempts) => {
+            // Collect projects whose tasks were successfully merged so we
+            // can re-evaluate dependents of those merges. Without this,
+            // scheduler-driven merges (as opposed to tool-call transitions
+            // that flow through handle_task_update) leave dependents
+            // stuck in ready/planning until the next manual schedule pass.
+            let mut merged_projects: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for a in &attempts {
+                if a.success
+                    && let Ok(Some(t)) = db.get_task(a.task_id)
+                {
+                    merged_projects.insert(t.project_name);
+                }
+            }
+            for project in &merged_projects {
+                run_schedule_pass(db, project, resolver, None, writer, reader);
+            }
             for a in &attempts {
                 if !a.success {
                     eprintln!(
@@ -5608,6 +5633,122 @@ mod tests {
         );
         assert!(!result.is_error);
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_update_to_merged_emits_schedule_event() {
+        // Transitioning merging -> merged should emit ScheduleNeeded so
+        // dependents that were blocked on this task get re-evaluated
+        // on the next scheduler pass.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let mut events = Vec::new();
+
+        // Create a task and walk it through to merging.
+        let task = db
+            .create_task(
+                "test-project",
+                "dep",
+                None,
+                None,
+                None,
+                true,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        for next in ["ready", "active", "approved", "merging"] {
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some(next.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        // merging -> merged via the tool handler.
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "merged"}),
+            Some("s1"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project"
+            )),
+            "expected ScheduleNeeded for test-project, got {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn test_update_to_closed_emits_schedule_event() {
+        // Transitioning active -> closed should emit ScheduleNeeded so
+        // any dependents stuck in ready/planning get re-evaluated.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let mut events = Vec::new();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "soon to be closed",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "closed"}),
+            Some("s1"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut events,
+        );
+        assert!(!result.is_error);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project"
+            )),
+            "expected ScheduleNeeded for test-project, got {:?}",
+            events
+        );
     }
 
     #[test]
