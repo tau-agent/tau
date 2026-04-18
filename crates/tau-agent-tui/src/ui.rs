@@ -1097,51 +1097,63 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // rendered geometry.
     app.task_picker_viewport_rows.set(viewport_rows);
 
+    // Two-phase scroll math:
+    //
+    // 1. Reserve a line at top/bottom for ▲/▼ indicators *when the list
+    //    overflows the viewport*, so the indicators don't shadow a task
+    //    row. `body_capacity` is the number of rows we actually have for
+    //    tasks+headers.
+    // 2. Run cursor-in-view clamp over `body_capacity`, not the raw
+    //    viewport.
+    //
+    // When the full list fits in the viewport no indicators are drawn and
+    // `body_capacity == viewport_rows`.
+    let overflows = rows.len() > viewport_rows;
+    // Reserve one for top, one for bottom, but only when the overall list
+    // overflows. We always reserve symmetrically when overflowing to keep
+    // cursor-motion math stable (the actual indicator rendering still
+    // checks per-edge visibility).
+    let reserve = if overflows && viewport_rows >= 3 {
+        2
+    } else {
+        0
+    };
+    let body_capacity = viewport_rows.saturating_sub(reserve).max(1);
+
     // Scroll offset handled in-place: resolve cursor_row, then clamp offset.
     let cursor_row =
         crate::app::selectable_row_index_for_cursor(&rows, app.task_picker_cursor).unwrap_or(0);
-    let margin = if viewport_rows >= 4 { 1 } else { 0 };
+    let margin = if body_capacity >= 4 { 1 } else { 0 };
     let mut offset = app.task_picker_scroll_offset.get();
     if cursor_row < offset.saturating_add(margin) {
         offset = cursor_row.saturating_sub(margin);
     }
-    if cursor_row + margin + 1 > offset + viewport_rows {
-        offset = (cursor_row + margin + 1).saturating_sub(viewport_rows);
+    if cursor_row + margin + 1 > offset + body_capacity {
+        offset = (cursor_row + margin + 1).saturating_sub(body_capacity);
     }
-    if offset + viewport_rows > rows.len() {
-        offset = rows.len().saturating_sub(viewport_rows);
+    if offset + body_capacity > rows.len() {
+        offset = rows.len().saturating_sub(body_capacity);
     }
     // Publish the resolved offset back to the app so next-frame navigation
     // (and tests) can observe the current top-of-view.
     app.task_picker_scroll_offset.set(offset);
 
-    let end = (offset + viewport_rows).min(rows.len());
+    let end = (offset + body_capacity).min(rows.len());
     let above = offset;
     let below = rows.len().saturating_sub(end);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Scroll-indicator top line: rendered inline as the first visible row
-    // when content extends above the viewport.  We still render `viewport_rows`
-    // entries total, but the topmost slot becomes the indicator.
-    let start_idx = if above > 0 && viewport_rows >= 3 {
+    // ▲ indicator: extra line above the body (does not shadow a task row).
+    if above > 0 && reserve > 0 {
         lines.push(Line::from(Span::styled(
             format!(" ▲ {} more above", above),
             theme.fg(theme.dim),
         )));
-        1
-    } else {
-        0
-    };
-    let reserve_bottom = below > 0 && viewport_rows >= 3;
-    let body_end = if reserve_bottom {
-        end.saturating_sub(1).max(offset + start_idx)
-    } else {
-        end
-    };
+    }
 
-    for (row_idx, row) in rows[offset + start_idx..body_end].iter().enumerate() {
-        let abs_idx = offset + start_idx + row_idx;
+    for (row_idx, row) in rows[offset..end].iter().enumerate() {
+        let abs_idx = offset + row_idx;
         match row {
             PickerRow::Header(text) => {
                 lines.push(render_group_header(text, w, theme));
@@ -1192,7 +1204,8 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    if reserve_bottom {
+    // ▼ indicator: extra line below the body (does not shadow a task row).
+    if below > 0 && reserve > 0 {
         lines.push(Line::from(Span::styled(
             format!(" ▼ {} more below", below),
             theme.fg(theme.dim),
