@@ -3502,6 +3502,129 @@ mod tests {
         assert!(roles.contains(&("reviewer-session", "reviewer")));
     }
 
+    /// End-to-end wiring: handle_task_update emits a `QueueInfo` on the
+    /// wire for every state-changing update.  Exercises the call-site in
+    /// tasks.rs that plugs notify_state_change into the general agent
+    /// path.
+    #[test]
+    fn test_handle_task_update_emits_queue_info_on_state_change() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a ready-state task directly in the DB (skip the
+        // create-handler to avoid its own CreateSession noise).
+        let task = db
+            .create_task(
+                "test-project",
+                "Emit test",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        db.record_session(task.id, "s-worker", "worker").unwrap();
+        db.set_session_id(task.id, "s-worker").unwrap();
+
+        // Transition ready -> active via the handler.
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "active"}),
+            Some("s-worker"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "handler error: {:?}",
+            extract_text(&result)
+        );
+
+        // Drain the mock so it processes pending writes into responses.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.process_pending();
+        }
+
+        let shared = writer.shared.lock().unwrap();
+        let written = shared.written_lines.join("\n");
+        assert!(
+            written.contains("\"queue_info\""),
+            "expected a QueueInfo on the wire, got:\n{}",
+            written
+        );
+        let expected_line = format!("[task #{}] Emit test: ready → active", task.id);
+        assert!(
+            written.contains(&expected_line),
+            "expected info text {:?} in: {}",
+            expected_line,
+            written
+        );
+        // Recipient is s-worker (creator+worker deduped).
+        assert!(
+            written.contains("s-worker"),
+            "expected s-worker as recipient in: {}",
+            written
+        );
+    }
+
+    /// No-op transitions (task_update that doesn't change state) do not
+    /// emit a QueueInfo.
+    #[test]
+    fn test_handle_task_update_no_state_change_no_info() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let task = db
+            .create_task(
+                "test-project",
+                "Titled",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        db.record_session(task.id, "s-any", "worker").unwrap();
+
+        // Change title only — no state field.
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "title": "Retitled"}),
+            Some("s-any"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.process_pending();
+        }
+        let shared = writer.shared.lock().unwrap();
+        let written = shared.written_lines.join("\n");
+        assert!(
+            !written.contains("\"queue_info\""),
+            "title-only update should not emit QueueInfo:\n{}",
+            written
+        );
+    }
+
     #[test]
     fn test_session_tracking_idempotent() {
         let db = TasksDb::open_memory().unwrap();
