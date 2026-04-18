@@ -1,11 +1,13 @@
 //! Task protocol handlers — used by both client dispatch and plugin dispatch.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::protocol::{
     Response, TaskHistoryInfo, TaskInfo, TaskMessageInfo, TaskRelationInfo, TaskSessionInfo,
 };
 
 use super::dispatch::get_session_info_impl;
-use super::state::SharedState;
+use super::state::{SharedState, lock_state};
 
 fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
     TaskInfo {
@@ -24,9 +26,50 @@ fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
         require_approval: t.require_approval,
         sandbox_profile: t.sandbox_profile,
         held: t.held,
+        has_live_session: false,
         created_at: t.created_at,
         updated_at: t.updated_at,
     }
+}
+
+/// Convert a DB task to its wire form, setting `has_live_session` by
+/// intersecting the task's recorded sessions with `live_task_ids`.
+fn task_to_info_with_live(t: crate::tasks_db::Task, live_task_ids: &HashSet<i64>) -> TaskInfo {
+    let mut info = task_to_info(t);
+    if live_task_ids.contains(&info.id) {
+        info.has_live_session = true;
+    }
+    info
+}
+
+/// Compute the set of task ids in `project` that currently have at least one
+/// live (actively-running) session.  Intersects `task_sessions` rows with the
+/// server's `live_sessions` set.
+fn live_task_ids_for_project(state: &SharedState, project: &str) -> HashSet<i64> {
+    let db = match open_tasks_db() {
+        Ok(db) => db,
+        Err(_) => return HashSet::new(),
+    };
+    let rows = db.list_project_task_sessions(project).unwrap_or_default();
+    if rows.is_empty() {
+        return HashSet::new();
+    }
+    // Bucket sessions-by-task so we don't lock shared state once per row.
+    let mut by_task: HashMap<i64, Vec<String>> = HashMap::new();
+    for (task_id, sid) in rows {
+        by_task.entry(task_id).or_default().push(sid);
+    }
+    let st = lock_state(state);
+    by_task
+        .into_iter()
+        .filter_map(|(task_id, sids)| {
+            if sids.iter().any(|s| st.live_sessions.contains(s)) {
+                Some(task_id)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn msg_to_info(m: crate::tasks_db::TaskMessage) -> TaskMessageInfo {
@@ -54,7 +97,8 @@ fn open_tasks_db() -> Result<crate::tasks_db::TasksDb, Response> {
     })
 }
 
-pub fn handle_task_list(
+pub(super) fn handle_task_list(
+    state: &SharedState,
     project: &str,
     state_filter: Option<&str>,
     parent_id: Option<i64>,
@@ -66,10 +110,11 @@ pub fn handle_task_list(
     match db.list_tasks(project, state_filter, parent_id, None, None) {
         Ok(tasks) => {
             let tree = crate::tasks_db::tree_order(tasks);
+            let live = live_task_ids_for_project(state, project);
             Response::TaskTree {
                 tasks: tree
                     .into_iter()
-                    .map(|(d, t)| (d, task_to_info(t)))
+                    .map(|(d, t)| (d, task_to_info_with_live(t, &live)))
                     .collect(),
             }
         }
@@ -159,11 +204,20 @@ pub(super) fn handle_task_get(state: &SharedState, id: i64) -> Response {
             created_at: h.created_at,
         })
         .collect();
+
+    // Populate has_live_session from the sessions we just enriched, and for
+    // subtasks via a per-project lookup.
+    let mut task_info = task_to_info(task);
+    task_info.has_live_session = sessions.iter().any(|s| s.is_live);
+    let live_for_project = live_task_ids_for_project(state, &task_info.project_name);
     Response::TaskDetail {
-        task: task_to_info(task),
+        task: task_info,
         messages: messages.into_iter().map(msg_to_info).collect(),
         relations: relations.into_iter().map(rel_to_info).collect(),
-        subtasks: subtasks.into_iter().map(task_to_info).collect(),
+        subtasks: subtasks
+            .into_iter()
+            .map(|t| task_to_info_with_live(t, &live_for_project))
+            .collect(),
         sessions,
         history,
     }

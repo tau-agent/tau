@@ -449,6 +449,12 @@ pub struct TaskInfo {
     pub sandbox_profile: Option<String>,
     #[serde(default)]
     pub held: bool,
+    /// Best-effort hint: true when any session recorded on this task is
+    /// currently running a chat turn.  Populated server-side for the
+    /// TaskList / TaskTree / TaskDetail responses; defaults to false for
+    /// back-compat with older clients / serialised payloads.
+    #[serde(default)]
+    pub has_live_session: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -882,6 +888,7 @@ mod tests {
             require_approval: false,
             sandbox_profile: None,
             held: false,
+            has_live_session: false,
             created_at: 1000,
             updated_at: 2000,
         };

@@ -967,6 +967,18 @@ fn task_state_style(state: &str, theme: &Theme) -> (&'static str, Style) {
     }
 }
 
+/// Visual indicator for tasks that currently have a live (actively running)
+/// session.  Returns a two-column glyph (`"\u{25CF} "` for live, `"  "`
+/// otherwise) together with the style to paint it in.  The two-column shape
+/// keeps the task list columns aligned whether or not the indicator is on.
+fn live_indicator(task: &tau_agent::protocol::TaskInfo, theme: &Theme) -> (&'static str, Style) {
+    if task.has_live_session {
+        ("● ", theme.fg(theme.accent))
+    } else {
+        ("  ", theme.fg(theme.dim))
+    }
+}
+
 /// Determine `is_last` sibling for each item in a pre-ordered depth list.
 ///
 /// A task at depth D is the last sibling if no later filtered task shares
@@ -1107,6 +1119,12 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             };
             spans.push(Span::styled(format!(" {}", connector), theme.fg(theme.dim)));
             used += 1 + UnicodeWidthStr::width(connector.as_str());
+
+            // Live-session indicator: a dot before the state icon when any
+            // session recorded on this task is actively running.
+            let (live_glyph, live_style) = live_indicator(task, theme);
+            spans.push(Span::styled(live_glyph.to_string(), live_style));
+            used += 2;
 
             // State icon
             let (icon, icon_style) = task_state_style(&task.state, theme);
@@ -1677,6 +1695,40 @@ mod tests {
     }
 
     #[test]
+    fn live_indicator_shows_dot_only_when_live() {
+        use tau_agent::protocol::TaskInfo;
+        let theme = dark();
+        let make = |live: bool| TaskInfo {
+            id: 1,
+            project_name: String::new(),
+            title: String::new(),
+            state: "active".into(),
+            priority: 0,
+            parent_id: None,
+            tags: None,
+            affected_files: None,
+            branch: None,
+            worktree_path: None,
+            session_id: None,
+            skip_review: false,
+            require_approval: false,
+            sandbox_profile: None,
+            held: false,
+            has_live_session: live,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let (g, _) = live_indicator(&make(true), &theme);
+        assert!(g.starts_with('\u{25CF}'), "expected live dot, got {:?}", g);
+        // Two columns wide so the task list stays aligned.
+        assert_eq!(UnicodeWidthStr::width(g), 2);
+
+        let (g, _) = live_indicator(&make(false), &theme);
+        assert_eq!(g, "  ");
+        assert_eq!(UnicodeWidthStr::width(g), 2);
+    }
+
+    #[test]
     fn task_picker_right_block_aligned_across_depths() {
         // Mirrors the session picker alignment test but for task picker layout.
         const W: usize = 80;
@@ -1695,6 +1747,7 @@ mod tests {
 
             let mut spans: Vec<String> = Vec::new();
             spans.push(format!(" {}", connector)); // leading space + connector
+            spans.push("  ".to_string()); // live indicator (inactive)
             spans.push("◆ ".to_string()); // state icon
             spans.push(format!("{:>4} ", 14)); // task ID
 
@@ -1741,6 +1794,7 @@ mod tests {
             require_approval: false,
             sandbox_profile: None,
             held: false,
+            has_live_session: false,
             created_at: 0,
             updated_at: 0,
         };

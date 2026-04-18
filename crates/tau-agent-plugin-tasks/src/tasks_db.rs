@@ -1562,6 +1562,43 @@ impl TasksDb {
         Ok(())
     }
 
+    /// Return `(task_id, session_id)` for every row in `task_sessions` that
+    /// belongs to a task in `project_name`.  Used by the server to compute
+    /// a per-task "has a live session right now" flag by intersecting with
+    /// `live_sessions` in shared state — cheaper than N per-task queries.
+    pub fn list_project_task_sessions(
+        &self,
+        project_name: &str,
+    ) -> tau_agent_plugin::Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ts.task_id, ts.session_id \
+                 FROM task_sessions ts \
+                 INNER JOIN tasks t ON t.id = ts.task_id \
+                 WHERE t.project_name = ?1",
+            )
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("prepare list_project_task_sessions: {}", e))
+            })?;
+
+        let rows = stmt
+            .query_map(params![project_name], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("list_project_task_sessions: {}", e))
+            })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("read project task session row: {}", e))
+            })?);
+        }
+        Ok(out)
+    }
+
     /// Get all sessions for a task.
     pub fn get_sessions(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<TaskSession>> {
         let mut stmt = self
@@ -3285,6 +3322,48 @@ mod tests {
         // create_task does not write to task_history.
         let history = db.get_history(task.id).unwrap();
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn test_list_project_task_sessions_filters_by_project() {
+        let db = TasksDb::open_memory().unwrap();
+        let t1 = db
+            .create_task(
+                "proj-a", "a", None, None, None, false, "ready", false, None, None, false,
+            )
+            .unwrap();
+        let t2 = db
+            .create_task(
+                "proj-a", "b", None, None, None, false, "ready", false, None, None, false,
+            )
+            .unwrap();
+        let t3 = db
+            .create_task(
+                "proj-b", "c", None, None, None, false, "ready", false, None, None, false,
+            )
+            .unwrap();
+
+        db.record_session(t1.id, "s-a1", "worker").unwrap();
+        db.record_session(t1.id, "s-a2", "reviewer").unwrap();
+        db.record_session(t2.id, "s-a3", "worker").unwrap();
+        db.record_session(t3.id, "s-b1", "worker").unwrap();
+
+        let mut rows = db.list_project_task_sessions("proj-a").unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (t1.id, "s-a1".to_string()),
+                (t1.id, "s-a2".to_string()),
+                (t2.id, "s-a3".to_string()),
+            ]
+        );
+
+        let rows_b = db.list_project_task_sessions("proj-b").unwrap();
+        assert_eq!(rows_b, vec![(t3.id, "s-b1".to_string())]);
+
+        let empty = db.list_project_task_sessions("proj-c").unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

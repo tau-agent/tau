@@ -747,6 +747,26 @@ async fn run_inner(
                     )
                     .await?;
                 }
+                Action::OpenTaskPickerWithState { state } => {
+                    app.task_picker_previous_mode = app.mode;
+                    app.mode = AppMode::TaskPicker;
+                    app.picker_tasks.clear();
+                    app.task_picker_confirm = None;
+                    app.task_picker_detail = None;
+                    app.task_picker_filter.clear();
+                    app.task_picker_filter_mode = false;
+                    app.task_picker_create_mode = false;
+                    let project = app.task_project();
+                    send_request_and_recv(
+                        Request::TaskList {
+                            project,
+                            state: Some(state),
+                            parent_id: None,
+                        },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
                 Action::TaskDispatch { id } => {
                     send_request_and_recv(
                         Request::ExecuteTool {

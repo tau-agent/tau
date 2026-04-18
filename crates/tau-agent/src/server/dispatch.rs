@@ -1763,6 +1763,7 @@ pub(super) async fn handle_client(
                 parent_id,
             } => {
                 let resp = super::task_handlers::handle_task_list(
+                    &state,
                     &project,
                     state_filter.as_deref(),
                     parent_id,

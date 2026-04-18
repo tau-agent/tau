@@ -174,10 +174,6 @@ pub struct App {
     /// TaskDetail response hasn't come back yet.  When the response arrives we
     /// resolve the primary session and emit `Action::SwitchSession`.
     pub pending_task_switch: Option<i64>,
-    /// Pending `/task active` — set when the user ran the command and we're
-    /// waiting for the TaskList response before emitting `Action::SwitchSession`
-    /// for the top-priority active task.
-    pub pending_task_active_switch: bool,
     /// Task ID and title assigned to the current session (if any), for footer display.
     pub current_task_id: Option<(i64, String)>,
     /// Whether a text block in the current turn has already been
@@ -275,7 +271,6 @@ impl App {
             task_picker_confirm: None,
             task_picker_detail: None,
             pending_task_switch: None,
-            pending_task_active_switch: false,
             current_task_id: None,
             turn_text_finalized: false,
             pending_steer: None,
@@ -1967,11 +1962,10 @@ impl App {
                 Some(Action::TaskGet { id })
             }
             "active" => {
-                // List active tasks, then switch to the most relevant one.
-                self.pending_task_active_switch = true;
-                Some(Action::TaskList {
-                    project: self.task_project(),
-                    state: Some("active".into()),
+                // Open the task picker pre-filtered to active tasks so the
+                // user can j/k to pick and Enter to switch.
+                Some(Action::OpenTaskPickerWithState {
+                    state: "active".into(),
                 })
             }
             _ => {
@@ -2472,45 +2466,6 @@ impl App {
                         break;
                     }
                 }
-                // Pending /task active: pick the top active task and resolve
-                // its primary session via a follow-up TaskGet.
-                if self.pending_task_active_switch {
-                    self.pending_task_active_switch = false;
-                    // Active tasks from the filtered list; sort by priority desc,
-                    // then by updated_at desc.
-                    let mut actives: Vec<&TaskInfo> = tasks
-                        .iter()
-                        .filter(|(_, t)| t.state == "active")
-                        .map(|(_, t)| t)
-                        .collect();
-                    actives.sort_by(|a, b| {
-                        b.priority
-                            .cmp(&a.priority)
-                            .then_with(|| b.updated_at.cmp(&a.updated_at))
-                    });
-                    if let Some(top) = actives.first() {
-                        self.messages.push(MessageItem::Status {
-                            text: format!(
-                                "Active tasks ({}), switching to #{}: {}",
-                                actives.len(),
-                                top.id,
-                                top.title
-                            ),
-                        });
-                        // Walk the rest as a mini list.
-                        for t in actives.iter().skip(1).take(9) {
-                            self.messages.push(MessageItem::Status {
-                                text: format!("  #{:<4} prio {:<3} {}", t.id, t.priority, t.title),
-                            });
-                        }
-                        self.pending_task_switch = Some(top.id);
-                        return Some(Action::TaskGet { id: top.id });
-                    }
-                    self.messages.push(MessageItem::Status {
-                        text: "no active tasks".into(),
-                    });
-                    return None;
-                }
                 // If in task picker mode, populate picker state
                 if self.mode == AppMode::TaskPicker {
                     self.picker_tasks = tasks;
@@ -2980,6 +2935,11 @@ pub enum Action {
     },
     /// Open the task picker overlay.
     OpenTaskPicker,
+    /// Open the task picker overlay pre-filtered to tasks in the given
+    /// state.  Used by `/task active` and similar quick-switch commands.
+    OpenTaskPickerWithState {
+        state: String,
+    },
     /// Dispatch a task (schedule if needed + create session).
     TaskDispatch {
         id: i64,
@@ -3021,7 +2981,7 @@ pub(crate) fn format_age_since(now_secs: i64, then_secs: i64) -> String {
     if delta < 0 {
         return "in the future".into();
     }
-    if delta < 45 {
+    if delta < 60 {
         return "now".into();
     }
     let m = delta / 60;
@@ -3745,6 +3705,7 @@ mod tests {
             require_approval: false,
             sandbox_profile: None,
             held: false,
+            has_live_session: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -4561,11 +4522,14 @@ mod tests {
     fn format_age_since_human_buckets() {
         assert_eq!(format_age_since(1000, 0), "?");
         assert_eq!(format_age_since(1000, 1010), "in the future");
+        // Up to 59 seconds renders as "now".
         assert_eq!(format_age_since(1000, 990), "now");
-        assert_eq!(format_age_since(1000, 900), "1m ago");
+        assert_eq!(format_age_since(1000, 950), "now");
+        // 60s → 1m.
+        assert_eq!(format_age_since(1000, 940), "1m ago");
         // 10 minutes.
         assert_eq!(format_age_since(10_000, 9_400), "10m ago");
-        // 2h ago
+        // 1h ago
         assert_eq!(format_age_since(7200, 1), "1h ago");
         // 2d ago
         assert_eq!(format_age_since(3 * 86400, 86400), "2d ago");
@@ -4723,43 +4687,14 @@ mod tests {
     }
 
     #[test]
-    fn task_active_lists_active_tasks_and_switches_to_top() {
+    fn task_active_opens_picker_filtered_to_active() {
         let mut app = make_app();
-        // Initiate /task active.
         let action = app.handle_task_slash_command("active");
         match action {
-            Some(Action::TaskList { state, .. }) => {
-                assert_eq!(state.as_deref(), Some("active"))
+            Some(Action::OpenTaskPickerWithState { state }) => {
+                assert_eq!(state, "active");
             }
-            other => panic!("expected TaskList, got {other:?}"),
+            other => panic!("expected OpenTaskPickerWithState, got {other:?}"),
         }
-        assert!(app.pending_task_active_switch);
-
-        // Server replies with two active tasks and an extra non-active one.
-        let mut hi = make_task_info(10, "hi prio", "active");
-        hi.priority = 9;
-        let mut lo = make_task_info(11, "lo prio", "active");
-        lo.priority = 1;
-        let other = make_task_info(12, "merged", "merged");
-        let tree = vec![(0, hi.clone()), (0, lo), (0, other)];
-        let action = app.handle_server_response(Response::TaskTree { tasks: tree });
-        // Expect a follow-up TaskGet for the top-priority active task.
-        match action {
-            Some(Action::TaskGet { id }) => assert_eq!(id, hi.id),
-            other => panic!("expected TaskGet, got {other:?}"),
-        }
-        assert!(!app.pending_task_active_switch);
-        assert_eq!(app.pending_task_switch, Some(hi.id));
-    }
-
-    #[test]
-    fn task_active_no_active_tasks() {
-        let mut app = make_app();
-        app.handle_task_slash_command("active");
-        let action = app.handle_server_response(Response::TaskTree {
-            tasks: vec![(0, make_task_info(1, "m", "merged"))],
-        });
-        assert!(action.is_none());
-        assert!(!app.pending_task_active_switch);
     }
 }
