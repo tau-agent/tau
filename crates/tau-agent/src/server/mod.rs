@@ -61,7 +61,7 @@ impl ShutdownHandle {
         let msg = crate::protocol::Response::ServerShutdown { restart };
         for tx in clients.iter() {
             if tx.try_send(msg.clone()).is_err() {
-                eprintln!("warning: failed to send shutdown notification to client");
+                tracing::warn!("failed to send shutdown notification to client");
             }
         }
     }
@@ -290,7 +290,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
             )
             .await
             {
-                eprintln!("client error: {}", e);
+                tracing::warn!(%e, "client error");
             }
         })
         .detach();
@@ -300,7 +300,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     {
         let st = lock_state(&state);
         if let Err(e) = st.db.reset_all_phases() {
-            eprintln!("warning: failed to reset phases on shutdown: {}", e);
+            tracing::warn!(%e, "failed to reset phases on shutdown");
         }
     }
 
@@ -316,6 +316,12 @@ pub async fn run() -> crate::Result<()> {
         spawn_idle_sweep,
     };
     use state::log_stale_phases_at_startup;
+
+    // Initialise tracing before anything else so startup events land in the
+    // log file. The returned guard must live for the entire server lifetime
+    // so the non-blocking appender drains on shutdown.
+    let _log_guard = crate::logging::init_tracing();
+    tracing::info!(pid = std::process::id(), "tau server starting");
 
     let registry = build_registry();
     let cfg = config::load_config()?;
@@ -344,11 +350,10 @@ pub async fn run() -> crate::Result<()> {
     // Run one-time project migration if needed
     let tasks_db_path = crate::paths::data_dir().join("tasks.db");
     if let Err(e) = crate::migration::run_project_migration(&db, &tasks_db_path) {
-        eprintln!("WARNING: project migration failed: {}", e);
-        eprintln!("Run `tau project migrate` to retry manually.");
+        tracing::warn!(%e, "project migration failed; run `tau project migrate` to retry");
     }
 
-    eprintln!("tau server listening on {}", sock.display());
+    tracing::info!(socket = %sock.display(), "tau server listening");
 
     // Load plugins
     let plugins_config = crate::plugin::load_plugins_config();
@@ -390,13 +395,13 @@ pub async fn run() -> crate::Result<()> {
     {
         let shutdown = shutdown.clone();
         if let Err(e) = crate::shutdown::install(move |sig| {
-            eprintln!(
-                "tau server: received {}, requesting shutdown",
-                crate::shutdown::signal_name(sig),
+            tracing::info!(
+                signal = crate::shutdown::signal_name(sig),
+                "received signal, requesting shutdown",
             );
             shutdown.request_shutdown(false);
         }) {
-            eprintln!("tau server: failed to install signal handlers: {}", e);
+            tracing::warn!(%e, "failed to install signal handlers");
         }
     }
 
@@ -440,13 +445,13 @@ pub async fn run() -> crate::Result<()> {
         let resume_ids = {
             let st = lock_state(&state);
             st.db.sessions_needing_resume().unwrap_or_else(|e| {
-                eprintln!("failed to query sessions needing resume: {}", e);
+                tracing::warn!(%e, "failed to query sessions needing resume");
                 Vec::new()
             })
         };
         let mut resuming: std::collections::HashSet<String> = resume_ids.iter().cloned().collect();
         for sid in resume_ids {
-            eprintln!("auto-resuming session {}", sid);
+            tracing::info!(session_id = %sid, "auto-resuming session");
             let s = state.clone();
             let p = plugins.clone();
             let sh = shutdown.clone();
@@ -455,7 +460,7 @@ pub async fn run() -> crate::Result<()> {
             let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
             smol::spawn(async move {
                 if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
-                    eprintln!("auto-resume session {} error: {}", sid, e);
+                    tracing::warn!(session_id = %sid, %e, "auto-resume error");
                 }
             })
             .detach();
@@ -466,13 +471,13 @@ pub async fn run() -> crate::Result<()> {
         let queued_ids = {
             let st = lock_state(&state);
             st.db.sessions_with_queued_messages().unwrap_or_else(|e| {
-                eprintln!("failed to query sessions with queued messages: {}", e);
+                tracing::warn!(%e, "failed to query sessions with queued messages");
                 Vec::new()
             })
         };
         for sid in queued_ids {
             if resuming.insert(sid.clone()) {
-                eprintln!("auto-resuming session {} (has queued messages)", sid);
+                tracing::info!(session_id = %sid, "auto-resuming session (has queued messages)");
                 // Set the has_queued flag so the agent loop will drain them.
                 {
                     let mut st = lock_state(&state);
@@ -489,7 +494,7 @@ pub async fn run() -> crate::Result<()> {
                 let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
                 smol::spawn(async move {
                     if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
-                        eprintln!("auto-resume session {} error: {}", sid, e);
+                        tracing::warn!(session_id = %sid, %e, "auto-resume error");
                     }
                 })
                 .detach();
@@ -527,7 +532,7 @@ pub async fn run() -> crate::Result<()> {
             )
             .await
             {
-                eprintln!("client error: {}", e);
+                tracing::warn!(%e, "client error");
             }
         })
         .detach();
@@ -536,16 +541,16 @@ pub async fn run() -> crate::Result<()> {
     // Wait for in-flight agent loops to finish (up to 60s)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while shutdown.active_count() > 0 && std::time::Instant::now() < deadline {
-        eprintln!(
-            "waiting for {} in-flight request(s)...",
-            shutdown.active_count()
+        tracing::info!(
+            in_flight = shutdown.active_count(),
+            "waiting for in-flight requests to drain"
         );
         smol::Timer::after(std::time::Duration::from_secs(1)).await;
     }
     if shutdown.active_count() > 0 {
-        eprintln!(
-            "timeout: {} request(s) still in flight, exiting anyway",
-            shutdown.active_count()
+        tracing::warn!(
+            in_flight = shutdown.active_count(),
+            "shutdown timeout: requests still in flight, exiting anyway"
         );
     }
 
@@ -554,13 +559,13 @@ pub async fn run() -> crate::Result<()> {
     {
         let st = lock_state(&state);
         if let Err(e) = st.db.reset_all_phases() {
-            eprintln!("warning: failed to reset phases on shutdown: {}", e);
+            tracing::warn!(%e, "failed to reset phases on shutdown");
         }
     }
 
     // Cleanup
     std::fs::remove_file(&sock).ok();
     std::fs::remove_file(pid_path()).ok();
-    eprintln!("tau server stopped");
+    tracing::info!("tau server stopped");
     Ok(())
 }

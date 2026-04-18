@@ -41,6 +41,9 @@ rand = "0.10"
 fs2 = "0.4"
 nix = { version = "0.30", features = ["signal", "process"] }
 tau-agent-tui = { path = "crates/tau-agent-tui", version = "0.1.0" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
 
 [profile.release]
 lto = true
