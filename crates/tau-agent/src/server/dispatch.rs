@@ -1792,7 +1792,6 @@ pub(super) async fn handle_client(
                 tags,
                 affected_files,
                 skip_review,
-                skip_planning,
                 require_approval,
                 sandbox_profile,
             } => {
@@ -1804,7 +1803,6 @@ pub(super) async fn handle_client(
                     tags,
                     affected_files,
                     skip_review,
-                    skip_planning,
                     require_approval,
                     sandbox_profile,
                 );

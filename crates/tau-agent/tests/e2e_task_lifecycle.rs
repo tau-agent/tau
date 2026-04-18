@@ -401,7 +401,7 @@ fn full_task_lifecycle_pipeline() {
         serde_json::json!({
             "title": "Lifecycle subtask",
             "parent_id": parent_id,
-            "skip_planning": false,
+            "initial_state": "planning",
             "skip_review": false,
             "message": "Implement the feature.\n\nRequirements:\n- Add hello.txt with 'hello world'",
         }),
@@ -686,7 +686,7 @@ fn skip_planning_subtask_starts_ready() {
         serde_json::json!({
             "title": "Skip planning subtask",
             "parent_id": parent_id,
-            "skip_planning": true,
+            "initial_state": "ready",
             "message": "Do the work directly",
         }),
     );
@@ -747,7 +747,7 @@ fn affected_files_guard_on_refining_to_ready() {
         serde_json::json!({
             "title": "Subtask needs affected_files",
             "parent_id": parent_id,
-            "skip_planning": false,
+            "initial_state": "planning",
         }),
     );
     let task_id = subtask["id"].as_i64().unwrap();
@@ -834,7 +834,7 @@ fn refining_to_planning_backward_transition() {
         serde_json::json!({
             "title": "Subtask for refining→planning test",
             "parent_id": parent_id,
-            "skip_planning": false,
+            "initial_state": "planning",
         }),
     );
     let task_id = subtask["id"].as_i64().unwrap();
@@ -925,7 +925,7 @@ fn refining_to_interactive_escalation() {
         serde_json::json!({
             "title": "Subtask for escalation test",
             "parent_id": parent_id,
-            "skip_planning": false,
+            "initial_state": "planning",
         }),
     );
     let task_id = subtask["id"].as_i64().unwrap();
@@ -996,7 +996,7 @@ fn review_transition_without_rebase() {
         serde_json::json!({
             "title": "No rebase needed for review",
             "parent_id": parent_id,
-            "skip_planning": true,
+            "initial_state": "ready",
             "message": "Test that review works without rebase",
         }),
     );
@@ -1083,7 +1083,7 @@ fn active_to_approved_requires_skip_review() {
         serde_json::json!({
             "title": "No skip_review subtask",
             "parent_id": parent_id,
-            "skip_planning": true,
+            "initial_state": "ready",
             "message": "Test skip_review enforcement",
         }),
     );

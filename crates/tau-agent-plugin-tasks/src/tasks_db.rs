@@ -23,7 +23,6 @@ pub struct Task {
     pub worktree_path: Option<String>,
     pub session_id: Option<String>,
     pub skip_review: bool,
-    pub skip_planning: bool,
     pub require_approval: bool,
     pub sandbox_profile: Option<String>,
     pub created_at: i64,
@@ -64,7 +63,6 @@ pub struct TaskUpdate {
     pub tags: Option<serde_json::Value>,
     pub affected_files: Option<serde_json::Value>,
     pub skip_review: Option<bool>,
-    pub skip_planning: Option<bool>,
     pub require_approval: Option<bool>,
     pub merge_target: Option<String>,
     pub sandbox_profile: Option<String>,
@@ -255,7 +253,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     worktree_path TEXT,
     session_id TEXT,
     skip_review INTEGER NOT NULL DEFAULT 0,
-    skip_planning INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -352,7 +349,8 @@ impl TasksDb {
 
     /// Run schema migrations. Currently handles:
     /// - Dropping the `assigned_session` column (consolidated into `session_id`).
-    /// - Adding the `skip_planning` column.
+    /// - Dropping the `skip_planning` column (replaced by `task_create`'s
+    ///   explicit `initial_state` argument; see task #512).
     fn migrate(conn: &Connection) -> tau_agent_plugin::Result<()> {
         // Rename project → project_name if the old column still exists.
         let has_old_project: bool = conn
@@ -392,18 +390,25 @@ impl TasksDb {
             .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate assigned_session: {}", e)))?;
         }
 
-        // Add skip_planning column if it doesn't exist.
+        // Add skip_planning column if it doesn't exist. Historical: this
+        // column used to control whether a subtask skipped the planning
+        // phase. Task #512 replaced it with an explicit `initial_state`
+        // argument on `task_create`. We still ADD the column here for
+        // forward-compat with older DBs that predate both the column and
+        // its removal — otherwise the DROP COLUMN below would fail on a
+        // very old schema. The subsequent DROP COLUMN removes it.
         let has_skip_planning: bool = conn
             .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'skip_planning'")
             .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
             .map(|count| count > 0)
             .unwrap_or(false);
 
-        if !has_skip_planning {
-            conn.execute_batch(
-                "ALTER TABLE tasks ADD COLUMN skip_planning INTEGER NOT NULL DEFAULT 0;",
-            )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate skip_planning: {}", e)))?;
+        if has_skip_planning {
+            // Drop the legacy skip_planning column (task #512).
+            conn.execute_batch("ALTER TABLE tasks DROP COLUMN skip_planning;")
+                .map_err(|e| {
+                    tau_agent_plugin::Error::Io(format!("migrate drop skip_planning: {}", e))
+                })?;
         }
 
         // Add require_approval column if it doesn't exist.
@@ -474,10 +479,10 @@ impl TasksDb {
 
     /// Create a new task. Returns the created task.
     ///
-    /// Default state depends on context:
-    /// - Tasks with a `parent_id` (subtasks) default to `planning` state
-    ///   (or `ready` if `skip_planning` is true)
-    /// - Top-level tasks default to `interactive`
+    /// `initial_state` selects the starting state and must be one of
+    /// `"interactive"`, `"planning"`, or `"ready"`. The choice applies
+    /// uniformly to top-level tasks and subtasks — there is no automatic
+    /// parent-based divergence anymore (see task #512).
     #[allow(clippy::too_many_arguments)]
     pub fn create_task(
         &self,
@@ -487,7 +492,7 @@ impl TasksDb {
         parent_id: Option<i64>,
         tags: Option<&serde_json::Value>,
         skip_review: bool,
-        skip_planning: bool,
+        initial_state: &str,
         require_approval: bool,
         merge_target: Option<&str>,
         sandbox_profile: Option<&str>,
@@ -499,19 +504,21 @@ impl TasksDb {
             .transpose()
             .map_err(|e| tau_agent_plugin::Error::Parse(e.to_string()))?;
 
-        // Subtasks default to 'planning' state (or 'ready' if skip_planning).
-        // skip_review is always forced to false for subtasks.
-        let (default_state, skip_review, skip_planning, require_approval) = if parent_id.is_some() {
-            let state = if skip_planning { "ready" } else { "planning" };
-            (state, false, skip_planning, require_approval)
-        } else {
-            ("interactive", skip_review, skip_planning, require_approval)
+        // Validate initial_state and apply uniformly regardless of parent_id.
+        let default_state = match initial_state {
+            "interactive" | "planning" | "ready" => initial_state,
+            other => {
+                return Err(tau_agent_plugin::Error::Parse(format!(
+                    "invalid initial_state '{}': expected 'interactive', 'planning', or 'ready'",
+                    other
+                )));
+            }
         };
 
         self.conn
             .execute(
-                "INSERT INTO tasks (project_name, title, state, priority, parent_id, tags, skip_review, skip_planning, require_approval, merge_target, sandbox_profile, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO tasks (project_name, title, state, priority, parent_id, tags, skip_review, require_approval, merge_target, sandbox_profile, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     project_name,
                     title,
@@ -520,7 +527,6 @@ impl TasksDb {
                     parent_id,
                     tags_str,
                     skip_review as i32,
-                    skip_planning as i32,
                     require_approval as i32,
                     merge_target,
                     sandbox_profile,
@@ -540,7 +546,7 @@ impl TasksDb {
         self.conn
             .query_row(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
                         created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
@@ -561,7 +567,7 @@ impl TasksDb {
     ) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut sql = String::from(
             "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                    branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval, sandbox_profile,
+                    branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
                     created_at, updated_at
              FROM tasks WHERE project_name = ?1",
         );
@@ -749,19 +755,6 @@ impl TasksDb {
                 "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "skip_review", old_str, new_str, session_id, now],
-            )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
-        }
-
-        if let Some(val) = update.skip_planning {
-            let old_str = Some(task.skip_planning.to_string());
-            let new_str = val.to_string();
-            params_vec.push(Box::new(val as i32));
-            sets.push("skip_planning = ?".to_string());
-            tx.execute(
-                "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, "skip_planning", old_str, new_str, session_id, now],
             )
             .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
         }
@@ -1075,7 +1068,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.skip_planning, t.require_approval, t.sandbox_profile, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.created_at,
                         t.updated_at
                  FROM task_relations r
                  JOIN tasks t ON t.id = r.to_task
@@ -1107,7 +1100,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.skip_planning, t.require_approval, t.sandbox_profile, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.created_at,
                         t.updated_at
                  FROM tasks t
                  WHERE t.project_name = ?1 AND t.state IN ('ready', 'planning')
@@ -1144,7 +1137,7 @@ impl TasksDb {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project_name {
             Some(p) => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved' AND project_name = ?1
@@ -1154,7 +1147,7 @@ impl TasksDb {
             ),
             None => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved'
@@ -1211,7 +1204,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
                         created_at, updated_at
                  FROM tasks
                  WHERE project_name = ?1
@@ -1286,7 +1279,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
                         created_at, updated_at
                  FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
             )
@@ -1590,7 +1583,7 @@ impl TasksDb {
         if let Some(state) = state_filter {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.skip_planning, t.require_approval, t.sandbox_profile, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1 AND t.state = ?2
@@ -1613,7 +1606,7 @@ impl TasksDb {
         } else {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.skip_planning, t.require_approval, t.sandbox_profile, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1
@@ -1754,7 +1747,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, skip_planning, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
                         created_at, updated_at
                  FROM tasks
                  WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
@@ -1820,11 +1813,10 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         worktree_path: row.get(10)?,
         session_id: row.get(11)?,
         skip_review: row.get::<_, i32>(12)? != 0,
-        skip_planning: row.get::<_, i32>(13)? != 0,
-        require_approval: row.get::<_, i32>(14)? != 0,
-        sandbox_profile: row.get(15)?,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
+        require_approval: row.get::<_, i32>(13)? != 0,
+        sandbox_profile: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 
@@ -1862,7 +1854,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -1893,7 +1885,7 @@ mod tests {
                 None,
                 Some(&tags),
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -1915,7 +1907,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -1929,7 +1921,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -1937,7 +1929,16 @@ mod tests {
             .unwrap();
         let _t3 = db
             .create_task(
-                "other", "Task 3", None, None, None, false, false, false, None, None,
+                "other",
+                "Task 3",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
             )
             .unwrap();
 
@@ -1981,7 +1982,7 @@ mod tests {
             None,
             Some(&tags),
             false,
-            false,
+            "interactive",
             false,
             None,
             None,
@@ -1994,7 +1995,7 @@ mod tests {
             None,
             None,
             false,
-            false,
+            "interactive",
             false,
             None,
             None,
@@ -2024,7 +2025,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2162,7 +2163,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2207,7 +2208,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2311,7 +2312,7 @@ mod tests {
                     None,
                     None,
                     false,
-                    false,
+                    "interactive",
                     false,
                     None,
                     None,
@@ -2367,7 +2368,7 @@ mod tests {
                     None,
                     None,
                     false,
-                    false,
+                    "interactive",
                     false,
                     None,
                     None,
@@ -2420,7 +2421,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2452,7 +2453,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2483,7 +2484,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2539,7 +2540,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2553,7 +2554,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2584,7 +2585,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2609,7 +2610,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2623,7 +2624,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2645,7 +2646,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2659,7 +2660,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2673,7 +2674,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2707,7 +2708,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2721,7 +2722,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -2735,7 +2736,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -2760,7 +2761,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2773,7 +2774,7 @@ mod tests {
             Some(parent.id),
             None,
             false,
-            false,
+            "planning",
             false,
             None,
             None,
@@ -2786,7 +2787,7 @@ mod tests {
             Some(parent.id),
             None,
             false,
-            false,
+            "planning",
             false,
             None,
             None,
@@ -2799,7 +2800,7 @@ mod tests {
             None,
             None,
             false,
-            false,
+            "interactive",
             false,
             None,
             None,
@@ -2839,7 +2840,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2868,7 +2869,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2902,7 +2903,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2961,7 +2962,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -2995,7 +2996,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3027,7 +3028,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3052,7 +3053,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3082,7 +3083,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3132,7 +3133,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3140,7 +3141,10 @@ mod tests {
             .unwrap();
         assert_eq!(parent.state, "interactive");
 
-        // Subtask defaults to planning state; skip_review is forced to false
+        // Subtasks default to planning state when initial_state="planning".
+        // Post-task-#512, skip_review is NOT force-set to false for subtasks —
+        // behaviour on the skip_review / require_approval axes is uniform with
+        // top-level tasks and simply reflects the caller's arguments.
         let child = db
             .create_task(
                 "test-project",
@@ -3149,18 +3153,18 @@ mod tests {
                 Some(parent.id),
                 None,
                 true,
-                false,
+                "planning",
                 false,
                 None,
                 None,
             )
             .unwrap();
         assert_eq!(child.state, "planning");
-        assert!(!child.skip_review);
+        assert!(child.skip_review);
     }
 
     #[test]
-    fn test_subtask_with_skip_planning_defaults_to_ready() {
+    fn test_create_task_initial_state_ready_subtask() {
         let db = TasksDb::open_memory().unwrap();
         let parent = db
             .create_task(
@@ -3170,14 +3174,14 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
             )
             .unwrap();
 
-        // Subtask with skip_planning=true starts in ready state
+        // Subtask with initial_state="ready" starts in ready state.
         let child = db
             .create_task(
                 "test-project",
@@ -3186,69 +3190,93 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                true,
+                "ready",
                 false,
                 None,
                 None,
             )
             .unwrap();
         assert_eq!(child.state, "ready");
-        assert!(child.skip_planning);
     }
 
     #[test]
-    fn test_top_level_task_ignores_skip_planning() {
+    fn test_create_task_initial_state_applies_to_top_level() {
         let db = TasksDb::open_memory().unwrap();
 
-        // Top-level task with skip_planning=true should still start in 'interactive'
+        // Top-level task with initial_state="ready" — no automatic forcing
+        // to "interactive" any more (task #512 unified the behaviour).
         let task = db
             .create_task(
                 "test-project",
-                "Top level",
+                "Top level ready",
                 None,
                 None,
                 None,
                 false,
-                true,
+                "ready",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(task.state, "ready");
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Top level planning",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Top level interactive",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
                 false,
                 None,
                 None,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
-        assert!(task.skip_planning);
     }
 
     #[test]
-    fn test_skip_planning_roundtrip() {
+    fn test_create_task_initial_state_invalid_rejected() {
         let db = TasksDb::open_memory().unwrap();
-        let task = db
+        let err = db
             .create_task(
                 "test-project",
-                "Test",
+                "Bad",
                 None,
                 None,
                 None,
                 false,
-                true,
+                "bogus",
                 false,
                 None,
                 None,
             )
-            .unwrap();
-        assert!(task.skip_planning);
-
-        let updated = db
-            .update_task(
-                task.id,
-                &TaskUpdate {
-                    skip_planning: Some(false),
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap();
-        assert!(!updated.skip_planning);
+            .expect_err("invalid initial_state should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid initial_state") && msg.contains("bogus"),
+            "unexpected error message: {}",
+            msg
+        );
     }
 
     #[test]
@@ -3262,7 +3290,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 true,
                 None,
                 None,
@@ -3294,7 +3322,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3314,7 +3342,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 Some("restricted"),
@@ -3346,7 +3374,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3366,7 +3394,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3407,7 +3435,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3450,7 +3478,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3482,7 +3510,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3518,7 +3546,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3555,7 +3583,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3581,7 +3609,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3607,7 +3635,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3632,7 +3660,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3682,7 +3710,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3704,7 +3732,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3720,7 +3748,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -3742,7 +3770,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3758,7 +3786,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -3787,7 +3815,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 Some("develop"),
                 None,
@@ -3809,7 +3837,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3826,7 +3854,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 Some("main"),
                 None,
@@ -3848,7 +3876,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 Some("release/v2"),
                 None,
@@ -3869,7 +3897,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3906,7 +3934,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3924,7 +3952,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3940,7 +3968,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -3956,7 +3984,16 @@ mod tests {
     fn create_task_in_state(db: &TasksDb, project: &str, title: &str, state: &str) -> Task {
         let task = db
             .create_task(
-                project, title, None, None, None, true, false, false, None, None,
+                project,
+                title,
+                None,
+                None,
+                None,
+                true,
+                "interactive",
+                false,
+                None,
+                None,
             )
             .unwrap();
         let transitions: &[&str] = match state {
@@ -4222,7 +4259,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4244,7 +4281,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4258,7 +4295,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4286,7 +4323,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4300,7 +4337,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4326,7 +4363,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4340,7 +4377,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4366,7 +4403,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4380,7 +4417,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4394,7 +4431,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4421,7 +4458,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4435,7 +4472,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4460,7 +4497,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4474,7 +4511,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4495,7 +4532,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4509,7 +4546,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4533,7 +4570,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4547,7 +4584,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4561,7 +4598,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4575,7 +4612,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4620,16 +4657,60 @@ mod tests {
         // Then D -> A should be rejected (cycle through either path)
         let db = TasksDb::open_memory().unwrap();
         let a = db
-            .create_task("p", "A", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "A",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let b = db
-            .create_task("p", "B", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "B",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let c = db
-            .create_task("p", "C", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "C",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let d = db
-            .create_task("p", "D", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "D",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
 
         db.add_relation(a.id, b.id, "depends_on").unwrap();
@@ -4643,7 +4724,18 @@ mod tests {
 
         // But D -> (new task E) is fine
         let e = db
-            .create_task("p", "E", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "E",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         db.add_relation(d.id, e.id, "depends_on").unwrap();
     }
@@ -4654,19 +4746,74 @@ mod tests {
         // Adding E -> C should be rejected (cycle C -> D -> E -> C)
         let db = TasksDb::open_memory().unwrap();
         let a = db
-            .create_task("p", "A", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "A",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let b = db
-            .create_task("p", "B", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "B",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let c = db
-            .create_task("p", "C", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "C",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let d = db
-            .create_task("p", "D", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "D",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let e = db
-            .create_task("p", "E", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "E",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
 
         db.add_relation(a.id, b.id, "depends_on").unwrap();
@@ -4683,10 +4830,32 @@ mod tests {
         // A depends_on B, B blocks A — no real cycle since blocks is informational
         let db = TasksDb::open_memory().unwrap();
         let a = db
-            .create_task("p", "A", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "A",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let b = db
-            .create_task("p", "B", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "B",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
 
         db.add_relation(a.id, b.id, "depends_on").unwrap();
@@ -4699,20 +4868,64 @@ mod tests {
         // A -> C and B -> C is fine (convergent, no cycle)
         let db = TasksDb::open_memory().unwrap();
         let a = db
-            .create_task("p", "A", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "A",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let b = db
-            .create_task("p", "B", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "B",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let c = db
-            .create_task("p", "C", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "C",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
 
         db.add_relation(a.id, c.id, "depends_on").unwrap();
         db.add_relation(b.id, c.id, "depends_on").unwrap();
         // And C -> D is fine (no cycle)
         let d = db
-            .create_task("p", "D", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "D",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         db.add_relation(c.id, d.id, "depends_on").unwrap();
     }
@@ -4739,7 +4952,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4763,7 +4976,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4797,7 +5010,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4848,7 +5061,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4882,7 +5095,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4932,7 +5145,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4966,7 +5179,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5014,7 +5227,6 @@ mod tests {
             worktree_path: None,
             session_id: None,
             skip_review: false,
-            skip_planning: false,
             require_approval: false,
             sandbox_profile: None,
             created_at: 0,
@@ -5098,7 +5310,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5112,7 +5324,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5126,7 +5338,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5151,7 +5363,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5165,7 +5377,7 @@ mod tests {
                 Some(root.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5179,7 +5391,7 @@ mod tests {
                 Some(child.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5204,7 +5416,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5228,7 +5440,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5275,7 +5487,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5304,7 +5516,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5382,7 +5594,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5415,7 +5627,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5446,7 +5658,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5487,7 +5699,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5543,7 +5755,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5600,7 +5812,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5653,7 +5865,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5716,7 +5928,7 @@ mod tests {
                     None,
                     None,
                     true,
-                    true,
+                    "interactive",
                     false,
                     None,
                     None,
@@ -5790,7 +6002,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5824,7 +6036,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5853,19 +6065,9 @@ mod tests {
 
         let task = db
             .create_task(
-                project, "Do work", None, None, None, false, true, false, None, None,
+                project, "Do work", None, None, None, false, "ready", false, None, None,
             )
             .unwrap();
-        // interactive -> ready (skip_planning)
-        db.update_task(
-            task.id,
-            &TaskUpdate {
-                state: Some("ready".into()),
-                ..Default::default()
-            },
-            None,
-        )
-        .unwrap();
         // Assign to move to active
         db.assign_task(task.id, "s456").unwrap();
 
@@ -5885,7 +6087,7 @@ mod tests {
                 None,
                 None,
                 false,
-                true,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5910,7 +6112,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6020,5 +6222,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(name, "test-project");
+
+        // Verify the legacy skip_planning column was dropped (task #512).
+        let has_skip_planning: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'skip_planning'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            !has_skip_planning,
+            "legacy skip_planning column should be dropped by migrate()"
+        );
     }
 }

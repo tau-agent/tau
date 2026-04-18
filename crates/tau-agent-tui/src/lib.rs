@@ -705,7 +705,6 @@ async fn run_inner(
                             tags: None,
                             affected_files: None,
                             skip_review: None,
-                            skip_planning: None,
                             require_approval: None,
                             sandbox_profile: None,
                         },

@@ -194,9 +194,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                         "type": "boolean",
                         "description": "If true, task skips review and goes directly to approved when done"
                     },
-                    "skip_planning": {
-                        "type": "boolean",
-                        "description": "If true, subtask starts in ready state instead of planning"
+                    "initial_state": {
+                        "type": "string",
+                        "enum": ["interactive", "planning", "ready"],
+                        "description": "Initial task state. 'planning' (default) dispatches a planning session to analyse and refine the spec. 'ready' queues the task for a worker immediately — use when you already have a complete spec. 'interactive' opens a user-driven refinement session — use only when the user explicitly asks to iterate on the task."
                     },
                     "require_approval": {
                         "type": "boolean",
@@ -219,9 +220,11 @@ fn tasks_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Create a new task in the project task board".into()),
             prompt_guidelines: vec![
-                "Top-level tasks start in 'interactive' state and immediately spawn a session intended for the user to drive refinement of the spec. Only create a top-level task when the user will participate in that refinement.".into(),
-                "If you already have a complete spec and want to queue work yourself, create a subtask of an existing top-level task with skip_planning=true (starts in 'ready', no interactive session, auto-dispatches a worker). Do NOT create a top-level task and then immediately transition it to 'ready' — the interactive session that was already dispatched becomes orphaned.".into(),
-                "Subtasks are auto-dispatched on creation: skip_planning=true → worker session on a worktree; skip_planning=false → planning session (read-only, no worktree). Only create a subtask when you want work to start immediately.".into(),
+                "Tasks default to 'planning' state: a planning session analyses the spec and produces a refined plan for review. Use this when the task needs thinking through first.".into(),
+                "Pass initial_state=\"ready\" when you already have a complete, self-contained spec and want to queue work immediately — no planning session, the next scheduler pass dispatches a worker.".into(),
+                "Pass initial_state=\"interactive\" only when the user explicitly asked to iterate on the task conversationally. This spawns a user-driven refinement session; do NOT use it for agent-authored tasks.".into(),
+                "Top-level and subtask behaviour is identical on the initial-state axis. Use parent_id for grouping and parallelisation, not to control dispatch.".into(),
+                "Sessions dispatched for top-level tasks are automatically parented under the project's root (user-facing) session, so new work surfaces in the user's session tree regardless of where in the session tree task_create was called.".into(),
             ],
         },
         PluginToolDef {
@@ -329,10 +332,6 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "skip_review": {
                         "type": "boolean",
                         "description": "Whether to skip review"
-                    },
-                    "skip_planning": {
-                        "type": "boolean",
-                        "description": "Whether to skip planning"
                     },
                     "require_approval": {
                         "type": "boolean",
@@ -555,10 +554,38 @@ fn handle_task_create(
         .get("skip_review")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let skip_planning = args
-        .get("skip_planning")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+
+    // Reject the removed skip_planning parameter with a clear error so
+    // stale callers discover the new API immediately (task #512).
+    if args.get("skip_planning").is_some() {
+        return tool_err(
+            tool_call_id,
+            "'skip_planning' has been removed; use 'initial_state' instead \
+             ('ready' is the former skip_planning=true behavior, 'planning' the default).",
+        );
+    }
+
+    // New explicit initial_state argument. Default to "planning" — the
+    // previous top-level / subtask asymmetry is gone: the caller chooses.
+    let initial_state = match args.get("initial_state") {
+        None => "planning",
+        Some(v) => match v.as_str() {
+            Some(s @ ("interactive" | "planning" | "ready")) => s,
+            Some(other) => {
+                return tool_err(
+                    tool_call_id,
+                    &format!(
+                        "invalid initial_state '{}': expected 'interactive', 'planning', or 'ready'",
+                        other
+                    ),
+                );
+            }
+            None => {
+                return tool_err(tool_call_id, "initial_state must be a string");
+            }
+        },
+    };
+
     let require_approval = args
         .get("require_approval")
         .and_then(|v| v.as_bool())
@@ -574,7 +601,7 @@ fn handle_task_create(
         parent_id,
         tags,
         skip_review,
-        skip_planning,
+        initial_state,
         require_approval,
         merge_target,
         sandbox_profile,
@@ -1011,6 +1038,15 @@ fn handle_task_update(
         None => return tool_err(tool_call_id, "id is required"),
     };
 
+    // Reject the removed skip_planning parameter on updates too (task #512).
+    if args.get("skip_planning").is_some() {
+        return tool_err(
+            tool_call_id,
+            "'skip_planning' has been removed; use 'initial_state' on task_create instead \
+             ('ready' is the former skip_planning=true behavior, 'planning' the default).",
+        );
+    }
+
     let update = TaskUpdate {
         title: args.get("title").and_then(|v| v.as_str()).map(String::from),
         state: args.get("state").and_then(|v| v.as_str()).map(String::from),
@@ -1018,7 +1054,6 @@ fn handle_task_update(
         tags: args.get("tags").cloned(),
         affected_files: args.get("affected_files").cloned(),
         skip_review: args.get("skip_review").and_then(|v| v.as_bool()),
-        skip_planning: args.get("skip_planning").and_then(|v| v.as_bool()),
         require_approval: args.get("require_approval").and_then(|v| v.as_bool()),
         merge_target: args
             .get("merge_target")
@@ -2675,7 +2710,7 @@ mod tests {
         // Create
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Test task", "priority": 3, "message": "Hello"}),
+            &serde_json::json!({"title": "Test task", "priority": 3, "message": "Hello", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -2793,10 +2828,32 @@ mod tests {
     fn test_tool_relate() {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
-            .create_task("p", "A", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "A",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let t2 = db
-            .create_task("p", "B", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "B",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
 
         let result = handle_task_relate(
@@ -2819,7 +2876,18 @@ mod tests {
     fn test_tool_message_edit() {
         let db = TasksDb::open_memory().unwrap();
         let task = db
-            .create_task("p", "A", None, None, None, false, false, false, None, None)
+            .create_task(
+                "p",
+                "A",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+            )
             .unwrap();
         let msg = db.add_message(task.id, "original", None).unwrap();
 
@@ -2879,7 +2947,7 @@ mod tests {
         // Create a task and move to ready
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Assignable task"}),
+            &serde_json::json!({"title": "Assignable task", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -2930,7 +2998,7 @@ mod tests {
 
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Task for context session"}),
+            &serde_json::json!({"title": "Task for context session", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -2977,7 +3045,7 @@ mod tests {
 
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Interactive task"}),
+            &serde_json::json!({"title": "Interactive task", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -3018,7 +3086,7 @@ mod tests {
 
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "No session task"}),
+            &serde_json::json!({"title": "No session task", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: None,
@@ -3065,7 +3133,7 @@ mod tests {
         // Create parent task
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Parent"}),
+            &serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -3080,7 +3148,8 @@ mod tests {
         let parent_id = parent["id"].as_i64().unwrap();
         assert_eq!(parent["state"], "interactive");
 
-        // Create subtask — should default to planning state, skip_review=false
+        // Create subtask — should default to planning state. Post-task-#512
+        // skip_review is no longer force-cleared for subtasks.
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id, "skip_review": true}),
@@ -3097,12 +3166,12 @@ mod tests {
         assert!(!result.is_error);
         let subtask: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(subtask["state"], "planning");
-        assert_eq!(subtask["skip_review"], false);
+        assert_eq!(subtask["skip_review"], true);
 
-        // Create subtask with skip_planning — should default to ready state
+        // Create subtask with initial_state="ready" — should start in ready state
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Subtask skip plan", "parent_id": parent_id, "skip_planning": true}),
+            &serde_json::json!({"title": "Subtask skip plan", "parent_id": parent_id, "initial_state": "ready"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -3133,7 +3202,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3193,7 +3262,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3237,7 +3306,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3272,7 +3341,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3322,7 +3391,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3386,7 +3455,7 @@ mod tests {
             .map(|t| t.prompt_guidelines.len())
             .sum();
         assert!(
-            total < 12,
+            total < 16,
             "task_* prompt_guidelines total should stay small; got {}",
             total
         );
@@ -3411,31 +3480,47 @@ mod tests {
     }
 
     #[test]
-    fn test_task_create_guidelines_explain_interactive_session() {
-        // Regression test for task #511. The task_create guidelines must make
-        // three things explicit:
-        //   1. Top-level tasks spawn an interactive session for the user.
-        //   2. Self-specified work should use a skip_planning=true subtask,
-        //      NOT a top-level task immediately bumped to 'ready' (which
-        //      leaves an orphaned interactive session behind).
-        //   3. Subtasks auto-dispatch on creation.
+    fn test_task_create_guidelines_explain_initial_state() {
+        // Regression test for task #512. The task_create guidelines must
+        // make four things explicit:
+        //   1. Tasks default to 'planning' (planning session analyses the
+        //      spec).
+        //   2. initial_state="ready" is how you queue complete specs for
+        //      immediate worker dispatch.
+        //   3. initial_state="interactive" is reserved for user-driven
+        //      refinement.
+        //   4. Sessions dispatched for top-level tasks are root-parented
+        //      so they surface in the user's tree.
         let tools = tasks_tools();
         let task_create = tools
             .iter()
             .find(|t| t.name == "task_create")
             .expect("task_create tool def");
         assert!(
-            task_create.prompt_guidelines.len() >= 3,
-            "task_create should have at least 3 guidelines; got {}",
+            task_create.prompt_guidelines.len() >= 4,
+            "task_create should have at least 4 guidelines; got {}",
             task_create.prompt_guidelines.len()
         );
+        let joined = task_create.prompt_guidelines.join("\n");
         assert!(
-            task_create
-                .prompt_guidelines
-                .iter()
-                .any(|g| g.contains("orphaned") || g.contains("for the user to drive")),
-            "task_create guidelines should warn about the orphaned interactive session / \
-             user-driven refinement pattern"
+            joined.contains("'planning'") && joined.contains("default"),
+            "task_create guidelines should document the planning default: {}",
+            joined
+        );
+        assert!(
+            joined.contains("initial_state=\"ready\""),
+            "task_create guidelines should document initial_state=\"ready\": {}",
+            joined
+        );
+        assert!(
+            joined.contains("initial_state=\"interactive\""),
+            "task_create guidelines should document initial_state=\"interactive\": {}",
+            joined
+        );
+        assert!(
+            joined.contains("root"),
+            "task_create guidelines should mention root-session parenting: {}",
+            joined
         );
     }
 
@@ -3452,7 +3537,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3479,7 +3564,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3493,7 +3578,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3519,7 +3604,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3533,7 +3618,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3569,7 +3654,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3583,7 +3668,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3615,7 +3700,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3667,7 +3752,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3697,7 +3782,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3711,7 +3796,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3741,7 +3826,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3755,7 +3840,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3786,7 +3871,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3800,7 +3885,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3833,7 +3918,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3847,7 +3932,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -3880,7 +3965,7 @@ mod tests {
 
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Interactive task"}),
+            &serde_json::json!({"title": "Interactive task", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("creating-session"),
@@ -3920,7 +4005,7 @@ mod tests {
         // Create without a session_id context — session still created, just no parent
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "No parent session task"}),
+            &serde_json::json!({"title": "No parent session task", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: None,
@@ -3956,7 +4041,7 @@ mod tests {
         // Create parent (interactive — gets mock-s1)
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Parent"}),
+            &serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -4010,7 +4095,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4087,7 +4172,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4126,7 +4211,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4219,7 +4304,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4227,7 +4312,7 @@ mod tests {
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
 
-        // Child subtask starts in ready state (skip_planning=true)
+        // Child subtask starts in ready state (initial_state="ready")
         let child = db
             .create_task(
                 "test-project",
@@ -4236,7 +4321,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 true,
-                true,
+                "ready",
                 false,
                 None,
                 None,
@@ -4307,7 +4392,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4349,7 +4434,7 @@ mod tests {
         // Create a task and move to ready
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Interactive task"}),
+            &serde_json::json!({"title": "Interactive task", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -4394,7 +4479,7 @@ mod tests {
         // Create parent task
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Parent"}),
+            &serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -4408,7 +4493,7 @@ mod tests {
         let parent: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         let parent_id = parent["id"].as_i64().unwrap();
 
-        // Create subtask — defaults to planning (skip_planning=false), should emit ScheduleNeeded
+        // Create subtask — defaults to planning, should emit ScheduleNeeded
         let result = handle_task_create(
             &db,
             &serde_json::json!({"title": "Subtask", "parent_id": parent_id}),
@@ -4448,7 +4533,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4541,7 +4626,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4617,7 +4702,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4681,7 +4766,7 @@ mod tests {
                 None,
                 None,
                 true,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4746,7 +4831,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4812,7 +4897,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4875,7 +4960,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -4992,7 +5077,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5105,7 +5190,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5119,7 +5204,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5225,7 +5310,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5239,7 +5324,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5345,7 +5430,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5359,7 +5444,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5414,7 +5499,7 @@ mod tests {
         // Create an interactive task
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Direct refine task"}),
+            &serde_json::json!({"title": "Direct refine task", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -5474,7 +5559,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5488,7 +5573,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5542,7 +5627,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5556,7 +5641,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5619,7 +5704,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5633,7 +5718,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5689,7 +5774,7 @@ mod tests {
         // Create parent (interactive — gets mock-s1)
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Parent"}),
+            &serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -5777,7 +5862,7 @@ mod tests {
         // Create two independent tasks
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Task A"}),
+            &serde_json::json!({"title": "Task A", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -5793,7 +5878,7 @@ mod tests {
 
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Task B"}),
+            &serde_json::json!({"title": "Task B", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -5847,7 +5932,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5861,7 +5946,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -5929,7 +6014,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -5943,7 +6028,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -6005,7 +6090,7 @@ mod tests {
         // Create an interactive task (gets mock-s1)
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Already has session"}),
+            &serde_json::json!({"title": "Already has session", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -6072,7 +6157,7 @@ mod tests {
         let (mut writer, mut reader) = mock_io();
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Session will be archived"}),
+            &serde_json::json!({"title": "Session will be archived", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -6146,7 +6231,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6160,7 +6245,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -6233,7 +6318,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6247,7 +6332,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -6308,7 +6393,7 @@ mod tests {
         // Create an interactive task (gets mock-s1)
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Existing session notify"}),
+            &serde_json::json!({"title": "Existing session notify", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -6397,7 +6482,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6411,7 +6496,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -6477,7 +6562,7 @@ mod tests {
         // in another state.
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Fresh interactive task"}),
+            &serde_json::json!({"title": "Fresh interactive task", "initial_state": "interactive"}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -6531,7 +6616,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6627,7 +6712,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6699,7 +6784,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6713,7 +6798,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -6800,7 +6885,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6855,7 +6940,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6899,7 +6984,7 @@ mod tests {
         let mut events = Vec::new();
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Interactive warning test"}),
+            &serde_json::json!({"title": "Interactive warning test", "initial_state": "interactive"}),
             &ctx,
             &resolver,
             &mut writer,
@@ -6934,7 +7019,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -6948,7 +7033,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                false,
+                "planning",
                 false,
                 None,
                 None,
@@ -6991,7 +7076,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -7047,7 +7132,7 @@ mod tests {
                 None,
                 None,
                 false,
-                false,
+                "interactive",
                 false,
                 None,
                 None,
@@ -7061,7 +7146,7 @@ mod tests {
                 Some(parent.id),
                 None,
                 false,
-                true, // skip_planning → starts in ready
+                "ready", // initial_state="ready" → starts in ready
                 false,
                 None,
                 None,

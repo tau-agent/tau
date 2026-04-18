@@ -663,7 +663,6 @@ pub(super) async fn handle_server_request(
             tags,
             affected_files,
             skip_review,
-            skip_planning,
             require_approval,
             sandbox_profile,
         } => super::task_handlers::handle_task_update(
@@ -674,7 +673,6 @@ pub(super) async fn handle_server_request(
             tags.clone(),
             affected_files.clone(),
             *skip_review,
-            *skip_planning,
             *require_approval,
             sandbox_profile.clone(),
         ),

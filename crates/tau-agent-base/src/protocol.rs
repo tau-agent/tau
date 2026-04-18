@@ -210,8 +210,6 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         skip_review: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        skip_planning: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
         require_approval: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sandbox_profile: Option<String>,
@@ -427,7 +425,6 @@ pub struct TaskInfo {
     pub worktree_path: Option<String>,
     pub session_id: Option<String>,
     pub skip_review: bool,
-    pub skip_planning: bool,
     pub require_approval: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_profile: Option<String>,
@@ -809,7 +806,6 @@ mod tests {
             worktree_path: None,
             session_id: Some("s123".into()),
             skip_review: false,
-            skip_planning: true,
             require_approval: false,
             sandbox_profile: None,
             created_at: 1000,
@@ -857,7 +853,6 @@ mod tests {
                 tags: None,
                 affected_files: None,
                 skip_review: None,
-                skip_planning: None,
                 require_approval: None,
                 sandbox_profile: None,
             },

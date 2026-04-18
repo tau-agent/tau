@@ -1653,7 +1653,6 @@ mod tests {
             worktree_path: None,
             session_id: None,
             skip_review: false,
-            skip_planning: false,
             require_approval: false,
             sandbox_profile: None,
             created_at: 0,

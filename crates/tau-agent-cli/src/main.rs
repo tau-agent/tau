@@ -2380,7 +2380,6 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
                 .ok_or_else(|| tau_agent::Error::Io(format!("task {} not found", id)))?;
 
             let skip = if task.skip_review { "yes" } else { "no" };
-            let skip_plan = if task.skip_planning { "yes" } else { "no" };
             let require_approval = if task.require_approval { "yes" } else { "no" };
             let branch = task.branch.as_deref().unwrap_or("none");
             let parent = task
@@ -2420,8 +2419,8 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
 
             println!("Task #{}: {}", task.id, task.title);
             println!(
-                "State: {} | Priority: {} | Skip review: {} | Skip planning: {} | Require approval: {}",
-                task.state, task.priority, skip, skip_plan, require_approval
+                "State: {} | Priority: {} | Skip review: {} | Require approval: {}",
+                task.state, task.priority, skip, require_approval
             );
             println!("Branch: {} | Parent: {}", branch, parent);
             println!("Tags: {}", tags);
@@ -2480,6 +2479,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
             priority,
         } => {
             let project = project_key()?;
+            let initial_state = if skip_planning { "ready" } else { "planning" };
             let task = db.create_task(
                 &project,
                 &title,
@@ -2487,7 +2487,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
                 parent,
                 None,
                 skip_review,
-                skip_planning,
+                initial_state,
                 require_approval,
                 None,
                 None,
