@@ -238,7 +238,13 @@ pub struct App {
     /// every time the picker is opened.
     pub picker_view: PickerView,
     /// Scroll offset (index of the topmost visible row) for the picker.
-    pub task_picker_scroll_offset: usize,
+    /// Written by the renderer on each frame; read by the key handler so
+    /// that page/home/end jumps operate on the currently-visible region.
+    pub task_picker_scroll_offset: std::cell::Cell<usize>,
+    /// Last-rendered viewport capacity (body rows) for the picker.  Written
+    /// by `draw_task_picker` before each frame; read by the key handler to
+    /// size page jumps.  0 before the first render.
+    pub task_picker_viewport_rows: std::cell::Cell<usize>,
     /// Cursor position in the task picker (into filtered indices).
     pub task_picker_cursor: usize,
     /// Mode to restore when the task picker is closed.
@@ -348,7 +354,8 @@ impl App {
             picker_tasks: Vec::new(),
             picker_groups: PickerGroups::default(),
             picker_view: PickerView::SchedulerState,
-            task_picker_scroll_offset: 0,
+            task_picker_scroll_offset: std::cell::Cell::new(0),
+            task_picker_viewport_rows: std::cell::Cell::new(0),
             task_picker_cursor: 0,
             task_picker_previous_mode: AppMode::Input,
             task_picker_filter: String::new(),
@@ -1383,7 +1390,7 @@ impl App {
         self.task_picker_filter_mode = false;
         self.task_picker_create_mode = false;
         self.task_picker_detail = None;
-        self.task_picker_scroll_offset = 0;
+        self.task_picker_scroll_offset.set(0);
     }
 
     /// Clamp task picker cursor to valid range within current view.
@@ -1394,6 +1401,14 @@ impl App {
         } else if self.task_picker_cursor >= count {
             self.task_picker_cursor = count - 1;
         }
+    }
+
+    /// Page size for PgUp/PgDn: `viewport_rows - 2`, clamped to a sane
+    /// minimum so a tiny viewport (or a pre-first-render handler call)
+    /// still scrolls by at least 1 row.
+    fn task_picker_page_size(&self) -> usize {
+        let vp = self.task_picker_viewport_rows.get();
+        vp.saturating_sub(2).max(1)
     }
 
     /// Refresh action for the task picker: fires a `TaskOverview` in the
@@ -1409,37 +1424,6 @@ impl App {
                 project,
                 state: None,
             },
-        }
-    }
-
-    /// Adjust `task_picker_scroll_offset` so the cursor stays in-view.
-    /// `viewport_rows` is the number of body rows we can show (excluding
-    /// the footer hint).  Called by the renderer before draw and by
-    /// navigation handlers when the viewport height is known.
-    #[allow(dead_code)]
-    pub fn task_picker_adjust_scroll(&mut self, viewport_rows: usize) {
-        let rows = self.task_picker_rows();
-        let total = rows.len();
-        if total == 0 || viewport_rows == 0 {
-            self.task_picker_scroll_offset = 0;
-            return;
-        }
-        let cursor_row =
-            selectable_row_index_for_cursor(&rows, self.task_picker_cursor).unwrap_or(0);
-        // Keep a 1-row margin where possible.
-        let margin = if viewport_rows >= 4 { 1 } else { 0 };
-
-        if cursor_row < self.task_picker_scroll_offset + margin {
-            self.task_picker_scroll_offset = cursor_row.saturating_sub(margin);
-        }
-        let bottom = self.task_picker_scroll_offset + viewport_rows;
-        if cursor_row + margin >= bottom {
-            self.task_picker_scroll_offset =
-                cursor_row + margin + 1 - viewport_rows.min(cursor_row + margin + 1);
-        }
-        // Clamp so we don't scroll past the end.
-        if self.task_picker_scroll_offset + viewport_rows > total {
-            self.task_picker_scroll_offset = total.saturating_sub(viewport_rows);
         }
     }
 
@@ -1639,16 +1623,16 @@ impl App {
                 }
                 // Page up
                 (KeyCode::PageUp, _) => {
-                    const PAGE_SIZE: usize = 10;
-                    self.task_picker_cursor = self.task_picker_cursor.saturating_sub(PAGE_SIZE);
+                    let page = self.task_picker_page_size();
+                    self.task_picker_cursor = self.task_picker_cursor.saturating_sub(page);
                     None
                 }
                 // Page down
                 (KeyCode::PageDown, _) => {
                     if selectable_count > 0 {
-                        const PAGE_SIZE: usize = 10;
+                        let page = self.task_picker_page_size();
                         self.task_picker_cursor =
-                            (self.task_picker_cursor + PAGE_SIZE).min(selectable_count - 1);
+                            (self.task_picker_cursor + page).min(selectable_count - 1);
                     }
                     None
                 }
@@ -1736,7 +1720,7 @@ impl App {
                         PickerView::Ancestry => PickerView::SchedulerState,
                     };
                     self.task_picker_cursor = 0;
-                    self.task_picker_scroll_offset = 0;
+                    self.task_picker_scroll_offset.set(0);
                     // Refresh with the appropriate request for the new view.
                     return Some(self.task_picker_refresh_action());
                 }
@@ -2786,7 +2770,7 @@ impl App {
                         blocked_on: bo_map,
                     };
                     self.task_picker_cursor = 0;
-                    self.task_picker_scroll_offset = 0;
+                    self.task_picker_scroll_offset.set(0);
                     self.task_picker_confirm = None;
                     return None;
                 }
@@ -3448,22 +3432,6 @@ pub(crate) fn selectable_row_index_for_cursor(rows: &[PickerRow], cursor: usize)
         .filter(|(_, r)| r.is_selectable())
         .nth(cursor)
         .map(|(i, _)| i)
-}
-
-/// Inverse of [`selectable_row_index_for_cursor`]: given a row index, return
-/// the cursor position of the *nearest* selectable row at or after it.
-#[allow(dead_code)]
-pub(crate) fn cursor_for_row_index(rows: &[PickerRow], row_index: usize) -> usize {
-    let mut cursor = 0;
-    for (i, r) in rows.iter().enumerate() {
-        if i >= row_index && r.is_selectable() {
-            return cursor;
-        }
-        if r.is_selectable() {
-            cursor += 1;
-        }
-    }
-    cursor.saturating_sub(1)
 }
 
 /// Current unix timestamp in seconds, clamped to 0 on clock skew.
@@ -5438,7 +5406,7 @@ mod tests {
     #[test]
     fn pgdn_advances_scroll_past_viewport() {
         // Build enough rows to overflow a small viewport, then verify that
-        // repeated 'down' presses drive the scroll offset forward.
+        // PgDn from the top advances the cursor by (viewport - 2) rows.
         let mut app = make_app();
         open_task_picker(&mut app, AppMode::Input);
         let many: Vec<TaskInfo> = (0..30)
@@ -5446,14 +5414,20 @@ mod tests {
             .collect();
         app.picker_groups = make_groups_with(many, Vec::new(), Vec::new(), Vec::new(), Vec::new());
 
-        // Jump cursor to the end; scroll_offset should be updated by the
-        // explicit adjust call.
-        app.task_picker_cursor = app.task_picker_selectable_count() - 1;
-        app.task_picker_adjust_scroll(5);
-        assert!(
-            app.task_picker_scroll_offset > 0,
-            "scroll offset should move to keep the cursor in view",
-        );
+        // Simulate the renderer having reported a 10-row viewport.
+        app.task_picker_viewport_rows.set(10);
+
+        let before = app.task_picker_cursor;
+        let key = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        app.handle_task_picker_key(&key);
+        // PgDn uses viewport_rows - 2 as its stride.
+        assert_eq!(app.task_picker_cursor, before + 8);
+
+        // Pressing PgDn again should keep advancing (but clamp).
+        let mid = app.task_picker_cursor;
+        app.handle_task_picker_key(&key);
+        assert!(app.task_picker_cursor > mid);
+        assert!(app.task_picker_cursor < app.task_picker_selectable_count());
     }
 
     #[test]

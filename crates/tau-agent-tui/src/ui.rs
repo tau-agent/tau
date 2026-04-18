@@ -983,7 +983,7 @@ fn live_indicator(task: &tau_agent::protocol::TaskInfo, theme: &Theme) -> (&'sta
 ///
 /// A task at depth D is the last sibling if no later filtered task shares
 /// the same depth without an intervening task at a shallower depth.
-#[allow(dead_code)]
+#[cfg(test)]
 fn compute_is_last_flags(
     tasks: &[(usize, tau_agent::protocol::TaskInfo)],
     filtered: &[usize],
@@ -1092,11 +1092,16 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         return;
     }
 
+    // Viewport capacity for the body (excluding footer hint).  Published
+    // via a Cell so key handlers can size PgUp/PgDn jumps against the
+    // rendered geometry.
+    app.task_picker_viewport_rows.set(viewport_rows);
+
     // Scroll offset handled in-place: resolve cursor_row, then clamp offset.
     let cursor_row =
         crate::app::selectable_row_index_for_cursor(&rows, app.task_picker_cursor).unwrap_or(0);
     let margin = if viewport_rows >= 4 { 1 } else { 0 };
-    let mut offset = app.task_picker_scroll_offset;
+    let mut offset = app.task_picker_scroll_offset.get();
     if cursor_row < offset.saturating_add(margin) {
         offset = cursor_row.saturating_sub(margin);
     }
@@ -1106,6 +1111,9 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if offset + viewport_rows > rows.len() {
         offset = rows.len().saturating_sub(viewport_rows);
     }
+    // Publish the resolved offset back to the app so next-frame navigation
+    // (and tests) can observe the current top-of-view.
+    app.task_picker_scroll_offset.set(offset);
 
     let end = (offset + viewport_rows).min(rows.len());
     let above = offset;
@@ -1309,9 +1317,14 @@ fn render_task_row(
 
     // Title + optional metadata suffixes.
     let mut title_text = task.title.clone();
+    // State label prefix: show the state explicitly when the task's bucket
+    // is mixed (e.g. ACTIVE contains active/review/refining/merging;
+    // BLOCKED and HELD contain ready/planning).  Suppressed inside buckets
+    // whose rows all share the group's implied state (QUEUED — READY,
+    // QUEUED — PLANNING) and for held rows which already carry the 🔒
+    // marker.
     if !suppress_state_label && !task.held {
-        // prefix with state label in brackets when group is mixed (active/blocked/held).
-        // Use short form.
+        title_text = format!("[{}] {}", task.state, title_text);
     }
     if parent_out_of_group {
         if let Some(pid) = task.parent_id {

@@ -751,7 +751,7 @@ async fn run_inner(
                     app.task_picker_filter.clear();
                     app.task_picker_filter_mode = false;
                     app.task_picker_create_mode = false;
-                    app.task_picker_scroll_offset = 0;
+                    app.task_picker_scroll_offset.set(0);
                     let project = app.task_project();
                     send_request_and_recv(
                         Request::TaskOverview {
