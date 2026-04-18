@@ -477,13 +477,23 @@ pub fn dispatch(
     // not the refiner/reviewer that triggered the state change.
     let hierarchy_parent = resolve_hierarchy_parent(db, &task);
 
+    // Top-level tasks re-parent new worker sessions onto the triggering
+    // session's root so they surface in the user's primary session tree
+    // regardless of where in the tree the task was dispatched from
+    // (task #512). Subtasks keep the hierarchy parent.
+    let session_parent = if task.parent_id.is_none() {
+        parent_session_id.and_then(|sid| find_root_session(sid, writer, reader))
+    } else {
+        hierarchy_parent.clone()
+    };
+
     // Create session via ServerRequest.
     let create_req = tau_agent_plugin::Request::CreateSession {
         model,
         provider: None,
         system_prompt: None,
         cwd,
-        parent_id: hierarchy_parent,
+        parent_id: session_parent,
         child_budget: 16,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
@@ -599,13 +609,23 @@ fn dispatch_planning(
         .map(str::to_string)
         .or_else(|| resolve_parent_session(db, task));
 
+    // Top-level tasks re-parent onto the triggering session's root so
+    // new planning sessions surface in the user's primary tree
+    // (task #512). Subtasks keep the parent task's session as hierarchy
+    // parent.
+    let session_parent = if task.parent_id.is_none() {
+        parent_session_id.and_then(|sid| find_root_session(sid, writer, reader))
+    } else {
+        hierarchy_parent.clone()
+    };
+
     // Planning sessions use the project directory as cwd (no worktree).
     let create_req = tau_agent_plugin::Request::CreateSession {
         model,
         provider: None,
         system_prompt: None,
         cwd: Some(project_path.to_string()),
-        parent_id: hierarchy_parent,
+        parent_id: session_parent,
         child_budget: 16,
         tagline: Some(format!("Planning task {}: {}", task.id, task.title)),
         auto_archive: false,

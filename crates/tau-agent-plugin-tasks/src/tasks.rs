@@ -708,12 +708,21 @@ fn create_interactive_session(
     let model =
         parent_session_id.and_then(|sid| tasks_scheduler::get_session_model(sid, writer, reader));
 
+    // Session-tree parent: top-level tasks re-parent onto the triggering
+    // session's root so new work surfaces in the user's primary tree
+    // (task #512). Subtasks keep the current session as parent.
+    let session_parent = if task.parent_id.is_none() {
+        parent_session_id.and_then(|sid| tasks_scheduler::find_root_session(sid, writer, reader))
+    } else {
+        parent_session_id.map(String::from)
+    };
+
     let create_req = Request::CreateSession {
         model,
         provider: None,
         system_prompt: None,
         cwd: Some(project_path.clone()),
-        parent_id: parent_session_id.map(String::from),
+        parent_id: session_parent,
         child_budget: 16,
         tagline: Some(format!("Task {}: {}", task.id, task.title)),
         auto_archive: false,
@@ -2476,6 +2485,7 @@ mod tests {
             archived_sessions: std::collections::HashSet::new(),
             create_session_error: None,
             written_lines: Vec::new(),
+            session_ancestors: std::collections::HashMap::new(),
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -2498,6 +2508,7 @@ mod tests {
             archived_sessions: archived,
             create_session_error: None,
             written_lines: Vec::new(),
+            session_ancestors: std::collections::HashMap::new(),
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -2515,6 +2526,7 @@ mod tests {
             archived_sessions: std::collections::HashSet::new(),
             create_session_error: Some(error.to_string()),
             written_lines: Vec::new(),
+            session_ancestors: std::collections::HashMap::new(),
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -2546,6 +2558,10 @@ mod tests {
         create_session_error: Option<String>,
         /// All raw lines written by the plugin (captured before processing).
         written_lines: Vec<String>,
+        /// Canned ancestor chains for GetSessionAncestors. Maps a session ID
+        /// to its leaf-first ancestor list. If unset for a session, the
+        /// default response treats the session as its own root.
+        session_ancestors: std::collections::HashMap<String, Vec<tau_agent_plugin::SessionInfo>>,
     }
 
     impl MockShared {
@@ -2598,6 +2614,37 @@ mod tests {
                                     project_name: None,
                                 },
                             }
+                        }
+                        tau_agent_plugin::Request::GetSessionAncestors { session_id } => {
+                            let sessions = self
+                                .session_ancestors
+                                .get(session_id.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    // Default: session is its own (non-archived) root.
+                                    vec![tau_agent_plugin::SessionInfo {
+                                        id: session_id.clone(),
+                                        model: "mock-model".to_string(),
+                                        provider: "mock".to_string(),
+                                        cwd: None,
+                                        message_count: 0,
+                                        stats: Default::default(),
+                                        last_activity: 0,
+                                        parent_id: None,
+                                        child_count: 0,
+                                        child_budget: 16,
+                                        tagline: None,
+                                        state: "idle".to_string(),
+                                        context_pct: None,
+                                        archived: self
+                                            .archived_sessions
+                                            .contains(session_id.as_str()),
+                                        last_exit_status: None,
+                                        is_live: false,
+                                        project_name: None,
+                                    }]
+                                });
+                            tau_agent_plugin::Response::SessionAncestors { sessions }
                         }
                         tau_agent_plugin::Request::QueueMessage { .. } => {
                             tau_agent_plugin::Response::Ok
@@ -4030,6 +4077,194 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "mock-s1");
         assert_eq!(sessions[0].role, "interactive");
+    }
+
+    /// Helper: build a mock configured to return a specific ancestor chain
+    /// for a session_id.
+    fn mock_io_with_ancestors(
+        chains: Vec<(&str, Vec<tau_agent_plugin::SessionInfo>)>,
+    ) -> (MockWriter, BufReader<MockReader>) {
+        let mut ancestors = std::collections::HashMap::new();
+        for (sid, chain) in chains {
+            ancestors.insert(sid.to_string(), chain);
+        }
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(MockShared {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            session_counter: 0,
+            archived_sessions: std::collections::HashSet::new(),
+            create_session_error: None,
+            written_lines: Vec::new(),
+            session_ancestors: ancestors,
+        }));
+        let writer = MockWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockReader { shared };
+        (writer, BufReader::new(reader))
+    }
+
+    /// Build a minimal SessionInfo fixture for ancestor responses.
+    fn test_session_info(id: &str, parent_id: Option<&str>) -> tau_agent_plugin::SessionInfo {
+        tau_agent_plugin::SessionInfo {
+            id: id.to_string(),
+            model: "mock-model".into(),
+            provider: "mock".into(),
+            cwd: None,
+            message_count: 0,
+            stats: Default::default(),
+            last_activity: 0,
+            parent_id: parent_id.map(str::to_string),
+            child_count: 0,
+            child_budget: 16,
+            tagline: None,
+            state: "idle".into(),
+            context_pct: None,
+            archived: false,
+            last_exit_status: None,
+            is_live: false,
+            project_name: None,
+        }
+    }
+
+    /// Top-level task: the fresh interactive session must be parented on
+    /// the calling session's **root** (from GetSessionAncestors), not on
+    /// the nested worker session that happened to call `task_create`.
+    ///
+    /// Regression test for task #512.
+    #[test]
+    fn test_top_level_interactive_session_parented_on_root() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        // Nested-worker calls task_create; its ancestor chain leads to
+        // "user-root".
+        let (mut writer, mut reader) = mock_io_with_ancestors(vec![(
+            "nested-worker",
+            vec![
+                test_session_info("nested-worker", Some("mid")),
+                test_session_info("mid", Some("user-root")),
+                test_session_info("user-root", None),
+            ],
+        )]);
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Top-level task", "initial_state": "interactive"}),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("nested-worker"),
+                tool_call_id: "tc1",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+
+        // Inspect the CreateSession request actually sent to the server:
+        // its parent_id should be "user-root", not "nested-worker".
+        let mut shared = writer.shared.lock().unwrap();
+        shared.process_pending();
+        let all_written = shared.written_lines.join("\n");
+        let create_line = all_written
+            .lines()
+            .find(|l| l.contains("\"create_session\""))
+            .expect("expected a CreateSession request line");
+        let parsed: serde_json::Value = serde_json::from_str(create_line).unwrap();
+        let parent_id = parsed
+            .pointer("/request/parent_id")
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            parent_id,
+            Some("user-root"),
+            "top-level task session should be root-parented; full request: {}",
+            create_line
+        );
+    }
+
+    /// Subtask session must keep its hierarchy parent (the calling
+    /// session), NOT re-parent onto the root — grouping subtasks under
+    /// their orchestrator is how task boards stay organised.
+    ///
+    /// Regression test for task #512 — verifies the top-level-only scope
+    /// of root-parenting.
+    #[test]
+    fn test_subtask_session_keeps_hierarchy_parent() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io_with_ancestors(vec![(
+            "orchestrator",
+            vec![
+                test_session_info("orchestrator", Some("user-root")),
+                test_session_info("user-root", None),
+            ],
+        )]);
+
+        // Parent task so the subtask has somewhere to hang off.
+        let parent = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Parent", "initial_state": "interactive"}),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("orchestrator"),
+                tool_call_id: "tc-parent",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!parent.is_error);
+        let parent_task: serde_json::Value = serde_json::from_str(&extract_text(&parent)).unwrap();
+        let parent_id = parent_task["id"].as_i64().unwrap();
+
+        // Drain written_lines so we only inspect the subtask's CreateSession below.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.process_pending();
+            shared.written_lines.clear();
+        }
+
+        // Subtask → initial_state=interactive (requires explicit opt-in in
+        // the unified world; `planning` would not create a session).
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Subtask",
+                "parent_id": parent_id,
+                "initial_state": "interactive",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("orchestrator"),
+                tool_call_id: "tc-sub",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+
+        let mut shared = writer.shared.lock().unwrap();
+        shared.process_pending();
+        let all_written = shared.written_lines.join("\n");
+        let create_line = all_written
+            .lines()
+            .find(|l| l.contains("\"create_session\""))
+            .expect("expected a CreateSession request line");
+        let parsed: serde_json::Value = serde_json::from_str(create_line).unwrap();
+        let parent_id_sent = parsed
+            .pointer("/request/parent_id")
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            parent_id_sent,
+            Some("orchestrator"),
+            "subtask session should keep its hierarchy parent (the calling session); \
+             full request: {}",
+            create_line
+        );
     }
 
     #[test]
