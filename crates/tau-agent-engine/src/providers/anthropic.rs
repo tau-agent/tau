@@ -1081,6 +1081,7 @@ mod tests {
                     timestamp: 0,
                     duration_ms: None,
                     summary: None,
+                    post_persist_actions: Vec::new(),
                 }),
             ],
             tools: Vec::new(),

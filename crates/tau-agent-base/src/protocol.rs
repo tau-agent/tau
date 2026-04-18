@@ -197,6 +197,16 @@ pub enum Request {
         tool_name: String,
         arguments: serde_json::Value,
     },
+    /// Enqueue a Tier-3 post-idle action for the given session. The server
+    /// drains the queue once the session's lock releases (after the agent
+    /// loop exits). Intended for side effects that need exclusive access
+    /// to the caller's session or its subtree (e.g. archival, merge pass).
+    ///
+    /// See [`crate::types::PostIdleAction`] for the action semantics.
+    EnqueuePostIdleAction {
+        session_id: String,
+        action: crate::types::PostIdleAction,
+    },
     /// Set the tagline for a session.
     SetTagline { session_id: String, tagline: String },
     /// List tasks for a project.

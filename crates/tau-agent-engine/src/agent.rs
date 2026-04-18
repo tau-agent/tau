@@ -49,6 +49,12 @@ pub struct AgentConfig {
     pub refresh_api_key: Option<Box<dyn Fn() -> Option<String> + Send + Sync>>,
     /// Model to use for loop-review checkpoints. If `None`, uses the session's own model.
     pub review_model: Option<Model>,
+    /// Callback to drain Tier-2 post-persist actions attached to a tool
+    /// result. Called immediately after the tool result is persisted to
+    /// the caller's session history, so actions (e.g. self-recipient info
+    /// messages) render textually after the tool result.
+    #[allow(clippy::type_complexity)]
+    pub post_persist_callback: Option<Box<dyn Fn(&[PostPersistAction]) + Send + Sync>>,
 }
 
 /// Default idle timeout for SSE stream chunks (90 seconds).
@@ -67,6 +73,7 @@ impl Default for AgentConfig {
             on_message: None,
             refresh_api_key: None,
             review_model: None,
+            post_persist_callback: None,
         }
     }
 }
@@ -402,6 +409,16 @@ pub async fn run(
 
             let tool_msg = Message::ToolResult(result.clone());
             emit_message(config, &tool_msg);
+
+            // Tier-2 drain: run post-persist actions now that the tool
+            // result has reached the caller's history. See
+            // `PostPersistAction` for semantics.
+            if !result.post_persist_actions.is_empty()
+                && let Some(ref cb) = config.post_persist_callback
+            {
+                cb(&result.post_persist_actions);
+            }
+
             new_messages.push(tool_msg);
             context.messages.push(Message::ToolResult(result));
         }
@@ -960,6 +977,7 @@ pub fn is_context_overflow(err_msg: &str) -> bool {
 mod tests {
     use super::*;
     use crate::providers::mock::*;
+    use std::sync::{Arc, Mutex};
     use tau_agent_plugin_worker::InProcessWorker;
 
     fn setup_registry(responses: Vec<MockResponse>) -> ProviderRegistry {
@@ -1049,6 +1067,158 @@ mod tests {
             assert!(
                 matches!(&result.new_messages[2], Message::Assistant(a) if a.text().contains("hi"))
             );
+        });
+    }
+
+    /// Tier-2: a tool result with a `post_persist_actions` entry must invoke
+    /// the `post_persist_callback` exactly once, with the same actions, and
+    /// — critically — AFTER the tool result has been emitted via the
+    /// `on_message` callback.  This is what guarantees the rendered order
+    /// `[tool_call, tool_result, info_message]` in the session history.
+    #[test]
+    fn tier2_post_persist_runs_after_tool_result_persisted() {
+        smol::block_on(async {
+            let registry = setup_registry(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "mock".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                MockResponse::Text("done".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let mut worker = MockToolExecutor::new();
+            let actions = vec![PostPersistAction::EmitInfoMessage {
+                target_session_id: "caller".into(),
+                text: "hello".into(),
+            }];
+            worker.handle().on_tool(
+                "mock",
+                MockToolResponse::SuccessWithActions("ok".into(), actions.clone()),
+            );
+
+            // Record the order in which on_message and post_persist_callback fire.
+            let order = Arc::new(Mutex::new(Vec::<String>::new()));
+            let order_msg = order.clone();
+            let order_cb = order.clone();
+            let cb_actions = Arc::new(Mutex::new(Vec::<PostPersistAction>::new()));
+            let cb_actions_for_cb = cb_actions.clone();
+
+            let config = AgentConfig {
+                on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
+                    let tag = match msg {
+                        Message::Assistant(_) => "assistant",
+                        Message::ToolResult(_) => "tool_result",
+                        Message::User(_) => "user",
+                        Message::Info(_) => "info",
+                        Message::CompactionSummary(_) => "compaction",
+                    };
+                    order_msg.lock().expect("order lock").push(tag.to_string());
+                }))),
+                post_persist_callback: Some(Box::new(move |actions: &[PostPersistAction]| {
+                    order_cb
+                        .lock()
+                        .expect("order lock")
+                        .push("post_persist".into());
+                    cb_actions_for_cb
+                        .lock()
+                        .expect("actions lock")
+                        .extend_from_slice(actions);
+                })),
+                ..Default::default()
+            };
+
+            let (tx, _rx) = smol::channel::unbounded();
+            run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .expect("run");
+
+            // Ordering: assistant(tool_call) → tool_result → post_persist
+            // → assistant(reply).
+            let order_final = order.lock().expect("order lock").clone();
+            let tool_idx = order_final
+                .iter()
+                .position(|s| s == "tool_result")
+                .expect("tool_result emitted");
+            let pp_idx = order_final
+                .iter()
+                .position(|s| s == "post_persist")
+                .expect("post_persist fired");
+            assert!(
+                tool_idx < pp_idx,
+                "post_persist must fire after tool_result; order={:?}",
+                order_final
+            );
+
+            // Callback received the exact actions that were attached.
+            let got = cb_actions.lock().expect("actions lock").clone();
+            assert_eq!(got.len(), 1);
+            match &got[0] {
+                PostPersistAction::EmitInfoMessage {
+                    target_session_id,
+                    text,
+                } => {
+                    assert_eq!(target_session_id, "caller");
+                    assert_eq!(text, "hello");
+                }
+            }
+        });
+    }
+
+    /// Tier-2: no actions → callback is not invoked at all.
+    #[test]
+    fn tier2_post_persist_not_invoked_when_no_actions() {
+        smol::block_on(async {
+            let registry = setup_registry(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "mock".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                MockResponse::Text("done".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let mut worker = MockToolExecutor::new();
+            worker
+                .handle()
+                .on_tool("mock", MockToolResponse::Success("ok".into()));
+
+            let hits = Arc::new(Mutex::new(0usize));
+            let hits_cb = hits.clone();
+
+            let config = AgentConfig {
+                post_persist_callback: Some(Box::new(move |_actions: &[PostPersistAction]| {
+                    *hits_cb.lock().expect("hits lock") += 1;
+                })),
+                ..Default::default()
+            };
+
+            let (tx, _rx) = smol::channel::unbounded();
+            run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .expect("run");
+
+            assert_eq!(*hits.lock().expect("hits lock"), 0);
         });
     }
 

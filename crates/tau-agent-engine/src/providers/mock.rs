@@ -292,6 +292,8 @@ fn send_mock_response(tx: &EventSender, response: MockResponse) {
 pub enum MockToolResponse {
     /// Successful tool result text.
     Success(String),
+    /// Successful result with attached Tier-2 post-persist actions.
+    SuccessWithActions(String, Vec<PostPersistAction>),
     /// Tool-level error (is_error = true in the result).
     ToolError(String),
     /// Executor-level error (returns Err from execute).
@@ -409,6 +411,21 @@ fn execute_mock_tool_response(
                 timestamp: timestamp_ms(),
                 duration_ms: None,
                 summary: None,
+                post_persist_actions: Vec::new(),
+            }),
+            MockToolResponse::SuccessWithActions(text, actions) => Ok(ToolResultMessage {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text,
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: timestamp_ms(),
+                duration_ms: None,
+                summary: None,
+                post_persist_actions: actions,
             }),
             MockToolResponse::ToolError(msg) => Ok(ToolResultMessage {
                 tool_call_id: tool_call.id.clone(),
@@ -422,6 +439,7 @@ fn execute_mock_tool_response(
                 timestamp: timestamp_ms(),
                 duration_ms: None,
                 summary: None,
+                post_persist_actions: Vec::new(),
             }),
             MockToolResponse::ExecutorError(msg) => Err(tau_agent_base::Error::Http(msg)),
             MockToolResponse::Delayed { delay_ms, response } => {

@@ -416,6 +416,7 @@ mod tests {
             session_done_waiters: Vec::new(),
             reply_waiters: HashMap::new(),
             next_msg_id: 0,
+            post_idle_queue: HashMap::new(),
         }))
     }
 

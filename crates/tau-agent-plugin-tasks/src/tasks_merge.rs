@@ -180,6 +180,27 @@ pub fn merge_task(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<MergeResult> {
+    merge_task_for_caller(db, task_id, project_dir, None, writer, reader)
+}
+
+/// Variant of [`merge_task`] that knows the caller's session id, so it can
+/// defer archiving sessions in the caller's subtree to Tier-3 via
+/// [`Request::EnqueuePostIdleAction`].  This is what fixes the archival
+/// race described in task #533: when the reviewer calls
+/// `task_update(state=approved)`, the reviewer's own session is one of the
+/// sessions scheduled for archive — archiving inline would fail silently
+/// because the reviewer's lock is still held by the agent loop.
+///
+/// If `caller_session_id` is `None` (scheduler-tick merges, CLI merges),
+/// archival runs inline as before.
+pub fn merge_task_for_caller(
+    db: &TasksDb,
+    task_id: i64,
+    project_dir: &str,
+    caller_session_id: Option<&str>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> tau_agent_plugin::Result<MergeResult> {
     // 1. Get task, branch, merge target
     let task = db
         .get_task(task_id)?
@@ -441,9 +462,35 @@ pub fn merge_task(
     // decide to archive.
     if let Ok(sessions) = db.get_sessions(task_id) {
         let (to_archive, to_skip) = sessions_to_archive(&sessions);
-        for ts in to_archive {
-            archive_session(writer, reader, &ts.session_id);
-            log.push_str(&format!("Archived {} session {}\n", ts.role, ts.session_id));
+
+        // Tier-3 check: if the caller's session is in the to-archive set,
+        // inline archival would race with the caller's own agent loop
+        // (lock still held).  Defer the whole task-archival batch to
+        // post-idle via EnqueuePostIdleAction so it runs after the
+        // caller's turn exits.
+        let caller_in_archive =
+            caller_session_id.is_some_and(|cid| to_archive.iter().any(|ts| ts.session_id == cid));
+
+        if caller_in_archive {
+            if let Some(cid) = caller_session_id {
+                let _ = server_request(
+                    writer,
+                    reader,
+                    Request::EnqueuePostIdleAction {
+                        session_id: cid.to_string(),
+                        action: tau_agent_plugin::PostIdleAction::ArchiveTaskSessions { task_id },
+                    },
+                );
+                log.push_str(&format!(
+                    "Deferred archival of {} task session(s) to post-idle (caller is in subtree)\n",
+                    to_archive.len()
+                ));
+            }
+        } else {
+            for ts in to_archive {
+                archive_session(writer, reader, &ts.session_id);
+                log.push_str(&format!("Archived {} session {}\n", ts.role, ts.session_id));
+            }
         }
         for ts in to_skip {
             log.push_str(&format!(

@@ -134,6 +134,7 @@ fn tool_ok(tool_call_id: &str, text: &str) -> PluginToolResult {
         })],
         is_error: false,
         summary: None,
+        post_persist_actions: Vec::new(),
     }
 }
 
@@ -146,6 +147,7 @@ fn tool_err(tool_call_id: &str, text: &str) -> PluginToolResult {
         })],
         is_error: true,
         summary: None,
+        post_persist_actions: Vec::new(),
     }
 }
 
@@ -158,6 +160,7 @@ fn tool_ok_summary(tool_call_id: &str, text: &str, summary: impl Into<String>) -
         })],
         is_error: false,
         summary: Some(summary.into()),
+        post_persist_actions: Vec::new(),
     }
 }
 
@@ -1108,6 +1111,7 @@ fn handle_task_update(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     pending_events: &mut Vec<SchedulerEvent>,
+    post_persist_actions: &mut Vec<tau_agent_plugin::PostPersistAction>,
 ) -> PluginToolResult {
     let id = match args.get("id").and_then(|v| v.as_i64()) {
         Some(id) => id,
@@ -1222,7 +1226,9 @@ fn handle_task_update(
             // Held tasks do not trigger schedule passes — releasing via
             // hold=false will (see below).
             match task.state.as_str() {
-                "approved" => pending_events.push(SchedulerEvent::MergeNeeded),
+                "approved" => {
+                    pending_events.push(SchedulerEvent::MergeNeeded(session_id.map(String::from)));
+                }
                 "ready" | "planning" if !task.held => {
                     pending_events.push(SchedulerEvent::ScheduleNeeded(
                         task.project_name.clone(),
@@ -1512,7 +1518,16 @@ fn handle_task_update(
                 // Re-fetch so newly set session_id (interactive case) is
                 // visible to the recipient collector.
                 let fresh = db.get_task(task.id).ok().flatten().unwrap_or(task.clone());
-                crate::tasks_notify::notify_state_change(db, &fresh, old, context, writer, reader);
+                crate::tasks_notify::notify_state_change_split(
+                    db,
+                    &fresh,
+                    old,
+                    context,
+                    session_id,
+                    writer,
+                    reader,
+                    post_persist_actions,
+                );
             }
 
             // When a task transitions to a terminal state, auto-archive its session
@@ -1525,7 +1540,16 @@ fn handle_task_update(
                 if let Some(ref old) = old_state
                     && &task.state != old
                 {
-                    crate::tasks_notify::notify_state_change(db, &task, old, None, writer, reader);
+                    crate::tasks_notify::notify_state_change_split(
+                        db,
+                        &task,
+                        old,
+                        None,
+                        session_id,
+                        writer,
+                        reader,
+                        post_persist_actions,
+                    );
                 }
 
                 auto_archive_task_session(db, &task, resolver, writer, reader);
@@ -1962,7 +1986,7 @@ fn handle_task_merge(
         Ok(p) => p,
         Err(e) => return tool_err(tool_call_id, &format!("resolve project: {}", e)),
     };
-    match tasks_merge::merge_task(db, id, &project_dir, writer, reader) {
+    match tasks_merge::merge_task_for_caller(db, id, &project_dir, session_id, writer, reader) {
         Ok(result) => {
             if result.success {
                 // Transition to merged
@@ -2102,8 +2126,11 @@ fn handle_task_merge(
 /// pending events after each tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SchedulerEvent {
-    /// A task moved to `approved` — run the merge queue.
-    MergeNeeded,
+    /// A task moved to `approved` — run the merge queue.  The optional
+    /// session id is the caller that triggered the event; it's threaded
+    /// through to [`tasks_merge::merge_task_for_caller`] so archival of
+    /// the caller's own subtree can be deferred to Tier-3.
+    MergeNeeded(Option<String>),
     /// A task moved to `ready` — run a scheduling pass for the given project.
     /// The optional session ID is the session that triggered the event, used
     /// to inherit the model when auto-dispatching tasks.
@@ -2268,6 +2295,12 @@ pub fn run_tasks_plugin() {
                 let project_name = project_name.as_deref();
                 let session = session_id.as_deref();
 
+                // Tier-2 actions to attach to the returned tool result.
+                // Accumulated by handlers that need a side effect (e.g. a
+                // self-recipient info message) to render textually AFTER the
+                // tool result is persisted.
+                let mut post_persist_actions: Vec<tau_agent_plugin::PostPersistAction> = Vec::new();
+
                 let mut result = match name.as_str() {
                     "task_create" => handle_task_create(
                         &db,
@@ -2304,6 +2337,7 @@ pub fn run_tasks_plugin() {
                         &mut writer,
                         &mut chan_reader,
                         &mut pending_events,
+                        &mut post_persist_actions,
                     ),
                     "task_message" => handle_task_message(&db, &arguments, session, &tool_call_id),
                     "task_message_edit" => handle_task_message_edit(&db, &arguments, &tool_call_id),
@@ -2366,6 +2400,12 @@ pub fn run_tasks_plugin() {
                         }));
                 }
 
+                // Attach any Tier-2 post-persist actions accumulated during
+                // the handler call (e.g. self-recipient info messages).
+                if !post_persist_actions.is_empty() {
+                    result.post_persist_actions.extend(post_persist_actions);
+                }
+
                 send_message(&mut writer, &PluginMessage::ToolResult(result));
             }
             PluginRequest::Init { .. } | PluginRequest::SessionStart { .. } => {
@@ -2380,7 +2420,7 @@ pub fn run_tasks_plugin() {
                     let task_id = data.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
                     match new_state {
                         "approved" => {
-                            pending_events.push(SchedulerEvent::MergeNeeded);
+                            pending_events.push(SchedulerEvent::MergeNeeded(None));
                         }
                         "ready" | "planning" => {
                             // Look up the task's project for the schedule pass.
@@ -2534,11 +2574,17 @@ fn drain_scheduler_events(
     let batch = std::mem::take(events);
 
     let mut need_merge = false;
+    let mut merge_caller: Option<String> = None;
     let mut schedule_projects: Vec<(String, Option<String>)> = Vec::new();
 
     for ev in batch {
         match ev {
-            SchedulerEvent::MergeNeeded => need_merge = true,
+            SchedulerEvent::MergeNeeded(caller) => {
+                need_merge = true;
+                if merge_caller.is_none() {
+                    merge_caller = caller;
+                }
+            }
             SchedulerEvent::ScheduleNeeded(project_name, session_id) => {
                 if !schedule_projects.iter().any(|(p, _)| p == &project_name) {
                     schedule_projects.push((project_name, session_id));
@@ -2550,7 +2596,7 @@ fn drain_scheduler_events(
     // Run merge pass first (merging may unblock dependencies that become
     // ready, but schedule passes are triggered by explicit events anyway).
     if need_merge {
-        run_merge_pass(db, resolver, writer, reader);
+        run_merge_pass(db, resolver, merge_caller.as_deref(), writer, reader);
     }
 
     let mut warnings = Vec::new();
@@ -2580,11 +2626,18 @@ fn drain_scheduler_events(
 fn run_merge_pass(
     db: &TasksDb,
     resolver: &ProjectResolver,
+    caller_session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) {
     let resolve_fn = |name: &str| resolver.resolve(name);
-    match tasks_scheduler::merge_approved(db, &resolve_fn, writer, reader) {
+    match tasks_scheduler::merge_approved_for_caller(
+        db,
+        &resolve_fn,
+        caller_session_id,
+        writer,
+        reader,
+    ) {
         Ok(attempts) => {
             // Collect projects whose tasks were successfully merged so we
             // can re-evaluate dependents of those merges. Without this,
@@ -3068,6 +3121,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let text = extract_text(&result);
@@ -3083,6 +3137,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(result.is_error);
@@ -3282,6 +3337,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -3330,6 +3386,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
 
@@ -3418,6 +3475,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
 
@@ -3540,6 +3598,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(result.is_error);
         assert!(extract_text(&result).contains("skip_review is false"));
@@ -3553,6 +3612,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(!result.is_error);
@@ -3600,6 +3660,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(!result.is_error);
@@ -3682,6 +3743,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -3694,10 +3756,10 @@ mod tests {
         assert!(roles.contains(&("reviewer-session", "reviewer")));
     }
 
-    /// End-to-end wiring: handle_task_update emits a `QueueInfo` on the
-    /// wire for every state-changing update.  Exercises the call-site in
-    /// tasks.rs that plugs notify_state_change into the general agent
-    /// path.
+    /// End-to-end wiring: handle_task_update defers the self-recipient
+    /// info message to `post_persist_actions` (Tier-2) when the caller
+    /// itself is among the recipients.  This ensures the info message
+    /// renders *after* the tool result in the caller's session history.
     #[test]
     fn test_handle_task_update_emits_queue_info_on_state_change() {
         let db = TasksDb::open_memory().unwrap();
@@ -3724,7 +3786,10 @@ mod tests {
         db.record_session(task.id, "s-worker", "worker").unwrap();
         db.set_session_id(task.id, "s-worker").unwrap();
 
-        // Transition ready -> active via the handler.
+        // Transition ready -> active via the handler.  Caller is s-worker,
+        // which is also the only recipient — the info message must be
+        // deferred to `post_persist_actions`, NOT fired eagerly as QueueInfo.
+        let mut post_persist: Vec<tau_agent_plugin::PostPersistAction> = Vec::new();
         let result = handle_task_update(
             &db,
             &serde_json::json!({"id": task.id, "state": "active"}),
@@ -3734,6 +3799,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut post_persist,
         );
         assert!(
             !result.is_error,
@@ -3749,24 +3815,31 @@ mod tests {
 
         let shared = writer.shared.lock().unwrap();
         let written = shared.written_lines.join("\n");
+        // The caller's own info message must NOT appear as an eagerly-fired
+        // QueueInfo (it would land in the history before the tool result).
         assert!(
-            written.contains("\"queue_info\""),
-            "expected a QueueInfo on the wire, got:\n{}",
+            !written.contains("\"queue_info\""),
+            "did not expect any QueueInfo when caller is sole recipient, got:\n{}",
             written
         );
-        let expected_line = format!("[task #{}] Emit test: ready → active", task.id);
-        assert!(
-            written.contains(&expected_line),
-            "expected info text {:?} in: {}",
-            expected_line,
-            written
+        // It must instead live in `post_persist_actions` with the right text
+        // and target.
+        assert_eq!(
+            post_persist.len(),
+            1,
+            "expected one post-persist action, got: {:?}",
+            post_persist
         );
-        // Recipient is s-worker (creator+worker deduped).
-        assert!(
-            written.contains("s-worker"),
-            "expected s-worker as recipient in: {}",
-            written
-        );
+        match &post_persist[0] {
+            tau_agent_plugin::PostPersistAction::EmitInfoMessage {
+                target_session_id,
+                text,
+            } => {
+                assert_eq!(target_session_id, "s-worker");
+                let expected_line = format!("[task #{}] Emit test: ready → active", task.id);
+                assert_eq!(text, &expected_line);
+            }
+        }
     }
 
     /// No-op transitions (task_update that doesn't change state) do not
@@ -3802,6 +3875,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(!result.is_error);
@@ -3881,6 +3955,7 @@ mod tests {
         // `dispatch_review`, which CreateSession-s a reviewer session
         // (mock returns "mock-s1") and records it before (per the fix)
         // notify_state_change fires.
+        let mut post_persist: Vec<tau_agent_plugin::PostPersistAction> = Vec::new();
         let result = handle_task_update(
             &db,
             &serde_json::json!({"id": task.id, "state": "review"}),
@@ -3890,6 +3965,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut post_persist,
         );
         assert!(
             !result.is_error,
@@ -3925,13 +4001,16 @@ mod tests {
             reviewer_sid,
             calls
         );
-        // The worker session still receives the message too.
+        // The worker session is the caller, so its info is deferred to
+        // Tier-2 `post_persist_actions` rather than fired as QueueInfo.
         assert!(
-            calls
-                .iter()
-                .any(|(sid, text)| sid == "s-worker" && text == &expected_text),
-            "worker session missing from recipients. calls: {:?}",
-            calls
+            post_persist.iter().any(|a| matches!(
+                a,
+                tau_agent_plugin::PostPersistAction::EmitInfoMessage { target_session_id, text }
+                    if target_session_id == "s-worker" && text == &expected_text
+            )),
+            "worker session missing from post-persist actions. post_persist: {:?}",
+            post_persist
         );
     }
 
@@ -3973,6 +4052,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(
@@ -4042,6 +4122,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(
@@ -4134,6 +4215,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(
@@ -4375,6 +4457,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
 
@@ -5214,6 +5297,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -5262,6 +5346,7 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(!result.is_error);
@@ -5342,6 +5427,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -5416,6 +5502,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -5497,9 +5584,10 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
-        assert_eq!(events, vec![SchedulerEvent::MergeNeeded]);
+        assert_eq!(events, vec![SchedulerEvent::MergeNeeded(Some("s1".into()))]);
     }
 
     #[test]
@@ -5536,6 +5624,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         assert_eq!(
@@ -5639,6 +5728,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         assert!(events.is_empty());
@@ -5692,6 +5782,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         assert!(
@@ -5748,6 +5839,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         assert!(
@@ -5765,8 +5857,8 @@ mod tests {
         // drain_scheduler_events should deduplicate MergeNeeded and
         // same-project ScheduleNeeded events.
         let mut events = vec![
-            SchedulerEvent::MergeNeeded,
-            SchedulerEvent::MergeNeeded,
+            SchedulerEvent::MergeNeeded(None),
+            SchedulerEvent::MergeNeeded(None),
             SchedulerEvent::ScheduleNeeded("project-a".into(), Some("s1".into())),
             SchedulerEvent::ScheduleNeeded("project-a".into(), Some("s2".into())),
             SchedulerEvent::ScheduleNeeded("project-b".into(), None),
@@ -5779,7 +5871,7 @@ mod tests {
         let mut schedule_projects: Vec<(String, Option<String>)> = Vec::new();
         for ev in batch {
             match ev {
-                SchedulerEvent::MergeNeeded => need_merge = true,
+                SchedulerEvent::MergeNeeded(_) => need_merge = true,
                 SchedulerEvent::ScheduleNeeded(project, session_id) => {
                     if !schedule_projects.iter().any(|(p, _)| p == &project) {
                         schedule_projects.push((project, session_id));
@@ -5864,6 +5956,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(!result.is_error, "unexpected error: {:?}", result);
 
@@ -5939,6 +6032,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(!result.is_error, "unexpected error: {:?}", result);
         // No QueueMessage should be attempted when there is no session_id
@@ -6004,6 +6098,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut Vec::new(),
+            &mut Vec::new(),
         );
         assert!(!result.is_error, "unexpected error: {:?}", result);
         assert!(
@@ -6059,6 +6154,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6125,6 +6221,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -6190,6 +6287,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6229,6 +6327,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6308,6 +6407,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6349,6 +6449,7 @@ mod tests {
             &mut writer2,
             &mut reader2,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6429,6 +6530,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6468,6 +6570,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6550,6 +6653,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6591,6 +6695,7 @@ mod tests {
             &mut writer2,
             &mut reader2,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6674,6 +6779,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6733,6 +6839,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6813,6 +6920,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(result.is_error, "expected error for missing affected_files");
         assert!(
@@ -6891,6 +6999,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -6962,6 +7071,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -7182,6 +7292,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -7266,6 +7377,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -7335,6 +7447,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -7349,6 +7462,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -7417,6 +7531,7 @@ mod tests {
             &mut writer2,
             &mut reader2,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -7492,6 +7607,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -7573,6 +7689,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -7641,6 +7758,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
 
         // Clear written lines to only check new messages
@@ -7661,6 +7779,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -7747,6 +7866,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(
             !result.is_error,
@@ -8142,6 +8262,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error, "task_update should succeed");
         let text = extract_text(&result);
@@ -8187,6 +8308,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error, "task_update should succeed");
         let text = extract_text(&result);
@@ -8283,6 +8405,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error, "task_update should succeed");
         let text = extract_text(&result);
@@ -8337,6 +8460,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut events,
+            &mut Vec::new(),
         );
         assert!(!result.is_error, "task_update should succeed");
         let text = extract_text(&result);
@@ -8505,6 +8629,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut pending,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
 
@@ -8529,6 +8654,7 @@ mod tests {
             &mut writer,
             &mut reader,
             &mut pending,
+            &mut Vec::new(),
         );
         assert!(!result.is_error);
         let reloaded = db.get_task(task.id).unwrap().unwrap();

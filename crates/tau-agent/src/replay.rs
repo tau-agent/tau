@@ -423,6 +423,7 @@ mod tests {
                 timestamp: 0,
                 duration_ms: None,
                 summary: None,
+                post_persist_actions: Vec::new(),
             }),
             Message::Assistant({
                 let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
@@ -563,6 +564,7 @@ mod tests {
                             timestamp: 0,
                             duration_ms: None,
                             summary: None,
+                            post_persist_actions: Vec::new(),
                         }],
                     },
                     RecordedTurn {

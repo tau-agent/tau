@@ -85,6 +85,7 @@ pub fn server_request(
                         })],
                         is_error: true,
                         summary: None,
+                        post_persist_actions: Vec::new(),
                     }),
                 );
                 // Continue waiting for our ServerResponse.

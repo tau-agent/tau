@@ -48,6 +48,11 @@ pub(super) struct State {
     pub(super) reply_waiters: HashMap<String, smol::channel::Sender<String>>,
     /// Monotonic counter for generating unique msg_ids.
     pub(super) next_msg_id: u64,
+    /// Per-session Tier-3 post-idle action queue.  Drained after the
+    /// session's lock is released (agent turn exits).  Actions enqueued
+    /// while draining are appended for a bounded number of drain rounds
+    /// to prevent infinite loops.  See `PostIdleAction` for semantics.
+    pub(super) post_idle_queue: HashMap<String, Vec<crate::types::PostIdleAction>>,
 }
 
 pub(super) type SharedState = Arc<Mutex<State>>;

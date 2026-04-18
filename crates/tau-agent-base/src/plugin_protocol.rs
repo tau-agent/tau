@@ -156,6 +156,11 @@ pub struct PluginToolResult {
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Tier-2 actions to run after this tool result is persisted to the
+    /// caller's session history. Drained by the agent loop once the tool
+    /// result reaches the caller's history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_persist_actions: Vec<crate::types::PostPersistAction>,
 }
 
 /// Convert a `PluginToolDef` to a `Tool` (for LLM context).

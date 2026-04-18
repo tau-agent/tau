@@ -841,6 +841,13 @@ pub(super) async fn handle_client(
                     &test_overrides,
                 );
 
+                // Tier-3 post-idle drain: release the session lock, then run
+                // queued post-idle actions (e.g. archive caller's subtree).
+                // Actions must run AFTER the lock drops so they can freely
+                // grab session locks without deadlocking.
+                drop(_session_guard);
+                super::post_idle::drain(&state, &session_id).await;
+
                 if shutdown.is_shutting_down() {
                     send(
                         &mut writer,
@@ -1803,6 +1810,18 @@ pub(super) async fn handle_client(
                 shutdown.request_shutdown(restart);
                 send(&mut writer, &Response::Ok).await?;
                 return Ok(());
+            }
+            crate::protocol::Request::EnqueuePostIdleAction { .. } => {
+                // Post-idle enqueueing is only meaningful from a plugin
+                // context where the caller's session is known. External
+                // clients should not be able to enqueue post-idle work.
+                send(
+                    &mut writer,
+                    &Response::Error {
+                        message: "enqueue_post_idle_action is only available from plugins".into(),
+                    },
+                )
+                .await?;
             }
             crate::protocol::Request::SetTagline {
                 session_id,

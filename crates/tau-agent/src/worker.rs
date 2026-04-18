@@ -244,6 +244,7 @@ async fn async_main() -> crate::Result<()> {
                                 content: result.content,
                                 is_error: result.is_error,
                                 summary: result.summary,
+                                post_persist_actions: Vec::new(),
                             }))
                             .await;
                     })

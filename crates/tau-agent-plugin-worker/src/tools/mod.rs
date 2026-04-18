@@ -97,6 +97,7 @@ pub fn execute_tool(
             timestamp: timestamp_ms(),
             duration_ms: None,
             summary: None,
+            post_persist_actions: Vec::new(),
         };
     }
 
@@ -120,6 +121,7 @@ pub fn execute_tool(
         timestamp: timestamp_ms(),
         duration_ms: None,
         summary: result.summary,
+        post_persist_actions: Vec::new(),
     }
 }
 

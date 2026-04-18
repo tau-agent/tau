@@ -1676,6 +1676,7 @@ mod tests {
                 timestamp: 4001,
                 duration_ms: None,
                 summary: None,
+                post_persist_actions: Vec::new(),
             }),
         )
         .unwrap();
@@ -1969,6 +1970,7 @@ mod tests {
                 timestamp: 2000,
                 duration_ms: None,
                 summary: None,
+                post_persist_actions: Vec::new(),
             }),
         )
         .unwrap();

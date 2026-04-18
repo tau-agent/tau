@@ -232,6 +232,47 @@ pub struct ToolResultMessage {
     pub duration_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Tier-2 actions to run after this tool result is persisted to the
+    /// caller's session history, still inside the caller's turn. Ordering:
+    /// actions run in vec order, each strictly after `emit_message` has
+    /// persisted this tool result.
+    ///
+    /// Not serialised as part of the permanent message history — these are
+    /// transient side effects attached to the returned tool result and
+    /// dropped once drained by the agent loop.
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub post_persist_actions: Vec<PostPersistAction>,
+}
+
+/// Tier-2 actions the server performs after persisting a tool result,
+/// still inside the calling session's agent loop (lock held).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PostPersistAction {
+    /// Append an info message to any session's history. Use this for side
+    /// effects that must render after the tool result (typically, info
+    /// messages going to the caller's own session).
+    EmitInfoMessage {
+        target_session_id: String,
+        text: String,
+    },
+}
+
+/// Tier-3 actions the server performs after the calling session's lock is
+/// released — i.e. after the agent loop exits. Used for side effects that
+/// need exclusive access to the caller's session or its subtree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PostIdleAction {
+    /// Archive all archivable sessions for a task (worker, planner, refiner,
+    /// reviewer, log roles). Retries up to 20 times on "session busy"
+    /// errors, 1s apart, before giving up.
+    ArchiveTaskSessions { task_id: i64 },
+    /// Run the merge pass for an approved task. One-shot; failure transitions
+    /// the task to `failed` state and notifies the root session. Used for
+    /// merges triggered by a tool call where the caller is part of the task
+    /// being merged.
+    MergeTask { task_id: i64 },
 }
 
 impl ToolResultMessage {
@@ -252,6 +293,7 @@ impl ToolResultMessage {
             timestamp: timestamp_ms(),
             duration_ms: None,
             summary: None,
+            post_persist_actions: Vec::new(),
         }
     }
 
@@ -268,6 +310,7 @@ impl ToolResultMessage {
             timestamp: timestamp_ms(),
             duration_ms: None,
             summary: None,
+            post_persist_actions: Vec::new(),
         }
     }
 }
@@ -650,6 +693,7 @@ mod tests {
             timestamp: 1000,
             duration_ms: Some(1234),
             summary: None,
+            post_persist_actions: Vec::new(),
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(json.contains("\"duration_ms\":1234"));

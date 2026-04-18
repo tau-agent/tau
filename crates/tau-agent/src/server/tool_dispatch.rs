@@ -147,6 +147,7 @@ pub(super) async fn execute_tool_impl(
             timestamp: timestamp_ms(),
             duration_ms: None,
             summary: None,
+            post_persist_actions: Vec::new(),
         },
     };
 
@@ -493,6 +494,16 @@ pub(super) async fn handle_server_request(
             text,
         } => {
             queue_info_to_session(state, target_session_id, text);
+            Response::Ok
+        }
+        Request::EnqueuePostIdleAction { session_id, action } => {
+            {
+                let mut st = lock_state(state);
+                st.post_idle_queue
+                    .entry(session_id.clone())
+                    .or_default()
+                    .push(action.clone());
+            }
             Response::Ok
         }
         Request::ArchiveSession {

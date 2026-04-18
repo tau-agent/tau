@@ -651,6 +651,7 @@ impl PluginHandle {
                         timestamp: crate::types::timestamp_ms(),
                         duration_ms: None,
                         summary: result.summary,
+                        post_persist_actions: result.post_persist_actions,
                     });
                 }
                 PluginMessage::ServerRequest {

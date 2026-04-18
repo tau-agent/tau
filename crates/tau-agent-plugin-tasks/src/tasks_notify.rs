@@ -276,6 +276,36 @@ pub fn notify_state_change(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) {
+    notify_state_change_split(
+        db,
+        task,
+        from,
+        context,
+        None,
+        writer,
+        reader,
+        &mut Vec::new(),
+    );
+}
+
+/// Like [`notify_state_change`] but splits the recipient list into
+/// "others" (fired eagerly as Tier-1) and "self" (the `caller_session_id`,
+/// if any, which is accumulated into `post_persist` as Tier-2 actions so
+/// the info message renders *after* the tool result in the caller's
+/// session history).
+///
+/// When `caller_session_id` is `None`, behaves identically to
+/// [`notify_state_change`] — all recipients fire eagerly.
+pub fn notify_state_change_split(
+    db: &TasksDb,
+    task: &Task,
+    from: &str,
+    context: Option<&str>,
+    caller_session_id: Option<&str>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+    post_persist: &mut Vec<tau_agent_plugin::PostPersistAction>,
+) {
     if from == task.state {
         // No actual transition — avoid noise.
         return;
@@ -285,6 +315,15 @@ pub fn notify_state_change(
     let recipients = collect_recipients(db, task, writer, reader);
 
     for sid in recipients {
+        if caller_session_id == Some(sid.as_str()) {
+            // Defer to Tier-2 so this renders after the tool result in the
+            // caller's history.
+            post_persist.push(tau_agent_plugin::PostPersistAction::EmitInfoMessage {
+                target_session_id: sid,
+                text: text.clone(),
+            });
+            continue;
+        }
         let _ = server_request(
             writer,
             reader,
@@ -598,6 +637,101 @@ mod tests {
         assert_eq!(
             calls[0].1,
             format!("[task #{}] T1: ready → active", task.id)
+        );
+    }
+
+    /// `notify_state_change_split` with `caller_session_id == Some("s-worker")`
+    /// sends the message to the caller via `post_persist` (Tier-2), not via
+    /// the eager QueueInfo wire path.
+    #[test]
+    fn notify_split_defers_caller_to_post_persist() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Split", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec worker");
+        db.record_session(task.id, "s-other", "refiner")
+            .expect("rec other");
+        db.set_session_id(task.id, "s-worker").expect("sid");
+        task.state = "active".into();
+        task.session_id = Some("s-worker".into());
+
+        let (shared, mut w, mut r) = make_io();
+        let mut post_persist: Vec<tau_agent_plugin::PostPersistAction> = Vec::new();
+        notify_state_change_split(
+            &db,
+            &task,
+            "ready",
+            None,
+            Some("s-worker"),
+            &mut w,
+            &mut r,
+            &mut post_persist,
+        );
+
+        // Caller (s-worker) must NOT appear in queue_info calls — it's
+        // deferred to post_persist.
+        let calls = captured_sorted(&shared);
+        let eager_sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(
+            !eager_sids.contains(&"s-worker"),
+            "caller should not be in eager QueueInfo: {:?}",
+            calls
+        );
+        // Non-caller (s-other) still fires eagerly.
+        assert!(
+            eager_sids.contains(&"s-other"),
+            "non-caller should fire eagerly: {:?}",
+            calls
+        );
+
+        // Caller's info message is in post_persist with the right text.
+        let expected = format!("[task #{}] Split: ready → active", task.id);
+        assert_eq!(post_persist.len(), 1, "post_persist: {:?}", post_persist);
+        match &post_persist[0] {
+            tau_agent_plugin::PostPersistAction::EmitInfoMessage {
+                target_session_id,
+                text,
+            } => {
+                assert_eq!(target_session_id, "s-worker");
+                assert_eq!(text, &expected);
+            }
+        }
+    }
+
+    /// `notify_state_change_split` with `caller_session_id == None` is
+    /// indistinguishable from `notify_state_change` — everyone fires
+    /// eagerly.
+    #[test]
+    fn notify_split_caller_none_fires_everything_eagerly() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "NoCaller", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec");
+        db.record_session(task.id, "s-other", "refiner")
+            .expect("rec2");
+        task.state = "active".into();
+
+        let (shared, mut w, mut r) = make_io();
+        let mut post_persist: Vec<tau_agent_plugin::PostPersistAction> = Vec::new();
+        notify_state_change_split(
+            &db,
+            &task,
+            "ready",
+            None,
+            None,
+            &mut w,
+            &mut r,
+            &mut post_persist,
+        );
+
+        let calls = captured_sorted(&shared);
+        let sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(sids.contains(&"s-worker"), "sids: {:?}", sids);
+        assert!(sids.contains(&"s-other"), "sids: {:?}", sids);
+        assert!(
+            post_persist.is_empty(),
+            "no caller → post_persist empty: {:?}",
+            post_persist
         );
     }
 

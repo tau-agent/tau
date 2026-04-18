@@ -3,6 +3,7 @@
 mod agent_runner;
 mod dispatch;
 mod notifications;
+mod post_idle;
 mod registry;
 mod state;
 pub(crate) mod task_handlers;
@@ -223,6 +224,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         session_done_waiters: Vec::new(),
         reply_waiters: HashMap::new(),
         next_msg_id: 0,
+        post_idle_queue: HashMap::new(),
     }));
 
     log_stale_phases_at_startup(&state);
@@ -382,6 +384,7 @@ pub async fn run() -> crate::Result<()> {
         session_done_waiters: Vec::new(),
         reply_waiters: HashMap::new(),
         next_msg_id: 0,
+        post_idle_queue: HashMap::new(),
     }));
 
     log_stale_phases_at_startup(&state);

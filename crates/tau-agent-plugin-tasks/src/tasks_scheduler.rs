@@ -1356,6 +1356,20 @@ pub fn merge_approved(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<Vec<MergeAttempt>> {
+    merge_approved_for_caller(db, resolve_path, None, writer, reader)
+}
+
+/// Variant of [`merge_approved`] that threads a caller session id through
+/// [`merge_one_task`] — the caller may be in the to-be-archived subtree
+/// of one of the approved tasks, in which case archival is deferred to
+/// Tier-3.  See [`crate::tasks_merge::merge_task_for_caller`].
+pub fn merge_approved_for_caller(
+    db: &TasksDb,
+    resolve_path: &dyn Fn(&str) -> tau_agent_plugin::Result<String>,
+    caller_session_id: Option<&str>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> tau_agent_plugin::Result<Vec<MergeAttempt>> {
     let approved = db.get_approved_tasks(None)?;
     if approved.is_empty() {
         return Ok(Vec::new());
@@ -1376,7 +1390,7 @@ pub fn merge_approved(
 
     for tasks in by_target.values() {
         for task in tasks {
-            let attempt = merge_one_task(db, task, resolve_path, writer, reader);
+            let attempt = merge_one_task(db, task, resolve_path, caller_session_id, writer, reader);
             attempts.push(attempt);
         }
     }
@@ -1392,6 +1406,7 @@ fn merge_one_task(
     db: &TasksDb,
     task: &Task,
     resolve_path: &dyn Fn(&str) -> tau_agent_plugin::Result<String>,
+    caller_session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> MergeAttempt {
@@ -1465,7 +1480,14 @@ fn merge_one_task(
             };
         }
     };
-    match crate::tasks_merge::merge_task(db, task_id, &project_dir, writer, reader) {
+    match crate::tasks_merge::merge_task_for_caller(
+        db,
+        task_id,
+        &project_dir,
+        caller_session_id,
+        writer,
+        reader,
+    ) {
         Ok(result) => {
             if result.success {
                 // Transition to merged
@@ -3498,6 +3520,7 @@ mod tests {
                             )],
                             is_error: true,
                             summary: None,
+                            post_persist_actions: Vec::new(),
                         }),
                     );
                 }

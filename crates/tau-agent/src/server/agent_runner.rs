@@ -182,6 +182,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                         timestamp: crate::types::timestamp_ms(),
                         duration_ms: None,
                         summary: result.summary,
+                        post_persist_actions: result.post_persist_actions,
                     });
                 }
                 crate::plugin::PluginMessage::ServerRequest {
@@ -383,6 +384,27 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                 tracing::warn!(%e, "db error persisting agent message");
             }
         }))),
+        post_persist_callback: {
+            let state_clone_pp = state.clone();
+            Some(Box::new(
+                move |actions: &[tau_agent_base::types::PostPersistAction]| {
+                    for action in actions {
+                        match action {
+                            tau_agent_base::types::PostPersistAction::EmitInfoMessage {
+                                target_session_id,
+                                text,
+                            } => {
+                                super::notifications::queue_info_to_session(
+                                    &state_clone_pp,
+                                    target_session_id,
+                                    text,
+                                );
+                            }
+                        }
+                    }
+                },
+            ))
+        },
         refresh_api_key: {
             let state_clone_refresh = state.clone();
             let provider_name = model.provider.clone();
@@ -819,6 +841,11 @@ pub(super) async fn run_child_chat(
         &test_overrides,
     );
 
+    // Tier-3 post-idle drain: release the session lock, then run queued
+    // post-idle actions (archive caller's subtree, etc.).
+    drop(_session_guard);
+    super::post_idle::drain(&state, &session_id).await;
+
     Ok(())
 }
 
@@ -1064,6 +1091,11 @@ pub(super) async fn resume_child_session(
         &session_id,
         &test_overrides,
     );
+
+    // Tier-3 post-idle drain: release the session lock, then run queued
+    // post-idle actions (archive caller's subtree, etc.).
+    drop(_session_guard);
+    super::post_idle::drain(&state, &session_id).await;
 
     Ok(())
 }
