@@ -11,7 +11,7 @@ use tau_agent::protocol::format_tokens;
 use tau_agent::types::AgentPhase;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, PickerRow, PickerView};
 use crate::theme::{Theme, ThemeColor};
 
 /// Draw the full UI.
@@ -983,6 +983,7 @@ fn live_indicator(task: &tau_agent::protocol::TaskInfo, theme: &Theme) -> (&'sta
 ///
 /// A task at depth D is the last sibling if no later filtered task shares
 /// the same depth without an intervening task at a shallower depth.
+#[allow(dead_code)]
 fn compute_is_last_flags(
     tasks: &[(usize, tau_agent::protocol::TaskInfo)],
     filtered: &[usize],
@@ -1008,15 +1009,12 @@ fn compute_is_last_flags(
 fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     use ratatui::widgets::Clear;
 
-    let filtered = app.task_picker_filtered_indices();
-
     // Use most of the screen width
     let picker_width: u16 = (area.width * 3 / 4)
         .max(50)
         .min(area.width.saturating_sub(2));
-    // Height: tasks + footer(1) + borders(2), clamped to area
-    let content_lines = filtered.len().max(1) as u16;
-    let picker_height = (content_lines + 3).min(area.height.saturating_sub(2));
+    // Height: generous — overview may be longer than viewport, let scroll do its job.
+    let picker_height = area.height.saturating_sub(2).max(10);
 
     // Position: centered
     let x = (area.width.saturating_sub(picker_width)) / 2;
@@ -1026,17 +1024,22 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Clear the area behind the overlay
     frame.render_widget(Clear, picker_area);
 
-    // Title includes filter/create mode when active
+    let view_label = match app.picker_view {
+        PickerView::SchedulerState => "",
+        PickerView::Ancestry => " ANCESTRY (g)",
+    };
+
+    // Title includes filter/create mode + view label.
     let title = if app.task_picker_create_mode && !app.task_picker_filter.is_empty() {
-        format!(" Tasks [+{}] ", app.task_picker_filter)
+        format!(" Tasks{} [+{}] ", view_label, app.task_picker_filter)
     } else if app.task_picker_create_mode {
-        " Tasks [+] ".to_string()
+        format!(" Tasks{} [+] ", view_label)
     } else if !app.task_picker_filter.is_empty() {
-        format!(" Tasks [/{}] ", app.task_picker_filter)
+        format!(" Tasks{} [/{}] ", view_label, app.task_picker_filter)
     } else if app.task_picker_filter_mode {
-        " Tasks [/] ".to_string()
+        format!(" Tasks{} [/] ", view_label)
     } else {
-        " Tasks ".to_string()
+        format!(" Tasks{} ", view_label)
     };
 
     // Border
@@ -1058,38 +1061,102 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         return;
     }
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
     let w = inner.width as usize;
+    // Reserve 1 line for the footer hint.
+    let viewport_rows = (inner.height as usize).saturating_sub(1);
 
-    // Right-side column widths
-    const PRI_W: usize = 3; // "p0" .. "p9"
-    const SES_W: usize = 8; // session id
-    const COL_GAP: usize = 2;
-    let right_len = COL_GAP + PRI_W + COL_GAP + SES_W;
+    // Build the full row list for the current view.
+    let rows = app.task_picker_rows();
 
-    if app.picker_tasks.is_empty() {
+    // Empty-state early exit (no rows at all — e.g. scheduler view with nothing).
+    if rows.is_empty() || viewport_rows == 0 {
+        let hint = picker_footer_hint(app);
+        let hint_display: String = if hint.len() > w {
+            hint[..w].to_string()
+        } else {
+            hint.to_string()
+        };
+        let msg = if app.picker_groups.inflight_count == 0
+            && app.picker_tasks.is_empty()
+            && app.picker_groups.max_concurrent == 0
+        {
+            " (loading...)"
+        } else {
+            " (no matches)"
+        };
+        let text = Text::from(vec![
+            Line::from(Span::styled(msg, theme.fg(theme.muted))),
+            Line::from(Span::styled(hint_display, theme.fg(theme.dim))),
+        ]);
+        frame.render_widget(Paragraph::new(text), inner);
+        return;
+    }
+
+    // Scroll offset handled in-place: resolve cursor_row, then clamp offset.
+    let cursor_row =
+        crate::app::selectable_row_index_for_cursor(&rows, app.task_picker_cursor).unwrap_or(0);
+    let margin = if viewport_rows >= 4 { 1 } else { 0 };
+    let mut offset = app.task_picker_scroll_offset;
+    if cursor_row < offset.saturating_add(margin) {
+        offset = cursor_row.saturating_sub(margin);
+    }
+    if cursor_row + margin + 1 > offset + viewport_rows {
+        offset = (cursor_row + margin + 1).saturating_sub(viewport_rows);
+    }
+    if offset + viewport_rows > rows.len() {
+        offset = rows.len().saturating_sub(viewport_rows);
+    }
+
+    let end = (offset + viewport_rows).min(rows.len());
+    let above = offset;
+    let below = rows.len().saturating_sub(end);
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Scroll-indicator top line (inside viewport when there's content above).
+    if above > 0 && viewport_rows >= 3 {
         lines.push(Line::from(Span::styled(
-            " (loading...)",
-            theme.fg(theme.muted),
+            format!(" ▲ {} more above", above),
+            theme.fg(theme.dim),
         )));
-    } else if filtered.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " (no matches)",
-            theme.fg(theme.muted),
-        )));
-    } else {
-        // Compute is_last flags for tree connectors
-        let is_last_flags = compute_is_last_flags(&app.picker_tasks, &filtered);
+    }
 
-        for (filter_pos, &task_idx) in filtered.iter().enumerate() {
-            let (depth, ref task) = app.picker_tasks[task_idx];
-            let is_selected = filter_pos == app.task_picker_cursor;
-            let is_last = is_last_flags[filter_pos];
+    for (row_idx, row) in rows[offset..end].iter().enumerate() {
+        let abs_idx = offset + row_idx;
+        // Replace the first/last visible line with the scroll indicator if needed.
+        if (above > 0 && row_idx == 0) || (below > 0 && abs_idx == end - 1 && row_idx > 0) {
+            // We already pushed the top indicator if needed; skip rendering the
+            // task that sits in that slot so it doesn't show truncated.
+            if above > 0 && row_idx == 0 {
+                continue;
+            }
+            // Bottom indicator: replace the last line.
+            lines.push(Line::from(Span::styled(
+                format!(" ▼ {} more below", below),
+                theme.fg(theme.dim),
+            )));
+            continue;
+        }
+        match row {
+            PickerRow::Header(text) => {
+                lines.push(render_group_header(text, w, theme));
+            }
+            PickerRow::Task {
+                depth,
+                task,
+                parent_out_of_group,
+                suppress_state_label,
+                blocked_on,
+                age_hint,
+            } => {
+                let is_selected =
+                    crate::app::selectable_row_index_for_cursor(&rows, app.task_picker_cursor)
+                        .map(|idx| idx == abs_idx)
+                        .unwrap_or(false);
 
-            // Confirmation prompt replaces the selected row
-            if is_selected {
-                if let Some((confirm_cursor, ref confirm_label, _)) = app.task_picker_confirm {
-                    if confirm_cursor == app.task_picker_cursor {
+                // Confirmation prompt replaces the selected row.
+                if is_selected {
+                    if let Some((_, ref confirm_label, _)) = app.task_picker_confirm {
                         let confirm_text = format!(" {} y/n", confirm_label);
                         let confirm_padded = if confirm_text.len() < w {
                             format!("{}{}", confirm_text, " ".repeat(w - confirm_text.len()))
@@ -1103,129 +1170,25 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         continue;
                     }
                 }
+
+                lines.push(render_task_row(
+                    task,
+                    *depth,
+                    *parent_out_of_group,
+                    *suppress_state_label,
+                    blocked_on,
+                    age_hint.as_deref(),
+                    is_selected,
+                    !app.task_picker_filter.is_empty(),
+                    w,
+                    theme,
+                ));
             }
-
-            // Build spans for this row
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            let mut used = 0usize;
-
-            // Tree indent with connectors (flatten when filtering)
-            let connector = if !app.task_picker_filter.is_empty() || depth == 0 {
-                String::new()
-            } else if is_last {
-                format!("{}└── ", "│   ".repeat(depth - 1))
-            } else {
-                format!("{}├── ", "│   ".repeat(depth - 1))
-            };
-            spans.push(Span::styled(format!(" {}", connector), theme.fg(theme.dim)));
-            used += 1 + UnicodeWidthStr::width(connector.as_str());
-
-            // Live-session indicator: a dot before the state icon when any
-            // session recorded on this task is actively running.
-            let (live_glyph, live_style) = live_indicator(task, theme);
-            spans.push(Span::styled(live_glyph.to_string(), live_style));
-            used += 2;
-
-            // State icon
-            let (icon, icon_style) = task_state_style(&task.state, theme);
-            spans.push(Span::styled(format!("{} ", icon), icon_style));
-            // State icons are typically width 1 + 1 space = 2
-            used += UnicodeWidthStr::width(icon).max(1) + 1;
-
-            // Task ID (right-aligned, 4 chars + 1 space)
-            let id_style = if is_selected {
-                theme.fg(theme.text)
-            } else {
-                theme.fg(theme.muted)
-            };
-            spans.push(Span::styled(format!("{:>4} ", task.id), id_style));
-            used += 5;
-
-            // Right-side info: priority + session
-            let pri_str = format!("p{}", task.priority);
-            let session_str: String = task
-                .session_id
-                .as_deref()
-                .unwrap_or("-")
-                .chars()
-                .take(SES_W)
-                .collect();
-
-            let right_text = format!(
-                "  {:>pri_w$}  {:>ses_w$}",
-                pri_str,
-                session_str,
-                pri_w = PRI_W,
-                ses_w = SES_W,
-            );
-
-            // Title fills the middle
-            let title_space = w.saturating_sub(used + right_len + 1);
-            let title_style = if task.state == "merged" || task.state == "closed" {
-                theme.italic_fg(theme.dim)
-            } else if is_selected {
-                theme.fg(theme.text)
-            } else {
-                Style::default()
-            };
-
-            let title_display = if title_space >= 4 {
-                if UnicodeWidthStr::width(task.title.as_str()) > title_space {
-                    format!(
-                        " {}...",
-                        truncate_to_width(&task.title, title_space.saturating_sub(4))
-                    )
-                } else {
-                    format!(" {}", task.title)
-                }
-            } else {
-                String::new()
-            };
-
-            spans.push(Span::styled(title_display, title_style));
-
-            // Pad to push right-side block to the right edge
-            let line_so_far_width: usize = spans
-                .iter()
-                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
-                .sum();
-            let pad = w.saturating_sub(line_so_far_width + right_len);
-            if pad > 0 {
-                spans.push(Span::raw(" ".repeat(pad)));
-            }
-
-            spans.push(Span::styled(right_text, theme.fg(theme.dim)));
-
-            // Row style (selection background)
-            let row_style = if is_selected {
-                Style::default().bg(theme.selected_bg.to_ratatui())
-            } else {
-                Style::default()
-            };
-
-            let mut line = Line::from(spans);
-            // Pad the entire line to full width for selection highlight
-            let line_w = line.width();
-            if line_w < w {
-                line.spans
-                    .push(Span::styled(" ".repeat(w - line_w), row_style));
-            }
-            line = line.style(row_style);
-
-            lines.push(line);
         }
     }
 
     // Footer hint
-    let hint = if app.task_picker_confirm.is_some() {
-        " y/enter confirm  any key cancel"
-    } else if app.task_picker_create_mode {
-        " type title  enter create  esc cancel"
-    } else if app.task_picker_filter_mode {
-        " type to filter  enter accept  esc clear"
-    } else {
-        " /search  c new  j/k nav  enter view  a approve  r ready  d dispatch  g goto  F2/esc close"
-    };
+    let hint = picker_footer_hint(app);
     let hint_display: String = if hint.len() > w {
         hint[..w].to_string()
     } else {
@@ -1233,28 +1196,186 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     };
     lines.push(Line::from(Span::styled(hint_display, theme.fg(theme.dim))));
 
-    // Scroll the task list if needed
-    let available_lines = inner.height as usize;
-    let task_lines = available_lines.saturating_sub(1); // reserve 1 for hint
-
-    if lines.len() > available_lines {
-        let num_tasks = lines.len() - 1; // exclude hint
-        let hint_line = lines.pop().expect("lines not empty: hint was just pushed");
-
-        let scroll_start = if app.task_picker_cursor >= task_lines {
-            app.task_picker_cursor - task_lines + 1
-        } else {
-            0
-        };
-        let scroll_end = (scroll_start + task_lines).min(num_tasks);
-
-        let mut visible: Vec<Line<'static>> = lines[scroll_start..scroll_end].to_vec();
-        visible.push(hint_line);
-        lines = visible;
-    }
-
     let text = Text::from(lines);
     frame.render_widget(Paragraph::new(text), inner);
+}
+
+fn picker_footer_hint(app: &App) -> &'static str {
+    if app.task_picker_confirm.is_some() {
+        " y/enter confirm  any key cancel"
+    } else if app.task_picker_create_mode {
+        " type title  enter create  esc cancel"
+    } else if app.task_picker_filter_mode {
+        " type to filter  enter accept  esc clear"
+    } else {
+        " /search  c new  j/k nav  enter goto  d detail  a approve  r ready  x dispatch  g view  F2/esc close"
+    }
+}
+
+/// Render a non-selectable section header.
+fn render_group_header(text: &str, w: usize, theme: &Theme) -> Line<'static> {
+    let pad = if text.len() + 1 < w {
+        w - text.len() - 1
+    } else {
+        0
+    };
+    let header = format!(" {}{}", text, " ".repeat(pad));
+    Line::from(Span::styled(
+        header,
+        theme
+            .bold_fg(theme.accent)
+            .add_modifier(ratatui::style::Modifier::UNDERLINED),
+    ))
+}
+
+/// Render a single task row (shared between scheduler and ancestry views).
+#[allow(clippy::too_many_arguments)]
+fn render_task_row(
+    task: &tau_agent::protocol::TaskInfo,
+    depth: usize,
+    parent_out_of_group: bool,
+    suppress_state_label: bool,
+    blocked_on: &[i64],
+    age_hint: Option<&str>,
+    is_selected: bool,
+    filter_active: bool,
+    w: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    const PRI_W: usize = 3;
+    const SES_W: usize = 8;
+    const COL_GAP: usize = 2;
+    let right_len = COL_GAP + PRI_W + COL_GAP + SES_W;
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+
+    // Indent (flatten when filter is active).
+    let indent = if filter_active || depth == 0 {
+        String::new()
+    } else {
+        "│   ".repeat(depth.saturating_sub(1)) + "└── "
+    };
+    spans.push(Span::styled(format!(" {}", indent), theme.fg(theme.dim)));
+    used += 1 + UnicodeWidthStr::width(indent.as_str());
+
+    // Live-session indicator.
+    let (live_glyph, live_style) = live_indicator(task, theme);
+    spans.push(Span::styled(live_glyph.to_string(), live_style));
+    used += 2;
+
+    // State / held icon.
+    let (icon, icon_style) = if task.held {
+        ("🔒", theme.fg(theme.warning))
+    } else {
+        task_state_style(&task.state, theme)
+    };
+    spans.push(Span::styled(format!("{} ", icon), icon_style));
+    used += UnicodeWidthStr::width(icon).max(1) + 1;
+
+    // Task id.
+    let id_style = if is_selected {
+        theme.fg(theme.text)
+    } else {
+        theme.fg(theme.muted)
+    };
+    spans.push(Span::styled(format!("{:>4} ", task.id), id_style));
+    used += 5;
+
+    // Right-side info: priority + session.
+    let pri_str = if task.priority > 0 {
+        format!("p{}", task.priority)
+    } else {
+        "   ".to_string()
+    };
+    let session_str: String = task
+        .session_id
+        .as_deref()
+        .unwrap_or("-")
+        .chars()
+        .take(SES_W)
+        .collect();
+    let right_text = format!(
+        "  {:>pri_w$}  {:>ses_w$}",
+        pri_str,
+        session_str,
+        pri_w = PRI_W,
+        ses_w = SES_W,
+    );
+
+    // Title + optional metadata suffixes.
+    let mut title_text = task.title.clone();
+    if !suppress_state_label && !task.held {
+        // prefix with state label in brackets when group is mixed (active/blocked/held).
+        // Use short form.
+    }
+    if parent_out_of_group {
+        if let Some(pid) = task.parent_id {
+            title_text.push_str(&format!(" (parent: #{})", pid));
+        }
+    }
+    if !blocked_on.is_empty() {
+        let suffix: String = blocked_on
+            .iter()
+            .map(|id| format!("⏳ #{}", id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        title_text.push_str(&format!("  {}", suffix));
+    }
+    if task.held {
+        title_text.push_str("  🔒 held");
+    }
+    if let Some(age) = age_hint {
+        title_text.push_str(&format!("  {} ago", age.trim_end_matches(" ago")));
+    }
+
+    let title_style = if matches!(task.state.as_str(), "merged" | "closed") {
+        theme.italic_fg(theme.dim)
+    } else if is_selected {
+        theme.fg(theme.text)
+    } else {
+        Style::default()
+    };
+    let title_space = w.saturating_sub(used + right_len + 1);
+    let title_display = if title_space >= 4 {
+        if UnicodeWidthStr::width(title_text.as_str()) > title_space {
+            format!(
+                " {}...",
+                truncate_to_width(&title_text, title_space.saturating_sub(4))
+            )
+        } else {
+            format!(" {}", title_text)
+        }
+    } else {
+        String::new()
+    };
+    spans.push(Span::styled(title_display, title_style));
+
+    // Pad to push right-side block to the right edge.
+    let line_so_far_width: usize = spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    let pad = w.saturating_sub(line_so_far_width + right_len);
+    if pad > 0 {
+        spans.push(Span::raw(" ".repeat(pad)));
+    }
+    spans.push(Span::styled(right_text, theme.fg(theme.dim)));
+
+    // Selection background.
+    let row_style = if is_selected {
+        Style::default().bg(theme.selected_bg.to_ratatui())
+    } else {
+        Style::default()
+    };
+    let mut line = Line::from(spans);
+    let line_w = line.width();
+    if line_w < w {
+        line.spans
+            .push(Span::styled(" ".repeat(w - line_w), row_style));
+    }
+    line = line.style(row_style);
+    line
 }
 
 fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {

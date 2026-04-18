@@ -1343,6 +1343,7 @@ impl App {
     /// Index into the row list of the currently-selected task.
     /// `task_picker_cursor` is measured in *selectable* rows — this maps it
     /// back to the full-rows index used by the renderer.
+    #[allow(dead_code)]
     pub fn task_picker_selected_row_index(&self) -> Option<usize> {
         let rows = self.task_picker_rows();
         selectable_row_index_for_cursor(&rows, self.task_picker_cursor)
@@ -1369,6 +1370,7 @@ impl App {
     /// Resolve the task picker cursor to an index in `picker_tasks`.
     /// Returns `None` if no matching tasks or cursor is out of range.
     /// Only meaningful in `PickerView::Ancestry`.
+    #[allow(dead_code)]
     pub fn task_picker_selected_task_idx(&self) -> Option<usize> {
         let filtered = self.task_picker_filtered_indices();
         filtered.get(self.task_picker_cursor).copied()
@@ -1414,6 +1416,7 @@ impl App {
     /// `viewport_rows` is the number of body rows we can show (excluding
     /// the footer hint).  Called by the renderer before draw and by
     /// navigation handlers when the viewport height is known.
+    #[allow(dead_code)]
     pub fn task_picker_adjust_scroll(&mut self, viewport_rows: usize) {
         let rows = self.task_picker_rows();
         let total = rows.len();
@@ -1549,12 +1552,15 @@ impl App {
         if let Some((cursor_pos, _, action_kind)) = self.task_picker_confirm.take() {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    let filtered = self.task_picker_filtered_indices();
-                    if let Some(&real_idx) = filtered.get(cursor_pos) {
-                        if let Some((_, task)) = self.picker_tasks.get(real_idx) {
-                            let task_id = task.id;
-                            return self.execute_task_picker_confirm(task_id, action_kind);
-                        }
+                    // Save/restore cursor around the selection lookup: the
+                    // confirm prompt is pinned to `cursor_pos`, which may
+                    // differ from the current cursor if the user navigated.
+                    let saved = self.task_picker_cursor;
+                    self.task_picker_cursor = cursor_pos;
+                    let task = self.task_picker_selected_task();
+                    self.task_picker_cursor = saved;
+                    if let Some(task) = task {
+                        return self.execute_task_picker_confirm(task.id, action_kind);
                     }
                     None
                 }
@@ -1604,7 +1610,7 @@ impl App {
         }
         // Priority 4: Normal navigation
         else {
-            let filtered_len = self.task_picker_filtered_indices().len();
+            let selectable_count = self.task_picker_selectable_count();
             match (key.code, key.modifiers) {
                 // / enters filter mode
                 (KeyCode::Char('/'), _) => {
@@ -1626,7 +1632,7 @@ impl App {
                 }
                 // Navigate down
                 (KeyCode::Down | KeyCode::Char('j'), _) => {
-                    if filtered_len > 0 && self.task_picker_cursor < filtered_len - 1 {
+                    if selectable_count > 0 && self.task_picker_cursor < selectable_count - 1 {
                         self.task_picker_cursor += 1;
                     }
                     None
@@ -1639,10 +1645,10 @@ impl App {
                 }
                 // Page down
                 (KeyCode::PageDown, _) => {
-                    if filtered_len > 0 {
+                    if selectable_count > 0 {
                         const PAGE_SIZE: usize = 10;
                         self.task_picker_cursor =
-                            (self.task_picker_cursor + PAGE_SIZE).min(filtered_len - 1);
+                            (self.task_picker_cursor + PAGE_SIZE).min(selectable_count - 1);
                     }
                     None
                 }
@@ -1653,25 +1659,41 @@ impl App {
                 }
                 // End: jump to last
                 (KeyCode::End, _) => {
-                    if filtered_len > 0 {
-                        self.task_picker_cursor = filtered_len - 1;
+                    if selectable_count > 0 {
+                        self.task_picker_cursor = selectable_count - 1;
                     }
                     None
                 }
-                // Enter: fetch task detail
+                // Enter: switch to the task's primary session if available;
+                // fall back to opening detail (handled in TaskDetail response).
                 (KeyCode::Enter, _) => {
-                    if let Some(idx) = self.task_picker_selected_task_idx()
-                        && let Some((_, task)) = self.picker_tasks.get(idx)
-                    {
+                    if let Some(task) = self.task_picker_selected_task() {
+                        self.pending_task_switch = Some(task.id);
                         return Some(Action::TaskGet { id: task.id });
+                    }
+                    None
+                }
+                // d: open task detail pane (read-only view, no session switch).
+                (KeyCode::Char('d'), _) => {
+                    if let Some(task) = self.task_picker_selected_task() {
+                        return Some(Action::TaskGet { id: task.id });
+                    }
+                    None
+                }
+                // x: dispatch selected task (with confirmation).
+                (KeyCode::Char('x'), _) => {
+                    if let Some(task) = self.task_picker_selected_task() {
+                        self.task_picker_confirm = Some((
+                            self.task_picker_cursor,
+                            format!("Dispatch #{}?", task.id),
+                            TaskPickerConfirmAction::Dispatch,
+                        ));
                     }
                     None
                 }
                 // a: approve selected task (with confirmation)
                 (KeyCode::Char('a'), _) => {
-                    if let Some(idx) = self.task_picker_selected_task_idx()
-                        && let Some((_, task)) = self.picker_tasks.get(idx)
-                    {
+                    if let Some(task) = self.task_picker_selected_task() {
                         self.task_picker_confirm = Some((
                             self.task_picker_cursor,
                             format!("Approve #{}?", task.id),
@@ -1682,26 +1704,11 @@ impl App {
                 }
                 // r: ready selected task (with confirmation)
                 (KeyCode::Char('r'), _) => {
-                    if let Some(idx) = self.task_picker_selected_task_idx()
-                        && let Some((_, task)) = self.picker_tasks.get(idx)
-                    {
+                    if let Some(task) = self.task_picker_selected_task() {
                         self.task_picker_confirm = Some((
                             self.task_picker_cursor,
                             format!("Ready #{}?", task.id),
                             TaskPickerConfirmAction::Ready,
-                        ));
-                    }
-                    None
-                }
-                // d: dispatch selected task (with confirmation)
-                (KeyCode::Char('d'), _) => {
-                    if let Some(idx) = self.task_picker_selected_task_idx()
-                        && let Some((_, task)) = self.picker_tasks.get(idx)
-                    {
-                        self.task_picker_confirm = Some((
-                            self.task_picker_cursor,
-                            format!("Dispatch #{}?", task.id),
-                            TaskPickerConfirmAction::Dispatch,
                         ));
                     }
                     None
@@ -1713,9 +1720,7 @@ impl App {
                 }
                 // m: merge selected task (with confirmation)
                 (KeyCode::Char('m'), _) => {
-                    if let Some(idx) = self.task_picker_selected_task_idx()
-                        && let Some((_, task)) = self.picker_tasks.get(idx)
-                    {
+                    if let Some(task) = self.task_picker_selected_task() {
                         self.task_picker_confirm = Some((
                             self.task_picker_cursor,
                             format!("Merge #{}?", task.id),
@@ -1724,18 +1729,16 @@ impl App {
                     }
                     None
                 }
-                // g: go to session
+                // g: toggle view axis (scheduler <-> ancestry)
                 (KeyCode::Char('g'), _) => {
-                    if let Some(idx) = self.task_picker_selected_task_idx()
-                        && let Some((_, task)) = self.picker_tasks.get(idx)
-                        && let Some(ref session_id) = task.session_id
-                    {
-                        let session_id = session_id.clone();
-                        self.mode = self.task_picker_previous_mode;
-                        self.task_picker_reset_transient();
-                        return Some(Action::SwitchSession(session_id));
-                    }
-                    None
+                    self.picker_view = match self.picker_view {
+                        PickerView::SchedulerState => PickerView::Ancestry,
+                        PickerView::Ancestry => PickerView::SchedulerState,
+                    };
+                    self.task_picker_cursor = 0;
+                    self.task_picker_scroll_offset = 0;
+                    // Refresh with the appropriate request for the new view.
+                    return Some(self.task_picker_refresh_action());
                 }
                 // F2/Esc: close picker, restore previous mode
                 (KeyCode::F(2) | KeyCode::Esc, _) => {
@@ -2849,6 +2852,24 @@ impl App {
                     if let Some(sid) = primary_session_id(&task, &sessions) {
                         return Some(Action::SwitchSession(sid));
                     }
+                    // No live session: in picker mode, open the detail pane
+                    // read-only and surface a status message.  Outside the
+                    // picker (command-line driven switch), emit an error.
+                    if self.mode == AppMode::TaskPicker {
+                        self.messages.push(MessageItem::Status {
+                            text: format!("task #{}: no live session — detail view only", task.id),
+                        });
+                        self.task_picker_detail = Some(Box::new(TaskPickerDetail {
+                            task,
+                            messages,
+                            relations,
+                            subtasks,
+                            sessions,
+                            history,
+                            scroll: 0,
+                        }));
+                        return None;
+                    }
                     self.messages.push(MessageItem::Error {
                         text: format!("task #{} has no session to switch to", task.id),
                     });
@@ -3431,6 +3452,7 @@ pub(crate) fn selectable_row_index_for_cursor(rows: &[PickerRow], cursor: usize)
 
 /// Inverse of [`selectable_row_index_for_cursor`]: given a row index, return
 /// the cursor position of the *nearest* selectable row at or after it.
+#[allow(dead_code)]
 pub(crate) fn cursor_for_row_index(rows: &[PickerRow], row_index: usize) -> usize {
     let mut cursor = 0;
     for (i, r) in rows.iter().enumerate() {
@@ -4210,6 +4232,23 @@ mod tests {
             (1, make_task_info(2, "Second task", "review")),
             (0, make_task_info(3, "Third task", "approved")),
         ];
+        // Mirror the same data into the scheduler groups so tests that drive
+        // the default picker view (scheduler) find rows to select.
+        app.picker_groups = PickerGroups {
+            active: vec![
+                (0, make_task_info(1, "First task", "active")),
+                (0, make_task_info(2, "Second task", "review")),
+            ],
+            queued_ready: Vec::new(),
+            queued_planning: Vec::new(),
+            blocked: Vec::new(),
+            held: Vec::new(),
+            recently_merged: Vec::new(),
+            recently_closed: Vec::new(),
+            inflight_count: 2,
+            max_concurrent: 8,
+            blocked_on: std::collections::HashMap::new(),
+        };
     }
 
     /// AgentDone while task picker is open should NOT close the picker.
@@ -4505,21 +4544,26 @@ mod tests {
         }
     }
 
-    /// 'g' from normal mode goes to session.
+    /// 'g' toggles picker view axis; Enter switches to the primary session.
     #[test]
     fn task_picker_go_to_session() {
         let mut app = make_app();
         open_task_picker(&mut app, AppMode::Input);
         populate_picker_tasks(&mut app);
 
+        // `g` toggles view; default is SchedulerState, so first press -> Ancestry.
+        assert_eq!(app.picker_view, PickerView::SchedulerState);
         let key_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
         let action = app.handle_task_picker_key(&key_g);
-        match action {
-            Some(Action::SwitchSession(sid)) => assert_eq!(sid, "s100"),
-            other => panic!("expected SwitchSession, got {other:?}"),
-        }
-        // Picker should be closed
-        assert_eq!(app.mode, AppMode::Input);
+        // Returns a refresh action for the new view.
+        assert!(matches!(action, Some(Action::TaskList { .. })));
+        assert_eq!(app.picker_view, PickerView::Ancestry);
+        // Toggling back returns to scheduler.
+        let action = app.handle_task_picker_key(&key_g);
+        assert!(matches!(action, Some(Action::TaskOverview { .. })));
+        assert_eq!(app.picker_view, PickerView::SchedulerState);
+        // Picker stays open through toggles.
+        assert_eq!(app.mode, AppMode::TaskPicker);
     }
 
     /// TaskTree response in TaskPicker mode populates picker_tasks.
@@ -4575,12 +4619,24 @@ mod tests {
         let action = app.handle_server_response(Response::TaskUpdated {
             task: make_task_info(10, "Test task", "approved"),
         });
-        // Should return a TaskList action to refresh
+        // Default view is SchedulerState; refresh fires TaskOverview.
         match action {
-            Some(Action::TaskList { project, state }) => {
+            Some(Action::TaskOverview { project, .. }) => {
                 assert_eq!(project, "test-project");
             }
-            other => panic!("expected TaskList for refresh, got {other:?}"),
+            other => panic!("expected TaskOverview for refresh, got {other:?}"),
+        }
+
+        // In ancestry view, refresh still uses TaskList.
+        app.picker_view = PickerView::Ancestry;
+        let action = app.handle_server_response(Response::TaskUpdated {
+            task: make_task_info(11, "Another", "approved"),
+        });
+        match action {
+            Some(Action::TaskList { project, .. }) => {
+                assert_eq!(project, "test-project");
+            }
+            other => panic!("expected TaskList for ancestry refresh, got {other:?}"),
         }
     }
 
@@ -5181,5 +5237,261 @@ mod tests {
             }
             other => panic!("expected OpenTaskPickerWithState, got {other:?}"),
         }
+    }
+
+    // ---- Scheduler-grouped picker tests ----
+
+    fn make_groups_with(
+        active: Vec<TaskInfo>,
+        queued_ready: Vec<TaskInfo>,
+        blocked: Vec<TaskInfo>,
+        held: Vec<TaskInfo>,
+        recently_merged: Vec<TaskInfo>,
+    ) -> PickerGroups {
+        PickerGroups {
+            active: active.into_iter().map(|t| (0, t)).collect(),
+            queued_ready: queued_ready.into_iter().map(|t| (0, t)).collect(),
+            queued_planning: Vec::new(),
+            blocked: blocked.into_iter().map(|t| (0, t)).collect(),
+            held: held.into_iter().map(|t| (0, t)).collect(),
+            recently_merged,
+            recently_closed: Vec::new(),
+            inflight_count: 0,
+            max_concurrent: 8,
+            blocked_on: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn scheduler_view_rows_emits_headers_and_tasks() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.picker_groups = make_groups_with(
+            vec![make_task_info(1, "active", "active")],
+            vec![make_task_info(2, "ready", "ready")],
+            vec![make_task_info(3, "blocked", "ready")],
+            vec![make_task_info(4, "held", "ready")],
+            vec![make_task_info(5, "merged", "merged")],
+        );
+        let rows = app.task_picker_rows();
+        let mut headers: Vec<String> = Vec::new();
+        let mut ids: Vec<i64> = Vec::new();
+        for r in &rows {
+            match r {
+                PickerRow::Header(t) => headers.push(t.clone()),
+                PickerRow::Task { task, .. } => ids.push(task.id),
+            }
+        }
+        assert!(headers.iter().any(|h| h.starts_with("ACTIVE")));
+        assert!(headers.iter().any(|h| h.starts_with("QUEUED — READY")));
+        assert!(headers.iter().any(|h| h.starts_with("QUEUED — PLANNING")));
+        assert!(headers.iter().any(|h| h.starts_with("BLOCKED")));
+        assert!(headers.iter().any(|h| h.starts_with("HELD")));
+        assert!(headers.iter().any(|h| h.starts_with("RECENTLY COMPLETED")));
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn parent_out_of_group_pinned_to_depth_zero() {
+        // Child whose parent isn't in the same bucket: render at depth 0
+        // with parent_out_of_group = true.
+        let mut child = make_task_info(20, "orphan child", "active");
+        child.parent_id = Some(1234); // parent not in the group
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.picker_groups =
+            make_groups_with(vec![child], Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let rows = app.task_picker_rows();
+        let found = rows.iter().find_map(|r| match r {
+            PickerRow::Task {
+                task,
+                depth,
+                parent_out_of_group,
+                ..
+            } if task.id == 20 => Some((*depth, *parent_out_of_group)),
+            _ => None,
+        });
+        assert_eq!(found, Some((0, true)));
+    }
+
+    #[test]
+    fn compute_group_depths_handles_child_after_parent() {
+        let mut parent = make_task_info(1, "root", "active");
+        parent.parent_id = None;
+        let mut child = make_task_info(2, "child", "active");
+        child.parent_id = Some(1);
+        let mut grandchild = make_task_info(3, "gc", "active");
+        grandchild.parent_id = Some(2);
+        let ordered = compute_group_depths(vec![parent, child, grandchild]);
+        let ids_and_depths: Vec<(i64, usize)> = ordered.iter().map(|(d, t)| (t.id, *d)).collect();
+        assert_eq!(ids_and_depths, vec![(1, 0), (2, 1), (3, 2)]);
+    }
+
+    #[test]
+    fn filter_restricts_within_groups_preserving_headers() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.picker_groups = make_groups_with(
+            vec![
+                make_task_info(1, "alpha active", "active"),
+                make_task_info(2, "beta active", "active"),
+            ],
+            vec![make_task_info(3, "alpha ready", "ready")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        app.task_picker_filter = "alpha".into();
+        let rows = app.task_picker_rows();
+        let mut task_ids: Vec<i64> = Vec::new();
+        let mut saw_ready_header = false;
+        let mut saw_active_header = false;
+        for r in &rows {
+            match r {
+                PickerRow::Header(h) => {
+                    if h.starts_with("ACTIVE") {
+                        saw_active_header = true;
+                    }
+                    if h.starts_with("QUEUED — READY") {
+                        saw_ready_header = true;
+                    }
+                }
+                PickerRow::Task { task, .. } => task_ids.push(task.id),
+            }
+        }
+        assert!(saw_active_header && saw_ready_header, "groups preserved");
+        assert_eq!(task_ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn d_key_opens_detail_for_selected_task() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+        let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key);
+        match action {
+            Some(Action::TaskGet { id }) => assert_eq!(id, 1),
+            other => panic!("expected TaskGet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_sets_pending_task_switch() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key);
+        match action {
+            Some(Action::TaskGet { id }) => assert_eq!(id, 1),
+            other => panic!("expected TaskGet, got {other:?}"),
+        }
+        assert_eq!(app.pending_task_switch, Some(1));
+    }
+
+    #[test]
+    fn enter_with_no_live_session_opens_detail_in_picker() {
+        // Simulate the pending-switch flow resolving with no sessions: the
+        // picker should open the detail pane read-only and *not* emit a
+        // SwitchSession.
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+        app.pending_task_switch = Some(1);
+        let mut task = make_task_info(1, "no sessions", "merged");
+        // Strip the legacy fallback session so primary_session_id returns None.
+        task.session_id = None;
+        let action = app.handle_server_response(Response::TaskDetail {
+            task,
+            messages: Vec::new(),
+            relations: Vec::new(),
+            subtasks: Vec::new(),
+            sessions: Vec::new(),
+            history: Vec::new(),
+        });
+        assert!(action.is_none(), "should not emit SwitchSession");
+        assert!(app.task_picker_detail.is_some(), "detail pane opened");
+        assert!(
+            app.messages.iter().any(
+                |m| matches!(m, MessageItem::Status { text } if text.contains("no live session"))
+            ),
+            "status message surfaced",
+        );
+    }
+
+    #[test]
+    fn g_key_toggles_view_axis_and_refreshes() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+        assert_eq!(app.picker_view, PickerView::SchedulerState);
+        let key = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE);
+        let action = app.handle_task_picker_key(&key);
+        assert_eq!(app.picker_view, PickerView::Ancestry);
+        assert!(matches!(action, Some(Action::TaskList { .. })));
+        let action = app.handle_task_picker_key(&key);
+        assert_eq!(app.picker_view, PickerView::SchedulerState);
+        assert!(matches!(action, Some(Action::TaskOverview { .. })));
+    }
+
+    #[test]
+    fn pgdn_advances_scroll_past_viewport() {
+        // Build enough rows to overflow a small viewport, then verify that
+        // repeated 'down' presses drive the scroll offset forward.
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        let many: Vec<TaskInfo> = (0..30)
+            .map(|i| make_task_info(i + 1, &format!("task {i}"), "active"))
+            .collect();
+        app.picker_groups = make_groups_with(many, Vec::new(), Vec::new(), Vec::new(), Vec::new());
+
+        // Jump cursor to the end; scroll_offset should be updated by the
+        // explicit adjust call.
+        app.task_picker_cursor = app.task_picker_selectable_count() - 1;
+        app.task_picker_adjust_scroll(5);
+        assert!(
+            app.task_picker_scroll_offset > 0,
+            "scroll offset should move to keep the cursor in view",
+        );
+    }
+
+    #[test]
+    fn end_jumps_to_last_selectable_row() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        populate_picker_tasks(&mut app);
+        let end_key = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+        app.handle_task_picker_key(&end_key);
+        let total = app.task_picker_selectable_count();
+        assert_eq!(app.task_picker_cursor, total - 1);
+        let home_key = KeyEvent::new(KeyCode::Home, KeyModifiers::NONE);
+        app.handle_task_picker_key(&home_key);
+        assert_eq!(app.task_picker_cursor, 0);
+    }
+
+    #[test]
+    fn task_overview_response_populates_groups() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        let action = app.handle_server_response(Response::TaskOverview {
+            active: vec![make_task_info(1, "a", "active")],
+            queued_ready: vec![make_task_info(2, "r", "ready")],
+            queued_planning: Vec::new(),
+            blocked: Vec::new(),
+            held: vec![make_task_info(3, "h", "ready")],
+            recently_merged: vec![make_task_info(4, "m", "merged")],
+            recently_closed: Vec::new(),
+            inflight_count: 1,
+            max_concurrent: 8,
+            blocked_on: Vec::new(),
+        });
+        assert!(action.is_none());
+        assert_eq!(app.picker_groups.active.len(), 1);
+        assert_eq!(app.picker_groups.queued_ready.len(), 1);
+        assert_eq!(app.picker_groups.held.len(), 1);
+        assert_eq!(app.picker_groups.recently_merged.len(), 1);
+        assert_eq!(app.picker_groups.inflight_count, 1);
+        assert_eq!(app.picker_groups.max_concurrent, 8);
     }
 }
