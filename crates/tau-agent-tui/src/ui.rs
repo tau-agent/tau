@@ -1113,30 +1113,27 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // Scroll-indicator top line (inside viewport when there's content above).
-    if above > 0 && viewport_rows >= 3 {
+    // Scroll-indicator top line: rendered inline as the first visible row
+    // when content extends above the viewport.  We still render `viewport_rows`
+    // entries total, but the topmost slot becomes the indicator.
+    let start_idx = if above > 0 && viewport_rows >= 3 {
         lines.push(Line::from(Span::styled(
             format!(" ▲ {} more above", above),
             theme.fg(theme.dim),
         )));
-    }
+        1
+    } else {
+        0
+    };
+    let reserve_bottom = below > 0 && viewport_rows >= 3;
+    let body_end = if reserve_bottom {
+        end.saturating_sub(1).max(offset + start_idx)
+    } else {
+        end
+    };
 
-    for (row_idx, row) in rows[offset..end].iter().enumerate() {
-        let abs_idx = offset + row_idx;
-        // Replace the first/last visible line with the scroll indicator if needed.
-        if (above > 0 && row_idx == 0) || (below > 0 && abs_idx == end - 1 && row_idx > 0) {
-            // We already pushed the top indicator if needed; skip rendering the
-            // task that sits in that slot so it doesn't show truncated.
-            if above > 0 && row_idx == 0 {
-                continue;
-            }
-            // Bottom indicator: replace the last line.
-            lines.push(Line::from(Span::styled(
-                format!(" ▼ {} more below", below),
-                theme.fg(theme.dim),
-            )));
-            continue;
-        }
+    for (row_idx, row) in rows[offset + start_idx..body_end].iter().enumerate() {
+        let abs_idx = offset + start_idx + row_idx;
         match row {
             PickerRow::Header(text) => {
                 lines.push(render_group_header(text, w, theme));
@@ -1185,6 +1182,13 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 ));
             }
         }
+    }
+
+    if reserve_bottom {
+        lines.push(Line::from(Span::styled(
+            format!(" ▼ {} more below", below),
+            theme.fg(theme.dim),
+        )));
     }
 
     // Footer hint
