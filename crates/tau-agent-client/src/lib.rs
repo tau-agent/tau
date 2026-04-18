@@ -80,6 +80,7 @@ impl Client {
                 | Response::Ok
                 | Response::SessionCreated { .. }
                 | Response::SessionInfo { .. }
+                | Response::SessionAncestors { .. }
                 | Response::SessionDeleted
                 | Response::SessionArchived
                 | Response::SessionRestored

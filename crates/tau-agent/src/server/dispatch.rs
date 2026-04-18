@@ -235,6 +235,52 @@ pub(super) fn get_session_info_impl(
     }
 }
 
+/// Maximum number of ancestors walked for `GetSessionAncestors`.  Prevents
+/// a pathological cycle or malformed `parent_id` graph from hanging the
+/// server.  The protocol docs promise leaf-first ordering up to this depth.
+const ANCESTOR_DEPTH_GUARD: usize = 64;
+
+pub(super) fn get_session_ancestors_impl(
+    state: &SharedState,
+    session_id: &str,
+) -> crate::protocol::Response {
+    let st = lock_state(state);
+    let mut out = Vec::new();
+    let mut current = session_id.to_string();
+    for _ in 0..ANCESTOR_DEPTH_GUARD {
+        let stored = match st.db.get_session(&current) {
+            Ok(Some(s)) => s,
+            // Unknown / stale id — stop and return what we have.  For the
+            // very first lookup this produces an empty Vec, which is the
+            // documented shape for an unknown `session_id`.
+            Ok(None) => break,
+            Err(e) => {
+                return crate::protocol::Response::Error {
+                    message: e.to_string(),
+                };
+            }
+        };
+        let messages = st.db.get_messages(&current).unwrap_or_default();
+        let last_msg = st.db.last_message_time(&current).unwrap_or(None);
+        let children = st.db.child_count(&current).unwrap_or(0);
+        let info = session_info(
+            &stored,
+            &messages,
+            last_msg,
+            children,
+            st.phases.get(&current),
+            st.live_sessions.contains(&current),
+        );
+        let next_parent = info.parent_id.clone();
+        out.push(info);
+        match next_parent {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    crate::protocol::Response::SessionAncestors { sessions: out }
+}
+
 pub(super) fn get_messages_impl(
     state: &SharedState,
     session_id: &str,
@@ -436,6 +482,10 @@ pub(super) async fn handle_client(
             }
             crate::protocol::Request::GetSessionInfo { session_id } => {
                 let resp = get_session_info_impl(&state, &session_id);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::GetSessionAncestors { session_id } => {
+                let resp = get_session_ancestors_impl(&state, &session_id);
                 send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::Chat { session_id, text } => {

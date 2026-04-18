@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use super::agent_runner::PluginExecutor;
 use super::dispatch::{
-    cancel_chat_impl, create_session_impl, get_messages_impl, get_session_info_impl,
-    list_sessions_impl,
+    cancel_chat_impl, create_session_impl, get_messages_impl, get_session_ancestors_impl,
+    get_session_info_impl, list_sessions_impl,
 };
 use super::notifications::{
     auto_archive_done_sessions, last_assistant_text, queue_and_maybe_resume, queue_info_to_session,
@@ -198,6 +198,9 @@ pub(super) async fn handle_server_request(
             project_name,
         ),
         Request::GetSessionInfo { session_id } => get_session_info_impl(state, session_id),
+        Request::GetSessionAncestors { session_id } => {
+            get_session_ancestors_impl(state, session_id)
+        }
         Request::GetMessages { session_id } => get_messages_impl(state, session_id),
         Request::ListSessions {
             include_archived,

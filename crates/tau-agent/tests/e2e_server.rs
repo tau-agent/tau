@@ -3605,3 +3605,353 @@ fn server_restart_clears_stale_phases() {
     }
     handle2.join().ok();
 }
+
+// ---------------------------------------------------------------------------
+// GetSessionAncestors
+// ---------------------------------------------------------------------------
+
+/// Helper: create a session via the server, returning its id.
+fn create_session(server: &TestServer, parent_id: Option<String>, child_budget: u32) -> String {
+    let conn = server.connect();
+    match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: None,
+            parent_id,
+            child_budget,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    }
+}
+
+/// Helper: request ancestors for a session, returning the Vec.
+fn get_ancestors(server: &TestServer, session_id: &str) -> Vec<tau_agent::protocol::SessionInfo> {
+    let conn = server.connect();
+    match send_recv(
+        &conn,
+        &Request::GetSessionAncestors {
+            session_id: session_id.to_string(),
+        },
+    ) {
+        Response::SessionAncestors { sessions } => sessions,
+        other => panic!("expected SessionAncestors, got {:?}", other),
+    }
+}
+
+#[test]
+fn get_session_ancestors_root() {
+    let server = TestServer::start(vec![]);
+    let root = create_session(&server, None, 0);
+
+    let ancestors = get_ancestors(&server, &root);
+    assert_eq!(
+        ancestors.len(),
+        1,
+        "root alone is still a chain of length 1"
+    );
+    assert_eq!(ancestors[0].id, root);
+    assert!(ancestors[0].parent_id.is_none());
+
+    server.shutdown();
+}
+
+#[test]
+fn get_session_ancestors_chain() {
+    let server = TestServer::start(vec![]);
+    // Build a→b→c (a is root; c is leaf).  Each parent needs budget=1 for
+    // its single child.
+    let a = create_session(&server, None, 1);
+    let b = create_session(&server, Some(a.clone()), 1);
+    let c = create_session(&server, Some(b.clone()), 0);
+
+    let ancestors = get_ancestors(&server, &c);
+    let ids: Vec<&str> = ancestors.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, vec![c.as_str(), b.as_str(), a.as_str()]);
+    // Verify parent_id threading is intact.
+    assert_eq!(ancestors[0].parent_id.as_deref(), Some(b.as_str()));
+    assert_eq!(ancestors[1].parent_id.as_deref(), Some(a.as_str()));
+    assert!(ancestors[2].parent_id.is_none());
+
+    server.shutdown();
+}
+
+#[test]
+fn get_session_ancestors_unknown() {
+    let server = TestServer::start(vec![]);
+
+    let ancestors = get_ancestors(&server, "does-not-exist");
+    assert!(
+        ancestors.is_empty(),
+        "unknown id must return empty, not error"
+    );
+
+    server.shutdown();
+}
+
+/// Insert a synthetic `StoredSession` row directly.
+fn insert_stored(db: &tau_agent::db::Db, id: &str, parent_id: Option<&str>, archived: bool) {
+    db.create_session(&tau_agent::db::StoredSession {
+        id: id.into(),
+        model: mock_model(),
+        system_prompt: None,
+        cwd: None,
+        is_subscription: false,
+        created_at: 1000,
+        parent_id: parent_id.map(|s| s.to_string()),
+        child_budget: 1,
+        tagline: None,
+        archived,
+        last_exit_status: None,
+        last_phase: None,
+        auto_archive: false,
+        notify_parent: true,
+        project_name: None,
+    })
+    .expect("create_session");
+}
+
+#[test]
+fn get_session_ancestors_depth_guard() {
+    // Build a 70-deep chain directly in the DB before the server starts,
+    // to avoid spinning up 70 real sessions through the API.
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-test.sock");
+    let db_path = dir.path().join("test.db");
+
+    {
+        let db = tau_agent::db::Db::open(&db_path).unwrap();
+        // Root first (no parent), then 1..=69 each parented to the prior.
+        insert_stored(&db, "s0", None, false);
+        for i in 1..70 {
+            let parent = format!("s{}", i - 1);
+            let id = format!("s{}", i);
+            insert_stored(&db, &id, Some(&parent), false);
+        }
+    }
+
+    let model = mock_model();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![]));
+
+    let config = tau_agent::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.clone(),
+        db_path,
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    let handle = std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config).await.ok();
+        });
+    });
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sock_path.exists());
+
+    // Request from the leaf (s69).  The guard caps at 64.
+    let start = std::time::Instant::now();
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(
+        &conn,
+        &Request::GetSessionAncestors {
+            session_id: "s69".into(),
+        },
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "call took too long: {:?}",
+        elapsed
+    );
+
+    let ancestors = match resp {
+        Response::SessionAncestors { sessions } => sessions,
+        other => panic!("expected SessionAncestors, got {:?}", other),
+    };
+    assert_eq!(ancestors.len(), 64, "depth guard should cap at 64");
+    assert_eq!(ancestors[0].id, "s69", "leaf-first ordering");
+    // Last entry is s69 - 63 = s6, and still has a parent (so caller can
+    // detect truncation by combining len==64 with parent_id.is_some()).
+    assert_eq!(ancestors[63].id, "s6");
+    assert!(
+        ancestors[63].parent_id.is_some(),
+        "truncation point still has an unresolved parent_id"
+    );
+
+    if let Ok(c) = UnixStream::connect(&sock_path) {
+        let req = serde_json::to_string(&Request::Shutdown { restart: false }).unwrap();
+        let mut c = c;
+        let _ = c.write_all(format!("{}\n", req).as_bytes());
+        let _ = c.flush();
+    }
+    handle.join().ok();
+}
+
+#[test]
+fn get_session_ancestors_includes_archived() {
+    // Chain a→b→c where b is archived.  We need archived=true on a
+    // single mid-chain row, which the server's `ArchiveSession` would
+    // cascade over subtree — so write it directly via the DB.
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-test.sock");
+    let db_path = dir.path().join("test.db");
+
+    {
+        let db = tau_agent::db::Db::open(&db_path).unwrap();
+        insert_stored(&db, "a", None, false);
+        insert_stored(&db, "b", Some("a"), /* archived */ true);
+        insert_stored(&db, "c", Some("b"), false);
+    }
+
+    let model = mock_model();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![]));
+    let config = tau_agent::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.clone(),
+        db_path,
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+    let handle = std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config).await.ok();
+        });
+    });
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sock_path.exists());
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(
+        &conn,
+        &Request::GetSessionAncestors {
+            session_id: "c".into(),
+        },
+    );
+    let ancestors = match resp {
+        Response::SessionAncestors { sessions } => sessions,
+        other => panic!("expected SessionAncestors, got {:?}", other),
+    };
+    let ids: Vec<&str> = ancestors.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, vec!["c", "b", "a"]);
+    assert!(!ancestors[0].archived, "c is not archived");
+    assert!(
+        ancestors[1].archived,
+        "b must still appear, flagged archived"
+    );
+    assert!(!ancestors[2].archived, "a is not archived");
+
+    if let Ok(c) = UnixStream::connect(&sock_path) {
+        let req = serde_json::to_string(&Request::Shutdown { restart: false }).unwrap();
+        let mut c = c;
+        let _ = c.write_all(format!("{}\n", req).as_bytes());
+        let _ = c.flush();
+    }
+    handle.join().ok();
+}
+
+#[test]
+fn get_session_ancestors_missing_mid_parent() {
+    // Chain a→b→c; then delete b.  Walking from c should return [c] only,
+    // because c.parent_id="b" is a stale FK after b is gone.
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-test.sock");
+    let db_path = dir.path().join("test.db");
+
+    {
+        let db = tau_agent::db::Db::open(&db_path).unwrap();
+        insert_stored(&db, "a", None, false);
+        insert_stored(&db, "b", Some("a"), false);
+        insert_stored(&db, "c", Some("b"), false);
+        // SQLite FKs are on: delete_session refuses to drop a parent with
+        // children.  We need a raw DELETE that bypasses FK enforcement so
+        // we can simulate the stale-FK race the docstring refers to.
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        raw.execute_batch("PRAGMA foreign_keys=OFF;").unwrap();
+        raw.execute("DELETE FROM sessions WHERE id = 'b'", [])
+            .unwrap();
+    }
+
+    let model = mock_model();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![]));
+    let config = tau_agent::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.clone(),
+        db_path,
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+    let handle = std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config).await.ok();
+        });
+    });
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sock_path.exists());
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(
+        &conn,
+        &Request::GetSessionAncestors {
+            session_id: "c".into(),
+        },
+    );
+    let ancestors = match resp {
+        Response::SessionAncestors { sessions } => sessions,
+        other => panic!("expected SessionAncestors, got {:?}", other),
+    };
+    let ids: Vec<&str> = ancestors.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["c"],
+        "walk stops at missing mid-chain parent (does not include a)"
+    );
+    assert_eq!(ancestors[0].parent_id.as_deref(), Some("b"));
+
+    if let Ok(c) = UnixStream::connect(&sock_path) {
+        let req = serde_json::to_string(&Request::Shutdown { restart: false }).unwrap();
+        let mut c = c;
+        let _ = c.write_all(format!("{}\n", req).as_bytes());
+        let _ = c.flush();
+    }
+    handle.join().ok();
+}

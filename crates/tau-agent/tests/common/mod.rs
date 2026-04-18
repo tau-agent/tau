@@ -44,6 +44,7 @@ pub fn send_recv_all(stream: &UnixStream, req: &Request) -> Vec<Response> {
             &resp,
             Response::SessionCreated { .. }
                 | Response::SessionInfo { .. }
+                | Response::SessionAncestors { .. }
                 | Response::Sessions { .. }
                 | Response::SessionDeleted
                 | Response::SessionsCompleted { .. }

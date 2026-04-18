@@ -49,6 +49,15 @@ pub enum Request {
     },
     /// Get info about a specific session.
     GetSessionInfo { session_id: String },
+    /// Return the requested session and all its ancestors.
+    ///
+    /// Ordered leaf-first: index 0 is `session_id`, the last entry is the root
+    /// (or the deepest reachable ancestor when the depth guard trips or a
+    /// `parent_id` points at a missing row).
+    ///
+    /// Returns an empty `sessions` vec if `session_id` itself is unknown —
+    /// **not** an error response.
+    GetSessionAncestors { session_id: String },
     /// List sessions.
     ListSessions {
         /// Include archived sessions in the listing.
@@ -239,6 +248,8 @@ pub enum Response {
     SessionCreated { session_id: String },
     /// Info about a single session.
     SessionInfo { info: SessionInfo },
+    /// Ancestor chain for a session, leaf-first.  See `Request::GetSessionAncestors`.
+    SessionAncestors { sessions: Vec<SessionInfo> },
     /// List of sessions.
     Sessions { sessions: Vec<SessionInfo> },
     /// Session deleted.
