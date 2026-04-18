@@ -617,9 +617,12 @@ async fn run_loop_review(
 /// Maximum retry delay in milliseconds (32 seconds).
 const MAX_RETRY_DELAY_MS: u64 = 32_000;
 
-/// Maximum retries for timeout errors (fewer than rate limits, since each
-/// timeout already consumed 30-120s of waiting).
-const MAX_TIMEOUT_RETRIES: usize = 2;
+/// Maximum retries for timeout errors. Each retry is expensive (can burn
+/// several minutes of first-byte timeout on adaptive-thinking models), but
+/// if the first attempt hit a transient transport hiccup the same request
+/// usually succeeds on retry. Six total attempts bounds worst-case clock
+/// time; the user can still cancel at any point.
+const MAX_TIMEOUT_RETRIES: usize = 5;
 
 /// Fixed delay between timeout retries in milliseconds (first retry is immediate).
 const TIMEOUT_RETRY_DELAY_MS: u64 = 5_000;
@@ -1931,8 +1934,11 @@ mod tests {
     fn test_idle_timeout() {
         smol::block_on(async {
             // Provide enough Hang responses for the initial attempt plus
-            // MAX_TIMEOUT_RETRIES (2) retries, totalling 3 attempts.
+            // MAX_TIMEOUT_RETRIES (5) retries, totalling 6 attempts.
             let registry = setup_registry(vec![
+                MockResponse::Hang,
+                MockResponse::Hang,
+                MockResponse::Hang,
                 MockResponse::Hang,
                 MockResponse::Hang,
                 MockResponse::Hang,
@@ -1961,9 +1967,11 @@ mod tests {
             .unwrap();
 
             let elapsed = start.elapsed();
-            // Should complete quickly — all timeouts fire immediately.
+            // Should complete within the retry window — the 5 timeout
+            // retries use a 5s fixed delay each (first retry is immediate),
+            // so the worst case is ~20s of retry backoff.
             assert!(
-                elapsed < std::time::Duration::from_secs(10),
+                elapsed < std::time::Duration::from_secs(30),
                 "idle timeout should fire quickly, took {:?}",
                 elapsed
             );
@@ -1988,8 +1996,11 @@ mod tests {
     #[test]
     fn timeout_exhaustion_emits_stream_event_error() {
         smol::block_on(async {
-            // 3 hangs = initial attempt + MAX_TIMEOUT_RETRIES (2) retries.
+            // 6 hangs = initial attempt + MAX_TIMEOUT_RETRIES (5) retries.
             let registry = setup_registry(vec![
+                MockResponse::Hang,
+                MockResponse::Hang,
+                MockResponse::Hang,
                 MockResponse::Hang,
                 MockResponse::Hang,
                 MockResponse::Hang,

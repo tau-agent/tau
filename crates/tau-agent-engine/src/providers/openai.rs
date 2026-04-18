@@ -42,6 +42,7 @@ impl Provider for OpenAi {
         let provider_name = model.provider.clone();
         let model_id = model.id.clone();
         let model_clone = model.clone();
+        let recv_response_timeout = common::recv_timeout_for(model, options);
 
         std::thread::spawn(move || {
             let ctx = StreamCtx {
@@ -51,6 +52,7 @@ impl Provider for OpenAi {
                 provider_name: &provider_name,
                 model_id: &model_id,
                 model: &model_clone,
+                recv_response_timeout,
             };
             let result = run_stream(&ctx, &body, &tx);
             if let Err(e) = result {
@@ -107,7 +109,7 @@ fn run_stream(
         .timeout_connect(Some(common::TIMEOUT_CONNECT))
         .timeout_send_request(Some(common::TIMEOUT_SEND_REQUEST))
         .timeout_send_body(Some(common::TIMEOUT_SEND_BODY))
-        .timeout_recv_response(Some(common::TIMEOUT_RECV_RESPONSE))
+        .timeout_recv_response(Some(ctx.recv_response_timeout))
         .http_status_as_error(false)
         .build()
         .send_json(body)
