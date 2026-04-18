@@ -1603,6 +1603,13 @@ pub(super) async fn handle_client(
                     send(&mut writer, &Response::Ok).await?;
                 }
             }
+            crate::protocol::Request::QueueInfo {
+                target_session_id,
+                text,
+            } => {
+                queue_info_to_session(&state, &target_session_id, &text);
+                send(&mut writer, &Response::Ok).await?;
+            }
             crate::protocol::Request::ReplyToMessage { msg_id, content } => {
                 let result = {
                     let mut st = lock_state(&state);

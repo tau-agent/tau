@@ -12,6 +12,7 @@ pub mod tasks_config;
 pub mod tasks_db;
 pub mod tasks_git;
 pub mod tasks_merge;
+pub mod tasks_notify;
 pub mod tasks_scheduler;
 
 /// Entry point for the `tau plugin-tasks` subprocess.

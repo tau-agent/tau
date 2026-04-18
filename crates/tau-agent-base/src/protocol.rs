@@ -149,6 +149,16 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         reply_to: Option<String>,
     },
+    /// Persist a zero-token display-only info message to a session's
+    /// message history. Unlike `QueueMessage`, this does **not** wake the
+    /// agent loop and the message is excluded from LLM context.
+    ///
+    /// Intended for observational notifications such as task state-change
+    /// info-lines surfaced in the TUI.
+    QueueInfo {
+        target_session_id: String,
+        text: String,
+    },
     /// Reply to a pending `await_reply` message.
     ReplyToMessage { msg_id: String, content: String },
     /// Reload plugins for a session (destroy + re-init).

@@ -1,0 +1,908 @@
+//! Task state-change notifications.
+//!
+//! Every time a task's `state` column actually changes we emit a one-line
+//! [`InfoMessage`](tau_agent_base::types::InfoMessage) to every session that
+//! participates in the task's lifecycle (worker, reviewer, planner,
+//! refiner, creator, interactive, …) plus, for terminal or
+//! user-attention-demanding transitions, the user's root session.
+//!
+//! Info messages are zero-token, display-only: they are persisted to the
+//! target session's message history, shown in the TUI, but excluded from
+//! LLM context and do **not** wake the agent loop.
+//!
+//! The public entry point is [`notify_state_change`]. Wire it into every
+//! code site that mutates `task.state` (see call-site grep in
+//! `handle_task_update`, `tasks_scheduler`, and `tasks_merge`).
+//!
+//! The existing specialised notifiers
+//! ([`tasks_merge::notify_parent_of_subtask_done`](crate::tasks_merge::notify_parent_of_subtask_done),
+//! [`tasks_merge::notify_parent_if_all_done`](crate::tasks_merge::notify_parent_if_all_done),
+//! [`tasks_merge::notify_session_of_merge_failure`](crate::tasks_merge::notify_session_of_merge_failure),
+//! and the `planning → interactive` scope-expansion QueueMessage) stay.
+//! Those carry action-prompting content; this module is purely
+//! observational.
+
+use std::collections::HashSet;
+use std::io::{BufRead, Write};
+
+use crate::tasks_db::{Task, TasksDb};
+use crate::tasks_scheduler::{find_root_session, server_request};
+
+/// Truncate a title to at most `MAX_TITLE_LEN` chars, replacing the tail
+/// with an ellipsis if it overflows. Character-count based (Unicode scalar
+/// values), not byte-count, so the cap is stable across scripts.
+const MAX_TITLE_LEN: usize = 120;
+
+fn capped_title(title: &str) -> String {
+    let char_count = title.chars().count();
+    if char_count <= MAX_TITLE_LEN {
+        title.to_string()
+    } else {
+        let head: String = title.chars().take(MAX_TITLE_LEN).collect();
+        format!("{}…", head)
+    }
+}
+
+/// Classify a transition target for root-broadcast purposes.
+fn broadcasts_to_root(to: &str) -> bool {
+    // Terminal states that the user should see regardless of where the
+    // action happened.  `closed` is excluded on purpose: it's "we're
+    // dropping this", not actionable.
+    matches!(to, "merged" | "failed" | "interactive")
+}
+
+/// Build the one-line info-message text for a transition.
+///
+/// * `* → merged`: `[task #{id}] {title}: merged`  (elides `from →`)
+/// * otherwise:    `[task #{id}] {title}: {from} → {to}`
+/// * with context: append ` ({context})` at the end.
+fn format_message(task: &Task, from: &str, context: Option<&str>) -> String {
+    let title = capped_title(&task.title);
+    let body = if task.state == "merged" {
+        format!("[task #{}] {}: merged", task.id, title)
+    } else {
+        format!("[task #{}] {}: {} → {}", task.id, title, from, task.state)
+    };
+    match context {
+        Some(ctx) if !ctx.is_empty() => format!("{} ({})", body, ctx),
+        _ => body,
+    }
+}
+
+/// Collect the set of session IDs that should see a state-change info
+/// message for `task` transitioning `from → task.state`.
+///
+/// Recipients, union-and-deduped:
+/// * every session recorded in the task's `task_sessions` table,
+/// * the parent task's `creator` and `interactive` sessions,
+/// * for root-broadcast transitions ([`broadcasts_to_root`]), the root
+///   session resolved from the task's current session / creator /
+///   parent-task session (first available anchor wins).
+///
+/// Archived sessions are skipped (via per-session `GetSessionInfo`).
+fn collect_recipients(
+    db: &TasksDb,
+    task: &Task,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Vec<String> {
+    let mut set: HashSet<String> = HashSet::new();
+
+    // 1. Task's own session_id (may or may not be in task_sessions).
+    if let Some(ref sid) = task.session_id {
+        set.insert(sid.clone());
+    }
+
+    // 2. Every recorded task_sessions row.
+    if let Ok(sessions) = db.get_sessions(task.id) {
+        for ts in sessions {
+            set.insert(ts.session_id);
+        }
+    }
+
+    // 3. Parent task's creator + interactive rows.
+    if let Some(parent_id) = task.parent_id {
+        if let Ok(parent_sessions) = db.get_sessions(parent_id) {
+            for ts in parent_sessions {
+                if ts.role == "creator" || ts.role == "interactive" {
+                    set.insert(ts.session_id);
+                }
+            }
+        }
+    }
+
+    // 4. Root broadcast for terminal / interactive transitions.
+    if broadcasts_to_root(&task.state) {
+        if let Some(root) = resolve_root_session(db, task, writer, reader) {
+            set.insert(root);
+        }
+    }
+
+    // 5. Filter archived sessions.
+    set.into_iter()
+        .filter(|sid| !is_session_archived(sid, writer, reader))
+        .collect()
+}
+
+/// Resolve the root session for root-broadcast transitions.  Tries the
+/// task's current session first, then the `creator` row on the task, then
+/// the parent task's session.  Returns `None` if none of the anchors
+/// exist or `find_root_session` returns `None`.
+fn resolve_root_session(
+    db: &TasksDb,
+    task: &Task,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<String> {
+    // Anchor 1: the task's current session_id.
+    if let Some(ref sid) = task.session_id {
+        if let Some(root) = find_root_session(sid, writer, reader) {
+            return Some(root);
+        }
+    }
+
+    // Anchor 2: the task's creator session (from task_sessions).
+    if let Ok(sessions) = db.get_sessions(task.id) {
+        for ts in &sessions {
+            if ts.role == "creator" {
+                if let Some(root) = find_root_session(&ts.session_id, writer, reader) {
+                    return Some(root);
+                }
+            }
+        }
+    }
+
+    // Anchor 3: the parent task's session.
+    if let Some(parent_id) = task.parent_id {
+        if let Ok(Some(parent)) = db.get_task(parent_id) {
+            if let Some(ref parent_sid) = parent.session_id {
+                if let Some(root) = find_root_session(parent_sid, writer, reader) {
+                    return Some(root);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Best-effort archived-session check via `GetSessionInfo`.  Returns
+/// `false` (i.e. "not archived, do emit") on RPC failure — we'd rather
+/// deliver a message to a live session than silently swallow it.
+fn is_session_archived(
+    session_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> bool {
+    match server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::GetSessionInfo {
+            session_id: session_id.to_string(),
+        },
+    ) {
+        Ok(tau_agent_plugin::Response::SessionInfo { info }) => info.archived,
+        _ => false,
+    }
+}
+
+/// Emit a state-change [`InfoMessage`](tau_agent_base::types::InfoMessage)
+/// to every session that should see it.
+///
+/// Called from every code site where a task's `state` column actually
+/// changes (`handle_task_update`, scheduler-driven transitions, merge
+/// outcomes).
+///
+/// * `task`: the task **after** the state change.  `task.id`, `task.title`,
+///   `task.state`, and `task.parent_id` must be populated.
+/// * `from`: the previous state.  If this is equal to `task.state` the
+///   call is a no-op (there was no real transition).
+/// * `context`: optional free-form suffix appended as `(context)` to the
+///   message (e.g. `"commit abc1234"`, `"rework requested"`).
+/// * `writer` / `reader`: the plugin's stdout/stdin for server RPCs.
+///
+/// Delivery is best-effort: errors on individual recipients are swallowed
+/// so a single broken RPC can't prevent the rest of the broadcast.
+pub fn notify_state_change(
+    db: &TasksDb,
+    task: &Task,
+    from: &str,
+    context: Option<&str>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    if from == task.state {
+        // No actual transition — avoid noise.
+        return;
+    }
+
+    let text = format_message(task, from, context);
+    let recipients = collect_recipients(db, task, writer, reader);
+
+    for sid in recipients {
+        let _ = server_request(
+            writer,
+            reader,
+            tau_agent_plugin::Request::QueueInfo {
+                target_session_id: sid,
+                text: text.clone(),
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks_db::TasksDb;
+    use std::collections::HashMap;
+    use std::io::BufReader;
+    use std::sync::{Arc, Mutex};
+    use tau_agent_plugin::{PluginMessage, PluginRequest, Request, Response, SessionInfo};
+
+    // -----------------------------------------------------------------
+    // Mock IO.  Responds to GetSessionInfo / GetSessionAncestors /
+    // QueueInfo.  Captures every QueueInfo so tests can assert on the
+    // recipient set and message text.
+    // -----------------------------------------------------------------
+
+    struct MockShared {
+        write_buf: Vec<u8>,
+        read_buf: Vec<u8>,
+        archived_sessions: HashSet<String>,
+        ancestors: HashMap<String, Vec<SessionInfo>>,
+        /// Captured (target_session_id, text) pairs from QueueInfo.
+        queue_info_calls: Vec<(String, String)>,
+    }
+
+    impl MockShared {
+        fn new() -> Self {
+            Self {
+                write_buf: Vec::new(),
+                read_buf: Vec::new(),
+                archived_sessions: HashSet::new(),
+                ancestors: HashMap::new(),
+                queue_info_calls: Vec::new(),
+            }
+        }
+
+        fn process_pending(&mut self) {
+            let buf = std::mem::take(&mut self.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let msg: PluginMessage = match serde_json::from_str(line) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let (request_id, request) = match msg {
+                    PluginMessage::ServerRequest {
+                        request_id,
+                        request,
+                    } => (request_id, request),
+                    _ => continue,
+                };
+                let response = self.respond(&request);
+                let reply = PluginRequest::ServerResponse {
+                    request_id,
+                    response,
+                };
+                if let Ok(mut json) = serde_json::to_string(&reply) {
+                    json.push('\n');
+                    self.read_buf.extend_from_slice(json.as_bytes());
+                }
+            }
+        }
+
+        fn respond(&mut self, request: &Request) -> Response {
+            match request {
+                Request::QueueInfo {
+                    target_session_id,
+                    text,
+                } => {
+                    self.queue_info_calls
+                        .push((target_session_id.clone(), text.clone()));
+                    Response::Ok
+                }
+                Request::GetSessionInfo { session_id } => Response::SessionInfo {
+                    info: fake_session(
+                        session_id,
+                        None,
+                        self.archived_sessions.contains(session_id),
+                    ),
+                },
+                Request::GetSessionAncestors { session_id } => {
+                    let sessions = self.ancestors.get(session_id).cloned().unwrap_or_else(|| {
+                        vec![fake_session(
+                            session_id,
+                            None,
+                            self.archived_sessions.contains(session_id),
+                        )]
+                    });
+                    Response::SessionAncestors { sessions }
+                }
+                _ => Response::Ok,
+            }
+        }
+    }
+
+    fn fake_session(id: &str, parent_id: Option<&str>, archived: bool) -> SessionInfo {
+        SessionInfo {
+            id: id.to_string(),
+            model: "mock".into(),
+            provider: "mock".into(),
+            cwd: None,
+            message_count: 0,
+            stats: Default::default(),
+            last_activity: 0,
+            parent_id: parent_id.map(str::to_string),
+            child_count: 0,
+            child_budget: 16,
+            tagline: None,
+            state: "idle".into(),
+            context_pct: None,
+            archived,
+            last_exit_status: None,
+            is_live: false,
+            project_name: None,
+        }
+    }
+
+    struct MockWriter {
+        shared: Arc<Mutex<MockShared>>,
+    }
+    impl std::io::Write for MockWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.shared
+                .lock()
+                .expect("mock writer lock")
+                .write_buf
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockReader {
+        shared: Arc<Mutex<MockShared>>,
+    }
+    impl std::io::Read for MockReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut shared = self.shared.lock().expect("mock reader lock");
+            shared.process_pending();
+            if shared.read_buf.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no mock responses left",
+                ));
+            }
+            let n = std::cmp::min(buf.len(), shared.read_buf.len());
+            buf[..n].copy_from_slice(&shared.read_buf[..n]);
+            shared.read_buf.drain(..n);
+            Ok(n)
+        }
+    }
+
+    fn make_io() -> (Arc<Mutex<MockShared>>, MockWriter, BufReader<MockReader>) {
+        let shared = Arc::new(Mutex::new(MockShared::new()));
+        let writer = MockWriter {
+            shared: shared.clone(),
+        };
+        let reader = BufReader::new(MockReader {
+            shared: shared.clone(),
+        });
+        (shared, writer, reader)
+    }
+
+    /// Get the captured (sid, text) pairs in deterministic (sid) order so
+    /// tests can make exact assertions regardless of HashSet iteration
+    /// order.
+    fn captured_sorted(shared: &Arc<Mutex<MockShared>>) -> Vec<(String, String)> {
+        let mut calls = shared
+            .lock()
+            .expect("mock shared lock")
+            .queue_info_calls
+            .clone();
+        calls.sort();
+        calls
+    }
+
+    fn create_task(db: &TasksDb, title: &str, parent_id: Option<i64>, initial: &str) -> Task {
+        db.create_task(
+            "test-project",
+            title,
+            None,
+            parent_id,
+            None,
+            false,
+            initial,
+            false,
+            None,
+            None,
+        )
+        .expect("create task")
+    }
+
+    // -----------------------------------------------------------------
+    // format_message
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn format_non_terminal_transition() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Demo", None, "ready");
+        task.state = "active".into();
+        assert_eq!(
+            format_message(&task, "ready", None),
+            format!("[task #{}] Demo: ready → active", task.id)
+        );
+    }
+
+    #[test]
+    fn format_terminal_merged_elides_from() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Demo", None, "ready");
+        task.state = "merged".into();
+        assert_eq!(
+            format_message(&task, "merging", None),
+            format!("[task #{}] Demo: merged", task.id)
+        );
+    }
+
+    #[test]
+    fn format_with_context_appends_suffix() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Demo", None, "ready");
+        task.state = "merged".into();
+        assert_eq!(
+            format_message(&task, "merging", Some("commit abc1234")),
+            format!("[task #{}] Demo: merged (commit abc1234)", task.id)
+        );
+        task.state = "active".into();
+        assert_eq!(
+            format_message(&task, "review", Some("rework requested")),
+            format!(
+                "[task #{}] Demo: review → active (rework requested)",
+                task.id
+            )
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Title-length cap
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn capped_title_leaves_short_titles_unchanged() {
+        let t = "x".repeat(50);
+        assert_eq!(capped_title(&t), t);
+    }
+
+    #[test]
+    fn capped_title_truncates_long_titles_with_ellipsis() {
+        let t = "x".repeat(125);
+        let capped = capped_title(&t);
+        assert_eq!(capped.chars().count(), MAX_TITLE_LEN + 1); // 120 + '…'
+        assert!(capped.ends_with('…'));
+        assert_eq!(
+            capped.chars().take(MAX_TITLE_LEN).collect::<String>(),
+            "x".repeat(MAX_TITLE_LEN)
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Recipient selection / dedup / archived filtering
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn notify_fires_on_non_terminal_transition() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "T1", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec");
+        db.set_session_id(task.id, "s-worker").expect("sid");
+        task.state = "active".into();
+        task.session_id = Some("s-worker".into());
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+
+        let calls = captured_sorted(&shared);
+        assert_eq!(calls.len(), 1, "calls: {:?}", calls);
+        assert_eq!(calls[0].0, "s-worker");
+        assert_eq!(
+            calls[0].1,
+            format!("[task #{}] T1: ready → active", task.id)
+        );
+    }
+
+    #[test]
+    fn notify_deduplicates_recipients() {
+        // Single session is both creator and worker — gets one message.
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Dup", None, "ready");
+        db.record_session(task.id, "s-one", "creator")
+            .expect("rec1");
+        db.record_session(task.id, "s-one", "worker").expect("rec2");
+        db.set_session_id(task.id, "s-one").expect("sid");
+        task.session_id = Some("s-one".into());
+        task.state = "active".into();
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+
+        let calls = captured_sorted(&shared);
+        assert_eq!(calls.len(), 1, "expected one dedup'd call, got {:?}", calls);
+        assert_eq!(calls[0].0, "s-one");
+    }
+
+    #[test]
+    fn notify_skips_archived_recipient() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Arc", None, "ready");
+        db.record_session(task.id, "s-live", "worker")
+            .expect("rec1");
+        db.record_session(task.id, "s-dead", "reviewer")
+            .expect("rec2");
+        task.state = "review".into();
+
+        let (shared, mut w, mut r) = make_io();
+        shared
+            .lock()
+            .expect("mock shared lock")
+            .archived_sessions
+            .insert("s-dead".into());
+
+        notify_state_change(&db, &task, "active", None, &mut w, &mut r);
+
+        let calls = captured_sorted(&shared);
+        let sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(sids.contains(&"s-live"), "sids: {:?}", sids);
+        assert!(
+            !sids.contains(&"s-dead"),
+            "archived session leaked: {:?}",
+            sids
+        );
+    }
+
+    #[test]
+    fn notify_no_op_on_identical_state() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Same", None, "ready");
+        db.record_session(task.id, "s-any", "worker").expect("rec");
+        task.state = "ready".into();
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+
+        assert!(captured_sorted(&shared).is_empty());
+    }
+
+    #[test]
+    fn notify_includes_parent_creator_and_interactive() {
+        // Parent task has a creator + an interactive row.  Both should be
+        // on the recipient list when a child transitions.
+        let db = TasksDb::open_memory().expect("db");
+        let parent = create_task(&db, "Parent", None, "interactive");
+        db.record_session(parent.id, "s-creator", "creator")
+            .expect("rec c");
+        db.record_session(parent.id, "s-ia", "interactive")
+            .expect("rec i");
+        db.record_session(parent.id, "s-unrelated", "worker")
+            .expect("rec w"); // should NOT receive
+
+        let mut child = create_task(&db, "Child", Some(parent.id), "ready");
+        db.record_session(child.id, "s-worker", "worker")
+            .expect("rec");
+        db.set_session_id(child.id, "s-worker").expect("sid");
+        child.session_id = Some("s-worker".into());
+        child.state = "active".into();
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &child, "ready", None, &mut w, &mut r);
+
+        let sids: Vec<String> = captured_sorted(&shared)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert!(sids.contains(&"s-worker".into()), "{:?}", sids);
+        assert!(sids.contains(&"s-creator".into()), "{:?}", sids);
+        assert!(sids.contains(&"s-ia".into()), "{:?}", sids);
+        assert!(
+            !sids.contains(&"s-unrelated".into()),
+            "parent worker leaked: {:?}",
+            sids
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Root-broadcast rules
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn notify_root_broadcast_on_merged() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "M", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec");
+        db.set_session_id(task.id, "s-worker").expect("sid");
+        task.session_id = Some("s-worker".into());
+        task.state = "merged".into();
+
+        let (shared, mut w, mut r) = make_io();
+        shared.lock().expect("lock").ancestors.insert(
+            "s-worker".into(),
+            vec![
+                fake_session("s-worker", Some("s-root"), false),
+                fake_session("s-root", None, false),
+            ],
+        );
+
+        notify_state_change(
+            &db,
+            &task,
+            "merging",
+            Some("commit deadbeef"),
+            &mut w,
+            &mut r,
+        );
+
+        let calls = captured_sorted(&shared);
+        let sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(sids.contains(&"s-worker"), "{:?}", sids);
+        assert!(sids.contains(&"s-root"), "root not notified: {:?}", sids);
+        // Message text check
+        let expected = format!("[task #{}] M: merged (commit deadbeef)", task.id);
+        for (_, text) in &calls {
+            assert_eq!(text, &expected);
+        }
+    }
+
+    #[test]
+    fn notify_root_broadcast_on_failed() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "F", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec");
+        db.set_session_id(task.id, "s-worker").expect("sid");
+        task.session_id = Some("s-worker".into());
+        task.state = "failed".into();
+
+        let (shared, mut w, mut r) = make_io();
+        shared.lock().expect("lock").ancestors.insert(
+            "s-worker".into(),
+            vec![
+                fake_session("s-worker", Some("s-root"), false),
+                fake_session("s-root", None, false),
+            ],
+        );
+
+        notify_state_change(
+            &db,
+            &task,
+            "merging",
+            Some("checklist failed"),
+            &mut w,
+            &mut r,
+        );
+
+        let sids: Vec<String> = captured_sorted(&shared)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert!(sids.contains(&"s-root".to_string()), "{:?}", sids);
+    }
+
+    #[test]
+    fn notify_root_broadcast_on_interactive() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "I", None, "planning");
+        // Transition task to refining so we can fake "refining → interactive".
+        db.update_task(
+            task.id,
+            &crate::tasks_db::TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("to refining");
+        db.record_session(task.id, "s-refiner", "refiner")
+            .expect("rec");
+        db.set_session_id(task.id, "s-refiner").expect("sid");
+        task.session_id = Some("s-refiner".into());
+        task.state = "interactive".into();
+
+        let (shared, mut w, mut r) = make_io();
+        shared.lock().expect("lock").ancestors.insert(
+            "s-refiner".into(),
+            vec![
+                fake_session("s-refiner", Some("s-root"), false),
+                fake_session("s-root", None, false),
+            ],
+        );
+
+        notify_state_change(
+            &db,
+            &task,
+            "refining",
+            Some("scope expansion"),
+            &mut w,
+            &mut r,
+        );
+
+        let sids: Vec<String> = captured_sorted(&shared)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert!(sids.contains(&"s-root".to_string()), "{:?}", sids);
+    }
+
+    #[test]
+    fn notify_no_root_broadcast_on_closed() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "C", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec");
+        db.set_session_id(task.id, "s-worker").expect("sid");
+        task.session_id = Some("s-worker".into());
+        task.state = "closed".into();
+
+        let (shared, mut w, mut r) = make_io();
+        shared.lock().expect("lock").ancestors.insert(
+            "s-worker".into(),
+            vec![
+                fake_session("s-worker", Some("s-root"), false),
+                fake_session("s-root", None, false),
+            ],
+        );
+
+        notify_state_change(&db, &task, "active", None, &mut w, &mut r);
+
+        let sids: Vec<String> = captured_sorted(&shared)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert!(
+            !sids.contains(&"s-root".to_string()),
+            "root leaked on closed: {:?}",
+            sids
+        );
+        assert!(sids.contains(&"s-worker".to_string()), "{:?}", sids);
+    }
+
+    #[test]
+    fn notify_root_broadcast_skipped_when_root_archived() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "AR", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec");
+        db.set_session_id(task.id, "s-worker").expect("sid");
+        task.session_id = Some("s-worker".into());
+        task.state = "merged".into();
+
+        let (shared, mut w, mut r) = make_io();
+        {
+            let mut s = shared.lock().expect("lock");
+            s.archived_sessions.insert("s-root".into());
+            s.ancestors.insert(
+                "s-worker".into(),
+                vec![
+                    fake_session("s-worker", Some("s-root"), false),
+                    fake_session("s-root", None, /* archived */ true),
+                ],
+            );
+        }
+
+        notify_state_change(&db, &task, "merging", None, &mut w, &mut r);
+
+        let sids: Vec<String> = captured_sorted(&shared)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert!(
+            !sids.contains(&"s-root".to_string()),
+            "archived root leaked: {:?}",
+            sids
+        );
+        // s-worker still notified (the broadcast didn't abort).
+        assert!(sids.contains(&"s-worker".to_string()), "{:?}", sids);
+    }
+
+    // -----------------------------------------------------------------
+    // Robustness
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn notify_survives_missing_sessions() {
+        // Parent task reference points at a deleted row: the lookup
+        // silently returns an empty list and the rest of the broadcast
+        // still happens.
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Mid", None, "ready");
+        db.record_session(task.id, "s-a", "worker").expect("rec a");
+        db.record_session(task.id, "s-b", "reviewer")
+            .expect("rec b");
+        task.state = "review".into();
+        // Fabricate a parent_id pointing at nothing — get_sessions for
+        // non-existent task returns Ok(empty) in the current impl, so
+        // this exercises the "chain-element missing" path.
+        task.parent_id = Some(999_999);
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, "active", None, &mut w, &mut r);
+
+        let sids: Vec<String> = captured_sorted(&shared)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert!(sids.contains(&"s-a".to_string()), "{:?}", sids);
+        assert!(sids.contains(&"s-b".to_string()), "{:?}", sids);
+    }
+
+    // -----------------------------------------------------------------
+    // Integration-style: full lifecycle
+    // -----------------------------------------------------------------
+
+    /// A task goes through
+    ///   planning → refining → ready → active → review → approved → merging → merged
+    /// with a fixed creator session that stays recorded throughout.  The
+    /// creator should observe exactly seven info-messages in order.
+    #[test]
+    fn notify_lifecycle_delivers_seven_messages_in_order() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Life", None, "planning");
+        db.record_session(task.id, "s-creator", "creator")
+            .expect("rec");
+
+        let (shared, mut w, mut r) = make_io();
+
+        let steps = [
+            ("planning", "refining", None),
+            ("refining", "ready", None),
+            ("ready", "active", None),
+            ("active", "review", None),
+            ("review", "approved", None),
+            ("approved", "merging", None),
+            ("merging", "merged", Some("commit cafef00d")),
+        ];
+
+        for (from, to, ctx) in steps {
+            task.state = to.to_string();
+            notify_state_change(&db, &task, from, ctx, &mut w, &mut r);
+        }
+
+        // Only s-creator was ever recorded against the task; it should
+        // receive one message per step.  (merged also broadcasts to the
+        // root but since we didn't configure ancestors, the default root
+        // is s-creator itself — which dedups.)
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        let creator_msgs: Vec<&str> = calls
+            .iter()
+            .filter(|(sid, _)| sid == "s-creator")
+            .map(|(_, t)| t.as_str())
+            .collect();
+
+        let id = task.id;
+        let expected: Vec<String> = vec![
+            format!("[task #{}] Life: planning → refining", id),
+            format!("[task #{}] Life: refining → ready", id),
+            format!("[task #{}] Life: ready → active", id),
+            format!("[task #{}] Life: active → review", id),
+            format!("[task #{}] Life: review → approved", id),
+            format!("[task #{}] Life: approved → merging", id),
+            format!("[task #{}] Life: merged (commit cafef00d)", id),
+        ];
+        let expected_refs: Vec<&str> = expected.iter().map(String::as_str).collect();
+
+        assert_eq!(creator_msgs, expected_refs, "full message log mismatch");
+    }
+}

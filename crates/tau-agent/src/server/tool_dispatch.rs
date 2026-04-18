@@ -458,6 +458,13 @@ pub(super) async fn handle_server_request(
                 },
             }
         }
+        Request::QueueInfo {
+            target_session_id,
+            text,
+        } => {
+            queue_info_to_session(state, target_session_id, text);
+            Response::Ok
+        }
         Request::ArchiveSession {
             session_id,
             require_ancestor,
