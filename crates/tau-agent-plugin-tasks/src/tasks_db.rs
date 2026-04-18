@@ -25,6 +25,12 @@ pub struct Task {
     pub skip_review: bool,
     pub require_approval: bool,
     pub sandbox_profile: Option<String>,
+    /// When true, the task is NOT scheduled for dispatch even if its state
+    /// would otherwise be schedulable. Orthogonal to state — a held task
+    /// remains visible in listings and preserves its state, but the
+    /// scheduler's eligibility predicate skips it. Released via
+    /// `update_task` with `held: Some(false)`.
+    pub held: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -66,6 +72,7 @@ pub struct TaskUpdate {
     pub require_approval: Option<bool>,
     pub merge_target: Option<String>,
     pub sandbox_profile: Option<String>,
+    pub held: Option<bool>,
 }
 
 /// Result of `assign_task`, containing the updated task plus information
@@ -253,6 +260,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     worktree_path TEXT,
     session_id TEXT,
     skip_review INTEGER NOT NULL DEFAULT 0,
+    held INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -452,6 +460,19 @@ impl TasksDb {
                 })?;
         }
 
+        // Add held column if it doesn't exist. Introduced by task #527 to
+        // let callers batch-seed a task board without racing the scheduler.
+        let has_held: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'held'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_held {
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN held INTEGER NOT NULL DEFAULT 0;")
+                .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate held: {}", e)))?;
+        }
+
         // Migrate done -> merged/closed terminal states.
         let has_done: bool = conn
             .prepare("SELECT COUNT(*) FROM tasks WHERE state = 'done'")
@@ -493,6 +514,7 @@ impl TasksDb {
         require_approval: bool,
         merge_target: Option<&str>,
         sandbox_profile: Option<&str>,
+        held: bool,
     ) -> tau_agent_plugin::Result<Task> {
         let now = tau_agent_plugin::timestamp_ms() as i64;
         let priority = priority.unwrap_or(0);
@@ -514,8 +536,8 @@ impl TasksDb {
 
         self.conn
             .execute(
-                "INSERT INTO tasks (project_name, title, state, priority, parent_id, tags, skip_review, require_approval, merge_target, sandbox_profile, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT INTO tasks (project_name, title, state, priority, parent_id, tags, skip_review, require_approval, merge_target, sandbox_profile, held, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     project_name,
                     title,
@@ -527,6 +549,7 @@ impl TasksDb {
                     require_approval as i32,
                     merge_target,
                     sandbox_profile,
+                    held as i32,
                     now,
                     now,
                 ],
@@ -543,7 +566,7 @@ impl TasksDb {
         self.conn
             .query_row(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
                         created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
@@ -564,7 +587,7 @@ impl TasksDb {
     ) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut sql = String::from(
             "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                    branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
+                    branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
                     created_at, updated_at
              FROM tasks WHERE project_name = ?1",
         );
@@ -765,6 +788,19 @@ impl TasksDb {
                 "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "require_approval", old_str, new_str, session_id, now],
+            )
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+        }
+
+        if let Some(val) = update.held {
+            let old_str = Some(task.held.to_string());
+            let new_str = val.to_string();
+            params_vec.push(Box::new(val as i32));
+            sets.push("held = ?".to_string());
+            tx.execute(
+                "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, "held", old_str, new_str, session_id, now],
             )
             .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
         }
@@ -1065,7 +1101,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.created_at,
                         t.updated_at
                  FROM task_relations r
                  JOIN tasks t ON t.id = r.to_task
@@ -1097,10 +1133,11 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.created_at,
                         t.updated_at
                  FROM tasks t
                  WHERE t.project_name = ?1 AND t.state IN ('ready', 'planning')
+                   AND NOT t.held
                    AND NOT EXISTS (
                        SELECT 1 FROM task_relations r
                        JOIN tasks dep ON dep.id = r.to_task
@@ -1134,7 +1171,7 @@ impl TasksDb {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project_name {
             Some(p) => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved' AND project_name = ?1
@@ -1144,7 +1181,7 @@ impl TasksDb {
             ),
             None => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved'
@@ -1201,7 +1238,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
                         created_at, updated_at
                  FROM tasks
                  WHERE project_name = ?1
@@ -1276,7 +1313,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
                         created_at, updated_at
                  FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
             )
@@ -1580,7 +1617,7 @@ impl TasksDb {
         if let Some(state) = state_filter {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1 AND t.state = ?2
@@ -1603,7 +1640,7 @@ impl TasksDb {
         } else {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1
@@ -1744,7 +1781,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
                         created_at, updated_at
                  FROM tasks
                  WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
@@ -1812,8 +1849,9 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         skip_review: row.get::<_, i32>(12)? != 0,
         require_approval: row.get::<_, i32>(13)? != 0,
         sandbox_profile: row.get(14)?,
-        created_at: row.get(15)?,
-        updated_at: row.get(16)?,
+        held: row.get::<_, i32>(15)? != 0,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 
@@ -1855,6 +1893,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1886,6 +1925,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1908,6 +1948,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let _t2 = db
@@ -1922,6 +1963,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let _t3 = db
@@ -1936,6 +1978,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1983,6 +2026,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .unwrap();
         db.create_task(
@@ -1996,6 +2040,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -2026,6 +2071,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2164,6 +2210,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2209,6 +2256,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // interactive -> ready -> active -> review -> approved
@@ -2313,6 +2361,7 @@ mod tests {
                     false,
                     None,
                     None,
+                    false,
                 )
                 .unwrap();
 
@@ -2369,6 +2418,7 @@ mod tests {
                     false,
                     None,
                     None,
+                    false,
                 )
                 .unwrap();
 
@@ -2422,6 +2472,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2454,6 +2505,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2485,6 +2537,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2541,6 +2594,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -2555,6 +2609,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2586,6 +2641,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2611,6 +2667,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -2625,6 +2682,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2647,6 +2705,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let _t2 = db
@@ -2661,6 +2720,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t3 = db
@@ -2675,6 +2735,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2709,6 +2770,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let _child1 = db
@@ -2723,6 +2785,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let _child2 = db
@@ -2737,6 +2800,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2762,6 +2826,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.create_task(
@@ -2775,6 +2840,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .unwrap();
         db.create_task(
@@ -2788,6 +2854,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .unwrap();
         db.create_task(
@@ -2801,6 +2868,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -2841,6 +2909,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.add_message(task.id, "msg", None).unwrap();
@@ -2870,6 +2939,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(task.skip_review);
@@ -2904,6 +2974,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -2963,6 +3034,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -2997,6 +3069,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -3029,6 +3102,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3054,6 +3128,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3084,6 +3159,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3134,6 +3210,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(parent.state, "interactive");
@@ -3154,6 +3231,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(child.state, "planning");
@@ -3175,6 +3253,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3191,6 +3270,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(child.state, "ready");
@@ -3214,6 +3294,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "ready");
@@ -3230,6 +3311,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -3246,6 +3328,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -3266,6 +3349,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .expect_err("invalid initial_state should fail");
         let msg = err.to_string();
@@ -3291,6 +3375,7 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(task.require_approval);
@@ -3323,6 +3408,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(!task.require_approval);
@@ -3343,6 +3429,7 @@ mod tests {
                 false,
                 None,
                 Some("restricted"),
+                false,
             )
             .unwrap();
         assert_eq!(task.sandbox_profile.as_deref(), Some("restricted"));
@@ -3375,6 +3462,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(task.sandbox_profile.is_none());
@@ -3395,6 +3483,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3436,6 +3525,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3479,6 +3569,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(task.branch.is_none());
@@ -3511,6 +3602,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(task.worktree_path.is_none());
@@ -3547,6 +3639,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3584,6 +3677,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_worktree_path(t1.id, "/tmp/wt-1").unwrap();
@@ -3610,6 +3704,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_worktree_path(t2.id, "/tmp/wt-2").unwrap();
@@ -3636,6 +3731,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3661,6 +3757,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_worktree_path(t4.id, "/tmp/wt-4").unwrap();
@@ -3711,6 +3808,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3733,6 +3831,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "task-1").unwrap();
@@ -3749,6 +3848,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3771,6 +3871,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // Don't set a branch on parent — should fall back to "main"
@@ -3787,6 +3888,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3816,6 +3918,7 @@ mod tests {
                 false,
                 Some("develop"),
                 None,
+                false,
             )
             .unwrap();
 
@@ -3838,6 +3941,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "task-1").unwrap();
@@ -3855,6 +3959,7 @@ mod tests {
                 false,
                 Some("main"),
                 None,
+                false,
             )
             .unwrap();
 
@@ -3877,6 +3982,7 @@ mod tests {
                 false,
                 Some("release/v2"),
                 None,
+                false,
             )
             .unwrap();
 
@@ -3898,6 +4004,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(task.merge_target.is_none());
@@ -3935,6 +4042,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(task.merge_target.is_none());
@@ -3953,6 +4061,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "feature-branch").unwrap();
@@ -3969,6 +4078,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert!(child.merge_target.is_none());
@@ -3991,6 +4101,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let transitions: &[&str] = match state {
@@ -4260,6 +4371,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4282,6 +4394,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4296,6 +4409,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4324,6 +4438,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4338,6 +4453,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4364,6 +4480,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4378,6 +4495,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4404,6 +4522,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4418,6 +4537,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t3 = db
@@ -4432,6 +4552,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4459,6 +4580,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4473,6 +4595,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4498,6 +4621,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4512,6 +4636,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4533,6 +4658,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4547,6 +4673,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4571,6 +4698,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4585,6 +4713,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t3 = db
@@ -4599,6 +4728,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t4 = db
@@ -4613,6 +4743,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4665,6 +4796,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let b = db
@@ -4679,6 +4811,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let c = db
@@ -4693,6 +4826,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let d = db
@@ -4707,6 +4841,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4732,6 +4867,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.add_relation(d.id, e.id, "depends_on").unwrap();
@@ -4754,6 +4890,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let b = db
@@ -4768,6 +4905,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let c = db
@@ -4782,6 +4920,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let d = db
@@ -4796,6 +4935,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let e = db
@@ -4810,6 +4950,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4838,6 +4979,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let b = db
@@ -4852,6 +4994,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4876,6 +5019,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let b = db
@@ -4890,6 +5034,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let c = db
@@ -4904,6 +5049,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4922,6 +5068,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.add_relation(c.id, d.id, "depends_on").unwrap();
@@ -4953,6 +5100,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -4977,6 +5125,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5011,6 +5160,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5062,6 +5212,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5096,6 +5247,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5146,6 +5298,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5180,6 +5333,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5226,6 +5380,7 @@ mod tests {
             skip_review: false,
             require_approval: false,
             sandbox_profile: None,
+            held: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -5311,6 +5466,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let child1 = db
@@ -5325,6 +5481,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let child2 = db
@@ -5339,6 +5496,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5364,6 +5522,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let child = db
@@ -5378,6 +5537,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let grandchild = db
@@ -5392,6 +5552,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5417,6 +5578,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5441,6 +5603,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5488,6 +5651,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "s1").unwrap();
@@ -5517,6 +5681,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -5595,6 +5760,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5628,6 +5794,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5659,6 +5826,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5700,6 +5868,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5756,6 +5925,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5813,6 +5983,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5866,6 +6037,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5929,6 +6101,7 @@ mod tests {
                     false,
                     None,
                     None,
+                    false,
                 )
                 .unwrap();
 
@@ -6003,6 +6176,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -6037,6 +6211,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -6062,7 +6237,7 @@ mod tests {
 
         let task = db
             .create_task(
-                project, "Do work", None, None, None, false, "ready", false, None, None,
+                project, "Do work", None, None, None, false, "ready", false, None, None, false,
             )
             .unwrap();
         // Assign to move to active
@@ -6088,6 +6263,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -6113,6 +6289,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -6230,5 +6407,147 @@ mod tests {
             !has_skip_planning,
             "legacy skip_planning column should be dropped by migrate()"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // `held` flag (task #527)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_create_task_held_persists() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "proj", "Parked", None, None, None, false, "ready", false, None, None,
+                true, // held
+            )
+            .unwrap();
+
+        assert!(task.held, "newly-created task should carry the held flag");
+        let loaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(loaded.held, "held flag must persist across reload");
+    }
+
+    #[test]
+    fn test_get_schedulable_skips_held_tasks() {
+        let db = TasksDb::open_memory().unwrap();
+        let visible = db
+            .create_task(
+                "proj", "Visible", None, None, None, false, "ready", false, None, None, false,
+            )
+            .unwrap();
+        let parked = db
+            .create_task(
+                "proj", "Parked", None, None, None, false, "ready", false, None, None, true,
+            )
+            .unwrap();
+
+        let sched = db.get_schedulable_tasks("proj").unwrap();
+        let ids: Vec<i64> = sched.iter().map(|t| t.id).collect();
+        assert!(
+            ids.contains(&visible.id),
+            "unheld ready task should be schedulable"
+        );
+        assert!(
+            !ids.contains(&parked.id),
+            "held task must be excluded from get_schedulable_tasks"
+        );
+    }
+
+    #[test]
+    fn test_update_task_toggles_held() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "proj", "Toggle", None, None, None, false, "ready", false, None, None, true,
+            )
+            .unwrap();
+        assert!(task.held);
+
+        let released = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    held: Some(false),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(!released.held, "held=false should clear the flag");
+
+        // Now get_schedulable_tasks should include it.
+        let sched = db.get_schedulable_tasks("proj").unwrap();
+        assert!(
+            sched.iter().any(|t| t.id == task.id),
+            "released task should become schedulable"
+        );
+
+        // Reapply the hold.
+        let held_again = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    held: Some(true),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert!(held_again.held);
+    }
+
+    #[test]
+    fn test_held_migration_adds_column_to_legacy_db() {
+        // Build a legacy schema that predates the held column.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY,
+                project_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'interactive',
+                priority INTEGER DEFAULT 0,
+                parent_id INTEGER REFERENCES tasks(id),
+                tags TEXT,
+                affected_files TEXT,
+                branch TEXT,
+                worktree_path TEXT,
+                session_id TEXT,
+                skip_review INTEGER NOT NULL DEFAULT 0,
+                require_approval INTEGER NOT NULL DEFAULT 0,
+                merge_target TEXT,
+                sandbox_profile TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE task_history (
+                id INTEGER PRIMARY KEY,
+                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                field TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                session_id TEXT,
+                created_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        // Before migration there is no held column.
+        let has_held: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'held'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(!has_held);
+
+        TasksDb::migrate(&conn).unwrap();
+
+        let has_held: bool = conn
+            .prepare("SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'held'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(has_held, "migrate() should add the held column");
     }
 }

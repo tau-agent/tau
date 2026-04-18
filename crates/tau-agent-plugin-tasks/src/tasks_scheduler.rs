@@ -1764,6 +1764,7 @@ pub struct SchedulerStatus {
     pub active: Vec<TaskStatus>,
     pub queued_planning: Vec<TaskStatus>,
     pub queued_ready: Vec<TaskStatus>,
+    pub held: Vec<TaskStatus>,
     pub blocked: Vec<TaskStatus>,
     pub inflight_count: usize,
     pub max_concurrent: usize,
@@ -1794,6 +1795,7 @@ pub fn get_status(
     let mut active = Vec::new();
     let mut queued_planning = Vec::new();
     let mut queued_ready = Vec::new();
+    let mut held = Vec::new();
     let mut blocked = Vec::new();
 
     // Build a map of active task IDs to their affected files for conflict detection.
@@ -1899,7 +1901,12 @@ pub fn get_status(
                     task: task.clone(),
                     wait_reasons,
                 };
-                if task.state == "planning" {
+                if task.held {
+                    // Held tasks are parked by the caller — the scheduler
+                    // skips them regardless of other state. Surface them in
+                    // a dedicated section instead of "about to be dispatched".
+                    held.push(status);
+                } else if task.state == "planning" {
                     queued_planning.push(status);
                 } else {
                     queued_ready.push(status);
@@ -1913,6 +1920,7 @@ pub fn get_status(
         active,
         queued_planning,
         queued_ready,
+        held,
         blocked,
         inflight_count,
         max_concurrent,
@@ -1958,6 +1966,14 @@ pub fn format_status(status: &SchedulerStatus) -> String {
         }
     }
 
+    // Held.
+    if !status.held.is_empty() {
+        out.push_str(&format!("\nHELD ({}):\n", status.held.len()));
+        for ts in &status.held {
+            format_task_line(&mut out, ts);
+        }
+    }
+
     // Blocked.
     if !status.blocked.is_empty() {
         out.push_str(&format!("\nBLOCKED ({}):\n", status.blocked.len()));
@@ -1969,6 +1985,7 @@ pub fn format_status(status: &SchedulerStatus) -> String {
     if status.active.is_empty()
         && status.queued_planning.is_empty()
         && status.queued_ready.is_empty()
+        && status.held.is_empty()
         && status.blocked.is_empty()
     {
         out.push_str("\nNo active or queued tasks.\n");
@@ -2029,6 +2046,10 @@ fn format_task_line(out: &mut String, ts: &TaskStatus) {
 
     if let Some(profile) = ts.task.sandbox_profile.as_deref() {
         let _ = write!(out, " 🔒{}", profile);
+    }
+
+    if ts.task.held {
+        let _ = write!(out, " 🔒held");
     }
 
     // Append wait reasons.
@@ -2109,6 +2130,7 @@ mod tests {
             skip_review: false,
             require_approval: false,
             sandbox_profile: None,
+            held: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -2691,6 +2713,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -2873,6 +2896,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -2938,6 +2962,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3014,6 +3039,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -3084,6 +3110,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -3146,6 +3173,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -3163,6 +3191,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3215,6 +3244,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "planner-session", "planner")
@@ -3499,6 +3529,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let child = db
@@ -3513,6 +3544,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(child.state, "planning");
@@ -3539,6 +3571,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3564,9 +3597,103 @@ mod tests {
         assert!(status.active.is_empty());
         assert!(status.queued_planning.is_empty());
         assert!(status.queued_ready.is_empty());
+        assert!(status.held.is_empty());
         assert!(status.blocked.is_empty());
         assert_eq!(status.inflight_count, 0);
         assert_eq!(status.max_concurrent, MAX_CONCURRENT_TASKS);
+    }
+
+    #[test]
+    fn test_get_status_routes_held_tasks_to_held_section() {
+        let db = TasksDb::open_memory().unwrap();
+        // A plain ready task stays in queued_ready.
+        let visible = create_ready_task(&db, "test-project", "Visible", 5, None);
+        // A held ready task belongs in the new `held` bucket.
+        let held_task = db
+            .create_task(
+                "test-project",
+                "Parked",
+                Some(3),
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+
+        let status = get_status(&db, "test-project", None).unwrap();
+        let queued_ids: Vec<i64> = status.queued_ready.iter().map(|s| s.task.id).collect();
+        let held_ids: Vec<i64> = status.held.iter().map(|s| s.task.id).collect();
+        assert!(queued_ids.contains(&visible.id));
+        assert!(!queued_ids.contains(&held_task.id));
+        assert!(held_ids.contains(&held_task.id));
+        assert_eq!(status.held.len(), 1);
+
+        // format_status should print a HELD section and not mis-file the
+        // task under QUEUED - READY.
+        let rendered = format_status(&status);
+        assert!(rendered.contains("HELD (1)"));
+        assert!(rendered.contains("🔒held"));
+        let ready_header = rendered
+            .find("QUEUED - READY")
+            .expect("queued ready section exists for the visible task");
+        let held_header = rendered.find("HELD (1)").expect("held section exists");
+        // The held task id should appear in the HELD section, not the ready
+        // section.
+        let held_region = &rendered[held_header..];
+        assert!(held_region.contains(&format!("#{}", held_task.id)));
+        // Slice from QUEUED-READY until HELD to verify the held id is
+        // absent from the ready section.
+        let ready_region = &rendered[ready_header..held_header];
+        assert!(!ready_region.contains(&format!("#{}", held_task.id)));
+    }
+
+    #[test]
+    fn test_schedule_skips_held_ready_tasks_across_passes() {
+        let db = TasksDb::open_memory().unwrap();
+        let held_task = db
+            .create_task(
+                "test-project",
+                "Parked",
+                Some(5),
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+
+        for _ in 0..3 {
+            let sched = db.get_schedulable_tasks("test-project").unwrap();
+            assert!(
+                !sched.iter().any(|t| t.id == held_task.id),
+                "held task must never be returned by get_schedulable_tasks"
+            );
+        }
+
+        // Release, then the task should become schedulable.
+        db.update_task(
+            held_task.id,
+            &crate::tasks_db::TaskUpdate {
+                held: Some(false),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let sched = db.get_schedulable_tasks("test-project").unwrap();
+        assert!(
+            sched.iter().any(|t| t.id == held_task.id),
+            "released task must be schedulable on the next pass"
+        );
     }
 
     #[test]
@@ -3635,6 +3762,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let child = db
@@ -3649,6 +3777,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(child.state, "planning");
@@ -3680,6 +3809,7 @@ mod tests {
                     with_task_id: 1,
                 }],
             }],
+            held: vec![],
             blocked: vec![],
             inflight_count: 1,
             max_concurrent: 8,
@@ -3740,6 +3870,7 @@ mod tests {
             }],
             queued_planning: vec![],
             queued_ready: vec![],
+            held: vec![],
             blocked: vec![],
             inflight_count: 1,
             max_concurrent: 8,

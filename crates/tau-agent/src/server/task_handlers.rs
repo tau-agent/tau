@@ -18,6 +18,7 @@ fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
         skip_review: t.skip_review,
         require_approval: t.require_approval,
         sandbox_profile: t.sandbox_profile,
+        held: t.held,
         created_at: t.created_at,
         updated_at: t.updated_at,
     }
@@ -155,6 +156,7 @@ pub fn handle_task_create(
         false,
         None,
         sandbox_profile,
+        false,
     ) {
         Ok(task) => Response::TaskUpdated {
             task: task_to_info(task),
@@ -191,6 +193,7 @@ pub fn handle_task_update(
         require_approval,
         merge_target: None,
         sandbox_profile,
+        held: None,
     };
     match db.update_task(id, &update, None) {
         Ok(task) => Response::TaskUpdated {

@@ -438,6 +438,8 @@ pub struct TaskInfo {
     pub require_approval: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_profile: Option<String>,
+    #[serde(default)]
+    pub held: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -818,6 +820,7 @@ mod tests {
             skip_review: false,
             require_approval: false,
             sandbox_profile: None,
+            held: false,
             created_at: 1000,
             updated_at: 2000,
         };

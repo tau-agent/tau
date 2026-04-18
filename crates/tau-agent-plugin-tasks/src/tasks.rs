@@ -223,6 +223,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "sandbox_profile": {
                         "type": "string",
                         "description": "Sandbox profile name from sandbox.toml to use when dispatching this task's sessions"
+                    },
+                    "hold": {
+                        "type": "boolean",
+                        "description": "When true, the task is created but NOT scheduled for dispatch, even if initial_state='ready'. Release by calling task_update with hold=false. Useful for batch-seeding a task board before manually choosing dispatch order. Default: false."
                     }
                 },
                 "required": ["title"]
@@ -234,6 +238,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "Pass initial_state=\"interactive\" only when the user explicitly asked to iterate on the task conversationally. This spawns a user-driven refinement session; do NOT use it for agent-authored tasks.".into(),
                 "Top-level and subtask behaviour is identical on the initial-state axis. Use parent_id for grouping and parallelisation, not to control dispatch.".into(),
                 "Sessions dispatched for top-level tasks are automatically parented under the project's root (user-facing) session, so new work surfaces in the user's session tree regardless of where in the session tree task_create was called.".into(),
+                "Pass hold=true to create a task without scheduling it. Useful for batch-seeding a backlog on a greenfield project: file N tasks at once, review, then release them in considered order via task_update(hold=false). Held tasks are visible in task_list/task_status with a held indicator but the scheduler skips them.".into(),
             ],
         },
         PluginToolDef {
@@ -353,6 +358,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "sandbox_profile": {
                         "type": "string",
                         "description": "Sandbox profile name from sandbox.toml to use when dispatching this task's sessions"
+                    },
+                    "hold": {
+                        "type": "boolean",
+                        "description": "Hold (true) or release (false) a task from scheduler dispatch. A held task remains visible in lists and preserves its state but the scheduler will not dispatch it. See task_create for details."
                     }
                 },
                 "required": ["id"]
@@ -362,6 +371,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "State transitions are validated — invalid attempts are rejected with a clear error (active→approved additionally requires skip_review=true).".into(),
                 "Some transitions auto-dispatch sessions (planning→refining, active→review); don't take further action on the task until that session completes.".into(),
                 "When working in an interactive task session and the user wants to start implementation, transition the task to 'ready' (with affected_files set) — do NOT edit project files directly. The scheduler creates an isolated branch/worktree and dispatches a worker session.".into(),
+                "Pass hold=true/false to hold or release a task from scheduler dispatch.".into(),
             ],
         },
         PluginToolDef {
@@ -599,6 +609,7 @@ fn handle_task_create(
         .get("require_approval")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let hold = args.get("hold").and_then(|v| v.as_bool()).unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str());
     let merge_target = args.get("merge_target").and_then(|v| v.as_str());
     let sandbox_profile = args.get("sandbox_profile").and_then(|v| v.as_str());
@@ -614,10 +625,13 @@ fn handle_task_create(
         require_approval,
         merge_target,
         sandbox_profile,
+        hold,
     ) {
         Ok(task) => {
             // Subtasks start in ready or planning state — trigger a schedule pass.
-            if task.state == "ready" || task.state == "planning" {
+            // Held tasks stay parked: the scheduler skips them until released
+            // via task_update(hold=false).
+            if (task.state == "ready" || task.state == "planning") && !task.held {
                 pending_events.push(SchedulerEvent::ScheduleNeeded(
                     project_name.to_string(),
                     session_id.map(String::from),
@@ -1101,6 +1115,7 @@ fn handle_task_update(
             .get("sandbox_profile")
             .and_then(|v| v.as_str())
             .map(String::from),
+        held: args.get("hold").and_then(|v| v.as_bool()),
     };
 
     // Track session as reviewer if transitioning to review or approved
@@ -1180,15 +1195,36 @@ fn handle_task_update(
             let mut dispatch_warnings: Vec<String> = Vec::new();
 
             // Trigger scheduler events based on the new state.
+            // Held tasks do not trigger schedule passes — releasing via
+            // hold=false will (see below).
             match task.state.as_str() {
                 "approved" => pending_events.push(SchedulerEvent::MergeNeeded),
-                "ready" | "planning" => {
+                "ready" | "planning" if !task.held => {
                     pending_events.push(SchedulerEvent::ScheduleNeeded(
                         task.project_name.clone(),
                         session_id.map(String::from),
                     ));
                 }
                 _ => {}
+            }
+
+            // Releasing a held task (hold=false) on a schedulable state
+            // should poke the scheduler so the task can be picked up on
+            // the next pass. The state-based arm above already covers the
+            // held=true → held=false case when combined with any other
+            // state change; this branch handles the pure release.
+            if matches!(update.held, Some(false))
+                && !task.held
+                && (task.state == "ready" || task.state == "planning")
+                && !pending_events.iter().any(|e| {
+                    matches!(e,
+                    SchedulerEvent::ScheduleNeeded(p, _) if p == &task.project_name)
+                })
+            {
+                pending_events.push(SchedulerEvent::ScheduleNeeded(
+                    task.project_name.clone(),
+                    session_id.map(String::from),
+                ));
             }
 
             // Note: the observational `notify_state_change` call is deferred
@@ -1499,6 +1535,13 @@ fn handle_task_update(
             }
             if args.get("affected_files").is_some() {
                 changes.push("affected_files".to_string());
+            }
+            if let Some(hold) = args.get("hold").and_then(|v| v.as_bool()) {
+                changes.push(if hold {
+                    "hold=true".to_string()
+                } else {
+                    "hold=false".to_string()
+                });
             }
             let summary = if changes.is_empty() {
                 format!("task_update: #{}", id)
@@ -2274,7 +2317,9 @@ pub fn run_tasks_plugin() {
                         }
                         "ready" | "planning" => {
                             // Look up the task's project for the schedule pass.
-                            if let Ok(Some(task)) = db.get_task(task_id) {
+                            if let Ok(Some(task)) = db.get_task(task_id)
+                                && !task.held
+                            {
                                 pending_events.push(SchedulerEvent::ScheduleNeeded(
                                     task.project_name.clone(),
                                     None,
@@ -3009,6 +3054,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -3023,6 +3069,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3057,6 +3104,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let msg = db.add_message(task.id, "original", None).unwrap();
@@ -3376,6 +3424,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3436,6 +3485,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3480,6 +3530,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3515,6 +3566,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3574,6 +3626,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "s-worker", "worker").unwrap();
@@ -3643,6 +3696,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "s-any", "worker").unwrap();
@@ -3724,6 +3778,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // Move through ready -> active (avoid the auto-review dispatch
@@ -3809,6 +3864,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "s-planner", "planner").unwrap();
@@ -3882,6 +3938,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -3950,6 +4007,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // Move planning -> refining directly in the DB (bypass the
@@ -4024,6 +4082,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4089,12 +4148,13 @@ mod tests {
             total
         );
 
-        // task_update's state-machine enumerations were folded into three bullets.
+        // task_update's state-machine enumerations were folded into three bullets,
+        // plus the hold bullet added by task #527.
         let task_update = tools.iter().find(|t| t.name == "task_update").unwrap();
         assert_eq!(
             task_update.prompt_guidelines.len(),
-            3,
-            "task_update should have exactly 3 guidelines after the trim"
+            4,
+            "task_update should have exactly 4 guidelines after the trim"
         );
 
         // Tools whose description fully covers behaviour should carry no guidelines.
@@ -4211,6 +4271,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4255,6 +4316,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4282,6 +4344,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4296,6 +4359,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4322,6 +4386,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4336,6 +4401,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4372,6 +4438,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -4386,6 +4453,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4418,6 +4486,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -4470,6 +4539,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
@@ -4500,6 +4570,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4514,6 +4585,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4544,6 +4616,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4558,6 +4631,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4589,6 +4663,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4603,6 +4678,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -4636,6 +4712,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4650,6 +4727,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5001,6 +5079,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
@@ -5078,6 +5157,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -5117,6 +5197,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
@@ -5210,6 +5291,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -5227,6 +5309,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.assign_task(child.id, "worker-session").unwrap();
@@ -5298,6 +5381,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5439,6 +5523,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5532,6 +5617,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
@@ -5608,6 +5694,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5672,6 +5759,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
@@ -5737,6 +5825,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5803,6 +5892,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5866,6 +5956,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5983,6 +6074,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -6096,6 +6188,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -6110,6 +6203,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -6216,6 +6310,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -6230,6 +6325,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "planning-session").unwrap();
@@ -6336,6 +6432,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -6350,6 +6447,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -6465,6 +6563,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -6479,6 +6578,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -6533,6 +6633,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -6547,6 +6648,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -6610,6 +6712,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -6624,6 +6727,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -6838,6 +6942,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -6852,6 +6957,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -6920,6 +7026,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -6934,6 +7041,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -7137,6 +7245,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -7151,6 +7260,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7224,6 +7334,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -7238,6 +7349,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -7388,6 +7500,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -7402,6 +7515,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7522,6 +7636,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7618,6 +7733,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7690,6 +7806,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -7704,6 +7821,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -7791,6 +7909,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7846,6 +7965,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // planning -> refining transition triggers dispatch
@@ -7925,6 +8045,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -7939,6 +8060,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -7982,6 +8104,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -8038,6 +8161,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let task = db
@@ -8052,6 +8176,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "ready");
@@ -8083,6 +8208,128 @@ mod tests {
         assert_eq!(
             reverted.state, "ready",
             "active → ready transition should succeed for dispatch-failure recovery"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // `hold` / `held` flag (task #527)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_handle_task_create_with_hold_flag() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let mut pending = Vec::new();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Parked",
+                "initial_state": "ready",
+                "hold": true,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        assert!(!result.is_error);
+
+        // hold=true + initial_state=ready must NOT emit a ScheduleNeeded event.
+        assert!(
+            !pending
+                .iter()
+                .any(|e| matches!(e, SchedulerEvent::ScheduleNeeded(..))),
+            "held task must not trigger a schedule pass on creation (got {:?})",
+            pending
+        );
+
+        // The task should be persisted in ready state with held=true.
+        let tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].state, "ready");
+        assert!(tasks[0].held);
+
+        // The scheduler must refuse to schedule it.
+        let sched = db.get_schedulable_tasks("test-project").unwrap();
+        assert!(sched.is_empty(), "held task must not appear as schedulable");
+    }
+
+    #[test]
+    fn test_handle_task_update_toggles_hold() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a held, ready task directly.
+        let task = db
+            .create_task(
+                "test-project",
+                "Held",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+
+        // Release: hold=false should schedule.
+        let mut pending = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "hold": false}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        assert!(!result.is_error);
+
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(!reloaded.held, "hold=false should clear the held flag");
+        assert!(
+            pending
+                .iter()
+                .any(|e| matches!(e, SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project")),
+            "releasing a ready task should emit ScheduleNeeded (got {:?})",
+            pending
+        );
+
+        // Re-hold: hold=true should NOT schedule.
+        let mut pending = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "hold": true}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        assert!(!result.is_error);
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(reloaded.held);
+        assert!(
+            !pending
+                .iter()
+                .any(|e| matches!(e, SchedulerEvent::ScheduleNeeded(..))),
+            "re-holding must not trigger a schedule pass"
         );
     }
 }

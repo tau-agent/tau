@@ -1655,6 +1655,7 @@ mod tests {
             skip_review: false,
             require_approval: false,
             sandbox_profile: None,
+            held: false,
             created_at: 0,
             updated_at: 0,
         };

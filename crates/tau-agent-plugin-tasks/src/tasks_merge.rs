@@ -744,6 +744,7 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "s-worker", "worker").unwrap();
@@ -926,6 +927,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -980,6 +982,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1010,6 +1013,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -1068,6 +1072,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -1131,6 +1136,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1148,6 +1154,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let child2 = db
@@ -1162,6 +1169,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1235,6 +1243,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1251,6 +1260,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         let _child2 = db
@@ -1265,6 +1275,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1333,6 +1344,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1359,6 +1371,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1376,6 +1389,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1477,6 +1491,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -1493,6 +1508,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1549,6 +1565,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
@@ -1576,6 +1593,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
         // Don't set session_id on parent
@@ -1592,6 +1610,7 @@ command = "cargo test"
                 false,
                 None,
                 None,
+                false,
             )
             .unwrap();
 
