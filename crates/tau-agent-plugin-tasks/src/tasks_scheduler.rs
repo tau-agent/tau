@@ -475,6 +475,12 @@ pub fn dispatch(
             "tasks scheduler: task {} already has a live worker session {}, reusing",
             task_id, existing_sid
         );
+        crate::tasks_notify::set_session_tagline(
+            &existing_sid,
+            &crate::tasks_notify::task_session_tagline(&task, "worker"),
+            writer,
+            reader,
+        );
         return Ok(existing_sid);
     }
 
@@ -520,7 +526,7 @@ pub fn dispatch(
         cwd,
         parent_id: session_parent,
         child_budget: 16,
-        tagline: Some(format!("Task {}: {}", task.id, task.title)),
+        tagline: Some(crate::tasks_notify::task_session_tagline(&task, "worker")),
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),
@@ -619,6 +625,12 @@ fn dispatch_planning(
             "tasks scheduler: planning task {} already has a live planner session {}, reusing",
             task_id, existing_sid
         );
+        crate::tasks_notify::set_session_tagline(
+            &existing_sid,
+            &crate::tasks_notify::task_session_tagline(task, "planning"),
+            writer,
+            reader,
+        );
         return Ok(existing_sid);
     }
 
@@ -661,7 +673,7 @@ fn dispatch_planning(
         cwd: Some(project_path.to_string()),
         parent_id: session_parent,
         child_budget: 16,
-        tagline: Some(format!("Planning task {}: {}", task.id, task.title)),
+        tagline: Some(crate::tasks_notify::task_session_tagline(task, "planning")),
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),
@@ -879,6 +891,12 @@ pub fn dispatch_review(
             "tasks: reusing existing reviewer session {} for task {}",
             existing_sid, task_id
         );
+        crate::tasks_notify::set_session_tagline(
+            &existing_sid,
+            &crate::tasks_notify::task_session_tagline(task, "review"),
+            writer,
+            reader,
+        );
         return Ok(existing_sid);
     }
 
@@ -908,7 +926,7 @@ pub fn dispatch_review(
         cwd,
         parent_id: hierarchy_parent,
         child_budget: 16,
-        tagline: Some(format!("Review task {}: {}", task.id, task.title)),
+        tagline: Some(crate::tasks_notify::task_session_tagline(task, "review")),
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),
@@ -1105,6 +1123,12 @@ pub fn dispatch_refining(
             "tasks: reusing existing refiner session {} for task {}",
             existing_sid, task_id
         );
+        crate::tasks_notify::set_session_tagline(
+            &existing_sid,
+            &crate::tasks_notify::task_session_tagline(task, "refining"),
+            writer,
+            reader,
+        );
         return Ok(existing_sid);
     }
 
@@ -1128,7 +1152,7 @@ pub fn dispatch_refining(
         cwd: Some(project_path.to_string()),
         parent_id: hierarchy_parent,
         child_budget: 16,
-        tagline: Some(format!("Refining task {}: {}", task.id, task.title)),
+        tagline: Some(crate::tasks_notify::task_session_tagline(task, "refining")),
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),

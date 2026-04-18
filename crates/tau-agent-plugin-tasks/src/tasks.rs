@@ -724,7 +724,10 @@ fn create_interactive_session(
         cwd: Some(project_path.clone()),
         parent_id: session_parent,
         child_budget: 16,
-        tagline: Some(format!("Task {}: {}", task.id, task.title)),
+        tagline: Some(crate::tasks_notify::task_session_tagline(
+            task,
+            "interactive",
+        )),
         auto_archive: false,
         notify_parent: false,
         project_name: Some(task.project_name.clone()),

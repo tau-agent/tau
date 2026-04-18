@@ -210,7 +210,7 @@ pub fn merge_task(
             cwd: Some(worktree_path.clone()),
             parent_id: None,
             child_budget: 0,
-            tagline: Some(format!("Merge task {}", task_id)),
+            tagline: Some(crate::tasks_notify::task_session_tagline(&task, "merge")),
             auto_archive: false,
             notify_parent: false,
             project_name: Some(task.project_name.clone()),

@@ -43,6 +43,71 @@ fn capped_title(title: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Session tagline helpers
+// ---------------------------------------------------------------------------
+
+/// Character cap for the `{title}` part of a task-session tagline. Chosen
+/// to keep the full `[task N] role: title` line well under the TUI's
+/// session-list width while preserving typical task titles in full.
+const TAGLINE_TITLE_MAX: usize = 80;
+
+/// Character-aware truncation with an ellipsis marker. UTF-8 safe: only
+/// splits on character boundaries, never mid-codepoint.
+fn truncate_title(title: &str, max: usize) -> String {
+    if title.chars().count() <= max {
+        return title.to_string();
+    }
+    let head_len = max.saturating_sub(1);
+    let mut out: String = title.chars().take(head_len).collect();
+    out.push('…');
+    out
+}
+
+/// Format a unified task-session tagline.
+///
+/// All task sessions use the same format, so the TUI session tree can
+/// tell at a glance whether a given session is driving spec refinement,
+/// implementation, review, etc.:
+///
+/// ```text
+/// [task {id}] {role}: {title}
+/// ```
+///
+/// where `{role}` is one of the role strings recorded in
+/// `task_sessions`: `interactive`, `planning`, `refining`, `worker`,
+/// `review`, `merge`. The title is truncated to [`TAGLINE_TITLE_MAX`]
+/// characters with an ellipsis if longer.
+pub fn task_session_tagline(task: &Task, role: &str) -> String {
+    let title = truncate_title(&task.title, TAGLINE_TITLE_MAX);
+    format!("[task {}] {}: {}", task.id, role, title)
+}
+
+/// Best-effort update of a session's tagline via [`Request::SetTagline`].
+///
+/// Call this when an existing session is reused across a role change
+/// (e.g. scheduler reuses a planner session in a new refining cycle):
+/// the tagline needs to reflect the session's *current* role so the TUI
+/// session tree stays accurate.
+///
+/// Errors are swallowed. If the session has since been archived the
+/// update is moot; if the server is unreachable we have bigger problems.
+pub fn set_session_tagline(
+    session_id: &str,
+    new_tagline: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let _ = server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::SetTagline {
+            session_id: session_id.to_string(),
+            tagline: new_tagline.to_string(),
+        },
+    );
+}
+
 /// Classify a transition target for root-broadcast purposes.
 fn broadcasts_to_root(to: &str) -> bool {
     // Terminal states that the user should see regardless of where the
@@ -257,6 +322,8 @@ mod tests {
         ancestors: HashMap<String, Vec<SessionInfo>>,
         /// Captured (target_session_id, text) pairs from QueueInfo.
         queue_info_calls: Vec<(String, String)>,
+        /// Captured (session_id, tagline) pairs from SetTagline.
+        set_tagline_calls: Vec<(String, String)>,
     }
 
     impl MockShared {
@@ -267,6 +334,7 @@ mod tests {
                 archived_sessions: HashSet::new(),
                 ancestors: HashMap::new(),
                 queue_info_calls: Vec::new(),
+                set_tagline_calls: Vec::new(),
             }
         }
 
@@ -317,6 +385,14 @@ mod tests {
                         self.archived_sessions.contains(session_id),
                     ),
                 },
+                Request::SetTagline {
+                    session_id,
+                    tagline,
+                } => {
+                    self.set_tagline_calls
+                        .push((session_id.clone(), tagline.clone()));
+                    Response::Ok
+                }
                 Request::GetSessionAncestors { session_id } => {
                     let sessions = self.ancestors.get(session_id).cloned().unwrap_or_else(|| {
                         vec![fake_session(
@@ -904,5 +980,160 @@ mod tests {
         let expected_refs: Vec<&str> = expected.iter().map(String::as_str).collect();
 
         assert_eq!(creator_msgs, expected_refs, "full message log mismatch");
+    }
+
+    // -----------------------------------------------------------------
+    // task_session_tagline
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn task_session_tagline_basic() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Short title", None, "ready");
+        for role in [
+            "interactive",
+            "planning",
+            "refining",
+            "worker",
+            "review",
+            "merge",
+        ] {
+            assert_eq!(
+                task_session_tagline(&task, role),
+                format!("[task {}] {}: Short title", task.id, role),
+                "role={}",
+                role
+            );
+        }
+    }
+
+    #[test]
+    fn task_session_tagline_title_cap_unchanged_at_limit() {
+        // Exactly TAGLINE_TITLE_MAX chars → passes through untouched.
+        let db = TasksDb::open_memory().expect("db");
+        let t = "x".repeat(TAGLINE_TITLE_MAX);
+        let task = create_task(&db, &t, None, "ready");
+        let line = task_session_tagline(&task, "worker");
+        assert_eq!(
+            line,
+            format!(
+                "[task {}] worker: {}",
+                task.id,
+                "x".repeat(TAGLINE_TITLE_MAX)
+            )
+        );
+    }
+
+    #[test]
+    fn task_session_tagline_title_cap_truncates_long_titles() {
+        // 100 chars, cap is TAGLINE_TITLE_MAX=80 → 79 'x' + '…'.
+        let db = TasksDb::open_memory().expect("db");
+        let t = "x".repeat(100);
+        let task = create_task(&db, &t, None, "ready");
+        let line = task_session_tagline(&task, "worker");
+        let expected_title = {
+            let mut s: String = "x".repeat(TAGLINE_TITLE_MAX - 1);
+            s.push('…');
+            s
+        };
+        assert_eq!(
+            line,
+            format!("[task {}] worker: {}", task.id, expected_title)
+        );
+        // The rendered title portion has exactly TAGLINE_TITLE_MAX chars
+        // (head + ellipsis).
+        assert_eq!(expected_title.chars().count(), TAGLINE_TITLE_MAX);
+    }
+
+    #[test]
+    fn task_session_tagline_utf8_respects_char_boundaries() {
+        // Each '☃' is 3 bytes but 1 char. 100 chars → 300 bytes.
+        // Must truncate at char boundary without producing broken UTF-8.
+        let db = TasksDb::open_memory().expect("db");
+        let t = "☃".repeat(100);
+        let task = create_task(&db, &t, None, "ready");
+        let line = task_session_tagline(&task, "refining");
+        // Still valid UTF-8 (implicit: String guarantees it), and the
+        // tagline's title portion is TAGLINE_TITLE_MAX chars.
+        let prefix = format!("[task {}] refining: ", task.id);
+        let title_part = &line[prefix.len()..];
+        assert_eq!(title_part.chars().count(), TAGLINE_TITLE_MAX);
+        assert!(title_part.ends_with('…'));
+        assert!(title_part.starts_with('☃'));
+        // All snowmen except the last char.
+        let snow_count = title_part.chars().filter(|c| *c == '☃').count();
+        assert_eq!(snow_count, TAGLINE_TITLE_MAX - 1);
+    }
+
+    #[test]
+    fn truncate_title_short_is_unchanged() {
+        assert_eq!(truncate_title("hello", 80), "hello");
+    }
+
+    #[test]
+    fn truncate_title_exact_is_unchanged() {
+        let s = "x".repeat(80);
+        assert_eq!(truncate_title(&s, 80), s);
+    }
+
+    #[test]
+    fn truncate_title_over_limit_gets_ellipsis() {
+        let s = "x".repeat(81);
+        let out = truncate_title(&s, 80);
+        assert_eq!(out.chars().count(), 80);
+        assert!(out.ends_with('…'));
+        let head: String = "x".repeat(79);
+        assert_eq!(out, format!("{}…", head));
+    }
+
+    // -----------------------------------------------------------------
+    // set_session_tagline (RPC wiring)
+    // -----------------------------------------------------------------
+
+    /// set_session_tagline sends a SetTagline request with the given
+    /// session id and tagline text. The mock captures the request so we
+    /// can assert on it directly.
+    #[test]
+    fn set_session_tagline_sends_rpc() {
+        let (shared, mut w, mut r) = make_io();
+        set_session_tagline("s-abc", "[task 7] refining: x", &mut w, &mut r);
+
+        let calls = shared.lock().expect("lock").set_tagline_calls.clone();
+        assert_eq!(calls.len(), 1, "calls: {:?}", calls);
+        assert_eq!(calls[0].0, "s-abc");
+        assert_eq!(calls[0].1, "[task 7] refining: x");
+    }
+
+    // -----------------------------------------------------------------
+    // Role-transition tagline updates (scheduler integration)
+    // -----------------------------------------------------------------
+
+    /// Simulate the scheduler-level reuse of a planner session in a new
+    /// refining cycle: when dispatch_refining (conceptually) reuses an
+    /// existing session, it must update that session's tagline so the
+    /// TUI session tree reflects the new role.
+    ///
+    /// We exercise this at the unit level: call
+    /// `set_session_tagline` with the tagline the scheduler would use
+    /// for a refiner role, and assert the captured RPC has the
+    /// `refining:` prefix (not the stale `planning:`).
+    #[test]
+    fn tagline_updated_on_role_transition() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Example", None, "planning");
+        let reused_sid = "s-reused";
+
+        let (shared, mut w, mut r) = make_io();
+        // Emulate scheduler.dispatch_refining finding a reusable session
+        // and refreshing its tagline with the new role.
+        let new_tagline = task_session_tagline(&task, "refining");
+        set_session_tagline(reused_sid, &new_tagline, &mut w, &mut r);
+
+        let calls = shared.lock().expect("lock").set_tagline_calls.clone();
+        assert_eq!(calls.len(), 1, "calls: {:?}", calls);
+        assert_eq!(calls[0].0, reused_sid);
+        assert_eq!(calls[0].1, format!("[task {}] refining: Example", task.id));
+        // Sanity check: it is not the old planning tagline.
+        assert!(!calls[0].1.contains("planning:"));
     }
 }
