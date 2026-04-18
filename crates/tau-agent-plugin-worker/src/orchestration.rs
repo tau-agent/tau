@@ -82,6 +82,13 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "Use after spawning children to collect their results.".into(),
                 "Returns status and summary (last assistant message) for each session.".into(),
+                // Phase 1 seamless-restart caveat: the plugin and the
+                // server share a lifetime, so a server restart in the
+                // middle of a session_join causes the call to error out.
+                // Re-issuing the call after reconnect is safe (state is
+                // server-authoritative via the session lock +
+                // last_exit_status).
+                "If the server restarts during this call, re-issue the same call; the server is authoritative and the response will reflect the latest state.".into(),
             ],
         },
         PluginToolDef {
@@ -244,6 +251,12 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             prompt_guidelines: vec![
                 "Fire-and-forget by default — use session_read to check for the target's response later.".into(),
                 "Pass await_reply=true to block until the target calls session_reply; your call returns the reply content directly.".into(),
+                // Phase 1 seamless-restart caveat for await_reply=true:
+                // if the server restarts while the caller is blocked
+                // waiting for a reply, the call errors out. Re-issuing
+                // it delivers the message a second time (at-least-once
+                // semantics); Phase 2 adds persistent waiter state.
+                "If await_reply=true and the server restarts, re-issuing this tool call will deliver the message twice. Until the persistent-waiter work lands, prefer idempotent message content or wait for the child via session_join instead.".into(),
             ],
         },
         PluginToolDef {
@@ -324,8 +337,8 @@ mod tests {
 
         assert_eq!(
             msg.prompt_guidelines.len(),
-            2,
-            "session_message should have exactly 2 guidelines, got {:?}",
+            3,
+            "session_message should have exactly 3 guidelines, got {:?}",
             msg.prompt_guidelines,
         );
         assert_eq!(

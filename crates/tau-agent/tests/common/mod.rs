@@ -72,6 +72,11 @@ pub struct TestServer {
 impl TestServer {
     /// Start a test server with mock provider in a background thread.
     pub fn start(mock_responses: Vec<MockResponse>) -> Self {
+        // Keep shutdown snappy in tests; production defaults to 180s.
+        // SAFETY: integration tests each run in their own process.
+        unsafe {
+            std::env::set_var("TAU_SHUTDOWN_DRAIN_SECS", "2");
+        }
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("tau-test.sock");
         let db_path = dir.path().join("test.db");
@@ -120,6 +125,11 @@ impl TestServer {
     where
         F: FnOnce(tau_agent::server::TestServerConfig) -> tau_agent::server::TestServerConfig,
     {
+        // Keep shutdown snappy in tests; production defaults to 180s.
+        // SAFETY: integration tests each run in their own process.
+        unsafe {
+            std::env::set_var("TAU_SHUTDOWN_DRAIN_SECS", "2");
+        }
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("tau-test.sock");
         let db_path = dir.path().join("test.db");

@@ -414,7 +414,7 @@ pub(super) async fn handle_client(
     let mut writer = &stream;
     let mut lines = reader.lines();
 
-    loop {
+    'outer: loop {
         // Wait for either a request line or a shutdown notification
         let line = {
             let line_fut = lines.next();
@@ -533,7 +533,7 @@ pub(super) async fn handle_client(
             crate::protocol::Request::Chat { session_id, text } => {
                 if shutdown.is_shutting_down() {
                     let resp = Response::Error {
-                        message: "server is shutting down".into(),
+                        message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
                     };
                     broadcast_to_subscribers(&state, &session_id, &resp);
                     send(&mut writer, &resp).await.ok();
@@ -1455,6 +1455,17 @@ pub(super) async fn handle_client(
                 session_ids,
                 timeout_secs,
             } => {
+                if shutdown.is_shutting_down() {
+                    send(
+                        &mut writer,
+                        &Response::Error {
+                            message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
                 // Wait for all specified sessions to have no active agent turn.
                 // A session is "done" if it's not currently locked (no active Chat).
                 let deadline =
@@ -1472,6 +1483,25 @@ pub(super) async fn handle_client(
                 }
 
                 loop {
+                    // Short-circuit on shutdown so the waiting client
+                    // gets a distinctive signal instead of blocking until
+                    // deadline while the server is draining.
+                    if shutdown.is_shutting_down() {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
+                            },
+                        )
+                        .await
+                        .ok();
+                        // Clean up waited_sessions bookkeeping before bailing.
+                        let mut st = lock_state(&state);
+                        for sid in &session_ids {
+                            st.waited_sessions.remove(sid);
+                        }
+                        continue 'outer;
+                    }
                     let mut all_done = true;
                     results.clear();
 
@@ -1543,6 +1573,17 @@ pub(super) async fn handle_client(
                 session_ids,
                 timeout_secs,
             } => {
+                if shutdown.is_shutting_down() {
+                    send(
+                        &mut writer,
+                        &Response::Error {
+                            message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
                 // Wait until at least one session completes.
                 // Returns results for all sessions that are done at that point.
                 let deadline =
@@ -1560,6 +1601,21 @@ pub(super) async fn handle_client(
                 }
 
                 loop {
+                    if shutdown.is_shutting_down() {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
+                            },
+                        )
+                        .await
+                        .ok();
+                        let mut st = lock_state(&state);
+                        for sid in &session_ids {
+                            st.waited_sessions.remove(sid);
+                        }
+                        continue 'outer;
+                    }
                     let mut done = Vec::new();
 
                     for sid in &session_ids {
@@ -1628,6 +1684,17 @@ pub(super) async fn handle_client(
                 await_reply,
                 reply_to: _,
             } => {
+                if await_reply && shutdown.is_shutting_down() {
+                    send(
+                        &mut writer,
+                        &Response::Error {
+                            message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
                 if await_reply {
                     // Generate a unique msg_id, create a oneshot channel,
                     // prefix the message so the target knows to reply.
@@ -1657,17 +1724,59 @@ pub(super) async fn handle_client(
                     );
 
                     // Wait for reply with a timeout (default 5 min).
+                    // Also periodically check for shutdown so the caller
+                    // learns to reconnect rather than blocking through a
+                    // restart.
                     let timeout = std::time::Duration::from_secs(300);
-                    match futures::future::select(
-                        std::pin::pin!(rx.recv()),
-                        std::pin::pin!(smol::Timer::after(timeout)),
-                    )
-                    .await
-                    {
-                        futures::future::Either::Left((Ok(reply), _)) => {
+                    let deadline = std::time::Instant::now() + timeout;
+                    let outcome: Option<Result<String, ()>> = loop {
+                        if shutdown.is_shutting_down() {
+                            break None;
+                        }
+                        let now = std::time::Instant::now();
+                        if now >= deadline {
+                            break Some(Err(()));
+                        }
+                        let step = (deadline - now).min(std::time::Duration::from_millis(200));
+                        match futures::future::select(
+                            std::pin::pin!(rx.recv()),
+                            std::pin::pin!(smol::Timer::after(step)),
+                        )
+                        .await
+                        {
+                            futures::future::Either::Left((Ok(reply), _)) => {
+                                break Some(Ok(reply));
+                            }
+                            futures::future::Either::Left((Err(_), _)) => {
+                                // Sender was dropped — treat as cancellation.
+                                break Some(Err(()));
+                            }
+                            futures::future::Either::Right((_, _)) => {
+                                // Step elapsed; re-check shutdown flag.
+                                continue;
+                            }
+                        }
+                    };
+                    match outcome {
+                        Some(Ok(reply)) => {
                             send(&mut writer, &Response::MessageReply { content: reply }).await?;
                         }
-                        _ => {
+                        None => {
+                            // Shutdown: clean up waiter and tell client to reconnect.
+                            {
+                                let mut st = lock_state(&state);
+                                st.reply_waiters.remove(&msg_id);
+                            }
+                            send(
+                                &mut writer,
+                                &Response::Error {
+                                    message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
+                                },
+                            )
+                            .await
+                            .ok();
+                        }
+                        Some(Err(_)) => {
                             // Timeout or channel closed — clean up waiter.
                             {
                                 let mut st = lock_state(&state);

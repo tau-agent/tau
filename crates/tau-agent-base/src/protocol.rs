@@ -421,6 +421,24 @@ pub enum Response {
     Error { message: String },
 }
 
+/// Sentinel message used by `Response::Error { message }` when a request
+/// was refused because the server is in the shutdown-drain window.
+///
+/// Clients recognise this exact string to distinguish "server is
+/// transitioning" (reconnect + retry) from "this specific operation
+/// failed" (surface the error). Kept as a plain constant rather than a
+/// dedicated enum variant so that older clients that only know about
+/// `Response::Error` still see a human-readable message in the UI.
+pub const SHUTTING_DOWN_ERROR: &str = "__tau_server_shutting_down__";
+
+/// Returns true if `err` is the distinctive "server is shutting down"
+/// signal produced by the server during its drain window. Used by
+/// clients to trigger reconnect/retry paths instead of surfacing the
+/// error to the user.
+pub fn is_shutting_down_error(err: &str) -> bool {
+    err == SHUTTING_DOWN_ERROR || err.contains("server is shutting down")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -1168,5 +1186,24 @@ mod tests {
             let json = serde_json::to_string(resp).expect("serialize response");
             let _: Response = serde_json::from_str(&json).expect("deserialize response");
         }
+    }
+
+    #[test]
+    fn shutting_down_error_round_trips_through_response() {
+        let err = Response::Error {
+            message: SHUTTING_DOWN_ERROR.into(),
+        };
+        let wire = serde_json::to_string(&err).expect("serialize");
+        let parsed: Response = serde_json::from_str(&wire).expect("deserialize");
+        match parsed {
+            Response::Error { message } => {
+                assert!(is_shutting_down_error(&message));
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+
+        assert!(is_shutting_down_error(SHUTTING_DOWN_ERROR));
+        assert!(is_shutting_down_error("server is shutting down"));
+        assert!(!is_shutting_down_error("some other error"));
     }
 }

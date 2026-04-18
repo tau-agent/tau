@@ -3957,3 +3957,406 @@ fn get_session_ancestors_missing_mid_parent() {
     }
     handle.join().ok();
 }
+
+// ---------------------------------------------------------------------------
+// Seamless-restart (task 549) tests
+// ---------------------------------------------------------------------------
+
+/// Helper: start a server bound to the given socket+db with the given
+/// queued mock responses. Returns the join handle of the server task.
+fn start_restart_server(
+    sock_path: &std::path::Path,
+    db_path: &std::path::Path,
+    responses: Vec<MockResponse>,
+) -> std::thread::JoinHandle<()> {
+    // Keep the drain window short for tests so shutdown doesn't block
+    // on the 180s production default.
+    // SAFETY: the test harness runs each integration test in its own
+    // process, so env-var mutation here is scoped to that process.
+    unsafe {
+        std::env::set_var("TAU_SHUTDOWN_DRAIN_SECS", "2");
+    }
+    let model = mock_model();
+    let mut registry = tau_agent::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(responses));
+    let config = tau_agent::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_path.to_path_buf(),
+        db_path: db_path.to_path_buf(),
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+    std::thread::spawn(move || {
+        smol::block_on(async {
+            tau_agent::server::run_with_config(config).await.ok();
+        });
+    })
+}
+
+fn wait_for_socket(path: &std::path::Path) {
+    for _ in 0..100 {
+        if path.exists() && UnixStream::connect(path).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("server socket did not appear: {}", path.display());
+}
+
+fn shutdown_server(sock_path: &std::path::Path, handle: std::thread::JoinHandle<()>) {
+    if let Ok(mut c) = UnixStream::connect(sock_path) {
+        let req = serde_json::to_string(&Request::Shutdown { restart: false }).unwrap();
+        let _ = c.write_all(format!("{}\n", req).as_bytes());
+        let _ = c.flush();
+    }
+    handle.join().ok();
+}
+
+#[test]
+fn seamless_restart_resumes_session_with_trailing_tool_result() {
+    // Arrange: persist a session whose last message is a `tool_result`
+    // (the server was about to fire the next LLM call when it died).
+    // On restart the auto-resume scan should pick it up and produce at
+    // least one new assistant message.
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-restart.sock");
+    let db_path = dir.path().join("tau-restart.db");
+
+    {
+        // Seed the DB directly — avoids the churn of driving a full
+        // agent turn that fails mid-tool-call.
+        use tau_agent::db::{Db, StoredSession};
+        use tau_agent::types::*;
+        let db = Db::open(&db_path).unwrap();
+        let sid = "resume-test";
+        db.create_session(&StoredSession {
+            id: sid.into(),
+            model: mock_model(),
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            is_subscription: false,
+            created_at: tau_agent::types::timestamp_ms() as i64,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message(sid, &Message::User(UserMessage::text("kick off")))
+            .unwrap();
+        // A tool-result as the tail signals "agent was about to make the
+        // next LLM call when shutdown hit".
+        db.append_message(
+            sid,
+            &Message::ToolResult(ToolResultMessage {
+                tool_call_id: "tc1".into(),
+                tool_name: "bash".into(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "ok".into(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: tau_agent::types::timestamp_ms(),
+                duration_ms: None,
+                summary: None,
+                post_persist_actions: Vec::new(),
+            }),
+        )
+        .unwrap();
+    }
+
+    // Act: start the server. Auto-resume should pick up the seeded
+    // session in the background and fire an LLM call that the mock
+    // answers with "resumed response".
+    let handle = start_restart_server(
+        &sock_path,
+        &db_path,
+        vec![MockResponse::Text("resumed response".into())],
+    );
+    wait_for_socket(&sock_path);
+
+    // Poll GetMessages until we see the resumed assistant reply or time out.
+    let sid = "resume-test";
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_resume = false;
+    while std::time::Instant::now() < deadline {
+        let conn = UnixStream::connect(&sock_path).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        if let Response::Messages { messages } = send_recv(
+            &conn,
+            &Request::GetMessages {
+                session_id: sid.into(),
+            },
+        ) {
+            let has_resumed_asst = messages.iter().any(|m| {
+                if let tau_agent::types::Message::Assistant(a) = m {
+                    a.content
+                        .iter()
+                        .any(|c| matches!(c, tau_agent::types::AssistantContent::Text(t) if t.text.contains("resumed")))
+                } else {
+                    false
+                }
+            });
+            if has_resumed_asst {
+                saw_resume = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    shutdown_server(&sock_path, handle);
+    assert!(
+        saw_resume,
+        "expected an assistant message containing 'resumed' after auto-resume"
+    );
+}
+
+#[test]
+fn seamless_restart_skips_completed_session() {
+    // Regression: a session with last_exit_status == "completed" must NOT
+    // be auto-resumed on startup, even if its tail looks incomplete.
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-completed.sock");
+    let db_path = dir.path().join("tau-completed.db");
+
+    {
+        use tau_agent::db::{Db, StoredSession};
+        use tau_agent::types::*;
+        let db = Db::open(&db_path).unwrap();
+        let sid = "completed-test";
+        db.create_session(&StoredSession {
+            id: sid.into(),
+            model: mock_model(),
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            is_subscription: false,
+            created_at: tau_agent::types::timestamp_ms() as i64,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: Some("completed".into()),
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message(sid, &Message::User(UserMessage::text("hi")))
+            .unwrap();
+    }
+
+    // If the server wrongly resumes, it will try to consume a mock
+    // response. We give it zero mock responses, so a wrong resume would
+    // produce an error assistant message. Correct behaviour: no assistant
+    // message ever appears.
+    let handle = start_restart_server(&sock_path, &db_path, vec![]);
+    wait_for_socket(&sock_path);
+
+    // Give the auto-resume scan plenty of time to run if it was going to.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = "completed-test";
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let messages = match send_recv(
+        &conn,
+        &Request::GetMessages {
+            session_id: sid.into(),
+        },
+    ) {
+        Response::Messages { messages } => messages,
+        other => panic!("{:?}", other),
+    };
+    let has_assistant = messages
+        .iter()
+        .any(|m| matches!(m, tau_agent::types::Message::Assistant(_)));
+    assert!(
+        !has_assistant,
+        "completed session must not be auto-resumed; got messages: {:?}",
+        messages,
+    );
+
+    shutdown_server(&sock_path, handle);
+}
+
+#[test]
+fn seamless_restart_skips_archived_session() {
+    // Regression: archived sessions must not be auto-resumed.
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-archived.sock");
+    let db_path = dir.path().join("tau-archived.db");
+
+    {
+        use tau_agent::db::{Db, StoredSession};
+        use tau_agent::types::*;
+        let db = Db::open(&db_path).unwrap();
+        let sid = "archived-test";
+        db.create_session(&StoredSession {
+            id: sid.into(),
+            model: mock_model(),
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            is_subscription: false,
+            created_at: tau_agent::types::timestamp_ms() as i64,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: true,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message(sid, &Message::User(UserMessage::text("hi")))
+            .unwrap();
+    }
+
+    let handle = start_restart_server(&sock_path, &db_path, vec![]);
+    wait_for_socket(&sock_path);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = "archived-test";
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let messages = match send_recv(
+        &conn,
+        &Request::GetMessages {
+            session_id: sid.into(),
+        },
+    ) {
+        Response::Messages { messages } => messages,
+        other => panic!("{:?}", other),
+    };
+    let has_assistant = messages
+        .iter()
+        .any(|m| matches!(m, tau_agent::types::Message::Assistant(_)));
+    assert!(!has_assistant, "archived session must not be auto-resumed");
+
+    shutdown_server(&sock_path, handle);
+}
+
+#[test]
+fn seamless_restart_rejects_new_chat_during_drain() {
+    // While the server is in the shutdown-drain window, a fresh Chat
+    // request must return the distinctive ServerShuttingDown error so
+    // clients know to reconnect rather than surfacing the failure.
+    //
+    // Keep the drain window long enough for the test to latch: fire an
+    // in-flight Delayed chat, then request shutdown. The server
+    // continues accepting connections (so our new Chat lands) but flips
+    // `is_shutting_down=true`, which is what rejects the new turn.
+    let server = TestServer::start(vec![
+        MockResponse::Delayed {
+            delay_ms: 3_000,
+            response: Box::new(MockResponse::Text("slow".into())),
+        },
+        MockResponse::Text("never used".into()),
+    ]);
+    let conn = server.connect();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: Some("t".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // Kick off a slow chat in a background thread so the server has an
+    // in-flight turn to drain around.
+    let chat_sock = server.sock_path.clone();
+    let chat_sid = sid.clone();
+    let chat_handle = std::thread::spawn(move || {
+        let chat_conn = UnixStream::connect(&chat_sock).unwrap();
+        chat_conn
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let _ = send_recv_all(
+            &chat_conn,
+            &Request::Chat {
+                session_id: chat_sid,
+                text: "go".into(),
+            },
+        );
+    });
+    // Give the chat a moment to register as in-flight.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Shut down the server. request_shutdown flips the flag; the drain
+    // loop then waits for in-flight turns. Use a dedicated connection
+    // and don't wait for the ack (the server may close as soon as
+    // request_shutdown returns).
+    let mut shutdown_conn = server.connect();
+    let req = serde_json::to_string(&Request::Shutdown { restart: true }).unwrap();
+    let _ = shutdown_conn.write_all(format!("{}\n", req).as_bytes());
+    let _ = shutdown_conn.flush();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Try to start a new Chat on the draining server. The server is
+    // still accepting connections (its accept loop only exits after
+    // drain) but must reject Chat with the distinctive signal.
+    let mut signalled = false;
+    if let Ok(conn2) = UnixStream::connect(&server.sock_path) {
+        conn2
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut conn2 = conn2;
+        let chat = serde_json::to_string(&Request::Chat {
+            session_id: sid.clone(),
+            text: "hi".into(),
+        })
+        .unwrap();
+        let _ = conn2.write_all(format!("{}\n", chat).as_bytes());
+        let _ = conn2.flush();
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(conn2);
+        for line_res in reader.lines() {
+            let Ok(line) = line_res else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(resp) = serde_json::from_str::<Response>(&line) else {
+                continue;
+            };
+            if matches!(resp, Response::ServerShutdown { .. }) {
+                signalled = true;
+                break;
+            }
+            if let Response::Error { message } = &resp
+                && tau_agent::protocol::is_shutting_down_error(message)
+            {
+                signalled = true;
+                break;
+            }
+            if matches!(resp, Response::AgentDone | Response::Cancelled) {
+                break;
+            }
+        }
+    }
+    chat_handle.join().ok();
+    assert!(signalled, "expected server-shutting-down signal");
+}

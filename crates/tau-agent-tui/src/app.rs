@@ -2667,7 +2667,7 @@ impl App {
             Response::ServerShutdown { restart } => {
                 if restart {
                     self.messages.push(MessageItem::Status {
-                        text: "[server restarting...]".into(),
+                        text: "⏳ server is restarting…".into(),
                     });
                 } else {
                     self.messages.push(MessageItem::Status {
@@ -2677,11 +2677,24 @@ impl App {
                 }
             }
             Response::Error { message } => {
-                self.finalize_in_flight();
-                self.messages.push(MessageItem::Error { text: message });
-                self.phase = AgentPhase::Idle;
-                self.set_mode(AppMode::Input);
-                self.pending_steer = None;
+                if tau_agent::protocol::is_shutting_down_error(&message) {
+                    // Treat as a transient server-restart signal rather
+                    // than a fatal error. The Subscribe task auto-reconnects
+                    // and re-fetches messages; no user-visible red line.
+                    self.messages.push(MessageItem::Status {
+                        text: "⏳ server is restarting…".into(),
+                    });
+                    self.finalize_in_flight();
+                    self.phase = AgentPhase::Idle;
+                    self.set_mode(AppMode::Input);
+                    self.pending_steer = None;
+                } else {
+                    self.finalize_in_flight();
+                    self.messages.push(MessageItem::Error { text: message });
+                    self.phase = AgentPhase::Idle;
+                    self.set_mode(AppMode::Input);
+                    self.pending_steer = None;
+                }
             }
             Response::UserMessage { text } => {
                 // Another client sent a message — display it

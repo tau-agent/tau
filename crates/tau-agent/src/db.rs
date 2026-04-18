@@ -10,6 +10,25 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::types::{Message, Model, UserMessage};
 
+/// Does this message, being the *last* persisted message of a session,
+/// indicate that an agent turn was interrupted and should be resumed?
+///
+/// Matches:
+/// * `User`       — agent was about to (or was) processing this turn
+/// * `ToolResult` — agent was about to make the next LLM call
+/// * `Assistant` with `stop_reason == ToolUse` — tool_uses dangling
+///   (repair inserts stub tool_results, then resume runs the next call)
+/// * `Assistant` with `stop_reason == Error` — stream died mid-flight;
+///   retrying is safe because the stub would otherwise be the final word
+pub(crate) fn message_indicates_incomplete_turn(msg: &Message) -> bool {
+    use crate::types::StopReason;
+    match msg {
+        Message::User(_) | Message::ToolResult(_) => true,
+        Message::Assistant(a) => matches!(a.stop_reason, StopReason::ToolUse | StopReason::Error),
+        _ => false,
+    }
+}
+
 /// Convert a rusqlite error into `crate::Error::Io` with a contextual prefix.
 fn db_err(ctx: &str) -> impl FnOnce(rusqlite::Error) -> crate::Error + '_ {
     move |e| crate::Error::Io(format!("{}: {}", ctx, e))
@@ -201,6 +220,13 @@ impl Db {
             "ALTER TABLE sessions ADD COLUMN notify_parent INTEGER NOT NULL DEFAULT 1;",
         );
         let _ = conn.execute_batch("ALTER TABLE sessions ADD COLUMN project_name TEXT;");
+        // Phase 1 seamless-restart: per-session opt-out for auto-resume.
+        // When a session is explicitly marked `resume_on_restart = 0`, the
+        // startup scan will skip it. Defaults to 1 so existing sessions
+        // retain the legacy "resume-by-default" behaviour.
+        let _ = conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN resume_on_restart INTEGER NOT NULL DEFAULT 1;",
+        );
 
         // Create index after migrations ensure the column exists
         let _ = conn.execute_batch(
@@ -247,7 +273,8 @@ impl Db {
                 last_phase     TEXT,
                 auto_archive   INTEGER NOT NULL DEFAULT 0,
                 notify_parent  INTEGER NOT NULL DEFAULT 1,
-                project_name   TEXT
+                project_name   TEXT,
+                resume_on_restart INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE messages (
                 id          INTEGER PRIMARY KEY,
@@ -507,27 +534,58 @@ impl Db {
         }
     }
 
-    /// Return IDs of child sessions whose last message is User or ToolResult,
-    /// indicating they were interrupted mid-work and should be auto-resumed.
+    /// Return IDs of non-archived sessions whose last message indicates
+    /// an incomplete turn (user waiting for model, tool_result waiting
+    /// for next LLM call, or an assistant message that left tool_uses
+    /// dangling / was cut off by a transport error). These are candidates
+    /// for auto-resume on server startup.
+    ///
+    /// Filters:
+    /// * `s.archived = 0`
+    /// * `s.resume_on_restart = 1`  (users can opt out)
+    /// * `s.last_exit_status IS NULL OR != 'completed'`
+    ///   — already-completed turns are never retried
+    /// * last message timestamp (or session creation) within the last
+    ///   `max_age_secs` seconds — stale sessions stay dormant
     pub fn sessions_needing_resume(&self) -> crate::Result<Vec<String>> {
-        // Only consider child sessions (parent_id IS NOT NULL).
-        // For each, get the last message and check its role.
+        // Default: 24h cutoff per the Phase 1 spec. Kept internal so the
+        // public API stays ergonomic; tests use `sessions_needing_resume_with_cutoff`.
+        const MAX_AGE_SECS: i64 = 24 * 3600;
+        self.sessions_needing_resume_with_cutoff(MAX_AGE_SECS)
+    }
+
+    /// Same as [`sessions_needing_resume`] but with an explicit recency
+    /// cutoff (seconds). A `max_age_secs <= 0` disables the filter.
+    pub fn sessions_needing_resume_with_cutoff(
+        &self,
+        max_age_secs: i64,
+    ) -> crate::Result<Vec<String>> {
+        let now_ms = crate::types::timestamp_ms() as i64;
+        let min_ts_ms = if max_age_secs > 0 {
+            now_ms - max_age_secs * 1000
+        } else {
+            i64::MIN
+        };
+
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT s.id, m.message_json
+                "SELECT s.id, m.message_json, COALESCE(m.created_at, s.created_at) AS last_ts
                  FROM sessions s
-                 JOIN messages m ON m.session_id = s.id
-                 WHERE s.parent_id IS NOT NULL
-                   AND s.archived = 0
-                   AND m.id = (SELECT MAX(m2.id) FROM messages m2 WHERE m2.session_id = s.id)",
+                 LEFT JOIN messages m
+                     ON m.session_id = s.id
+                    AND m.id = (SELECT MAX(m2.id) FROM messages m2 WHERE m2.session_id = s.id)
+                 WHERE s.archived = 0
+                   AND COALESCE(s.resume_on_restart, 1) = 1
+                   AND (s.last_exit_status IS NULL OR s.last_exit_status != 'completed')
+                   AND COALESCE(m.created_at, s.created_at) >= ?1",
             )
             .map_err(db_err("prepare sessions_needing_resume"))?;
 
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![min_ts_ms], |row| {
                 let id: String = row.get(0)?;
-                let json: String = row.get(1)?;
+                let json: Option<String> = row.get(1)?;
                 Ok((id, json))
             })
             .map_err(db_err("query sessions_needing_resume"))?;
@@ -535,13 +593,24 @@ impl Db {
         let mut result = Vec::new();
         for row in rows {
             let (id, json) = row.map_err(db_err("read resume row"))?;
-            if let Ok(msg) = serde_json::from_str::<Message>(&json)
-                && matches!(msg, Message::User(_) | Message::ToolResult(_))
-            {
+            let Some(json) = json else {
+                // No messages yet — nothing to resume.
+                continue;
+            };
+            let Ok(msg) = serde_json::from_str::<Message>(&json) else {
+                continue;
+            };
+            if message_indicates_incomplete_turn(&msg) {
                 result.push(id);
             }
         }
         Ok(result)
+    }
+
+    /// Set the `resume_on_restart` flag for a session.
+    pub fn set_resume_on_restart(&self, session_id: &str, enabled: bool) -> crate::Result<()> {
+        let v: i32 = if enabled { 1 } else { 0 };
+        self.update_session_field(session_id, "resume_on_restart", &v)
     }
 
     /// Count direct non-archived children of a session.
@@ -1766,7 +1835,247 @@ mod tests {
 
         let mut ids = db.sessions_needing_resume().unwrap();
         ids.sort();
-        assert_eq!(ids, vec!["child1", "child3"]);
+        // Phase 1 seamless-restart: top-level sessions are now in scope
+        // too. child2 (assistant stop_reason=Stop) is still skipped, as
+        // is child4 (empty).
+        assert_eq!(ids, vec!["child1", "child3", "top"]);
+    }
+
+    #[test]
+    fn sessions_needing_resume_skips_completed_and_archived() {
+        let db = Db::open_memory().unwrap();
+
+        // completed session — should be skipped even though last msg is user
+        db.create_session(&StoredSession {
+            id: "completed".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: crate::types::timestamp_ms() as i64,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: Some("completed".into()),
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message("completed", &Message::User(UserMessage::text("hi")))
+            .unwrap();
+
+        // archived session — should be skipped
+        db.create_session(&StoredSession {
+            id: "archived".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: crate::types::timestamp_ms() as i64,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: true,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message("archived", &Message::User(UserMessage::text("hi")))
+            .unwrap();
+
+        // resumable session — sanity check
+        db.create_session(&StoredSession {
+            id: "live".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: crate::types::timestamp_ms() as i64,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message("live", &Message::User(UserMessage::text("hi")))
+            .unwrap();
+
+        let ids = db.sessions_needing_resume().unwrap();
+        assert_eq!(ids, vec!["live"]);
+    }
+
+    #[test]
+    fn sessions_needing_resume_skips_opt_out_and_old_sessions() {
+        let db = Db::open_memory().unwrap();
+        let now_ms = crate::types::timestamp_ms() as i64;
+
+        // opt-out session — should be skipped even when recent
+        db.create_session(&StoredSession {
+            id: "opt_out".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: now_ms,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message("opt_out", &Message::User(UserMessage::text("hi")))
+            .unwrap();
+        db.set_resume_on_restart("opt_out", false).unwrap();
+
+        // stale session — should be skipped by the 24h cutoff
+        db.create_session(&StoredSession {
+            id: "stale".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: now_ms - 48 * 3600 * 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        // The message is persisted with "now" as created_at so we also
+        // insert it 2 days ago via the explicit cutoff query below.
+
+        // Fresh session — should be resumed
+        db.create_session(&StoredSession {
+            id: "fresh".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: now_ms,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message("fresh", &Message::User(UserMessage::text("hi")))
+            .unwrap();
+
+        let ids = db.sessions_needing_resume().unwrap();
+        // opt_out is filtered; stale has no messages AND created_at is
+        // 48h ago so it's outside the 24h cutoff. Only `fresh` remains.
+        assert_eq!(ids, vec!["fresh"]);
+    }
+
+    #[test]
+    fn sessions_needing_resume_matches_assistant_tool_use_and_error() {
+        let db = Db::open_memory().unwrap();
+        let now_ms = crate::types::timestamp_ms() as i64;
+
+        // Assistant with stop_reason=ToolUse: should be resumed (repair
+        // will stub the missing tool_result, then the next LLM call fires).
+        db.create_session(&StoredSession {
+            id: "tooluse".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: now_ms,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        let mut asst = AssistantMessage::empty("test", "test", "test-model");
+        asst.stop_reason = StopReason::ToolUse;
+        db.append_message("tooluse", &Message::Assistant(asst))
+            .unwrap();
+
+        // Assistant with stop_reason=Error: should be resumed (stream
+        // died mid-flight).
+        db.create_session(&StoredSession {
+            id: "error".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: now_ms,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        let mut asst = AssistantMessage::empty("test", "test", "test-model");
+        asst.stop_reason = StopReason::Error;
+        db.append_message("error", &Message::Assistant(asst))
+            .unwrap();
+
+        // Assistant with stop_reason=Stop: should NOT be resumed.
+        db.create_session(&StoredSession {
+            id: "ok".into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: now_ms,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived: false,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        })
+        .unwrap();
+        db.append_message(
+            "ok",
+            &Message::Assistant(AssistantMessage::empty("test", "test", "test-model")),
+        )
+        .unwrap();
+
+        let mut ids = db.sessions_needing_resume().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["error", "tooluse"]);
     }
 
     #[test]

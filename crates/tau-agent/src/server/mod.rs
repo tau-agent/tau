@@ -24,6 +24,25 @@ use crate::db::Db;
 use crate::provider::ProviderRegistry;
 use crate::types::*;
 
+/// Default drain window (seconds) for in-flight agent loops when a
+/// graceful shutdown is requested. Can be overridden by the
+/// `TAU_SHUTDOWN_DRAIN_SECS` environment variable.
+///
+/// 180s is the Phase 1 default (up from 60s) so that long-running
+/// operations like `just test` and multi-minute LLM turns have a
+/// realistic chance of finishing before the server bails.
+pub(crate) const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 180;
+
+/// Read the configured drain window from `TAU_SHUTDOWN_DRAIN_SECS`,
+/// falling back to [`DEFAULT_SHUTDOWN_DRAIN_SECS`]. A value of `0`
+/// disables the drain (immediate exit on shutdown) and is respected.
+pub(crate) fn shutdown_drain_secs() -> u64 {
+    match std::env::var("TAU_SHUTDOWN_DRAIN_SECS") {
+        Ok(v) => v.parse().unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS),
+        Err(_) => DEFAULT_SHUTDOWN_DRAIN_SECS,
+    }
+}
+
 /// A sender that can deliver shutdown notifications to a connected client.
 type ClientNotifier = smol::channel::Sender<crate::protocol::Response>;
 
@@ -147,6 +166,89 @@ fn prepare_socket_dir(sock: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// Emit an `InfoMessage` to a session informing the user / agent that
+/// this session was restarted. Used by the startup auto-resume scan so
+/// the transcript stays honest about the gap.
+fn notify_resumed_session(state: &SharedState, session_id: &str) {
+    notifications::queue_info_to_session(state, session_id, "Resumed after server restart.");
+}
+
+/// Detect sessions that were interrupted by the previous server
+/// lifetime and re-dispatch their agent loops in the background. Also
+/// picks up sessions that have pending queued messages. Called from
+/// both the production `run()` path and the `run_with_config()` test
+/// path so the two code paths stay in sync.
+fn spawn_auto_resume_tasks(
+    state: &SharedState,
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
+    shutdown: &ShutdownHandle,
+    session_locks: &SessionLocks,
+    throttle: &crate::throttle::ProviderThrottle,
+    test_overrides: &SharedTestOverrides,
+) {
+    use agent_runner::resume_child_session;
+
+    let resume_ids = {
+        let st = lock_state(state);
+        st.db.sessions_needing_resume().unwrap_or_else(|e| {
+            tracing::warn!(%e, "failed to query sessions needing resume");
+            Vec::new()
+        })
+    };
+    let mut resuming: std::collections::HashSet<String> = resume_ids.iter().cloned().collect();
+    for sid in resume_ids {
+        tracing::info!(session_id = %sid, "auto-resuming session after restart");
+        notify_resumed_session(state, &sid);
+        let s = state.clone();
+        let p = plugins.clone();
+        let sh = shutdown.clone();
+        let sl = session_locks.clone();
+        let th = throttle.clone();
+        let ov = test_overrides.clone();
+        smol::spawn(async move {
+            if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
+                tracing::warn!(session_id = %sid, %e, "auto-resume error");
+            }
+        })
+        .detach();
+    }
+
+    // Also resume sessions that have pending queued messages but aren't
+    // already being auto-resumed.
+    let queued_ids = {
+        let st = lock_state(state);
+        st.db.sessions_with_queued_messages().unwrap_or_else(|e| {
+            tracing::warn!(%e, "failed to query sessions with queued messages");
+            Vec::new()
+        })
+    };
+    for sid in queued_ids {
+        if resuming.insert(sid.clone()) {
+            tracing::info!(session_id = %sid, "auto-resuming session (has queued messages)");
+            // Set the has_queued flag so the agent loop will drain them.
+            {
+                let mut st = lock_state(state);
+                st.has_queued
+                    .entry(sid.clone())
+                    .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                    .store(true, Ordering::Release);
+            }
+            let s = state.clone();
+            let p = plugins.clone();
+            let sh = shutdown.clone();
+            let sl = session_locks.clone();
+            let th = throttle.clone();
+            let ov = test_overrides.clone();
+            smol::spawn(async move {
+                if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
+                    tracing::warn!(session_id = %sid, %e, "auto-resume error");
+                }
+            })
+            .detach();
+        }
+    }
+}
+
 /// Run a server with custom config (for testing).
 pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     use crate::auth::AuthStorage;
@@ -237,7 +339,16 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         while !shutdown_watcher.is_shutting_down() {
             smol::Timer::after(std::time::Duration::from_millis(100)).await;
         }
-        let _ = Async::<UnixStream>::connect(&sock_clone).await;
+        // Repeatedly self-connect so the accept loop wakes up and can
+        // observe the drain counter reaching zero. We poke every 100ms
+        // until in-flight work is done.
+        loop {
+            let _ = Async::<UnixStream>::connect(&sock_clone).await;
+            if shutdown_watcher.active_count() == 0 {
+                break;
+            }
+            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+        }
     })
     .detach();
 
@@ -262,6 +373,16 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         &test_overrides,
     );
 
+    // Auto-resume interrupted sessions (mirrors the production `run()` path).
+    spawn_auto_resume_tasks(
+        &state,
+        &plugins,
+        &shutdown,
+        &session_locks,
+        &throttle,
+        &test_overrides,
+    );
+
     loop {
         let (stream, _) = listener
             .accept()
@@ -269,7 +390,16 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
             .map_err(|e| crate::Error::Io(e.to_string()))?;
 
         if shutdown.is_shutting_down() {
-            break;
+            // Stop accepting *new* connections once the drain has
+            // committed to exit — but keep the accept loop running
+            // while in-flight turns are still draining so connected
+            // clients can observe Response::Error { SHUTTING_DOWN }
+            // for new chat attempts. We break only after the drain
+            // has really ended (active_count==0) so nothing useful is
+            // left to serve.
+            if shutdown.active_count() == 0 {
+                break;
+            }
         }
 
         let state = state.clone();
@@ -298,6 +428,15 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         .detach();
     }
 
+    // Drain in-flight agent loops before resetting phases, mirroring
+    // the production `run()` path. Tests override the window via
+    // `TAU_SHUTDOWN_DRAIN_SECS` to keep the test suite fast.
+    let drain_secs = shutdown_drain_secs();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
+    while shutdown.active_count() > 0 && std::time::Instant::now() < deadline {
+        smol::Timer::after(std::time::Duration::from_millis(100)).await;
+    }
+
     // Persist idle phase for all sessions on clean shutdown (same as production `run()`).
     {
         let st = lock_state(&state);
@@ -312,7 +451,6 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
 /// Run the server (blocking). Call from `smol::block_on`.
 pub async fn run() -> crate::Result<()> {
     use crate::auth::AuthStorage;
-    use agent_runner::resume_child_session;
     use registry::{
         build_registry, spawn_bg_chat_receiver, spawn_global_plugin_background_tasks,
         spawn_idle_sweep,
@@ -416,8 +554,15 @@ pub async fn run() -> crate::Result<()> {
         while !shutdown_watcher.is_shutting_down() {
             smol::Timer::after(std::time::Duration::from_millis(100)).await;
         }
-        // Connect to ourselves to unblock accept()
-        let _ = Async::<UnixStream>::connect(&sock_clone).await;
+        // Repeatedly self-connect so the accept loop wakes up and can
+        // observe the drain counter reaching zero.
+        loop {
+            let _ = Async::<UnixStream>::connect(&sock_clone).await;
+            if shutdown_watcher.active_count() == 0 {
+                break;
+            }
+            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+        }
     })
     .detach();
 
@@ -443,67 +588,20 @@ pub async fn run() -> crate::Result<()> {
         &Arc::new(TestOverrides::default()),
     );
 
-    // Auto-resume interrupted child sessions.
-    {
-        let resume_ids = {
-            let st = lock_state(&state);
-            st.db.sessions_needing_resume().unwrap_or_else(|e| {
-                tracing::warn!(%e, "failed to query sessions needing resume");
-                Vec::new()
-            })
-        };
-        let mut resuming: std::collections::HashSet<String> = resume_ids.iter().cloned().collect();
-        for sid in resume_ids {
-            tracing::info!(session_id = %sid, "auto-resuming session");
-            let s = state.clone();
-            let p = plugins.clone();
-            let sh = shutdown.clone();
-            let sl = session_locks.clone();
-            let th = throttle.clone();
-            let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
-            smol::spawn(async move {
-                if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
-                    tracing::warn!(session_id = %sid, %e, "auto-resume error");
-                }
-            })
-            .detach();
-        }
-
-        // Also resume sessions that have pending queued messages but aren't
-        // already being auto-resumed.
-        let queued_ids = {
-            let st = lock_state(&state);
-            st.db.sessions_with_queued_messages().unwrap_or_else(|e| {
-                tracing::warn!(%e, "failed to query sessions with queued messages");
-                Vec::new()
-            })
-        };
-        for sid in queued_ids {
-            if resuming.insert(sid.clone()) {
-                tracing::info!(session_id = %sid, "auto-resuming session (has queued messages)");
-                // Set the has_queued flag so the agent loop will drain them.
-                {
-                    let mut st = lock_state(&state);
-                    st.has_queued
-                        .entry(sid.clone())
-                        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-                        .store(true, Ordering::Release);
-                }
-                let s = state.clone();
-                let p = plugins.clone();
-                let sh = shutdown.clone();
-                let sl = session_locks.clone();
-                let th = throttle.clone();
-                let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
-                smol::spawn(async move {
-                    if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
-                        tracing::warn!(session_id = %sid, %e, "auto-resume error");
-                    }
-                })
-                .detach();
-            }
-        }
-    }
+    // Auto-resume interrupted sessions.
+    //
+    // Runs as a background task: connects come in on the listener above
+    // without waiting on the resume scan. Each resumable session gets an
+    // `InfoMessage("Resumed after server restart.")` in its transcript
+    // so the history stays honest about the gap.
+    spawn_auto_resume_tasks(
+        &state,
+        &plugins,
+        &shutdown,
+        &session_locks,
+        &throttle,
+        &Arc::new(TestOverrides::default()),
+    );
 
     loop {
         let (stream, _) = listener
@@ -512,7 +610,13 @@ pub async fn run() -> crate::Result<()> {
             .map_err(|e| crate::Error::Io(e.to_string()))?;
 
         if shutdown.is_shutting_down() {
-            break;
+            // Keep accepting connections while draining so connected
+            // clients can still observe Response::Error { SHUTTING_DOWN }
+            // for new chat attempts. See the matching comment in
+            // `run_with_config` above.
+            if shutdown.active_count() == 0 {
+                break;
+            }
         }
 
         let state = state.clone();
@@ -541,8 +645,14 @@ pub async fn run() -> crate::Result<()> {
         .detach();
     }
 
-    // Wait for in-flight agent loops to finish (up to 60s)
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    // Wait for in-flight agent loops to finish (configurable window).
+    let drain_secs = shutdown_drain_secs();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(drain_secs);
+    tracing::info!(
+        drain_secs,
+        in_flight = shutdown.active_count(),
+        "draining in-flight requests"
+    );
     while shutdown.active_count() > 0 && std::time::Instant::now() < deadline {
         tracing::info!(
             in_flight = shutdown.active_count(),
@@ -553,6 +663,7 @@ pub async fn run() -> crate::Result<()> {
     if shutdown.active_count() > 0 {
         tracing::warn!(
             in_flight = shutdown.active_count(),
+            drain_secs,
             "shutdown timeout: requests still in flight, exiting anyway"
         );
     }
@@ -571,4 +682,73 @@ pub async fn run() -> crate::Result<()> {
     std::fs::remove_file(pid_path()).ok();
     tracing::info!("tau server stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Env-var manipulation races between parallel tests. Serialize the
+    // drain-config tests with a single mutex so TAU_SHUTDOWN_DRAIN_SECS
+    // never overlaps across threads.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
+
+    #[test]
+    fn drain_default_is_180_seconds() {
+        let _g = env_lock();
+        // SAFETY: serialized via env_lock; other tests cannot observe the
+        // intermediate empty state.
+        unsafe {
+            std::env::remove_var("TAU_SHUTDOWN_DRAIN_SECS");
+        }
+        assert_eq!(shutdown_drain_secs(), 180);
+    }
+
+    #[test]
+    fn drain_honours_env_override() {
+        let _g = env_lock();
+        // SAFETY: serialized via env_lock.
+        unsafe {
+            std::env::set_var("TAU_SHUTDOWN_DRAIN_SECS", "5");
+        }
+        assert_eq!(shutdown_drain_secs(), 5);
+        // SAFETY: serialized via env_lock.
+        unsafe {
+            std::env::remove_var("TAU_SHUTDOWN_DRAIN_SECS");
+        }
+    }
+
+    #[test]
+    fn drain_falls_back_on_garbage_env() {
+        let _g = env_lock();
+        // SAFETY: serialized via env_lock.
+        unsafe {
+            std::env::set_var("TAU_SHUTDOWN_DRAIN_SECS", "not-a-number");
+        }
+        assert_eq!(shutdown_drain_secs(), DEFAULT_SHUTDOWN_DRAIN_SECS);
+        // SAFETY: serialized via env_lock.
+        unsafe {
+            std::env::remove_var("TAU_SHUTDOWN_DRAIN_SECS");
+        }
+    }
+
+    #[test]
+    fn shutdown_handle_tracks_in_flight() {
+        let h = ShutdownHandle::new();
+        assert_eq!(h.active_count(), 0);
+        h.enter();
+        h.enter();
+        assert_eq!(h.active_count(), 2);
+        h.leave();
+        assert_eq!(h.active_count(), 1);
+        assert!(!h.is_shutting_down());
+        h.request_shutdown(true);
+        assert!(h.is_shutting_down());
+    }
 }

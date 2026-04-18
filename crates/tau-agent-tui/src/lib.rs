@@ -243,8 +243,10 @@ async fn run_inner(
     // never permanently loses its event stream.
     let sub_tx = server_tx.clone();
     let initial_session_id = app.session_id.clone();
+    let refetch_tx = server_tx.clone();
     smol::spawn(async move {
         let mut current_session = initial_session_id;
+        let mut is_reconnect = false;
         loop {
             let connected = async {
                 let mut client = Client::connect().await?;
@@ -253,6 +255,30 @@ async fn run_inner(
                         session_id: current_session.clone(),
                     })
                     .await?;
+                // After reconnecting, catch up on any messages the server
+                // persisted while we were disconnected (e.g. during a
+                // seamless restart). Fire and forget: responses arrive on
+                // a dedicated short-lived connection.
+                if is_reconnect {
+                    let sid = current_session.clone();
+                    let tx = refetch_tx.clone();
+                    smol::spawn(async move {
+                        if let Ok(mut fetch) = Client::connect().await
+                            && fetch
+                                .send(&Request::GetMessages { session_id: sid })
+                                .await
+                                .is_ok()
+                        {
+                            fetch
+                                .recv_streaming(|resp| {
+                                    let _ = tx.try_send(resp.clone());
+                                })
+                                .await
+                                .ok();
+                        }
+                    })
+                    .detach();
+                }
                 let stream = client.response_stream();
                 futures::pin_mut!(stream);
                 loop {
@@ -292,6 +318,7 @@ async fn run_inner(
 
             // Connection lost — wait before reconnecting
             smol::Timer::after(std::time::Duration::from_millis(500)).await;
+            is_reconnect = true;
         }
     })
     .detach();
