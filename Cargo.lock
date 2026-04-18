@@ -2505,6 +2505,7 @@ dependencies = [
  "serde_json",
  "smol",
  "tau-agent-plugin",
+ "tau-agent-plugin-tasks",
  "tempfile",
 ]
 

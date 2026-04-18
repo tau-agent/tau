@@ -199,7 +199,8 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             }),
             prompt_snippet: Some("Use session_archive to clean up completed child sessions. Only works on descendants of the current session. Accepts a single session ID or an array of session IDs.".into()),
             prompt_guidelines: vec![
-                "Archive children after collecting their results to keep session listings clean.".into(),
+                "Archive children only once you're done with their transcripts — session_read returns nothing useful after archive.".into(),
+                "For children whose output you'll only consume once, pass auto_archive=true to session_spawn so cleanup happens automatically on completion.".into(),
             ],
         },
         PluginToolDef {
@@ -239,11 +240,10 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                 },
                 "required": ["session_id", "content"]
             }),
-            prompt_snippet: Some("Use session_message to send information to another session (parent, child, or sibling).".into()),
+            prompt_snippet: Some("Send a message to another session (parent, child, or sibling) as a user message.".into()),
             prompt_guidelines: vec![
-                "The message appears as a user message in the target session's conversation.".into(),
-                "Fire-and-forget: returns immediately, does not wait for a response. Use session_read to check for responses later.".into(),
-                "Use session_message with await_reply=true to send a message and block until the target calls session_reply.".into(),
+                "Fire-and-forget by default — use session_read to check for the target's response later.".into(),
+                "Pass await_reply=true to block until the target calls session_reply; your call returns the reply content directly.".into(),
             ],
         },
         PluginToolDef {
@@ -263,10 +263,9 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
                 },
                 "required": ["msg_id", "content"]
             }),
-            prompt_snippet: Some("Use session_reply to respond to a message that has await_reply set. The sender is blocked waiting for this reply.".into()),
+            prompt_snippet: Some("Reply to a session_message that had await_reply=true.".into()),
             prompt_guidelines: vec![
-                "Only use when you received a message containing 'awaits reply, msg_id=...' — extract the msg_id and call session_reply.".into(),
-                "The sender's session_message call will return with your reply content.".into(),
+                "Use only when you've received a message containing 'awaits reply, msg_id=...' — extract the msg_id and pass it here.".into(),
             ],
         },
         PluginToolDef {
@@ -304,4 +303,82 @@ pub fn tool_prompts() -> Vec<ToolPrompt> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn find_tool<'a>(tools: &'a [PluginToolDef], name: &str) -> &'a PluginToolDef {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("tool {name} not found"))
+    }
+
+    #[test]
+    fn session_message_and_reply_guideline_counts() {
+        let tools = orchestration_tools();
+        let msg = find_tool(&tools, "session_message");
+        let reply = find_tool(&tools, "session_reply");
+
+        assert_eq!(
+            msg.prompt_guidelines.len(),
+            2,
+            "session_message should have exactly 2 guidelines, got {:?}",
+            msg.prompt_guidelines,
+        );
+        assert_eq!(
+            reply.prompt_guidelines.len(),
+            1,
+            "session_reply should have exactly 1 guideline, got {:?}",
+            reply.prompt_guidelines,
+        );
+    }
+
+    #[test]
+    fn session_archive_mentions_auto_archive() {
+        let tools = orchestration_tools();
+        let archive = find_tool(&tools, "session_archive");
+
+        assert_eq!(
+            archive.prompt_guidelines.len(),
+            2,
+            "session_archive should have exactly 2 guidelines, got {:?}",
+            archive.prompt_guidelines,
+        );
+        assert!(
+            archive
+                .prompt_guidelines
+                .iter()
+                .any(|g| g.contains("auto_archive")),
+            "session_archive guidelines should mention auto_archive, got {:?}",
+            archive.prompt_guidelines,
+        );
+    }
+
+    #[test]
+    fn no_warning_prefix_or_auto_dispatch_caps_anywhere() {
+        let all_tools: Vec<PluginToolDef> = orchestration_tools()
+            .into_iter()
+            .chain(tau_agent_plugin_tasks::tasks::plugin_tool_defs())
+            .collect();
+
+        for tool in &all_tools {
+            for guideline in &tool.prompt_guidelines {
+                assert!(
+                    !guideline.starts_with("WARNING:"),
+                    "tool {} has a guideline starting with 'WARNING:': {:?}",
+                    tool.name,
+                    guideline,
+                );
+                assert!(
+                    !guideline.contains("AUTO-DISPATCH"),
+                    "tool {} has a guideline containing 'AUTO-DISPATCH' (all-caps): {:?}",
+                    tool.name,
+                    guideline,
+                );
+            }
+        }
+    }
 }

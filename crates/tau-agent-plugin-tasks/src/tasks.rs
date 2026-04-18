@@ -156,6 +156,15 @@ fn tool_ok_summary(tool_call_id: &str, text: &str, summary: impl Into<String>) -
 // Tool definitions
 // ---------------------------------------------------------------------------
 
+/// Returns the full set of `PluginToolDef`s for the tasks plugin.
+///
+/// Exposed so other crates (e.g. prompt regression tests in the worker
+/// plugin) can introspect the combined tool surface without duplicating
+/// the list.
+pub fn plugin_tool_defs() -> Vec<PluginToolDef> {
+    tasks_tools()
+}
+
 fn tasks_tools() -> Vec<PluginToolDef> {
     vec![
         PluginToolDef {
