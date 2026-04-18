@@ -866,6 +866,9 @@ fn handle_task_assign(
     // Note: assign_task now handles descendant DB updates atomically in its
     // transaction and returns the old session + descendant session info.
 
+    // Capture state before assign so we can emit a transition info-message.
+    let pre_state = db.get_task(id).ok().flatten().map(|t| t.state);
+
     match db.assign_task(id, sid) {
         Ok(result) => {
             let task = &result.task;
@@ -907,6 +910,20 @@ fn handle_task_assign(
                         }
                     }
                 }
+            }
+            // Emit state-change InfoMessage if the assign actually changed
+            // the task's state (ready → active).
+            if let Some(ref old) = pre_state
+                && old != &result.task.state
+            {
+                crate::tasks_notify::notify_state_change(
+                    db,
+                    &result.task,
+                    old,
+                    None,
+                    writer,
+                    reader,
+                );
             }
             match serde_json::to_string_pretty(&result.task) {
                 Ok(json) => {
@@ -1160,6 +1177,20 @@ fn handle_task_update(
                     ));
                 }
                 _ => {}
+            }
+
+            // Emit a state-change InfoMessage to every involved session
+            // (and, for terminal/interactive transitions, the user's root
+            // session).  Observational only — does not wake the agent.
+            if let Some(ref old) = old_state
+                && &task.state != old
+            {
+                let context = match (old.as_str(), task.state.as_str()) {
+                    ("review", "active") => Some("rework requested"),
+                    ("refining", "interactive") => Some("scope expansion"),
+                    _ => None,
+                };
+                crate::tasks_notify::notify_state_change(db, &task, old, context, writer, reader);
             }
 
             // When a task transitions from review back to active (changes
@@ -1768,6 +1799,11 @@ fn handle_task_merge(
         return tool_err(tool_call_id, &format!("transition to merging: {}", e));
     }
 
+    // Broadcast approved -> merging.
+    if let Ok(Some(t)) = db.get_task(id) {
+        crate::tasks_notify::notify_state_change(db, &t, "approved", None, writer, reader);
+    }
+
     // Run the merge
     let project_dir = match resolver.resolve(&task.project_name) {
         Ok(p) => p,
@@ -1788,6 +1824,19 @@ fn handle_task_merge(
                     return tool_err(
                         tool_call_id,
                         &format!("merge succeeded but transition to merged failed: {}", e),
+                    );
+                }
+
+                // Broadcast merging -> merged (terminal).
+                if let Ok(Some(t)) = db.get_task(id) {
+                    let ctx = crate::tasks_scheduler::extract_merge_commit(&project_dir, &t);
+                    crate::tasks_notify::notify_state_change(
+                        db,
+                        &t,
+                        "merging",
+                        ctx.as_deref(),
+                        writer,
+                        reader,
                     );
                 }
 
@@ -1820,6 +1869,18 @@ fn handle_task_merge(
                     eprintln!(
                         "tasks: failed to transition task {} back to active: {}",
                         id, e
+                    );
+                }
+
+                // Broadcast merging -> active (recoverable failure).
+                if let Ok(Some(t)) = db.get_task(id) {
+                    crate::tasks_notify::notify_state_change(
+                        db,
+                        &t,
+                        "merging",
+                        Some("merge failed — reverted to active"),
+                        writer,
+                        reader,
                     );
                 }
 
@@ -1857,6 +1918,20 @@ fn handle_task_merge(
             ) {
                 eprintln!("tasks: failed to transition task {} to failed: {}", id, te);
             }
+
+            // Broadcast merging -> failed (terminal).  Root session is
+            // included via notify_state_change's root-broadcast rule.
+            if let Ok(Some(t)) = db.get_task(id) {
+                crate::tasks_notify::notify_state_change(
+                    db,
+                    &t,
+                    "merging",
+                    Some(&format!("merge error: {}", e)),
+                    writer,
+                    reader,
+                );
+            }
+
             let _ = db.add_message(id, &format!("Merge error: {}", e), Some("system"));
             tool_err(tool_call_id, &format!("merge error: {}", e))
         }

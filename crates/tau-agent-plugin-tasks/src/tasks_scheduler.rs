@@ -104,6 +104,31 @@ pub(crate) fn extract_files(val: &Option<serde_json::Value>) -> Vec<String> {
     }
 }
 
+/// Best-effort short commit SHA of the merge target after a successful
+/// merge.  Used as the `context` argument to
+/// [`tasks_notify::notify_state_change`](crate::tasks_notify::notify_state_change)
+/// on `merging → merged` so the info-message reads
+/// `[task #N] title: merged (commit abcdef0)`.
+///
+/// Returns `None` if the SHA cannot be resolved (non-fatal — the merged
+/// info-message will simply omit the suffix).
+pub(crate) fn extract_merge_commit(project_dir: &str, task: &Task) -> Option<String> {
+    let target = task.merge_target.clone().unwrap_or_else(|| "main".into());
+    let out = std::process::Command::new("git")
+        .args(["-C", project_dir, "rev-parse", "--short", &target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(format!("commit {}", sha))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Schedule pass
 // ---------------------------------------------------------------------------
@@ -557,6 +582,15 @@ pub fn dispatch(
     // Update task with session info.
     db.set_session_id(task_id, &session_id)?;
     db.record_session(task_id, &session_id, "worker")?;
+
+    // Emit a ready → active state-change InfoMessage.  The worker session
+    // has been recorded above so it participates in the broadcast.  This
+    // covers both the scheduler-driven path (prepare_task transitioned
+    // ready → active earlier in schedule()) and the inline-prepare path
+    // (task.state == "ready" branch above).
+    if let Ok(Some(updated)) = db.get_task(task_id) {
+        crate::tasks_notify::notify_state_change(db, &updated, "ready", None, writer, reader);
+    }
 
     Ok(session_id)
 }
@@ -1382,6 +1416,11 @@ fn merge_one_task(
         };
     }
 
+    // Broadcast approved -> merging to all involved sessions.
+    if let Ok(Some(t)) = db.get_task(task_id) {
+        crate::tasks_notify::notify_state_change(db, &t, "approved", None, writer, reader);
+    }
+
     eprintln!("tasks scheduler: auto-merging task {} ({})", task_id, title);
 
     // Run the merge
@@ -1411,6 +1450,20 @@ fn merge_one_task(
                     eprintln!(
                         "tasks scheduler: merge succeeded but transition to merged failed for task {}: {}",
                         task_id, e
+                    );
+                }
+
+                // Broadcast merging -> merged (terminal).  Root session is
+                // added to the recipient list automatically.
+                if let Ok(Some(t)) = db.get_task(task_id) {
+                    let ctx = extract_merge_commit(&project_dir, &t);
+                    crate::tasks_notify::notify_state_change(
+                        db,
+                        &t,
+                        "merging",
+                        ctx.as_deref(),
+                        writer,
+                        reader,
                     );
                 }
 
@@ -1447,6 +1500,18 @@ fn merge_one_task(
                     eprintln!(
                         "tasks scheduler: failed to transition task {} back to active: {}",
                         task_id, e
+                    );
+                }
+
+                // Broadcast merging -> active (recoverable failure).
+                if let Ok(Some(t)) = db.get_task(task_id) {
+                    crate::tasks_notify::notify_state_change(
+                        db,
+                        &t,
+                        "merging",
+                        Some("merge failed — reverted to active"),
+                        writer,
+                        reader,
                     );
                 }
 
@@ -1492,6 +1557,19 @@ fn merge_one_task(
                     task_id, te
                 );
             }
+
+            // Broadcast merging -> active (unexpected error).
+            if let Ok(Some(t)) = db.get_task(task_id) {
+                crate::tasks_notify::notify_state_change(
+                    db,
+                    &t,
+                    "merging",
+                    Some(&format!("merge error: {}", e)),
+                    writer,
+                    reader,
+                );
+            }
+
             let _ = db.add_message(task_id, &format!("Auto-merge error: {}", e), Some("system"));
 
             eprintln!("tasks scheduler: task {} merge error: {}", task_id, e);
