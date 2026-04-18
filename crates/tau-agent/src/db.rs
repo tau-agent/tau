@@ -64,6 +64,24 @@ pub struct StoredSession {
     pub project_name: Option<String>,
 }
 
+/// Project-wide aggregate stats (totals across every session, archived
+/// included).  Produced by [`Db::project_stats`].
+#[derive(Debug, Clone, Default)]
+pub struct DbProjectStats {
+    /// Number of sessions (archived + active) belonging to the project.
+    pub session_count: usize,
+    /// Total messages across those sessions.
+    pub message_count: usize,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cache_read: u64,
+    pub tokens_cache_write: u64,
+    pub cost: f64,
+    /// Unix-seconds timestamp of the most recent message across all
+    /// sessions, or `None` when no sessions have any messages.
+    pub last_message_time: Option<i64>,
+}
+
 /// Stored project metadata.
 #[derive(Debug, Clone)]
 pub struct Project {
@@ -864,6 +882,51 @@ impl Db {
             .flatten();
 
         Ok(Some(stats))
+    }
+
+    /// Project-wide aggregate stats: totals across **every** session
+    /// belonging to `project_name`, including archived ones.
+    ///
+    /// Archived sessions are intentionally included — they are part of
+    /// historical spend.  Returns an all-zero `DbProjectStats` when the
+    /// project has no sessions; this is not an error.
+    pub fn project_stats(&self, project_name: &str) -> crate::Result<DbProjectStats> {
+        let stats: DbProjectStats = self
+            .conn
+            .query_row(
+                "SELECT
+                    COUNT(DISTINCT s.id)                                      AS session_count,
+                    COUNT(m.rowid)                                            AS message_count,
+                    COALESCE(SUM(CASE WHEN json_extract(m.message_json, '$.role') = 'assistant'
+                         THEN json_extract(m.message_json, '$.usage.input')       ELSE 0 END), 0) AS tokens_input,
+                    COALESCE(SUM(CASE WHEN json_extract(m.message_json, '$.role') = 'assistant'
+                         THEN json_extract(m.message_json, '$.usage.output')      ELSE 0 END), 0) AS tokens_output,
+                    COALESCE(SUM(CASE WHEN json_extract(m.message_json, '$.role') = 'assistant'
+                         THEN json_extract(m.message_json, '$.usage.cache_read')  ELSE 0 END), 0) AS tokens_cache_read,
+                    COALESCE(SUM(CASE WHEN json_extract(m.message_json, '$.role') = 'assistant'
+                         THEN json_extract(m.message_json, '$.usage.cache_write') ELSE 0 END), 0) AS tokens_cache_write,
+                    COALESCE(SUM(CASE WHEN json_extract(m.message_json, '$.role') = 'assistant'
+                         THEN json_extract(m.message_json, '$.usage.cost.total')  ELSE 0 END), 0.0) AS cost,
+                    MAX(m.created_at)                                         AS last_message_time
+                 FROM sessions s
+                 LEFT JOIN messages m ON m.session_id = s.id
+                 WHERE s.project_name = ?1",
+                params![project_name],
+                |row| {
+                    Ok(DbProjectStats {
+                        session_count: row.get::<_, i64>(0)? as usize,
+                        message_count: row.get::<_, i64>(1)? as usize,
+                        tokens_input: row.get::<_, i64>(2)? as u64,
+                        tokens_output: row.get::<_, i64>(3)? as u64,
+                        tokens_cache_read: row.get::<_, i64>(4)? as u64,
+                        tokens_cache_write: row.get::<_, i64>(5)? as u64,
+                        cost: row.get(6)?,
+                        last_message_time: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(db_err("project_stats"))?;
+        Ok(stats)
     }
 
     // ----- queued_messages -----
@@ -2028,6 +2091,127 @@ mod tests {
         let stats = db.session_stats("s1").unwrap().unwrap();
         // Should use the good message's tokens, not the error one
         assert_eq!(stats.last_input_tokens, Some(120)); // 100 + 20 + 0
+    }
+
+    /// Build a minimal session row for the project-stats tests below.
+    /// Defaults mirror the other tests in this module; callers override
+    /// the id / project_name / archived as needed.
+    fn make_stored(id: &str, project: Option<&str>, archived: bool) -> StoredSession {
+        StoredSession {
+            id: id.into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: 1000,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            archived,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: project.map(|p| p.to_string()),
+        }
+    }
+
+    #[test]
+    fn project_stats_aggregates_sessions_and_includes_archived() {
+        let db = Db::open_memory().unwrap();
+
+        // Three sessions:
+        //   s1, s2 — project "alpha" (s2 archived).
+        //   s3    — project "beta" (should be ignored for alpha query).
+        db.create_session(&make_stored("s1", Some("alpha"), false))
+            .unwrap();
+        db.create_session(&make_stored("s2", Some("alpha"), true))
+            .unwrap();
+        db.create_session(&make_stored("s3", Some("beta"), false))
+            .unwrap();
+
+        // s1: user + one assistant turn.
+        db.append_message("s1", &Message::User(UserMessage::text("hi")))
+            .unwrap();
+        let mut a1 = AssistantMessage::empty("test", "test", "test-model");
+        a1.usage.input = 100;
+        a1.usage.output = 50;
+        a1.usage.cache_read = 10;
+        a1.usage.cache_write = 5;
+        a1.usage.cost.total = 0.10;
+        db.append_message("s1", &Message::Assistant(a1)).unwrap();
+
+        // s2 (archived): one assistant turn — should be *included*.
+        let mut a2 = AssistantMessage::empty("test", "test", "test-model");
+        a2.usage.input = 200;
+        a2.usage.output = 25;
+        a2.usage.cache_read = 0;
+        a2.usage.cache_write = 0;
+        a2.usage.cost.total = 0.25;
+        db.append_message("s2", &Message::Assistant(a2)).unwrap();
+
+        // s3 (other project): noise — must not leak into alpha totals.
+        let mut a3 = AssistantMessage::empty("test", "test", "test-model");
+        a3.usage.input = 9_999;
+        a3.usage.cost.total = 9.99;
+        db.append_message("s3", &Message::Assistant(a3)).unwrap();
+
+        let alpha = db.project_stats("alpha").unwrap();
+        assert_eq!(alpha.session_count, 2);
+        // 1 user + 1 assistant (s1) + 1 assistant (s2) = 3 messages
+        assert_eq!(alpha.message_count, 3);
+        assert_eq!(alpha.tokens_input, 300);
+        assert_eq!(alpha.tokens_output, 75);
+        assert_eq!(alpha.tokens_cache_read, 10);
+        assert_eq!(alpha.tokens_cache_write, 5);
+        assert!((alpha.cost - 0.35).abs() < 1e-6);
+        assert!(alpha.last_message_time.is_some());
+
+        // Per-session sums must match the aggregate.
+        let s1 = db.session_stats("s1").unwrap().unwrap();
+        let s2 = db.session_stats("s2").unwrap().unwrap();
+        assert_eq!(alpha.tokens_input, s1.tokens_input + s2.tokens_input);
+        assert_eq!(alpha.tokens_output, s1.tokens_output + s2.tokens_output);
+        assert_eq!(
+            alpha.tokens_cache_read,
+            s1.tokens_cache_read + s2.tokens_cache_read
+        );
+        assert_eq!(
+            alpha.tokens_cache_write,
+            s1.tokens_cache_write + s2.tokens_cache_write
+        );
+        assert!((alpha.cost - (s1.cost + s2.cost)).abs() < 1e-6);
+        assert_eq!(alpha.message_count, s1.message_count + s2.message_count);
+    }
+
+    #[test]
+    fn project_stats_unknown_project_returns_zero() {
+        let db = Db::open_memory().unwrap();
+        // No sessions at all — must not error.
+        let stats = db.project_stats("nope").unwrap();
+        assert_eq!(stats.session_count, 0);
+        assert_eq!(stats.message_count, 0);
+        assert_eq!(stats.tokens_input, 0);
+        assert_eq!(stats.tokens_output, 0);
+        assert_eq!(stats.tokens_cache_read, 0);
+        assert_eq!(stats.tokens_cache_write, 0);
+        assert_eq!(stats.cost, 0.0);
+        assert!(stats.last_message_time.is_none());
+    }
+
+    #[test]
+    fn project_stats_session_without_messages() {
+        // A freshly created session with no messages should still contribute
+        // to session_count but leave all totals at zero.
+        let db = Db::open_memory().unwrap();
+        db.create_session(&make_stored("s1", Some("alpha"), false))
+            .unwrap();
+        let stats = db.project_stats("alpha").unwrap();
+        assert_eq!(stats.session_count, 1);
+        assert_eq!(stats.message_count, 0);
+        assert_eq!(stats.tokens_input, 0);
+        assert_eq!(stats.cost, 0.0);
+        assert!(stats.last_message_time.is_none());
     }
 
     #[test]

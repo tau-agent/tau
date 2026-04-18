@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use super::agent_runner::PluginExecutor;
 use super::dispatch::{
     cancel_chat_impl, create_session_impl, get_messages_impl, get_session_ancestors_impl,
-    get_session_info_impl, list_sessions_impl,
+    get_session_info_impl, list_sessions_impl, project_stats_impl,
 };
 use super::notifications::{
     auto_archive_done_sessions, last_assistant_text, queue_and_maybe_resume, queue_info_to_session,
@@ -746,6 +746,7 @@ pub(super) async fn handle_server_request(
         Request::TaskMergeQueue { project } => {
             super::task_handlers::handle_task_merge_queue(project)
         }
+        Request::ProjectStats { project_name } => project_stats_impl(state, project_name),
         _ => Response::Error {
             message: "request not supported in plugin context".into(),
         },

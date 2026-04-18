@@ -294,6 +294,34 @@ pub(super) fn get_messages_impl(
     }
 }
 
+/// Project-wide aggregate stats: totals across every session (archived
+/// included) belonging to the named project.  See
+/// [`crate::db::Db::project_stats`] for the underlying query.
+pub(super) fn project_stats_impl(
+    state: &SharedState,
+    project_name: &str,
+) -> crate::protocol::Response {
+    let st = lock_state(state);
+    match st.db.project_stats(project_name) {
+        Ok(s) => crate::protocol::Response::ProjectStats {
+            stats: crate::protocol::ProjectStatsInfo {
+                project_name: project_name.to_string(),
+                session_count: s.session_count,
+                message_count: s.message_count,
+                tokens_input: s.tokens_input,
+                tokens_output: s.tokens_output,
+                tokens_cache_read: s.tokens_cache_read,
+                tokens_cache_write: s.tokens_cache_write,
+                cost_usd: s.cost,
+                last_activity: s.last_message_time,
+            },
+        },
+        Err(e) => crate::protocol::Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
 pub(super) fn list_sessions_impl(
     state: &SharedState,
     include_archived: bool,
@@ -1927,6 +1955,10 @@ pub(super) async fn handle_client(
             }
             crate::protocol::Request::TaskMergeQueue { project } => {
                 let resp = super::task_handlers::handle_task_merge_queue(&project);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::ProjectStats { project_name } => {
+                let resp = project_stats_impl(&state, &project_name);
                 send(&mut writer, &resp).await?;
             }
         }

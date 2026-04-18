@@ -750,6 +750,13 @@ async fn run_inner(
                     send_request_and_recv(Request::TaskMergeQueue { project }, server_tx.clone())
                         .await?;
                 }
+                Action::ProjectStats { project_name } => {
+                    send_request_and_recv(
+                        Request::ProjectStats { project_name },
+                        server_tx.clone(),
+                    )
+                    .await?;
+                }
                 Action::OpenTaskPicker => {
                     app.task_picker_previous_mode = app.mode;
                     app.mode = AppMode::TaskPicker;

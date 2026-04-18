@@ -5,8 +5,8 @@ use ratatui_textarea::TextArea;
 
 use tau_agent::auth::SubscriptionUsage;
 use tau_agent::protocol::{
-    Response, SessionInfo, TaskHistoryInfo, TaskInfo, TaskMessageInfo, TaskRelationInfo,
-    TaskSessionInfo,
+    ProjectStatsInfo, Response, SessionInfo, TaskHistoryInfo, TaskInfo, TaskMessageInfo,
+    TaskRelationInfo, TaskSessionInfo,
 };
 use tau_agent::types::{
     AgentPhase, AssistantContent, Message, StopReason, StreamEvent, ToolResultMessage, UserContent,
@@ -2079,7 +2079,7 @@ impl App {
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|status|mq] /reload /sessions /session <id> /back /fork /new /archive /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|status|mq] /project stats [name] /reload /sessions /session <id> /back /fork /new /archive /help /quit"
                         .into(),
                 });
                 None
@@ -2092,9 +2092,37 @@ impl App {
                 }
             }
             "/task" | "/tasks" => self.handle_task_slash_command(args),
+            "/project" | "/projects" => self.handle_project_slash_command(args),
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!("unknown command: {}. Type /help", cmd),
+                });
+                None
+            }
+        }
+    }
+
+    /// Dispatch `/project <subcommand>` in the TUI.  Currently supports
+    /// `stats [name]` — defaults to the current project.
+    fn handle_project_slash_command(&mut self, args: &str) -> Option<Action> {
+        let parts: Vec<&str> = args.splitn(2, ' ').collect();
+        let subcmd = parts.first().copied().unwrap_or("");
+        match subcmd {
+            "" | "stats" => {
+                let project_name = parts
+                    .get(1)
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| self.task_project());
+                Some(Action::ProjectStats { project_name })
+            }
+            _ => {
+                self.messages.push(MessageItem::Error {
+                    text: format!(
+                        "unknown /project subcommand: {}. Try /project stats",
+                        subcmd
+                    ),
                 });
                 None
             }
@@ -2449,6 +2477,28 @@ impl App {
     }
 
     /// Render a merge queue (approved + merging tasks).
+    /// Render a project-stats block as a chat-status message.  Formatted
+    /// the same way as `tau project stats` on the command line.
+    fn render_project_stats(&mut self, stats: &ProjectStatsInfo) {
+        let last = match stats.last_activity {
+            Some(t) => format_unix_secs_ago(t),
+            None => "(no messages yet)".to_string(),
+        };
+        let text = format!(
+            "Project: {}\n  Sessions:     {}\n  Messages:     {}\n  Tokens:       input {}   output {}\n                cache_read {}   cache_write {}\n  Cost:         ${:.2}\n  Last activity: {}",
+            stats.project_name,
+            format_u64_commas(stats.session_count as u64),
+            format_u64_commas(stats.message_count as u64),
+            format_u64_commas(stats.tokens_input),
+            format_u64_commas(stats.tokens_output),
+            format_u64_commas(stats.tokens_cache_read),
+            format_u64_commas(stats.tokens_cache_write),
+            stats.cost_usd,
+            last,
+        );
+        self.messages.push(MessageItem::Status { text });
+    }
+
     fn render_merge_queue(&mut self, tasks: &[TaskInfo]) {
         if tasks.is_empty() {
             self.messages.push(MessageItem::Status {
@@ -2943,6 +2993,9 @@ impl App {
             Response::TaskMergeQueue { tasks } => {
                 self.render_merge_queue(&tasks);
             }
+            Response::ProjectStats { stats } => {
+                self.render_project_stats(&stats);
+            }
             _ => {}
         }
         None
@@ -3316,6 +3369,10 @@ pub enum Action {
     TaskMerge {
         id: i64,
     },
+    /// Fetch project-wide usage / cost stats and display them inline.
+    ProjectStats {
+        project_name: String,
+    },
 }
 
 /// Convert a crossterm KeyEvent to a tui_textarea compatible input event.
@@ -3376,6 +3433,42 @@ pub(crate) fn compute_group_depths(tasks: Vec<TaskInfo>) -> Vec<(usize, TaskInfo
         out.push((0, remaining));
     }
     out
+}
+
+/// Format an integer with thousand-separator commas. `1234567 -> "1,234,567"`.
+pub(crate) fn format_u64_commas(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let len = bytes.len();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Format a unix-seconds timestamp as a coarse "Nm / Nh / Nd / Nmo ago"
+/// relative to the current wall clock.  Shared with `tau project stats`.
+pub(crate) fn format_unix_secs_ago(unix_secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(unix_secs);
+    let delta = now - unix_secs;
+    if delta < 0 {
+        return "just now".into();
+    }
+    let delta = delta as u64;
+    match delta {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", delta / 60),
+        3600..=86399 => format!("{}h ago", delta / 3600),
+        86400..=2_591_999 => format!("{}d ago", delta / 86400),
+        _ => format!("{}mo ago", delta / 2_592_000),
+    }
 }
 
 /// Predicate for the picker filter: case-insensitive substring match across
@@ -5622,5 +5715,76 @@ mod tests {
         assert_eq!(app.picker_groups.recently_merged.len(), 1);
         assert_eq!(app.picker_groups.inflight_count, 1);
         assert_eq!(app.picker_groups.max_concurrent, 8);
+    }
+
+    #[test]
+    fn project_stats_slash_bare_uses_current_project() {
+        let mut app = make_app();
+        let action = app.handle_slash_command("/project stats");
+        match action {
+            Some(Action::ProjectStats { project_name }) => {
+                // `task_project()` falls back to the TUI's default — we just
+                // require a non-empty string here so the server has
+                // *something* to key on.  The exact default is an impl
+                // detail covered elsewhere.
+                assert!(!project_name.is_empty(), "expected a project name");
+            }
+            other => panic!("expected Action::ProjectStats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_stats_slash_with_explicit_name() {
+        let mut app = make_app();
+        let action = app.handle_slash_command("/project stats my-proj");
+        match action {
+            Some(Action::ProjectStats { project_name }) => {
+                assert_eq!(project_name, "my-proj");
+            }
+            other => panic!("expected Action::ProjectStats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_stats_response_rendered_as_status_message() {
+        let mut app = make_app();
+        let before = app.messages.len();
+        let action = app.handle_server_response(Response::ProjectStats {
+            stats: ProjectStatsInfo {
+                project_name: "tau".into(),
+                session_count: 3,
+                message_count: 42,
+                tokens_input: 1_234,
+                tokens_output: 56,
+                tokens_cache_read: 7_890,
+                tokens_cache_write: 12,
+                cost_usd: 0.42,
+                last_activity: None,
+            },
+        });
+        assert!(action.is_none());
+        assert!(app.messages.len() > before, "expected a status message");
+        let last = app.messages.last().expect("message");
+        match last {
+            MessageItem::Status { text } => {
+                assert!(text.contains("Project: tau"), "got: {text}");
+                assert!(text.contains("Sessions:     3"), "got: {text}");
+                assert!(text.contains("$0.42"), "got: {text}");
+                // Thousand-separator formatting on a 4-digit number.
+                assert!(text.contains("1,234"), "got: {text}");
+                assert!(text.contains("(no messages yet)"), "got: {text}");
+            }
+            other => panic!("expected Status message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn format_u64_commas_examples() {
+        assert_eq!(format_u64_commas(0), "0");
+        assert_eq!(format_u64_commas(42), "42");
+        assert_eq!(format_u64_commas(999), "999");
+        assert_eq!(format_u64_commas(1_000), "1,000");
+        assert_eq!(format_u64_commas(12_345), "12,345");
+        assert_eq!(format_u64_commas(1_234_567), "1,234,567");
     }
 }

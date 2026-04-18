@@ -282,6 +282,11 @@ pub enum Request {
     },
     /// Get merge queue (approved + merging tasks).
     TaskMergeQueue { project: String },
+    /// Project-wide aggregate usage / cost stats.
+    ///
+    /// Returns totals across every session (archived included) belonging
+    /// to `project_name`.
+    ProjectStats { project_name: String },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -410,6 +415,8 @@ pub enum Response {
     TaskTree { tasks: Vec<(usize, TaskInfo)> },
     /// Merge queue (approved + merging tasks, response to TaskMergeQueue).
     TaskMergeQueue { tasks: Vec<TaskInfo> },
+    /// Project-wide usage / cost totals (response to `ProjectStats`).
+    ProjectStats { stats: ProjectStatsInfo },
     /// Error.
     Error { message: String },
 }
@@ -673,6 +680,26 @@ impl TokenStats {
     pub fn total(&self) -> u64 {
         self.input + self.output + self.cache_read + self.cache_write
     }
+}
+
+/// Project-wide usage / cost totals, aggregated across every session
+/// (archived included) belonging to a project.
+///
+/// Returned by the `ProjectStats` request.  No per-model breakdown in v1.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectStatsInfo {
+    pub project_name: String,
+    pub session_count: usize,
+    pub message_count: usize,
+    pub tokens_input: u64,
+    pub tokens_output: u64,
+    pub tokens_cache_read: u64,
+    pub tokens_cache_write: u64,
+    pub cost_usd: f64,
+    /// Unix-seconds timestamp of the most recent message in any of the
+    /// project's sessions, or `None` if the project has no messages yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<i64>,
 }
 
 /// Format a token count for display: 1234 → "1.2K", 1234567 → "1.2M".
@@ -1070,6 +1097,9 @@ mod tests {
             Request::TaskMergeQueue {
                 project: "/tmp".into(),
             },
+            Request::ProjectStats {
+                project_name: "tau".into(),
+            },
         ];
         for req in &requests {
             let json = serde_json::to_string(req).expect("serialize request");
@@ -1120,6 +1150,19 @@ mod tests {
                 tasks: vec![(0, task.clone())],
             },
             Response::TaskMergeQueue { tasks: vec![task] },
+            Response::ProjectStats {
+                stats: ProjectStatsInfo {
+                    project_name: "tau".into(),
+                    session_count: 42,
+                    message_count: 8124,
+                    tokens_input: 12_340_156,
+                    tokens_output: 418_902,
+                    tokens_cache_read: 34_521_088,
+                    tokens_cache_write: 2_108_445,
+                    cost_usd: 28.47,
+                    last_activity: Some(1_700_000_000),
+                },
+            },
         ];
         for resp in &responses {
             let json = serde_json::to_string(resp).expect("serialize response");
