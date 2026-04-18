@@ -10,13 +10,14 @@ mod ui;
 
 use std::io;
 
+use crossterm::cursor::MoveTo;
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures::StreamExt;
 use ratatui::Terminal;
@@ -104,8 +105,14 @@ async fn run_tui(
         let _ = stdout.write_all(b"\x1b[>4;2m");
         let _ = stdout.flush();
     }
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+    )
+    .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| tau_agent::Error::Io(e.to_string()))?;
 
