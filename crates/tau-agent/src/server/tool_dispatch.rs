@@ -91,14 +91,22 @@ pub(super) async fn execute_tool_impl(
 
     // 5. Execute via the PluginExecutor (or mock)
     let (output_tx, _output_rx) = smol::channel::unbounded::<String>();
-    // Resolve a cancel token: use the session's cancel_flag if one exists,
-    // so Ctrl-C cancels this direct-execute call the same way it would a
-    // tool call from the agent loop.
+    // Resolve a cancel token: use the session's cancel_flag if one exists
+    // *and* it isn't currently tripped, so Ctrl-C cancels this direct-execute
+    // call the same way it would a tool call from the agent loop.
+    //
+    // If the session's flag happens to already be `true` (e.g. a prior
+    // Chat was cancelled and the flag wasn't cleared), we don't want to
+    // short-circuit this direct call — use a fresh never-cancelled token.
+    // Callers that truly want cancellation to reach this path should
+    // trip the flag *after* issuing the ExecuteTool request.
     let cancel_token = {
         let st = lock_state(state);
         match st.cancel_flags.get(session_id) {
-            Some(flag) => tau_agent_base::types::CancelToken::from_flag(flag.clone()),
-            None => tau_agent_base::types::CancelToken::new(),
+            Some(flag) if !flag.load(std::sync::atomic::Ordering::Relaxed) => {
+                tau_agent_base::types::CancelToken::from_flag(flag.clone())
+            }
+            _ => tau_agent_base::types::CancelToken::new(),
         }
     };
     let result = if let Some(ref factory) = test_overrides.tool_executor_factory {

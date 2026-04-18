@@ -558,6 +558,25 @@ impl PluginHandle {
         Ok((reader, writer))
     }
 
+    /// Extract just the async writer, leaving the async reader in place.
+    ///
+    /// Used by [`super::server::agent_runner::PluginExecutor::execute`] to
+    /// install a per-tool-call writer task that can serve concurrent senders
+    /// (main loop, ServerResponse path, cancel watcher). The writer is
+    /// returned to the handle via [`restore_async_writer`] when the call
+    /// completes.
+    pub fn take_async_writer(&mut self) -> crate::Result<AsyncPluginWriter> {
+        self.async_stdin
+            .take()
+            .ok_or_else(|| crate::Error::Io("no async stdin to take".into()))
+    }
+
+    /// Put an async writer back onto the handle. Counterpart of
+    /// [`take_async_writer`].
+    pub fn restore_async_writer(&mut self, writer: AsyncPluginWriter) {
+        self.async_stdin = Some(writer);
+    }
+
     /// Install background channels for reading and writing.
     ///
     /// After this, [`read_message_async`] receives from `msg_rx` and

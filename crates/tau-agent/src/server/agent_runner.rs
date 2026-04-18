@@ -66,9 +66,55 @@ impl crate::worker::ToolExecutor for PluginExecutor {
             return Err(e);
         }
 
-        // Send tool call to plugin.
-        handle
-            .send_async(&crate::plugin::PluginRequest::ToolCall {
+        // Set up a per-tool-call writer task so multiple concurrent senders
+        // (main loop, ServerResponse path, cancel watcher) can write to the
+        // plugin's stdin without contending on a shared `&mut AsyncWrite`.
+        //
+        // For session plugins (which includes the worker plugin running
+        // bash) there is no long-lived background writer — `set_background_channels`
+        // is only ever called for global plugins. Installing an ephemeral
+        // writer task here is what lets the cancel RPC reach the plugin
+        // while the main loop is blocked inside `read_message_async`.
+        //
+        // If the handle already has background channels installed (global
+        // plugin path), reuse its existing write channel and skip spawning
+        // a local writer task.
+        let (write_tx, writer_task): (
+            smol::channel::Sender<crate::plugin::PluginRequest>,
+            Option<smol::Task<crate::Result<crate::plugin::AsyncPluginWriter>>>,
+        ) = if let Some(tx) = handle.background_write_tx() {
+            (tx, None)
+        } else {
+            let (tx, rx) = smol::channel::unbounded::<crate::plugin::PluginRequest>();
+            let mut writer = match handle.take_async_writer() {
+                Ok(w) => w,
+                Err(e) => {
+                    let mut pm = self.plugins.lock().expect("plugins mutex poisoned");
+                    pm.return_tool_plugin(source, handle);
+                    return Err(e);
+                }
+            };
+            let plugin_name = handle.name.clone();
+            let task = smol::spawn(async move {
+                while let Ok(req) = rx.recv().await {
+                    if let Err(e) = crate::write_json_line_async(&mut writer, &req).await {
+                        tracing::warn!(
+                            plugin = %plugin_name,
+                            %e,
+                            "tool-call writer task error"
+                        );
+                        break;
+                    }
+                }
+                // Return the writer so the caller can put it back on the handle.
+                Ok(writer)
+            });
+            (tx, Some(task))
+        };
+
+        // Send tool call to plugin via the shared write channel.
+        if let Err(e) = write_tx
+            .send(crate::plugin::PluginRequest::ToolCall {
                 tool_call_id: tool_call.id.clone(),
                 name: tool_call.name.clone(),
                 arguments: tool_call.arguments.clone(),
@@ -76,21 +122,26 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                 session_id: Some(self.session_id.clone()),
                 project_name: self.project_name.clone(),
             })
-            .await?;
+            .await
+        {
+            drop(write_tx);
+            if let Some(task) = writer_task
+                && let Ok(w) = task.await
+            {
+                handle.restore_async_writer(w);
+            }
+            let mut pm = self.plugins.lock().expect("plugins mutex poisoned");
+            pm.return_tool_plugin(source, handle);
+            return Err(crate::Error::Io(format!("write channel closed: {}", e)));
+        }
 
         // Spawn a cancel-watcher task: when the cancel token is set, send a
         // CancelToolCall to the plugin so it can abort the in-flight tool
         // (e.g. SIGKILL the bash process group). Without this hop the plugin
         // would keep running the tool until the watchdog or natural exit.
-        //
-        // The watcher uses a dedicated write channel if available; otherwise
-        // we skip sending the cancel (best-effort). For the current tau
-        // architecture, all PluginExecutor instances run against plugins
-        // that have background channels installed via set_background_channels,
-        // but we guard defensively.
         let cancel_clone = cancel.clone();
         let cancel_tool_call_id = tool_call.id.clone();
-        let cancel_write_tx = handle.background_write_tx();
+        let cancel_write_tx = write_tx.clone();
         let cancel_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_done_for_task = cancel_done.clone();
         let cancel_watcher = smol::spawn(async move {
@@ -99,13 +150,11 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                     return;
                 }
                 if cancel_clone.is_cancelled() {
-                    if let Some(ref tx) = cancel_write_tx {
-                        let _ = tx
-                            .send(crate::plugin::PluginRequest::CancelToolCall {
-                                tool_call_id: cancel_tool_call_id.clone(),
-                            })
-                            .await;
-                    }
+                    let _ = cancel_write_tx
+                        .send(crate::plugin::PluginRequest::CancelToolCall {
+                            tool_call_id: cancel_tool_call_id.clone(),
+                        })
+                        .await;
                     return;
                 }
                 smol::Timer::after(std::time::Duration::from_millis(100)).await;
@@ -114,8 +163,11 @@ impl crate::worker::ToolExecutor for PluginExecutor {
 
         // Read messages from plugin until we get a ToolResult.
         let tool_call_for_hooks = tool_call.clone();
-        let result = loop {
-            let msg = handle.read_message_async().await?;
+        let result: crate::Result<crate::types::ToolResultMessage> = loop {
+            let msg = match handle.read_message_async().await {
+                Ok(m) => m,
+                Err(e) => break Err(e),
+            };
             match msg {
                 crate::plugin::PluginMessage::OutputDelta { text, .. } => {
                     let _ = output_tx.send(text).await;
@@ -148,12 +200,12 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                         &self.session_id,
                     )
                     .await;
-                    handle
-                        .send_async(&crate::plugin::PluginRequest::ServerResponse {
+                    let _ = write_tx
+                        .send(crate::plugin::PluginRequest::ServerResponse {
                             request_id,
                             response,
                         })
-                        .await?;
+                        .await;
                 }
                 _ => {
                     // Ignore unexpected messages during tool execution
@@ -164,6 +216,19 @@ impl crate::worker::ToolExecutor for PluginExecutor {
         // Tool call is done — tell the cancel watcher to exit.
         cancel_done.store(true, Ordering::Relaxed);
         cancel_watcher.cancel().await;
+
+        // Close the per-call write channel so the writer task drains and
+        // exits, then restore the async writer to the handle so future
+        // PluginExecutor::execute calls against this same handle can reuse
+        // it. For the bg-channel path (global plugins) there's no writer
+        // task and no writer to restore.
+        drop(write_tx);
+        if let Some(task) = writer_task {
+            match task.await {
+                Ok(writer) => handle.restore_async_writer(writer),
+                Err(e) => tracing::warn!(%e, "tool-call writer task error"),
+            }
+        }
 
         // Always return the plugin handle, even on error (brief lock).
         {
