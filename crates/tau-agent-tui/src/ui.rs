@@ -1384,6 +1384,102 @@ fn render_task_row(
     line
 }
 
+/// Build the body rows of the "Files:" block in the task-detail overlay.
+///
+/// Returns an empty vec when `task.affected_files` is missing or empty.
+/// Otherwise each returned string is a pre-indented row (caller just wraps
+/// in a span). Long lists are truncated with a trailing `… (+N more)` row.
+pub(crate) fn affected_files_lines(task: &tau_agent::protocol::TaskInfo) -> Vec<String> {
+    const MAX_FILES: usize = 8;
+
+    let files: Vec<String> = match task.affected_files.as_ref().and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        None => Vec::new(),
+    };
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let total = files.len();
+    let shown = total.min(MAX_FILES);
+    let mut out: Vec<String> = files
+        .iter()
+        .take(shown)
+        .map(|f| format!("    {}", f))
+        .collect();
+    if total > shown {
+        out.push(format!("    … (+{} more)", total - shown));
+    }
+    out
+}
+
+/// Build the body rows of the "Wait reasons:" block in the task-detail
+/// overlay.
+///
+/// Returns an empty vec when there is nothing to show (no wait reasons and
+/// not held).  `🔒 held` is included as a final line whenever `task.held`
+/// is true, independent of `wait_reasons` (the two categories coexist).
+pub(crate) fn wait_reason_lines(
+    task: &tau_agent::protocol::TaskInfo,
+    wait_reasons: &[tau_agent::protocol::TaskWaitReason],
+) -> Vec<String> {
+    use tau_agent::protocol::TaskWaitReason as R;
+    const MAX_FILES_IN_CONFLICT: usize = 4;
+
+    if wait_reasons.is_empty() && !task.held {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(wait_reasons.len() + 1);
+    for reason in wait_reasons {
+        let text = match reason {
+            R::Dependency {
+                task_id,
+                state,
+                project_name,
+                ..
+            } => {
+                if project_name != &task.project_name {
+                    format!(
+                        "    ⏳ depends on #{} ({}) [{}]",
+                        task_id, state, project_name
+                    )
+                } else {
+                    format!("    ⏳ depends on #{} ({})", task_id, state)
+                }
+            }
+            R::FileConflict {
+                files,
+                with_task_id,
+            } => {
+                let shown = files.len().min(MAX_FILES_IN_CONFLICT);
+                let mut list = files.iter().take(shown).cloned().collect::<Vec<_>>();
+                if files.len() > shown {
+                    list.push("…".to_string());
+                }
+                format!(
+                    "    ⏳ file conflict [{}] with #{}",
+                    list.join(", "),
+                    with_task_id
+                )
+            }
+            R::BudgetExhausted { used, max } => {
+                format!("    ⏳ budget: {}/{} in-flight", used, max)
+            }
+            R::MergeTargetNotFound { branch } => {
+                format!("    ⚠ merge target '{}' not found", branch)
+            }
+            R::NotScheduled => "    ⏳ not yet scheduled".to_string(),
+        };
+        out.push(text);
+    }
+    if task.held {
+        out.push("    🔒 held".to_string());
+    }
+    out
+}
+
 fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     use ratatui::widgets::Clear;
 
@@ -1487,6 +1583,34 @@ fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Span::styled("  Tags: ", theme.bold_fg(theme.text)),
         Span::styled(tags_str, theme.fg(theme.text)),
     ]));
+
+    // Affected files block (when non-empty).
+    let files_lines = affected_files_lines(task);
+    if !files_lines.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Files:",
+            theme.bold_fg(theme.text),
+        )));
+        for row in &files_lines {
+            lines.push(Line::from(Span::styled(row.clone(), theme.fg(theme.text))));
+        }
+    }
+
+    // Wait reasons block: rendered only when this task is queueable
+    // (ready/planning) and the scheduler attached at least one reason, or
+    // when the task is held (we always surface 🔒 held here).
+    let wr_lines = wait_reason_lines(task, &detail.wait_reasons);
+    if !wr_lines.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Wait reasons:",
+            theme.bold_fg(theme.text),
+        )));
+        for row in &wr_lines {
+            lines.push(Line::from(Span::styled(row.clone(), theme.fg(theme.text))));
+        }
+    }
 
     // Blank separator
     lines.push(Line::from(""));
@@ -1688,6 +1812,7 @@ fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 mod tests {
     use super::*;
     use crate::theme::dark;
+    use tau_agent::protocol::TaskInfo;
 
     #[test]
     fn truncate_to_width_ascii() {
@@ -1899,5 +2024,153 @@ mod tests {
                 col
             );
         }
+    }
+
+    fn empty_task(id: i64) -> TaskInfo {
+        TaskInfo {
+            id,
+            project_name: "proj".into(),
+            title: "t".into(),
+            state: "ready".into(),
+            priority: 0,
+            parent_id: None,
+            tags: None,
+            affected_files: None,
+            branch: None,
+            worktree_path: None,
+            session_id: None,
+            skip_review: false,
+            require_approval: false,
+            sandbox_profile: None,
+            held: false,
+            has_live_session: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn affected_files_lines_renders_each_file_indented() {
+        let mut t = empty_task(1);
+        t.affected_files = Some(serde_json::json!(["src/a.rs", "src/b.rs"]));
+        let got = affected_files_lines(&t);
+        assert_eq!(
+            got,
+            vec!["    src/a.rs".to_string(), "    src/b.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn affected_files_lines_truncates_long_list() {
+        let mut t = empty_task(1);
+        let files: Vec<String> = (0..12).map(|i| format!("f{i}.rs")).collect();
+        t.affected_files = Some(serde_json::json!(files));
+        let got = affected_files_lines(&t);
+        // 8 shown + 1 truncation row.
+        assert_eq!(got.len(), 9);
+        assert_eq!(got[0], "    f0.rs");
+        assert_eq!(got[7], "    f7.rs");
+        assert_eq!(got[8], "    … (+4 more)");
+    }
+
+    #[test]
+    fn affected_files_lines_empty_when_none_or_empty() {
+        let t = empty_task(1);
+        assert!(affected_files_lines(&t).is_empty());
+        let mut t2 = empty_task(1);
+        t2.affected_files = Some(serde_json::json!([]));
+        assert!(affected_files_lines(&t2).is_empty());
+    }
+
+    #[test]
+    fn wait_reason_lines_formats_every_variant() {
+        use tau_agent::protocol::TaskWaitReason as R;
+        let t = empty_task(1);
+        let reasons = vec![
+            R::Dependency {
+                task_id: 527,
+                title: "dep".into(),
+                state: "active".into(),
+                project_name: "proj".into(),
+            },
+            R::FileConflict {
+                files: vec!["tasks.rs".into()],
+                with_task_id: 534,
+            },
+            R::BudgetExhausted { used: 8, max: 8 },
+            R::MergeTargetNotFound {
+                branch: "main".into(),
+            },
+            R::NotScheduled,
+        ];
+        let got = wait_reason_lines(&t, &reasons);
+        assert_eq!(
+            got,
+            vec![
+                "    ⏳ depends on #527 (active)".to_string(),
+                "    ⏳ file conflict [tasks.rs] with #534".to_string(),
+                "    ⏳ budget: 8/8 in-flight".to_string(),
+                "    ⚠ merge target 'main' not found".to_string(),
+                "    ⏳ not yet scheduled".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_reason_lines_cross_project_dep_shows_project() {
+        use tau_agent::protocol::TaskWaitReason as R;
+        let t = empty_task(1);
+        let reasons = vec![R::Dependency {
+            task_id: 9,
+            title: "x".into(),
+            state: "review".into(),
+            project_name: "other".into(),
+        }];
+        let got = wait_reason_lines(&t, &reasons);
+        assert_eq!(
+            got,
+            vec!["    ⏳ depends on #9 (review) [other]".to_string()]
+        );
+    }
+
+    #[test]
+    fn wait_reason_lines_truncates_long_file_conflict() {
+        use tau_agent::protocol::TaskWaitReason as R;
+        let t = empty_task(1);
+        let files: Vec<String> = (0..7).map(|i| format!("f{i}.rs")).collect();
+        let reasons = vec![R::FileConflict {
+            files,
+            with_task_id: 3,
+        }];
+        let got = wait_reason_lines(&t, &reasons);
+        assert_eq!(
+            got,
+            vec!["    ⏳ file conflict [f0.rs, f1.rs, f2.rs, f3.rs, …] with #3".to_string()]
+        );
+    }
+
+    #[test]
+    fn wait_reason_lines_appends_held_marker() {
+        use tau_agent::protocol::TaskWaitReason as R;
+        let mut t = empty_task(1);
+        t.held = true;
+        // Held alone still yields a row.
+        let got = wait_reason_lines(&t, &[]);
+        assert_eq!(got, vec!["    🔒 held".to_string()]);
+        // Coexists with other reasons.
+        let got = wait_reason_lines(&t, &[R::NotScheduled]);
+        assert_eq!(
+            got,
+            vec![
+                "    ⏳ not yet scheduled".to_string(),
+                "    🔒 held".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_reason_lines_empty_when_nothing_to_show() {
+        let t = empty_task(1);
+        assert!(wait_reason_lines(&t, &[]).is_empty());
     }
 }

@@ -100,8 +100,11 @@ pub struct PickerGroups {
     pub recently_closed: Vec<TaskInfo>,
     pub inflight_count: usize,
     pub max_concurrent: usize,
-    /// For each blocked task id, the ids it is waiting on (to render `⏳ #N`).
-    pub blocked_on: std::collections::HashMap<i64, Vec<i64>>,
+    /// For each queued/blocked task id, the full list of scheduler wait
+    /// reasons keeping it from dispatch. Dependency reasons drive the
+    /// inline `⏳ #N` row suffix; the detail overlay renders every
+    /// reason verbatim.
+    pub wait_reasons: std::collections::HashMap<i64, Vec<tau_agent::protocol::TaskWaitReason>>,
 }
 
 /// One row in the scheduler-grouped task picker.
@@ -147,6 +150,10 @@ pub struct TaskPickerDetail {
     pub subtasks: Vec<TaskInfo>,
     pub sessions: Vec<TaskSessionInfo>,
     pub history: Vec<TaskHistoryInfo>,
+    /// Scheduler wait reasons for this task (empty for tasks that are
+    /// active/merged/etc.). Populated from the picker's last TaskOverview
+    /// snapshot so the detail overlay can render the full list.
+    pub wait_reasons: Vec<tau_agent::protocol::TaskWaitReason>,
     pub scroll: usize,
 }
 
@@ -1259,7 +1266,7 @@ impl App {
                 group,
                 needle.as_deref(),
                 suppress_state_label,
-                Some(&g.blocked_on),
+                Some(&g.wait_reasons),
                 None,
             );
             if tmp.is_empty() {
@@ -2736,7 +2743,7 @@ impl App {
                 recently_closed,
                 inflight_count,
                 max_concurrent,
-                blocked_on,
+                wait_reasons,
             } => {
                 // Piggyback: note any task assigned to our session.
                 let check_assignment = |ti: &TaskInfo| {
@@ -2756,10 +2763,12 @@ impl App {
                 }
 
                 if self.mode == AppMode::TaskPicker {
-                    let mut bo_map: std::collections::HashMap<i64, Vec<i64>> =
-                        std::collections::HashMap::new();
-                    for entry in blocked_on {
-                        bo_map.insert(entry.task_id, entry.waits_on);
+                    let mut wr_map: std::collections::HashMap<
+                        i64,
+                        Vec<tau_agent::protocol::TaskWaitReason>,
+                    > = std::collections::HashMap::new();
+                    for entry in wait_reasons {
+                        wr_map.insert(entry.task_id, entry.reasons);
                     }
                     self.picker_groups = PickerGroups {
                         active: compute_group_depths(active),
@@ -2771,7 +2780,7 @@ impl App {
                         recently_closed,
                         inflight_count,
                         max_concurrent,
-                        blocked_on: bo_map,
+                        wait_reasons: wr_map,
                     };
                     self.task_picker_cursor = 0;
                     self.task_picker_scroll_offset.set(0);
@@ -2847,6 +2856,12 @@ impl App {
                         self.messages.push(MessageItem::Status {
                             text: format!("task #{}: no live session — detail view only", task.id),
                         });
+                        let wr = self
+                            .picker_groups
+                            .wait_reasons
+                            .get(&task.id)
+                            .cloned()
+                            .unwrap_or_default();
                         self.task_picker_detail = Some(Box::new(TaskPickerDetail {
                             task,
                             messages,
@@ -2854,6 +2869,7 @@ impl App {
                             subtasks,
                             sessions,
                             history,
+                            wait_reasons: wr,
                             scroll: 0,
                         }));
                         return None;
@@ -2865,6 +2881,12 @@ impl App {
                 }
                 // If in task picker mode, populate detail view
                 if self.mode == AppMode::TaskPicker {
+                    let wr = self
+                        .picker_groups
+                        .wait_reasons
+                        .get(&task.id)
+                        .cloned()
+                        .unwrap_or_default();
                     self.task_picker_detail = Some(Box::new(TaskPickerDetail {
                         task,
                         messages,
@@ -2872,6 +2894,7 @@ impl App {
                         subtasks,
                         sessions,
                         history,
+                        wait_reasons: wr,
                         scroll: 0,
                     }));
                     return None;
@@ -3396,7 +3419,7 @@ pub(crate) fn push_group_rows(
     group: &[(usize, TaskInfo)],
     needle: Option<&str>,
     suppress_state_label: bool,
-    blocked_on: Option<&std::collections::HashMap<i64, Vec<i64>>>,
+    wait_reasons: Option<&std::collections::HashMap<i64, Vec<tau_agent::protocol::TaskWaitReason>>>,
     age_hint: Option<String>,
 ) {
     // Tasks in this bucket, keyed by id, so we can detect cross-bucket parents.
@@ -3412,8 +3435,22 @@ pub(crate) fn push_group_rows(
             Some(pid) => !ids.contains(&pid),
             None => false,
         };
-        let blocked = blocked_on
-            .and_then(|m| m.get(&t.id).cloned())
+        // Inline row suffix: dependency wait reasons only (keeps the
+        // compact `⏳ #N` display). The detail overlay renders the
+        // full list.
+        let blocked = wait_reasons
+            .and_then(|m| m.get(&t.id))
+            .map(|reasons| {
+                reasons
+                    .iter()
+                    .filter_map(|r| match r {
+                        tau_agent::protocol::TaskWaitReason::Dependency { task_id, .. } => {
+                            Some(*task_id)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         // Cross-group parent pins visual depth at 0, per spec.
         let visual_depth = if parent_out { 0 } else { *depth };
@@ -4219,7 +4256,7 @@ mod tests {
             recently_closed: Vec::new(),
             inflight_count: 2,
             max_concurrent: 8,
-            blocked_on: std::collections::HashMap::new(),
+            wait_reasons: std::collections::HashMap::new(),
         };
     }
 
@@ -4491,6 +4528,7 @@ mod tests {
             subtasks: vec![],
             sessions: vec![],
             history: vec![],
+            wait_reasons: vec![],
             scroll: 0,
         }));
         assert!(app.task_picker_detail.is_some());
@@ -5230,7 +5268,7 @@ mod tests {
             recently_closed: Vec::new(),
             inflight_count: 0,
             max_concurrent: 8,
-            blocked_on: std::collections::HashMap::new(),
+            wait_reasons: std::collections::HashMap::new(),
         }
     }
 
@@ -5575,7 +5613,7 @@ mod tests {
             recently_closed: Vec::new(),
             inflight_count: 1,
             max_concurrent: 8,
-            blocked_on: Vec::new(),
+            wait_reasons: Vec::new(),
         });
         assert!(action.is_none());
         assert_eq!(app.picker_groups.active.len(), 1);

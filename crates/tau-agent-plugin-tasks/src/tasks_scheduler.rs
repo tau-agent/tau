@@ -1750,6 +1750,35 @@ pub enum WaitReason {
     NotScheduled,
 }
 
+impl From<WaitReason> for tau_agent_base::protocol::TaskWaitReason {
+    fn from(w: WaitReason) -> Self {
+        use tau_agent_base::protocol::TaskWaitReason as P;
+        match w {
+            WaitReason::Dependency {
+                task_id,
+                title,
+                state,
+                project_name,
+            } => P::Dependency {
+                task_id,
+                title,
+                state,
+                project_name,
+            },
+            WaitReason::FileConflict {
+                files,
+                with_task_id,
+            } => P::FileConflict {
+                files,
+                with_task_id,
+            },
+            WaitReason::BudgetExhausted { used, max } => P::BudgetExhausted { used, max },
+            WaitReason::MergeTargetNotFound { branch } => P::MergeTargetNotFound { branch },
+            WaitReason::NotScheduled => P::NotScheduled,
+        }
+    }
+}
+
 /// Status of a single task in the scheduler view.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TaskStatus {
@@ -2142,7 +2171,7 @@ fn task_to_info_with_live(
 /// All classification (active / queued_ready / queued_planning / blocked /
 /// held) is delegated to [`get_status`]; this function just converts the
 /// scheduler `TaskStatus` entries into wire `TaskInfo`s, collects the
-/// `TaskBlockedOn` side table from dependency wait reasons, and queries the
+/// per-task wait-reason side table, and queries the
 /// DB for the recent tail.
 pub fn task_overview_response(
     db: &TasksDb,
@@ -2150,7 +2179,7 @@ pub fn task_overview_response(
     recent_limit: usize,
     live_task_ids: &HashSet<i64>,
 ) -> tau_agent_plugin::Result<tau_agent_base::protocol::Response> {
-    use tau_agent_base::protocol::{Response, TaskBlockedOn, TaskInfo};
+    use tau_agent_base::protocol::{Response, TaskInfo, TaskWaitReasons};
 
     let status = get_status(db, project, None)?;
 
@@ -2160,23 +2189,25 @@ pub fn task_overview_response(
             .collect()
     };
 
-    // Collect dep wait-reasons for blocked (and any active waiting on deps).
-    let mut blocked_on: Vec<TaskBlockedOn> = Vec::new();
-    for ts in status.blocked.iter().chain(status.active.iter()) {
-        let waits_on: Vec<i64> = ts
-            .wait_reasons
-            .iter()
-            .filter_map(|r| match r {
-                WaitReason::Dependency { task_id, .. } => Some(*task_id),
-                _ => None,
-            })
-            .collect();
-        if !waits_on.is_empty() {
-            blocked_on.push(TaskBlockedOn {
-                task_id: ts.task.id,
-                waits_on,
-            });
+    // Collect all wait reasons for blocked/queued (and any active still
+    // waiting on deps). The TUI uses dependency reasons for the inline
+    // `⏳ #N` suffix and the complete list for the detail overlay.
+    let mut wait_reasons: Vec<TaskWaitReasons> = Vec::new();
+    for ts in status
+        .blocked
+        .iter()
+        .chain(status.queued_ready.iter())
+        .chain(status.queued_planning.iter())
+        .chain(status.active.iter())
+    {
+        if ts.wait_reasons.is_empty() {
+            continue;
         }
+        let reasons: Vec<_> = ts.wait_reasons.iter().cloned().map(Into::into).collect();
+        wait_reasons.push(TaskWaitReasons {
+            task_id: ts.task.id,
+            reasons,
+        });
     }
 
     let active = to_infos(status.active);
@@ -2206,7 +2237,7 @@ pub fn task_overview_response(
         recently_closed,
         inflight_count: status.inflight_count,
         max_concurrent: status.max_concurrent,
-        blocked_on,
+        wait_reasons,
     })
 }
 
@@ -4353,40 +4384,57 @@ mod tests {
 
         let live = HashSet::new();
         let resp = task_overview_response(&db, "proj", 10, &live).unwrap();
-        let (active_ids, queued_ready_ids, blocked_ids, held_ids, merged_ids, inflight, blocked_on) =
-            match resp {
-                tau_agent_base::protocol::Response::TaskOverview {
-                    active,
-                    queued_ready,
-                    blocked,
-                    held,
-                    recently_merged,
-                    inflight_count,
-                    blocked_on,
-                    ..
-                } => (
-                    active.iter().map(|t| t.id).collect::<Vec<_>>(),
-                    queued_ready.iter().map(|t| t.id).collect::<Vec<_>>(),
-                    blocked.iter().map(|t| t.id).collect::<Vec<_>>(),
-                    held.iter().map(|t| t.id).collect::<Vec<_>>(),
-                    recently_merged.iter().map(|t| t.id).collect::<Vec<_>>(),
-                    inflight_count,
-                    blocked_on,
-                ),
-                other => panic!("expected TaskOverview, got {:?}", other),
-            };
+        let (
+            active_ids,
+            queued_ready_ids,
+            blocked_ids,
+            held_ids,
+            merged_ids,
+            inflight,
+            wait_reasons,
+        ) = match resp {
+            tau_agent_base::protocol::Response::TaskOverview {
+                active,
+                queued_ready,
+                blocked,
+                held,
+                recently_merged,
+                inflight_count,
+                wait_reasons,
+                ..
+            } => (
+                active.iter().map(|t| t.id).collect::<Vec<_>>(),
+                queued_ready.iter().map(|t| t.id).collect::<Vec<_>>(),
+                blocked.iter().map(|t| t.id).collect::<Vec<_>>(),
+                held.iter().map(|t| t.id).collect::<Vec<_>>(),
+                recently_merged.iter().map(|t| t.id).collect::<Vec<_>>(),
+                inflight_count,
+                wait_reasons,
+            ),
+            other => panic!("expected TaskOverview, got {:?}", other),
+        };
         assert_eq!(active_ids, vec![active.id]);
         assert_eq!(queued_ready_ids, vec![ready.id]);
         assert_eq!(blocked_ids, vec![blocked.id]);
         assert_eq!(held_ids, vec![held.id]);
         assert_eq!(merged_ids, vec![merge_me.id]);
         assert_eq!(inflight, 1);
-        // Dependency wait-reason surfaces in `blocked_on`.
-        let entry = blocked_on
+        // Dependency wait-reason surfaces in `wait_reasons`.
+        let entry = wait_reasons
             .iter()
             .find(|b| b.task_id == blocked.id)
             .expect("blocked task should have an entry");
-        assert_eq!(entry.waits_on, vec![ready.id]);
+        let dep_ids: Vec<i64> = entry
+            .reasons
+            .iter()
+            .filter_map(|r| match r {
+                tau_agent_base::protocol::TaskWaitReason::Dependency { task_id, .. } => {
+                    Some(*task_id)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(dep_ids, vec![ready.id]);
     }
 
     #[test]
@@ -4436,5 +4484,54 @@ mod tests {
         };
         assert_eq!(got.len(), 1);
         assert!(got[0].has_live_session, "live_ids should set the flag");
+    }
+
+    #[test]
+    fn wait_reason_to_protocol_mapping() {
+        use tau_agent_base::protocol::TaskWaitReason as P;
+
+        let cases = vec![
+            (
+                WaitReason::Dependency {
+                    task_id: 1,
+                    title: "t".into(),
+                    state: "active".into(),
+                    project_name: "p".into(),
+                },
+                P::Dependency {
+                    task_id: 1,
+                    title: "t".into(),
+                    state: "active".into(),
+                    project_name: "p".into(),
+                },
+            ),
+            (
+                WaitReason::FileConflict {
+                    files: vec!["a.rs".into(), "b.rs".into()],
+                    with_task_id: 7,
+                },
+                P::FileConflict {
+                    files: vec!["a.rs".into(), "b.rs".into()],
+                    with_task_id: 7,
+                },
+            ),
+            (
+                WaitReason::BudgetExhausted { used: 8, max: 8 },
+                P::BudgetExhausted { used: 8, max: 8 },
+            ),
+            (
+                WaitReason::MergeTargetNotFound {
+                    branch: "main".into(),
+                },
+                P::MergeTargetNotFound {
+                    branch: "main".into(),
+                },
+            ),
+            (WaitReason::NotScheduled, P::NotScheduled),
+        ];
+        for (src, want) in cases {
+            let got: P = src.into();
+            assert_eq!(got, want);
+        }
     }
 }

@@ -389,10 +389,12 @@ pub enum Response {
         inflight_count: usize,
         /// Scheduler's max-concurrent budget.
         max_concurrent: usize,
-        /// For each blocked task id, the ids it is waiting on. Used by the
-        /// TUI to render `⏳ #N` suffixes without re-issuing a TaskGet.
+        /// For each queued/blocked task id, the full list of wait reasons
+        /// keeping it from dispatch. Dependency reasons drive the inline
+        /// `⏳ #N` suffix in the picker; the detail pane renders every
+        /// reason verbatim.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        blocked_on: Vec<TaskBlockedOn>,
+        wait_reasons: Vec<TaskWaitReasons>,
     },
     /// Task list with tree depth info (response to TaskList).
     TaskTree { tasks: Vec<(usize, TaskInfo)> },
@@ -579,14 +581,39 @@ pub struct TaskSessionInfo {
     pub is_live: bool,
 }
 
-/// Relationship info attached to a `TaskOverview` response: for each blocked
-/// task id, the dependency ids it is waiting on.  A task with no entry here
-/// has no unmet dependencies (though it may still be blocked for other
-/// reasons such as budget exhaustion).
+/// Per-task wait-reason bundle attached to a `TaskOverview` response.
+///
+/// The scheduler classifies every non-dispatched task into one or more
+/// [`TaskWaitReason`]s; the TUI uses this both for inline `⏳ #N`
+/// suffixes (dependency reasons) and the full detail-overlay list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskBlockedOn {
+pub struct TaskWaitReasons {
     pub task_id: i64,
-    pub waits_on: Vec<i64>,
+    pub reasons: Vec<TaskWaitReason>,
+}
+
+/// Why a task is waiting / not yet dispatched. Mirrors the plugin-side
+/// `WaitReason` enum in `tau-agent-plugin-tasks`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TaskWaitReason {
+    /// Blocked by a dependency that hasn't completed yet.
+    Dependency {
+        task_id: i64,
+        title: String,
+        state: String,
+        project_name: String,
+    },
+    /// Affected files overlap with an active/in-flight task.
+    FileConflict {
+        files: Vec<String>,
+        with_task_id: i64,
+    },
+    /// Concurrent task budget exhausted.
+    BudgetExhausted { used: usize, max: usize },
+    /// The merge_target branch does not exist in the repository.
+    MergeTargetNotFound { branch: String },
+    /// In ready/planning state but not yet scheduled.
+    NotScheduled,
 }
 
 /// Entry in the task history log (`task_history` table).
@@ -1066,9 +1093,17 @@ mod tests {
                 recently_closed: Vec::new(),
                 inflight_count: 1,
                 max_concurrent: 8,
-                blocked_on: vec![TaskBlockedOn {
+                wait_reasons: vec![TaskWaitReasons {
                     task_id: 99,
-                    waits_on: vec![42, 43],
+                    reasons: vec![
+                        TaskWaitReason::Dependency {
+                            task_id: 42,
+                            title: "dep".into(),
+                            state: "active".into(),
+                            project_name: "tau".into(),
+                        },
+                        TaskWaitReason::BudgetExhausted { used: 8, max: 8 },
+                    ],
                 }],
             },
             Response::TaskTree {
