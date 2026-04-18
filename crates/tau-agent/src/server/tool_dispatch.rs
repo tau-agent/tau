@@ -91,9 +91,21 @@ pub(super) async fn execute_tool_impl(
 
     // 5. Execute via the PluginExecutor (or mock)
     let (output_tx, _output_rx) = smol::channel::unbounded::<String>();
+    // Resolve a cancel token: use the session's cancel_flag if one exists,
+    // so Ctrl-C cancels this direct-execute call the same way it would a
+    // tool call from the agent loop.
+    let cancel_token = {
+        let st = lock_state(state);
+        match st.cancel_flags.get(session_id) {
+            Some(flag) => tau_agent_base::types::CancelToken::from_flag(flag.clone()),
+            None => tau_agent_base::types::CancelToken::new(),
+        }
+    };
     let result = if let Some(ref factory) = test_overrides.tool_executor_factory {
         let mut executor = factory();
-        executor.execute(&tool_call, &output_tx).await
+        executor
+            .execute(&tool_call, &output_tx, &cancel_token)
+            .await
     } else {
         let mut executor: Box<dyn crate::worker::ToolExecutor> = Box::new(PluginExecutor {
             plugins: plugins.clone(),
@@ -107,7 +119,9 @@ pub(super) async fn execute_tool_impl(
             project_name,
             test_overrides: test_overrides.clone(),
         });
-        executor.execute(&tool_call, &output_tx).await
+        executor
+            .execute(&tool_call, &output_tx, &cancel_token)
+            .await
     };
 
     // 6. Build result message and persist

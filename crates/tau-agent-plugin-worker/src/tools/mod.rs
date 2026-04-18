@@ -57,7 +57,9 @@ impl ToolOutput {
 }
 
 /// A registered tool with its definition and executor.
-/// The executor receives (arguments, cwd).
+/// The executor receives (arguments, cwd, cancel_token). The cancel token
+/// is polled by long-running tools (bash) to abort mid-execution; tools
+/// that complete quickly (read, write, edit) are free to ignore it.
 ///
 /// `prepare_arguments` is an optional pre-validation hook that runs before
 /// `execute`. It lets a tool silently accept legacy argument shapes from
@@ -66,21 +68,45 @@ impl ToolOutput {
 pub struct ToolDef {
     pub tool: Tool,
     #[allow(clippy::type_complexity)]
-    pub execute: Box<dyn Fn(serde_json::Value, &str) -> ToolOutput + Send + Sync>,
+    pub execute: Box<dyn Fn(serde_json::Value, &str, &CancelToken) -> ToolOutput + Send + Sync>,
     #[allow(clippy::type_complexity)]
     pub prepare_arguments:
         Option<Box<dyn Fn(serde_json::Value) -> serde_json::Value + Send + Sync>>,
 }
 
 /// Execute a tool call against the registered tools.
-pub fn execute_tool(tools: &[ToolDef], tool_call: &ToolCall, cwd: &str) -> ToolResultMessage {
+pub fn execute_tool(
+    tools: &[ToolDef],
+    tool_call: &ToolCall,
+    cwd: &str,
+    cancel: &CancelToken,
+) -> ToolResultMessage {
+    // Short-circuit: if already cancelled before we even dispatch, return
+    // an error result rather than invoking the tool. This mirrors the
+    // agent-loop stubbing pattern for remaining tool calls after a cancel.
+    if cancel.is_cancelled() {
+        return ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: vec![ToolResultContent::Text(TextContent {
+                text: "error: cancelled before execution".into(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: true,
+            timestamp: timestamp_ms(),
+            duration_ms: None,
+            summary: None,
+        };
+    }
+
     let result = match tools.iter().find(|t| t.tool.name == tool_call.name) {
         Some(def) => {
             let args = match &def.prepare_arguments {
                 Some(prepare) => prepare(tool_call.arguments.clone()),
                 None => tool_call.arguments.clone(),
             };
-            (def.execute)(args, cwd)
+            (def.execute)(args, cwd, cancel)
         }
         None => ToolOutput::error(format!("unknown tool: {}", tool_call.name)),
     };

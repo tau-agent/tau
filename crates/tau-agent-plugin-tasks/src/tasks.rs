@@ -2414,6 +2414,13 @@ pub fn run_tasks_plugin() {
             PluginRequest::ServerResponse { .. } => {
                 // Not expected outside of tool/merge passes — ignore
             }
+            PluginRequest::CancelToolCall { .. } => {
+                // Tasks plugin tools are short-lived (in-memory task-board
+                // mutations) and don't spawn subprocesses, so mid-flight
+                // cancellation is a no-op here. Swallowing this silently
+                // is correct: the agent loop will still observe cancellation
+                // via should_stop between calls.
+            }
         }
     }
 }

@@ -30,7 +30,11 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
+fn execute(
+    args: serde_json::Value,
+    cwd: &str,
+    _cancel: &tau_agent_plugin::CancelToken,
+) -> ToolOutput {
     let Some(path_str) = args.get("path").and_then(|p| p.as_str()) else {
         return ToolOutput::error("missing 'path' argument");
     };

@@ -137,8 +137,49 @@ fn start_watchdog(child_id: u32, timeout_secs: u64) -> Arc<AtomicBool> {
     timed_out
 }
 
-/// Format the final tool output from collected stdout/stderr, exit code, and timeout flag.
-fn format_output(stdout: String, stderr: String, exit_code: i32, timed_out: bool) -> ToolOutput {
+/// Start a cancel-watcher thread that kills the child's process group as
+/// soon as the [`CancelToken`] becomes cancelled. Returns:
+/// - a `cancelled` flag that is set to `true` if the kill fired from this
+///   watcher (so `format_output` can distinguish cancelled from timed-out),
+/// - a `done` flag the caller flips to `true` once the child has exited
+///   normally, so the watcher thread wakes up and stops polling.
+///
+/// The watcher polls every 100 ms so that cancellation appears "immediate"
+/// from the user's perspective (well under the old 120 s watchdog ceiling)
+/// without burning CPU on a tight loop.
+fn start_cancel_watcher(
+    child_id: u32,
+    cancel: tau_agent_plugin::CancelToken,
+) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let cancelled_flag = cancelled.clone();
+    let done_flag = done.clone();
+    std::thread::spawn(move || {
+        loop {
+            if done_flag.load(Ordering::Relaxed) {
+                return;
+            }
+            if cancel.is_cancelled() {
+                cancelled_flag.store(true, Ordering::Relaxed);
+                let _ = signal::killpg(Pid::from_raw(child_id as i32), Signal::SIGKILL);
+                untrack_pgid(child_id as i32);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    (cancelled, done)
+}
+
+/// Format the final tool output from collected stdout/stderr, exit code, timeout flag, and cancelled flag.
+fn format_output(
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+    timed_out: bool,
+    cancelled: bool,
+) -> ToolOutput {
     let mut text = stdout;
     if !stderr.is_empty() {
         if !text.is_empty() {
@@ -158,6 +199,17 @@ fn format_output(stdout: String, stderr: String, exit_code: i32, timed_out: bool
             text.len() - 100_000,
             tail
         );
+    }
+
+    // Cancellation takes priority over timeout in the output marker: if a
+    // user Ctrl-C'd during a command that happened to also hit its timeout
+    // window, "(cancelled)" is the more useful signal.
+    if cancelled {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("(cancelled)");
+        return ToolOutput::error(text.trim_end().to_string());
     }
 
     if timed_out {
@@ -211,6 +263,7 @@ fn maybe_add_summary(output: &mut ToolOutput, command: &str, exit_code: i32) {
 pub fn execute_streaming(
     args: &serde_json::Value,
     cwd: &str,
+    cancel: &tau_agent_plugin::CancelToken,
     mut on_delta: impl FnMut(&str),
 ) -> ToolOutput {
     let Some(command) = args.get("command").and_then(|c| c.as_str()) else {
@@ -228,6 +281,7 @@ pub fn execute_streaming(
     track_pgid(pgid);
 
     let timed_out = start_watchdog(child.id(), timeout_secs);
+    let (cancelled, cancel_done) = start_cancel_watcher(child.id(), cancel.clone());
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -261,18 +315,24 @@ pub fn execute_streaming(
     let status = child.wait();
     let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
     untrack_pgid(pgid);
+    cancel_done.store(true, Ordering::Relaxed);
 
     let mut output = format_output(
         collected_stdout,
         collected_stderr,
         exit_code,
         timed_out.load(Ordering::Relaxed),
+        cancelled.load(Ordering::Relaxed),
     );
     maybe_add_summary(&mut output, command, exit_code);
     output
 }
 
-fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
+fn execute(
+    args: serde_json::Value,
+    cwd: &str,
+    cancel: &tau_agent_plugin::CancelToken,
+) -> ToolOutput {
     let Some(command) = args.get("command").and_then(|c| c.as_str()) else {
         return ToolOutput::error("missing 'command' argument");
     };
@@ -288,6 +348,7 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
     track_pgid(pgid);
 
     let timed_out = start_watchdog(child.id(), timeout_secs);
+    let (cancelled, cancel_done) = start_cancel_watcher(child.id(), cancel.clone());
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -319,12 +380,14 @@ fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
     let status = child.wait();
     let exit_code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
     untrack_pgid(pgid);
+    cancel_done.store(true, Ordering::Relaxed);
 
     let mut output = format_output(
         collected_stdout,
         collected_stderr,
         exit_code,
         timed_out.load(Ordering::Relaxed),
+        cancelled.load(Ordering::Relaxed),
     );
     maybe_add_summary(&mut output, command, exit_code);
     output
@@ -350,7 +413,11 @@ mod tests {
     #[test]
     fn bash_simple_command() {
         let _guard = lock_registry();
-        let output = execute(json!({"command": "echo hello"}), "/tmp");
+        let output = execute(
+            json!({"command": "echo hello"}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
         assert!(!output.is_error);
         assert!(output.content[0].text().contains("hello"));
     }
@@ -359,7 +426,11 @@ mod tests {
     fn bash_timeout_kills_process() {
         let _guard = lock_registry();
         let start = Instant::now();
-        let output = execute(json!({"command": "sleep 60", "timeout": 2}), "/tmp");
+        let output = execute(
+            json!({"command": "sleep 60", "timeout": 2}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
         let elapsed = start.elapsed();
 
         assert!(output.is_error, "should be error on timeout");
@@ -379,7 +450,11 @@ mod tests {
     fn bash_timeout_not_triggered() {
         let _guard = lock_registry();
         let start = Instant::now();
-        let output = execute(json!({"command": "echo fast", "timeout": 10}), "/tmp");
+        let output = execute(
+            json!({"command": "echo fast", "timeout": 10}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
         let elapsed = start.elapsed();
 
         assert!(!output.is_error);
@@ -395,6 +470,7 @@ mod tests {
         let output = execute_streaming(
             &json!({"command": "echo before; sleep 60", "timeout": 2}),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
             |line| deltas.push(line.to_string()),
         );
         let elapsed = start.elapsed();
@@ -418,6 +494,7 @@ mod tests {
         let output = execute(
             json!({"command": "bash -c 'sleep 60 & sleep 60 & wait'", "timeout": 2}),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
         );
         let elapsed = start.elapsed();
 
@@ -446,6 +523,7 @@ mod tests {
                     "timeout": 60,
                 }),
                 "/tmp",
+                &tau_agent_plugin::CancelToken::new(),
             )
         });
 
@@ -503,5 +581,150 @@ mod tests {
         // It either reports the killed sub-process exit or treats it as
         // an error — we don't care which, just that it returned.
         let _ = output;
+    }
+
+    #[test]
+    fn bash_cancel_flag_kills_subprocess_quickly() {
+        // Setting the cancel token while a bash subprocess is running must
+        // kill it within ~200 ms — the watcher polls at 100 ms intervals —
+        // rather than waiting for the timeout watchdog.
+        let _guard = lock_registry();
+        use std::time::Duration;
+
+        let cancel = tau_agent_plugin::CancelToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Flip the cancel flag after 150 ms.
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            cancel_clone.cancel();
+        });
+
+        let start = Instant::now();
+        // Long sleep with a long timeout — only cancellation can end it
+        // inside the test budget.
+        let output = execute(
+            json!({"command": "sleep 30", "timeout": 60}),
+            "/tmp",
+            &cancel,
+        );
+        let elapsed = start.elapsed();
+
+        flipper.join().expect("flipper thread panicked");
+
+        assert!(output.is_error, "cancelled bash should be an error result");
+        assert!(
+            output.content[0].text().contains("cancelled"),
+            "output should mention cancellation, got: {}",
+            output.content[0].text()
+        );
+        // Must return well before the 30 s sleep or 60 s timeout.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel should kill subprocess promptly, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn bash_prefire_cancel_returns_immediately() {
+        // A token that is already cancelled before execute() is called
+        // should still result in a cancelled-output termination without
+        // burning the full timeout.
+        let _guard = lock_registry();
+        use std::time::Duration;
+
+        let cancel = tau_agent_plugin::CancelToken::new();
+        cancel.cancel();
+
+        let start = Instant::now();
+        let output = execute(
+            json!({"command": "sleep 30", "timeout": 60}),
+            "/tmp",
+            &cancel,
+        );
+        let elapsed = start.elapsed();
+
+        assert!(output.is_error);
+        assert!(
+            output.content[0].text().contains("cancelled"),
+            "output should mention cancellation, got: {}",
+            output.content[0].text()
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "pre-cancelled execute should return quickly, took {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn format_output_distinguishes_cancelled_from_timeout() {
+        // cancelled=true wins over timed_out=true (user intent signal).
+        let out = format_output(String::new(), String::new(), -1, true, true);
+        assert!(out.is_error);
+        assert!(out.content[0].text().contains("(cancelled)"));
+        assert!(!out.content[0].text().contains("(timed out)"));
+
+        // Only timed_out: message says timed out.
+        let out = format_output(String::new(), String::new(), -1, true, false);
+        assert!(out.is_error);
+        assert!(out.content[0].text().contains("(timed out)"));
+        assert!(!out.content[0].text().contains("(cancelled)"));
+
+        // Only cancelled: message says cancelled.
+        let out = format_output(String::new(), String::new(), -1, false, true);
+        assert!(out.is_error);
+        assert!(out.content[0].text().contains("(cancelled)"));
+    }
+
+    #[test]
+    fn execute_tool_dispatch_short_circuits_on_prefire_cancel() {
+        // super::super::execute_tool is the entry point used by the worker
+        // plugin; if the cancel token is already set before dispatch, it
+        // must short-circuit without even invoking the tool.
+        use super::super::execute_tool;
+        use tau_agent_plugin::ToolCall;
+
+        let tools = super::super::default_tools();
+        let cancel = tau_agent_plugin::CancelToken::new();
+        cancel.cancel();
+
+        let tc = ToolCall {
+            id: "tc-cancelled".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "echo should-not-run"}),
+        };
+        let result = execute_tool(&tools, &tc, "/tmp", &cancel);
+        assert!(result.is_error);
+        let text: String = result
+            .content
+            .iter()
+            .map(|c| c.text().to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text.contains("cancelled before execution"),
+            "expected cancelled-before-execution, got: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn read_tool_with_prefire_cancel_returns_error() {
+        use super::super::execute_tool;
+        use tau_agent_plugin::ToolCall;
+
+        let tools = super::super::default_tools();
+        let cancel = tau_agent_plugin::CancelToken::new();
+        cancel.cancel();
+
+        let tc = ToolCall {
+            id: "tc-read".into(),
+            name: "read".into(),
+            arguments: json!({"path": "/dev/null"}),
+        };
+        let result = execute_tool(&tools, &tc, "/tmp", &cancel);
+        assert!(result.is_error);
     }
 }

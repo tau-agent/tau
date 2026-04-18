@@ -571,6 +571,17 @@ impl PluginHandle {
         self.bg_write_tx = Some(write_tx);
     }
 
+    /// Return a clone of this handle's background write channel, if one is
+    /// installed. Used by per-tool-call cancel watchers that need to send
+    /// [`PluginRequest::CancelToolCall`] to the plugin *while* a tool is
+    /// mid-execution — the main loop is blocked inside `read_message_async`
+    /// so it cannot write through the handle directly.
+    ///
+    /// Returns `None` for handles that still use sync I/O.
+    pub fn background_write_tx(&self) -> Option<smol::channel::Sender<PluginRequest>> {
+        self.bg_write_tx.clone()
+    }
+
     /// Execute a tool call, calling on_output for streaming deltas.
     pub fn execute_tool(
         &mut self,

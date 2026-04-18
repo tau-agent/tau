@@ -26,6 +26,14 @@ pub struct AgentConfig {
     pub idle_timeout_secs: u64,
     /// Optional shutdown check — if returns true, stop after current turn.
     pub should_stop: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// Cancellation token forwarded into tool execution. The agent loop
+    /// passes this into `ToolExecutor::execute` so long-running tools (bash)
+    /// can observe cancellation while they're mid-flight and abort promptly
+    /// instead of blocking until the watchdog fires.
+    ///
+    /// When `None`, a fresh (never-cancelled) token is constructed per tool
+    /// call — the tool still gets a valid token, just one that never trips.
+    pub cancel_token: Option<tau_agent_base::types::CancelToken>,
     /// Callback to drain queued messages for this session.
     /// Called at the top of each turn (after tool results, before next LLM call).
     /// Returns persisted `Message::User` entries that should be added to context.
@@ -54,6 +62,7 @@ impl Default for AgentConfig {
             retry_base_ms: 500,
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             should_stop: None,
+            cancel_token: None,
             drain_queued: None,
             on_message: None,
             refresh_api_key: None,
@@ -336,12 +345,18 @@ pub async fn run(
             // the LLM can see them and the agent loop continues.
             let (tool_output_tx, tool_output_rx) = smol::channel::unbounded::<String>();
 
+            // Resolve the cancel token: prefer the one on AgentConfig (shared
+            // with the server's per-session cancel flag); if absent, fall
+            // back to a fresh never-cancelled token so the tool still gets
+            // a valid handle.
+            let cancel_token = config.cancel_token.clone().unwrap_or_default();
+
             // Spawn tool execution and output forwarding concurrently.
             // The execute future must drop tool_output_tx when done so the
             // forward loop sees channel-closed and terminates.
             let started_at = std::time::Instant::now();
             let tool_future = async {
-                let res = worker.execute(tc, &tool_output_tx).await;
+                let res = worker.execute(tc, &tool_output_tx, &cancel_token).await;
                 drop(tool_output_tx);
                 res
             };
@@ -2296,6 +2311,121 @@ mod tests {
                 messages[0].starts_with("Retrying "),
                 "status should use standard prefix, got: {:?}",
                 messages[0]
+            );
+        });
+    }
+
+    /// Integration test for task 535: Ctrl-C during a bash tool call must
+    /// kill the subprocess promptly, not wait for the watchdog to fire.
+    ///
+    /// Runs the real bash tool inside the in-process worker, asks it to
+    /// `sleep 30`, trips the cancel token shortly after, and asserts the
+    /// full agent loop returns within a couple of seconds with a cancelled
+    /// tool result.
+    #[test]
+    fn cancel_token_kills_bash_mid_execution() {
+        smol::block_on(async {
+            use std::sync::atomic::Ordering as AtomicOrdering;
+
+            let registry = setup_registry(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "sleep 30", "timeout": 120}),
+                }]),
+                // If the subprocess didn't die promptly the second response
+                // would never be consumed within the test budget anyway.
+                MockResponse::Text("done.".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let mut worker = InProcessWorker::new();
+            let (tx, _rx) = smol::channel::unbounded();
+
+            // Shared cancel token: trip it 200 ms into the run so the
+            // subprocess is definitely spawned before cancellation.
+            let cancel = tau_agent_base::types::CancelToken::new();
+            let cancel_for_config = cancel.clone();
+            let cancel_for_flipper = cancel.clone();
+            let poll_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let poll_count_clone = poll_count.clone();
+
+            let flipper = smol::spawn(async move {
+                smol::Timer::after(std::time::Duration::from_millis(200)).await;
+                cancel_for_flipper.cancel();
+            });
+
+            let config = AgentConfig {
+                cancel_token: Some(cancel_for_config),
+                // should_stop is polled between tool calls; make it observe
+                // the same token so the agent loop exits once the tool returns.
+                should_stop: Some(Box::new(move || {
+                    // Use a synthetic counter only to keep this non-trivial;
+                    // the real signal is the cancel token mirrored below.
+                    let _ = poll_count_clone.fetch_add(1, AtomicOrdering::Relaxed);
+                    cancel.is_cancelled()
+                })),
+                ..Default::default()
+            };
+
+            let start = std::time::Instant::now();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .expect("agent run should succeed");
+            let elapsed = start.elapsed();
+
+            flipper.await;
+
+            // Must finish well before the 30 s sleep or 120 s timeout.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "agent loop should return promptly after cancel, took {:?}",
+                elapsed
+            );
+
+            // The tool result for tc1 must be present and marked as an error
+            // (cancelled runs are errors by convention).
+            let tool_result = result
+                .new_messages
+                .iter()
+                .find_map(|m| match m {
+                    Message::ToolResult(tr) if tr.tool_call_id == "tc1" => Some(tr),
+                    _ => None,
+                })
+                .expect("expected a ToolResult for tc1");
+            assert!(
+                tool_result.is_error,
+                "cancelled bash result should be an error, got: {:?}",
+                tool_result.content
+            );
+            let text: String = tool_result
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    ToolResultContent::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            assert!(
+                text.contains("cancelled"),
+                "tool result should mention cancellation, got: {text}"
+            );
+
+            // No tracked PGIDs left behind.
+            assert_eq!(
+                tau_agent_plugin_worker::tools::bash::tracked_pgid_count(),
+                0,
+                "tracked PGIDs should be empty after cancel"
             );
         });
     }

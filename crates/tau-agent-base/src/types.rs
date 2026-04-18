@@ -1,5 +1,56 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+/// Shared cancellation flag for tool execution.
+///
+/// A thin wrapper around `Arc<AtomicBool>`. Tools (bash, long-running shells)
+/// poll [`is_cancelled`] at short intervals and abort when it becomes true;
+/// the server flips the flag on Ctrl-C / cancel RPC.
+///
+/// Tools that complete in microseconds (read, write, edit) are free to ignore
+/// the token entirely, or check it once at the top to return a `cancelled`
+/// error if the user cancelled before execution began.
+///
+/// Clones share the same underlying atomic.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancelToken {
+    /// Create a new, un-cancelled token.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wrap an existing shared flag. Useful when the server already owns an
+    /// `Arc<AtomicBool>` (per-session cancel flag) and wants to expose it to
+    /// tool-execution paths without re-wrapping.
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+
+    /// Return the underlying shared flag (same `Arc`).
+    pub fn flag(&self) -> Arc<AtomicBool> {
+        self.flag.clone()
+    }
+
+    /// True if the token has been cancelled.
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+
+    /// Set the cancel flag. Idempotent.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Content blocks

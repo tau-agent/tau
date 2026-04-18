@@ -37,8 +37,9 @@ impl ToolExecutor for InProcessWorker {
         &mut self,
         tool_call: &ToolCall,
         _output_tx: &smol::channel::Sender<String>,
+        cancel: &tau_agent_plugin::CancelToken,
     ) -> tau_agent_plugin::Result<ToolResultMessage> {
-        let result = tools::execute_tool(&self.tools, tool_call, "/tmp");
+        let result = tools::execute_tool(&self.tools, tool_call, "/tmp", cancel);
         Ok(result)
     }
 }

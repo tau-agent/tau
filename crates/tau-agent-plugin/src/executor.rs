@@ -11,9 +11,20 @@ use tau_agent_base::types::{ToolCall, ToolResultMessage};
 /// Trait for tool execution (allows plugin-based or in-process).
 #[async_trait]
 pub trait ToolExecutor: Send {
+    /// Execute a tool call.
+    ///
+    /// `cancel` is a shared cancellation flag. Long-running tools (bash) poll
+    /// it and abort mid-execution when it becomes true; short tools (read,
+    /// write, edit) may ignore it or check it once at the top.
+    ///
+    /// Implementations that cannot poll the flag directly (e.g. a plugin
+    /// subprocess over an RPC channel) should spawn a background watcher
+    /// that translates the flag into a [`PluginRequest::CancelToolCall`]
+    /// sent to the plugin.
     async fn execute(
         &mut self,
         tool_call: &ToolCall,
         output_tx: &smol::channel::Sender<String>,
+        cancel: &tau_agent_base::types::CancelToken,
     ) -> tau_agent_base::Result<ToolResultMessage>;
 }

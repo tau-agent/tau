@@ -36,6 +36,7 @@ impl crate::worker::ToolExecutor for PluginExecutor {
         &mut self,
         tool_call: &ToolCall,
         output_tx: &smol::channel::Sender<String>,
+        cancel: &tau_agent_base::types::CancelToken,
     ) -> crate::Result<ToolResultMessage> {
         // Take the plugin handle out of the manager (brief lock).
         // This lets us execute tool I/O without holding the PluginManager lock,
@@ -76,6 +77,40 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                 project_name: self.project_name.clone(),
             })
             .await?;
+
+        // Spawn a cancel-watcher task: when the cancel token is set, send a
+        // CancelToolCall to the plugin so it can abort the in-flight tool
+        // (e.g. SIGKILL the bash process group). Without this hop the plugin
+        // would keep running the tool until the watchdog or natural exit.
+        //
+        // The watcher uses a dedicated write channel if available; otherwise
+        // we skip sending the cancel (best-effort). For the current tau
+        // architecture, all PluginExecutor instances run against plugins
+        // that have background channels installed via set_background_channels,
+        // but we guard defensively.
+        let cancel_clone = cancel.clone();
+        let cancel_tool_call_id = tool_call.id.clone();
+        let cancel_write_tx = handle.background_write_tx();
+        let cancel_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_done_for_task = cancel_done.clone();
+        let cancel_watcher = smol::spawn(async move {
+            loop {
+                if cancel_done_for_task.load(Ordering::Relaxed) {
+                    return;
+                }
+                if cancel_clone.is_cancelled() {
+                    if let Some(ref tx) = cancel_write_tx {
+                        let _ = tx
+                            .send(crate::plugin::PluginRequest::CancelToolCall {
+                                tool_call_id: cancel_tool_call_id.clone(),
+                            })
+                            .await;
+                    }
+                    return;
+                }
+                smol::Timer::after(std::time::Duration::from_millis(100)).await;
+            }
+        });
 
         // Read messages from plugin until we get a ToolResult.
         let tool_call_for_hooks = tool_call.clone();
@@ -125,6 +160,10 @@ impl crate::worker::ToolExecutor for PluginExecutor {
                 }
             }
         };
+
+        // Tool call is done — tell the cancel watcher to exit.
+        cancel_done.store(true, Ordering::Relaxed);
+        cancel_watcher.cancel().await;
 
         // Always return the plugin handle, even on error (brief lock).
         {
@@ -260,6 +299,9 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         should_stop: Some(Box::new(move || {
             shutdown_flag.load(Ordering::Relaxed) || cancel_flag_clone.load(Ordering::Relaxed)
         })),
+        cancel_token: Some(tau_agent_base::types::CancelToken::from_flag(
+            cancel_flag.clone(),
+        )),
         drain_queued: Some(Box::new(move || {
             if has_queued_clone.swap(false, Ordering::Acquire) {
                 let st = state_clone_drain.lock().expect("state mutex poisoned");

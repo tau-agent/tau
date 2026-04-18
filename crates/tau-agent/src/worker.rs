@@ -124,6 +124,14 @@ async fn async_main() -> crate::Result<()> {
     // Shared unjoined-children set (for session_join_all / session_join_any).
     let unjoined: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
+    // In-flight tool-call cancel tokens, keyed by tool_call_id. Inserted on
+    // ToolCall arrival, flipped by a CancelToolCall request from the server,
+    // removed when the tool completes. This is how mid-flight cancellation
+    // crosses the RPC boundary: the plugin's main loop processes
+    // CancelToolCall while the tool task is blocked in bash/read/write/edit.
+    let in_flight_cancels: Arc<Mutex<HashMap<String, tau_agent_plugin::CancelToken>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     // -----------------------------------------------------------------------
     // Writer task: drains msg_rx → stdout
     // -----------------------------------------------------------------------
@@ -142,6 +150,7 @@ async fn async_main() -> crate::Result<()> {
     let reader_msg_tx = msg_tx.clone();
     let reader_pending = pending_responses.clone();
     let reader_unjoined = unjoined.clone();
+    let reader_in_flight = in_flight_cancels.clone();
 
     let reader_handle = smol::spawn(async move {
         let mut reader = reader;
@@ -181,6 +190,14 @@ async fn async_main() -> crate::Result<()> {
                     let msg_tx = reader_msg_tx.clone();
                     let pending = reader_pending.clone();
                     let unjoined = reader_unjoined.clone();
+                    let in_flight = reader_in_flight.clone();
+
+                    // Register a cancel token for this tool call.
+                    let cancel = tau_agent_plugin::CancelToken::new();
+                    in_flight
+                        .lock()
+                        .await
+                        .insert(tool_call_id.clone(), cancel.clone());
 
                     smol::spawn(async move {
                         let cwd = cwd.unwrap_or_else(|| {
@@ -201,7 +218,8 @@ async fn async_main() -> crate::Result<()> {
                             )
                             .await
                         } else if name == "bash" {
-                            execute_bash_async(&tool_call_id, &arguments, &cwd, &msg_tx).await
+                            execute_bash_async(&tool_call_id, &arguments, &cwd, &msg_tx, &cancel)
+                                .await
                         } else {
                             // read, write, edit — run blocking tool on thread pool
                             let tools = crate::tools::default_tools();
@@ -210,9 +228,15 @@ async fn async_main() -> crate::Result<()> {
                                 name: name.clone(),
                                 arguments,
                             };
-                            smol::unblock(move || crate::tools::execute_tool(&tools, &tc, &cwd))
-                                .await
+                            let cancel_for_blocking = cancel.clone();
+                            smol::unblock(move || {
+                                crate::tools::execute_tool(&tools, &tc, &cwd, &cancel_for_blocking)
+                            })
+                            .await
                         };
+
+                        // Deregister the cancel token — tool is done.
+                        in_flight.lock().await.remove(&tool_call_id);
 
                         let _ = msg_tx
                             .send(PluginMessage::ToolResult(PluginToolResult {
@@ -224,6 +248,20 @@ async fn async_main() -> crate::Result<()> {
                             .await;
                     })
                     .detach();
+                }
+
+                PluginRequest::CancelToolCall { tool_call_id } => {
+                    // Flip the cancel token for the in-flight tool call, if any.
+                    // The tool's own cancel watcher (bash) will notice on its
+                    // next poll and SIGKILL the subprocess, which unblocks the
+                    // tool task and lets it return a cancelled ToolResult.
+                    //
+                    // If the tool_call_id is unknown (already completed or
+                    // never existed), this is a no-op — race-safe.
+                    let map = reader_in_flight.lock().await;
+                    if let Some(token) = map.get(&tool_call_id) {
+                        token.cancel();
+                    }
                 }
 
                 PluginRequest::ServerResponse {
@@ -355,6 +393,7 @@ async fn execute_bash_async(
     args: &serde_json::Value,
     cwd: &str,
     msg_tx: &Sender<PluginMessage>,
+    cancel: &tau_agent_plugin::CancelToken,
 ) -> ToolResultMessage {
     let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
         return ToolResultMessage::error(tool_call_id, "", "missing 'command' argument");
@@ -437,6 +476,32 @@ async fn execute_bash_async(
         tau_agent_plugin_worker::tools::bash::untrack_pgid(child_id as i32);
     });
 
+    // Spawn a cancel-watcher task: on cancellation, SIGKILL the process
+    // group. Polls every 100 ms and exits when the `cancel_done` flag
+    // is flipped by the caller after the child has exited naturally.
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled_for_watcher = cancelled.clone();
+    let cancel_done_for_watcher = cancel_done.clone();
+    let cancel_for_watcher = cancel.clone();
+    let cancel_watcher = smol::spawn(async move {
+        loop {
+            if cancel_done_for_watcher.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if cancel_for_watcher.is_cancelled() {
+                cancelled_for_watcher.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = nix::sys::signal::killpg(
+                    nix::unistd::Pid::from_raw(child_id as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                tau_agent_plugin_worker::tools::bash::untrack_pgid(child_id as i32);
+                return;
+            }
+            smol::Timer::after(std::time::Duration::from_millis(100)).await;
+        }
+    });
+
     // Read stdout (with streaming deltas) and stderr concurrently.
     let tcid = tool_call_id.to_string();
     let msg_tx_clone = msg_tx.clone();
@@ -484,6 +549,8 @@ async fn execute_bash_async(
 
     // Cancel the killer (child already exited).
     killer.cancel().await;
+    cancel_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    cancel_watcher.cancel().await;
 
     tau_agent_plugin_worker::tools::bash::untrack_pgid(pgid);
 
@@ -494,6 +561,7 @@ async fn execute_bash_async(
         collected_stderr,
         exit_code,
         timed_out.load(std::sync::atomic::Ordering::Relaxed),
+        cancelled.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -505,6 +573,7 @@ fn format_bash_output(
     stderr: String,
     exit_code: i32,
     timed_out: bool,
+    cancelled: bool,
 ) -> ToolResultMessage {
     let mut text = stdout;
     if !stderr.is_empty() {
@@ -525,6 +594,15 @@ fn format_bash_output(
             text.len() - 100_000,
             tail
         );
+    }
+
+    // Cancellation takes priority over timeout in the output marker.
+    if cancelled {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("(cancelled)");
+        return ToolResultMessage::error(tool_call_id, "", text.trim_end());
     }
 
     if timed_out {

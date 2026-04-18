@@ -44,6 +44,11 @@ pub enum PluginRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         project_name: Option<String>,
     },
+    /// Cancel an in-flight tool call. The plugin should abort the tool by
+    /// its `tool_call_id` (e.g. kill the bash subprocess) and return a
+    /// normal `ToolResult` indicating cancellation. If the tool has already
+    /// completed, this is a no-op.
+    CancelToolCall { tool_call_id: String },
     /// Notify session start.
     SessionStart {
         cwd: String,
@@ -172,5 +177,57 @@ impl From<&PluginToolDef> for crate::tool_prompt::ToolPrompt {
             snippet: def.prompt_snippet.clone().unwrap_or_default(),
             guidelines: def.prompt_guidelines.clone(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_tool_call_roundtrip() {
+        // Wire shape for the cancellation RPC — snake_case tag + field.
+        let req = PluginRequest::CancelToolCall {
+            tool_call_id: "tc-42".into(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert_eq!(
+            json,
+            r#"{"type":"cancel_tool_call","tool_call_id":"tc-42"}"#
+        );
+
+        let parsed: PluginRequest = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            PluginRequest::CancelToolCall { tool_call_id } => {
+                assert_eq!(tool_call_id, "tc-42");
+            }
+            other => panic!("expected CancelToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_call_roundtrip_unchanged_by_cancel_variant() {
+        // Back-compat sanity: adding CancelToolCall must not alter the wire
+        // encoding of pre-existing variants.
+        let req = PluginRequest::ToolCall {
+            tool_call_id: "tc-1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "echo hi"}),
+            cwd: Some("/tmp".into()),
+            session_id: None,
+            project_name: None,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains(r#""type":"tool_call""#));
+        assert!(json.contains(r#""tool_call_id":"tc-1""#));
+        assert!(json.contains(r#""name":"bash""#));
+        assert!(json.contains(r#""cwd":"/tmp""#));
+        // Absent optional fields should not serialise.
+        assert!(!json.contains("session_id"));
+        assert!(!json.contains("project_name"));
     }
 }

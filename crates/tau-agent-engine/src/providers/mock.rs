@@ -438,6 +438,7 @@ impl ToolExecutor for MockToolExecutor {
         &mut self,
         tool_call: &ToolCall,
         _output_tx: &smol::channel::Sender<String>,
+        _cancel: &tau_agent_base::types::CancelToken,
     ) -> tau_agent_base::Result<ToolResultMessage> {
         // Capture.
         self.inner

@@ -105,7 +105,11 @@ fn prepare_arguments(mut args: serde_json::Value) -> serde_json::Value {
     args
 }
 
-fn execute(args: serde_json::Value, cwd: &str) -> ToolOutput {
+fn execute(
+    args: serde_json::Value,
+    cwd: &str,
+    _cancel: &tau_agent_plugin::CancelToken,
+) -> ToolOutput {
     let Some(path_str) = args.get("path").and_then(|p| p.as_str()) else {
         return ToolOutput::error("missing 'path' argument");
     };
@@ -227,6 +231,7 @@ mod tests {
                 "edits": [{"old_text": "hello", "new_text": "goodbye"}]
             }),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
         );
         assert!(!result.is_error);
         assert_eq!(
@@ -247,6 +252,7 @@ mod tests {
                 ]
             }),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
         );
         assert!(!result.is_error, "got: {:?}", result.content);
         assert_eq!(
@@ -267,6 +273,7 @@ mod tests {
                 ]
             }),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
         );
         assert!(result.is_error);
         // File should be unchanged — validation failed before any edits applied
@@ -285,6 +292,7 @@ mod tests {
                 "edits": [{"old_text": "NOTFOUND", "new_text": "xxx"}]
             }),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
         );
         assert!(result.is_error);
     }
@@ -298,6 +306,7 @@ mod tests {
                 "edits": [{"old_text": "aaa", "new_text": "xxx"}]
             }),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
         );
         assert!(result.is_error);
         // File should be unchanged
@@ -316,6 +325,7 @@ mod tests {
                 "edits": []
             }),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
         );
         assert!(result.is_error);
         let msg = result.content[0].text();
@@ -333,6 +343,7 @@ mod tests {
                 "path": path.to_str().expect("path to str"),
             }),
             "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
         );
         assert!(result.is_error);
         assert!(result.content[0].text().contains("edits"));
@@ -429,7 +440,12 @@ mod tests {
                 "new_text": "goodbye",
             }),
         };
-        let result = execute_tool(&tools, &tool_call, "/tmp");
+        let result = execute_tool(
+            &tools,
+            &tool_call,
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
         assert!(!result.is_error, "got: {:?}", result.content);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read result"),
@@ -457,7 +473,12 @@ mod tests {
                 "new_text": "ALPHA",
             }),
         };
-        let result = execute_tool(&tools, &tool_call, dir.path().to_str().expect("cwd"));
+        let result = execute_tool(
+            &tools,
+            &tool_call,
+            dir.path().to_str().expect("cwd"),
+            &tau_agent_plugin::CancelToken::new(),
+        );
         assert!(!result.is_error, "got: {:?}", result.content);
         assert_eq!(
             std::fs::read_to_string(&path).expect("read result"),

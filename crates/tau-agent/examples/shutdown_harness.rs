@@ -34,6 +34,7 @@ fn main() {
         let _ = tau_agent_plugin_worker::tools::bash::execute_streaming(
             &serde_json::json!({"command": "sleep 600", "timeout": 1200}),
             "/tmp",
+            &tau_agent_base::types::CancelToken::new(),
             |_| {},
         );
     });
