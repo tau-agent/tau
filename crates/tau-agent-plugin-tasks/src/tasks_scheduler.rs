@@ -1938,7 +1938,7 @@ pub fn format_status(status: &SchedulerStatus) -> String {
 
     // Active tasks.
     if !status.active.is_empty() {
-        out.push_str(&format!("\nACTIVE ({}):\n", status.active.len()));
+        out.push_str(&format!("\nactive ({}):\n", status.active.len()));
         for ts in &status.active {
             format_task_line(&mut out, ts);
         }
@@ -1947,7 +1947,7 @@ pub fn format_status(status: &SchedulerStatus) -> String {
     // Queued - Planning.
     if !status.queued_planning.is_empty() {
         out.push_str(&format!(
-            "\nQUEUED - PLANNING ({}):\n",
+            "\nqueued - planning ({}):\n",
             status.queued_planning.len()
         ));
         for ts in &status.queued_planning {
@@ -1958,7 +1958,7 @@ pub fn format_status(status: &SchedulerStatus) -> String {
     // Queued - Ready.
     if !status.queued_ready.is_empty() {
         out.push_str(&format!(
-            "\nQUEUED - READY ({}):\n",
+            "\nqueued - ready ({}):\n",
             status.queued_ready.len()
         ));
         for ts in &status.queued_ready {
@@ -1968,7 +1968,7 @@ pub fn format_status(status: &SchedulerStatus) -> String {
 
     // Held.
     if !status.held.is_empty() {
-        out.push_str(&format!("\nHELD ({}):\n", status.held.len()));
+        out.push_str(&format!("\nheld ({}):\n", status.held.len()));
         for ts in &status.held {
             format_task_line(&mut out, ts);
         }
@@ -1976,7 +1976,7 @@ pub fn format_status(status: &SchedulerStatus) -> String {
 
     // Blocked.
     if !status.blocked.is_empty() {
-        out.push_str(&format!("\nBLOCKED ({}):\n", status.blocked.len()));
+        out.push_str(&format!("\nblocked ({}):\n", status.blocked.len()));
         for ts in &status.blocked {
             format_task_line(&mut out, ts);
         }
@@ -3745,20 +3745,20 @@ mod tests {
         assert!(held_ids.contains(&held_task.id));
         assert_eq!(status.held.len(), 1);
 
-        // format_status should print a HELD section and not mis-file the
-        // task under QUEUED - READY.
+        // format_status should print a held section and not mis-file the
+        // task under queued - ready.
         let rendered = format_status(&status);
-        assert!(rendered.contains("HELD (1)"));
+        assert!(rendered.contains("held (1)"));
         assert!(rendered.contains("🔒held"));
         let ready_header = rendered
-            .find("QUEUED - READY")
+            .find("queued - ready")
             .expect("queued ready section exists for the visible task");
-        let held_header = rendered.find("HELD (1)").expect("held section exists");
-        // The held task id should appear in the HELD section, not the ready
+        let held_header = rendered.find("held (1)").expect("held section exists");
+        // The held task id should appear in the held section, not the ready
         // section.
         let held_region = &rendered[held_header..];
         assert!(held_region.contains(&format!("#{}", held_task.id)));
-        // Slice from QUEUED-READY until HELD to verify the held id is
+        // Slice from queued-ready until held to verify the held id is
         // absent from the ready section.
         let ready_region = &rendered[ready_header..held_header];
         assert!(!ready_region.contains(&format!("#{}", held_task.id)));
@@ -3928,12 +3928,63 @@ mod tests {
         };
         let output = format_status(&status);
         assert!(output.contains("Task Scheduler Status"));
-        assert!(output.contains("ACTIVE"));
+        assert!(output.contains("active"));
         assert!(output.contains("#1"));
         assert!(output.contains("s100"));
-        assert!(output.contains("QUEUED - READY"));
+        assert!(output.contains("queued - ready"));
         assert!(output.contains("#2"));
         assert!(output.contains("file conflict"));
+    }
+
+    #[test]
+    fn test_format_status_all_empty_shows_no_group_headers() {
+        let status = SchedulerStatus {
+            active: vec![],
+            queued_planning: vec![],
+            queued_ready: vec![],
+            held: vec![],
+            blocked: vec![],
+            inflight_count: 0,
+            max_concurrent: 8,
+        };
+        let output = format_status(&status);
+        assert!(output.contains("in-flight: 0/8"));
+        assert!(output.contains("No active or queued tasks."));
+        for h in [
+            "active (",
+            "queued - ready",
+            "queued - planning",
+            "held (",
+            "blocked (",
+        ] {
+            assert!(
+                !output.contains(h),
+                "unexpected group header {h:?} in output:\n{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_status_only_active_hides_other_headers() {
+        let status = SchedulerStatus {
+            active: vec![TaskStatus {
+                task: make_task(1, 5, None),
+                session_id: Some("s100".into()),
+                wait_reasons: vec![],
+            }],
+            queued_planning: vec![],
+            queued_ready: vec![],
+            held: vec![],
+            blocked: vec![],
+            inflight_count: 1,
+            max_concurrent: 8,
+        };
+        let output = format_status(&status);
+        assert!(output.contains("active (1)"));
+        assert!(!output.contains("queued - ready"));
+        assert!(!output.contains("queued - planning"));
+        assert!(!output.contains("held ("));
+        assert!(!output.contains("blocked ("));
     }
 
     #[test]

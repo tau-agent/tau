@@ -112,6 +112,8 @@ pub struct PickerGroups {
 pub enum PickerRow {
     /// Non-selectable section header.
     Header(String),
+    /// Non-selectable blank-line separator between visible groups.
+    Spacer,
     /// A selectable task at a given visual depth.  `parent_out_of_group`
     /// signals that the task's parent isn't in the same bucket — the renderer
     /// appends a `(parent: #N)` suffix and pins depth at 0.
@@ -121,7 +123,7 @@ pub enum PickerRow {
         parent_out_of_group: bool,
         /// Group-local hint: when true, omit the redundant state label for
         /// rows rendered inside their own state's bucket (e.g. don't print
-        /// "active" again inside the ACTIVE group).
+        /// "active" again inside the active group).
         suppress_state_label: bool,
         /// Optional dependency wait-reason overlay (blocked-on task ids).
         blocked_on: Vec<i64>,
@@ -1241,107 +1243,109 @@ impl App {
         let now_ms = now_secs().saturating_mul(1000);
 
         let mut rows: Vec<PickerRow> = Vec::new();
+        let mut first_group = true;
 
-        // ACTIVE (count of N slots)
-        rows.push(PickerRow::Header(format!(
-            "ACTIVE ({} of {} slots)",
-            g.inflight_count, g.max_concurrent,
-        )));
-        push_group_rows(
+        // Build a scheduler group, but only emit header + rows if at least
+        // one task survives filtering.  A Spacer precedes every non-first
+        // visible group.
+        let push_group = |rows: &mut Vec<PickerRow>,
+                          first_group: &mut bool,
+                          header: String,
+                          group: &[(usize, TaskInfo)],
+                          suppress_state_label: bool| {
+            let mut tmp: Vec<PickerRow> = Vec::new();
+            push_group_rows(
+                &mut tmp,
+                group,
+                needle.as_deref(),
+                suppress_state_label,
+                Some(&g.blocked_on),
+                None,
+            );
+            if tmp.is_empty() {
+                return;
+            }
+            if !*first_group {
+                rows.push(PickerRow::Spacer);
+            }
+            rows.push(PickerRow::Header(header));
+            rows.extend(tmp);
+            *first_group = false;
+        };
+
+        // active group contains mixed states (active/review/refining/merging).
+        push_group(
             &mut rows,
+            &mut first_group,
+            format!(
+                "active ({} of {} slots)",
+                g.inflight_count, g.max_concurrent,
+            ),
             &g.active,
-            needle.as_deref(),
-            /* suppress_state_label */
-            false, // active group contains mixed states (active/review/refining/merging)
-            Some(&g.blocked_on),
-            /* age_hint */ None,
+            /* suppress_state_label */ false,
         );
 
-        rows.push(PickerRow::Header(format!(
-            "QUEUED — READY ({})",
-            g.queued_ready.len()
-        )));
-        push_group_rows(
+        push_group(
             &mut rows,
+            &mut first_group,
+            format!("queued — ready ({})", g.queued_ready.len()),
             &g.queued_ready,
-            needle.as_deref(),
             /* suppress_state_label */ true,
-            Some(&g.blocked_on),
-            None,
         );
 
-        rows.push(PickerRow::Header(format!(
-            "QUEUED — PLANNING ({})",
-            g.queued_planning.len()
-        )));
-        push_group_rows(
+        push_group(
             &mut rows,
+            &mut first_group,
+            format!("queued — planning ({})", g.queued_planning.len()),
             &g.queued_planning,
-            needle.as_deref(),
-            true,
-            Some(&g.blocked_on),
-            None,
+            /* suppress_state_label */ true,
         );
 
-        rows.push(PickerRow::Header(format!("BLOCKED ({})", g.blocked.len())));
-        push_group_rows(
+        push_group(
             &mut rows,
+            &mut first_group,
+            format!("blocked ({})", g.blocked.len()),
             &g.blocked,
-            needle.as_deref(),
-            false,
-            Some(&g.blocked_on),
-            None,
+            /* suppress_state_label */ false,
         );
 
-        rows.push(PickerRow::Header(format!("HELD ({})", g.held.len())));
-        push_group_rows(
+        push_group(
             &mut rows,
+            &mut first_group,
+            format!("held ({})", g.held.len()),
             &g.held,
-            needle.as_deref(),
-            false,
-            Some(&g.blocked_on),
-            None,
+            /* suppress_state_label */ false,
         );
 
         // Recently completed tail — flat, no tree indent, dim age hint.
-        let recent_total = g.recently_merged.len() + g.recently_closed.len();
-        if recent_total > 0 || needle.is_none() {
+        // Only emit the header if at least one row survives filtering.
+        let mut recent_tmp: Vec<PickerRow> = Vec::new();
+        for t in g.recently_merged.iter().chain(g.recently_closed.iter()) {
+            if let Some(n) = needle.as_deref() {
+                if !task_matches_filter(t, n) {
+                    continue;
+                }
+            }
+            let age = format_age_since_ms(now_ms, t.updated_at);
+            recent_tmp.push(PickerRow::Task {
+                depth: 0,
+                task: t.clone(),
+                parent_out_of_group: false,
+                suppress_state_label: false,
+                blocked_on: Vec::new(),
+                age_hint: Some(age),
+            });
+        }
+        if !recent_tmp.is_empty() {
+            if !first_group {
+                rows.push(PickerRow::Spacer);
+            }
+            let recent_total = g.recently_merged.len() + g.recently_closed.len();
             rows.push(PickerRow::Header(format!(
-                "RECENTLY COMPLETED ({})",
+                "recently completed ({})",
                 recent_total
             )));
-            for t in &g.recently_merged {
-                if let Some(n) = needle.as_deref() {
-                    if !task_matches_filter(t, n) {
-                        continue;
-                    }
-                }
-                let age = format_age_since_ms(now_ms, t.updated_at);
-                rows.push(PickerRow::Task {
-                    depth: 0,
-                    task: t.clone(),
-                    parent_out_of_group: false,
-                    suppress_state_label: false,
-                    blocked_on: Vec::new(),
-                    age_hint: Some(age),
-                });
-            }
-            for t in &g.recently_closed {
-                if let Some(n) = needle.as_deref() {
-                    if !task_matches_filter(t, n) {
-                        continue;
-                    }
-                }
-                let age = format_age_since_ms(now_ms, t.updated_at);
-                rows.push(PickerRow::Task {
-                    depth: 0,
-                    task: t.clone(),
-                    parent_out_of_group: false,
-                    suppress_state_label: false,
-                    blocked_on: Vec::new(),
-                    age_hint: Some(age),
-                });
-            }
+            rows.extend(recent_tmp);
         }
 
         rows
@@ -5248,15 +5252,127 @@ mod tests {
             match r {
                 PickerRow::Header(t) => headers.push(t.clone()),
                 PickerRow::Task { task, .. } => ids.push(task.id),
+                PickerRow::Spacer => {}
             }
         }
-        assert!(headers.iter().any(|h| h.starts_with("ACTIVE")));
-        assert!(headers.iter().any(|h| h.starts_with("QUEUED — READY")));
-        assert!(headers.iter().any(|h| h.starts_with("QUEUED — PLANNING")));
-        assert!(headers.iter().any(|h| h.starts_with("BLOCKED")));
-        assert!(headers.iter().any(|h| h.starts_with("HELD")));
-        assert!(headers.iter().any(|h| h.starts_with("RECENTLY COMPLETED")));
+        assert!(headers.iter().any(|h| h.starts_with("active")));
+        assert!(headers.iter().any(|h| h.starts_with("queued — ready")));
+        // queued — planning is empty here, so no header.
+        assert!(!headers.iter().any(|h| h.starts_with("queued — planning")));
+        assert!(headers.iter().any(|h| h.starts_with("blocked")));
+        assert!(headers.iter().any(|h| h.starts_with("held")));
+        assert!(headers.iter().any(|h| h.starts_with("recently completed")));
         assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn scheduler_view_rows_hides_empty_groups() {
+        // Only `active` populated — other group headers must be absent,
+        // and no leading spacer is emitted.
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.picker_groups = make_groups_with(
+            vec![make_task_info(1, "only", "active")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let rows = app.task_picker_rows();
+        let headers: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                PickerRow::Header(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers.len(), 1);
+        assert!(headers[0].starts_with("active"));
+        // No spacers: only one visible group.
+        assert!(!rows.iter().any(|r| matches!(r, PickerRow::Spacer)));
+        // First row is the header (no leading spacer).
+        assert!(matches!(rows.first(), Some(PickerRow::Header(_))));
+    }
+
+    #[test]
+    fn scheduler_view_rows_all_empty_yields_no_headers() {
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.picker_groups =
+            make_groups_with(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let rows = app.task_picker_rows();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn scheduler_view_rows_inserts_spacers_between_visible_groups() {
+        // active + queued — ready populated: [Header(active), Task, Spacer, Header(ready), Task].
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.picker_groups = make_groups_with(
+            vec![make_task_info(1, "a", "active")],
+            vec![make_task_info(2, "r", "ready")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let rows = app.task_picker_rows();
+        assert_eq!(rows.len(), 5);
+        assert!(matches!(rows[0], PickerRow::Header(ref h) if h.starts_with("active")));
+        assert!(matches!(rows[1], PickerRow::Task { .. }));
+        assert!(matches!(rows[2], PickerRow::Spacer));
+        assert!(matches!(rows[3], PickerRow::Header(ref h) if h.starts_with("queued — ready")));
+        assert!(matches!(rows[4], PickerRow::Task { .. }));
+    }
+
+    #[test]
+    fn scheduler_view_rows_filter_drops_group_entirely() {
+        // Filter matches in `active` only: no header/spacer survives for
+        // `queued — ready`, and no trailing spacer either.
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.picker_groups = make_groups_with(
+            vec![make_task_info(1, "alpha active", "active")],
+            vec![make_task_info(2, "beta ready", "ready")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        app.task_picker_filter = "alpha".into();
+        let rows = app.task_picker_rows();
+        // Expect exactly: Header(active), Task(1). No spacer anywhere.
+        assert_eq!(rows.len(), 2);
+        assert!(matches!(rows[0], PickerRow::Header(ref h) if h.starts_with("active")));
+        assert!(matches!(rows[1], PickerRow::Task { .. }));
+        assert!(!rows.iter().any(|r| matches!(r, PickerRow::Spacer)));
+    }
+
+    #[test]
+    fn scheduler_view_rows_partial_filter_keeps_spacer_between_remaining_groups() {
+        // Filter matches one task in each of two groups — the separating
+        // spacer must survive.
+        let mut app = make_app();
+        open_task_picker(&mut app, AppMode::Input);
+        app.picker_groups = make_groups_with(
+            vec![
+                make_task_info(1, "alpha active", "active"),
+                make_task_info(2, "beta active", "active"),
+            ],
+            vec![
+                make_task_info(3, "alpha ready", "ready"),
+                make_task_info(4, "beta ready", "ready"),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        app.task_picker_filter = "alpha".into();
+        let rows = app.task_picker_rows();
+        let spacer_count = rows
+            .iter()
+            .filter(|r| matches!(r, PickerRow::Spacer))
+            .count();
+        assert_eq!(spacer_count, 1);
     }
 
     #[test]
@@ -5317,14 +5433,15 @@ mod tests {
         for r in &rows {
             match r {
                 PickerRow::Header(h) => {
-                    if h.starts_with("ACTIVE") {
+                    if h.starts_with("active") {
                         saw_active_header = true;
                     }
-                    if h.starts_with("QUEUED — READY") {
+                    if h.starts_with("queued — ready") {
                         saw_ready_header = true;
                     }
                 }
                 PickerRow::Task { task, .. } => task_ids.push(task.id),
+                PickerRow::Spacer => {}
             }
         }
         assert!(saw_active_header && saw_ready_header, "groups preserved");

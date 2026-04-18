@@ -999,7 +999,7 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let view_label = match app.picker_view {
         PickerView::SchedulerState => "",
-        PickerView::Ancestry => " ANCESTRY (g)",
+        PickerView::Ancestry => " ancestry (g)",
     };
 
     // Title includes filter/create mode + view label.
@@ -1130,6 +1130,9 @@ fn draw_task_picker(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         match row {
             PickerRow::Header(text) => {
                 lines.push(render_group_header(text, w, theme));
+            }
+            PickerRow::Spacer => {
+                lines.push(Line::from(""));
             }
             PickerRow::Task {
                 depth,
@@ -1304,10 +1307,10 @@ fn render_task_row(
     // Title + optional metadata suffixes.
     let mut title_text = task.title.clone();
     // State label prefix: show the state explicitly when the task's bucket
-    // is mixed (e.g. ACTIVE contains active/review/refining/merging;
-    // BLOCKED and HELD contain ready/planning).  Suppressed inside buckets
-    // whose rows all share the group's implied state (QUEUED — READY,
-    // QUEUED — PLANNING) and for held rows which already carry the 🔒
+    // is mixed (e.g. active contains active/review/refining/merging;
+    // blocked and held contain ready/planning).  Suppressed inside buckets
+    // whose rows all share the group's implied state (queued — ready,
+    // queued — planning) and for held rows which already carry the 🔒
     // marker.
     if !suppress_state_label && !task.held {
         title_text = format!("[{}] {}", task.state, title_text);
