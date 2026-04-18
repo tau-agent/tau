@@ -336,6 +336,60 @@ pub fn get_session_model(
     }
 }
 
+/// Walk up the session parent chain and return the topmost (root) session's
+/// ID.
+///
+/// Used when dispatching a new session on behalf of a top-level task: the
+/// triggering session may be a deeply-nested worker that will soon be
+/// archived, which would orphan the new session.  Re-parenting onto the
+/// root of that chain (the user's primary session tree) keeps new work
+/// visible.
+///
+/// One round-trip to the server via `GetSessionAncestors` — the response
+/// is leaf-first, depth-guarded server-side at 64.
+///
+/// Returns:
+/// - `Some(root_id)` if a non-archived root (`parent_id == None`,
+///   `archived == false`) is reached.
+/// - `None` if:
+///   - the starting session doesn't exist (empty `sessions` response),
+///   - the depth-guard-truncated chain didn't include a root (last entry
+///     still has a parent),
+///   - the root reached is itself archived.
+///
+/// In the `None` case the caller should treat the new session as a root
+/// of its own (unparented).
+pub fn find_root_session(
+    session_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<String> {
+    let sessions = match server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::GetSessionAncestors {
+            session_id: session_id.to_string(),
+        },
+    ) {
+        Ok(tau_agent_plugin::Response::SessionAncestors { sessions }) => sessions,
+        _ => return None,
+    };
+
+    // Leaf-first: sessions[0] is the requested session, sessions.last() is
+    // the topmost ancestor seen.
+    let last = sessions.last()?;
+    // If the last entry still has a parent, the depth guard truncated the
+    // walk before reaching a root — treat as "root not found".
+    if last.parent_id.is_some() {
+        return None;
+    }
+    // Archived root → unparented new session (caller handles None).
+    if last.archived {
+        return None;
+    }
+    Some(last.id.clone())
+}
+
 /// Dispatch a single task: create a session via ServerRequest, send initial
 /// chat, and update the task with the session ID.
 ///
@@ -3662,5 +3716,173 @@ mod tests {
         );
         // Should use ⚠️ not ⏳ to signal it's an error
         assert!(out.contains("⚠️"), "expected warning emoji, got: {}", out);
+    }
+
+    // -----------------------------------------------------------------
+    // find_root_session helpers
+    // -----------------------------------------------------------------
+
+    /// Build a `SessionInfo` fixture. Only the fields the helper inspects
+    /// need real values; the rest are boilerplate.
+    fn session_info(
+        id: &str,
+        parent_id: Option<&str>,
+        archived: bool,
+    ) -> tau_agent_plugin::SessionInfo {
+        tau_agent_plugin::SessionInfo {
+            id: id.to_string(),
+            model: "m".into(),
+            provider: "p".into(),
+            cwd: None,
+            message_count: 0,
+            stats: Default::default(),
+            last_activity: 0,
+            parent_id: parent_id.map(str::to_string),
+            child_count: 0,
+            child_budget: 16,
+            tagline: None,
+            state: "idle".into(),
+            context_pct: None,
+            archived,
+            last_exit_status: None,
+            is_live: false,
+            project_name: None,
+        }
+    }
+
+    struct FindRootMock {
+        write_buf: Vec<u8>,
+        read_buf: Vec<u8>,
+        ancestors: Vec<tau_agent_plugin::SessionInfo>,
+    }
+
+    impl FindRootMock {
+        fn process(&mut self) {
+            use tau_agent_base::plugin_protocol::{PluginMessage, PluginRequest};
+            let buf = std::mem::take(&mut self.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Ok(PluginMessage::ServerRequest { request_id, .. }) =
+                    serde_json::from_str::<PluginMessage>(line)
+                {
+                    let resp = PluginRequest::ServerResponse {
+                        request_id,
+                        response: tau_agent_plugin::Response::SessionAncestors {
+                            sessions: self.ancestors.clone(),
+                        },
+                    };
+                    if let Ok(mut json) = serde_json::to_string(&resp) {
+                        json.push('\n');
+                        self.read_buf.extend_from_slice(json.as_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    struct MockFindRootWriter {
+        shared: std::sync::Arc<std::sync::Mutex<FindRootMock>>,
+    }
+    impl std::io::Write for MockFindRootWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.shared.lock().unwrap().write_buf.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockFindRootReader {
+        shared: std::sync::Arc<std::sync::Mutex<FindRootMock>>,
+    }
+    impl std::io::Read for MockFindRootReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut shared = self.shared.lock().unwrap();
+            shared.process();
+            if shared.read_buf.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no more mock responses",
+                ));
+            }
+            let n = std::cmp::min(buf.len(), shared.read_buf.len());
+            buf[..n].copy_from_slice(&shared.read_buf[..n]);
+            shared.read_buf.drain(..n);
+            Ok(n)
+        }
+    }
+
+    /// Run `find_root_session` against a canned `SessionAncestors` response.
+    fn run_find_root(
+        session_id: &str,
+        ancestors: Vec<tau_agent_plugin::SessionInfo>,
+    ) -> Option<String> {
+        use std::io::BufReader;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(FindRootMock {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            ancestors,
+        }));
+        let mut writer = MockFindRootWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockFindRootReader {
+            shared: shared.clone(),
+        };
+        let mut reader_buf = BufReader::new(reader);
+        super::find_root_session(session_id, &mut writer, &mut reader_buf)
+    }
+
+    #[test]
+    fn test_find_root_session_already_root() {
+        let root = session_info("root", None, false);
+        assert_eq!(run_find_root("root", vec![root]), Some("root".to_string()));
+    }
+
+    #[test]
+    fn test_find_root_session_one_deep() {
+        let child = session_info("child", Some("root"), false);
+        let root = session_info("root", None, false);
+        assert_eq!(
+            run_find_root("child", vec![child, root]),
+            Some("root".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_root_session_three_deep() {
+        let leaf = session_info("leaf", Some("c"), false);
+        let c = session_info("c", Some("b"), false);
+        let b = session_info("b", Some("root"), false);
+        let root = session_info("root", None, false);
+        assert_eq!(
+            run_find_root("leaf", vec![leaf, c, b, root]),
+            Some("root".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_root_session_archived_root_returns_none() {
+        let child = session_info("child", Some("root"), false);
+        let root = session_info("root", None, /* archived */ true);
+        assert_eq!(run_find_root("child", vec![child, root]), None);
+    }
+
+    #[test]
+    fn test_find_root_session_empty_response_returns_none() {
+        assert_eq!(run_find_root("nope", vec![]), None);
+    }
+
+    #[test]
+    fn test_find_root_session_depth_guard_truncated_returns_none() {
+        // Last entry still has a parent → the server's depth guard cut off
+        // the walk before reaching a root. Treat as "root not found".
+        let leaf = session_info("leaf", Some("a"), false);
+        let a = session_info("a", Some("b-unreachable"), false);
+        assert_eq!(run_find_root("leaf", vec![leaf, a]), None);
     }
 }
