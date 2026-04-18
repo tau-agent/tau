@@ -1662,11 +1662,26 @@ async fn cmd_server_start(foreground: bool) -> tau_agent::Result<()> {
 
 fn spawn_server_daemon() -> tau_agent::Result<()> {
     let exe = std::env::current_exe().map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+
+    // Route the daemon's stderr to a catch-all file: tracing handles normal
+    // diagnostic output, but panics and any un-migrated `eprintln!`s should
+    // still be captured for post-mortem debugging. The file is opened in
+    // append mode so daemon restarts don't truncate history.
+    let logs_dir = tau_agent::paths::logs_dir();
+    std::fs::create_dir_all(&logs_dir)
+        .map_err(|e| tau_agent::Error::Io(format!("create logs dir: {}", e)))?;
+    let stderr_path = logs_dir.join("daemon.stderr.log");
+    let stderr_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)
+        .map_err(|e| tau_agent::Error::Io(format!("open {}: {}", stderr_path.display(), e)))?;
+
     let child = std::process::Command::new(exe)
         .args(["server", "start", "--foreground"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .map_err(|e| tau_agent::Error::Io(format!("spawn: {}", e)))?;
     eprintln!("server started (pid {})", child.id());
