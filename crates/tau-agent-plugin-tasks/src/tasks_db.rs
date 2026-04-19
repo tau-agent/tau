@@ -38,6 +38,14 @@ pub struct Task {
     /// dispatch helpers fall back to the legacy parenting rule in that
     /// case. See `create_placeholder_session` in `tasks.rs`.
     pub placeholder_session_id: Option<String>,
+    /// True when the task was filed with `initial_state = ready` but
+    /// without a usable `affected_files` list and so was auto-routed
+    /// through the planning phase (task #596). The planner uses this
+    /// flag to deliver a focused "only populate affected_files, then
+    /// transition straight to ready" prompt instead of the standard
+    /// planning prompt. Defaults to `false` for tasks that took the
+    /// normal initial_state path.
+    pub auto_downgraded_from_ready: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -337,6 +345,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     skip_review INTEGER NOT NULL DEFAULT 0,
     held INTEGER NOT NULL DEFAULT 0,
     placeholder_session_id TEXT,
+    auto_downgraded_from_ready INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -569,6 +578,34 @@ impl TasksDb {
                 })?;
         }
 
+        // Add auto_downgraded_from_ready column if it doesn't exist.
+        // Introduced by task #596: when a caller files a task with
+        // `initial_state = ready` but no `affected_files`, we route the
+        // task through planning to populate the file list (so the
+        // scheduler can run it in parallel with disjoint tasks). The
+        // flag tells the planner prompt builder to emit a focused
+        // "only populate affected_files, then transition to ready"
+        // section instead of the standard planning prompt.
+        let has_auto_downgraded: bool = conn
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'auto_downgraded_from_ready'",
+            )
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_auto_downgraded {
+            conn.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN auto_downgraded_from_ready INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!(
+                    "migrate auto_downgraded_from_ready: {}",
+                    e
+                ))
+            })?;
+        }
+
         // Migrate done -> merged/closed terminal states.
         let has_done: bool = conn
             .prepare("SELECT COUNT(*) FROM tasks WHERE state = 'done'")
@@ -611,10 +648,16 @@ impl TasksDb {
         merge_target: Option<&str>,
         sandbox_profile: Option<&str>,
         held: bool,
+        affected_files: Option<&serde_json::Value>,
+        auto_downgraded_from_ready: bool,
     ) -> tau_agent_plugin::Result<Task> {
         let now = tau_agent_plugin::timestamp_ms() as i64;
         let priority = priority.unwrap_or(0);
         let tags_str = tags
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| tau_agent_plugin::Error::Parse(e.to_string()))?;
+        let affected_files_str = affected_files
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| tau_agent_plugin::Error::Parse(e.to_string()))?;
@@ -632,8 +675,8 @@ impl TasksDb {
 
         self.conn
             .execute(
-                "INSERT INTO tasks (project_name, title, state, priority, parent_id, tags, skip_review, require_approval, merge_target, sandbox_profile, held, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                "INSERT INTO tasks (project_name, title, state, priority, parent_id, tags, affected_files, skip_review, require_approval, merge_target, sandbox_profile, held, auto_downgraded_from_ready, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     project_name,
                     title,
@@ -641,11 +684,13 @@ impl TasksDb {
                     priority,
                     parent_id,
                     tags_str,
+                    affected_files_str,
                     skip_review as i32,
                     require_approval as i32,
                     merge_target,
                     sandbox_profile,
                     held as i32,
+                    auto_downgraded_from_ready as i32,
                     now,
                     now,
                 ],
@@ -662,7 +707,7 @@ impl TasksDb {
         self.conn
             .query_row(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                         created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
@@ -683,7 +728,7 @@ impl TasksDb {
     ) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut sql = String::from(
             "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                    branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                    branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                     created_at, updated_at
              FROM tasks WHERE project_name = ?1",
         );
@@ -757,7 +802,7 @@ impl TasksDb {
         limit: usize,
     ) -> tau_agent_plugin::Result<Vec<Task>> {
         let sql = "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                          branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                          branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                           created_at, updated_at
                    FROM tasks
                    WHERE project_name = ?1 AND state = ?2
@@ -1252,7 +1297,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.created_at,
                         t.updated_at
                  FROM task_relations r
                  JOIN tasks t ON t.id = r.to_task
@@ -1284,7 +1329,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.created_at,
                         t.updated_at
                  FROM tasks t
                  WHERE t.project_name = ?1 AND t.state IN ('ready', 'planning')
@@ -1322,7 +1367,7 @@ impl TasksDb {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project_name {
             Some(p) => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved' AND project_name = ?1
@@ -1332,7 +1377,7 @@ impl TasksDb {
             ),
             None => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved'
@@ -1389,7 +1434,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                         created_at, updated_at
                  FROM tasks
                  WHERE project_name = ?1
@@ -1464,7 +1509,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                         created_at, updated_at
                  FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
             )
@@ -1843,7 +1888,7 @@ impl TasksDb {
         if let Some(state) = state_filter {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1 AND t.state = ?2
@@ -1866,7 +1911,7 @@ impl TasksDb {
         } else {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1
@@ -2055,7 +2100,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'active' AND session_id IS NULL AND updated_at <= ?1",
@@ -2097,7 +2142,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'ready' AND session_id IS NOT NULL
@@ -2125,7 +2170,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
                         created_at, updated_at
                  FROM tasks
                  WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
@@ -2195,8 +2240,9 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         sandbox_profile: row.get(14)?,
         held: row.get::<_, i32>(15)? != 0,
         placeholder_session_id: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        auto_downgraded_from_ready: row.get::<_, i32>(17)? != 0,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
     })
 }
 
@@ -2239,6 +2285,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -2271,6 +2319,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -2294,6 +2344,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let _t2 = db
@@ -2309,6 +2361,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let _t3 = db
@@ -2322,6 +2376,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -2372,6 +2428,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            false,
         )
         .unwrap();
         db.create_task(
@@ -2384,6 +2442,8 @@ mod tests {
             "interactive",
             false,
             None,
+            None,
+            false,
             None,
             false,
         )
@@ -2415,6 +2475,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -2556,6 +2618,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -2600,6 +2664,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -2707,6 +2773,8 @@ mod tests {
                     None,
                     None,
                     false,
+                    None,
+                    false,
                 )
                 .unwrap();
 
@@ -2764,6 +2832,8 @@ mod tests {
                     None,
                     None,
                     false,
+                    None,
+                    false,
                 )
                 .unwrap();
 
@@ -2818,6 +2888,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -2851,6 +2923,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -2881,6 +2955,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -2940,6 +3016,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -2953,6 +3031,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -2987,6 +3067,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -3013,6 +3095,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -3026,6 +3110,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3051,6 +3137,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let _t2 = db
@@ -3066,6 +3154,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t3 = db
@@ -3079,6 +3169,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3116,6 +3208,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let _child1 = db
@@ -3131,6 +3225,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let _child2 = db
@@ -3144,6 +3240,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3172,6 +3270,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.create_task(
@@ -3184,6 +3284,8 @@ mod tests {
             "planning",
             false,
             None,
+            None,
+            false,
             None,
             false,
         )
@@ -3200,6 +3302,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            false,
         )
         .unwrap();
         db.create_task(
@@ -3212,6 +3316,8 @@ mod tests {
             "interactive",
             false,
             None,
+            None,
+            false,
             None,
             false,
         )
@@ -3255,6 +3361,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.add_message(task.id, "msg", None).unwrap();
@@ -3283,6 +3391,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3318,6 +3428,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3380,6 +3492,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -3415,6 +3529,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -3448,6 +3564,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -3472,6 +3590,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3503,6 +3623,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3571,6 +3693,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -3584,17 +3708,20 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let t1 = db
             .create_task(
-                "proj-a", "a", None, None, None, false, "ready", false, None, None, false,
+                "proj-a", "a", None, None, None, false, "ready", false, None, None, false, None,
+                false,
             )
             .unwrap();
         let t2 = db
             .create_task(
-                "proj-a", "b", None, None, None, false, "ready", false, None, None, false,
+                "proj-a", "b", None, None, None, false, "ready", false, None, None, false, None,
+                false,
             )
             .unwrap();
         let t3 = db
             .create_task(
-                "proj-b", "c", None, None, None, false, "ready", false, None, None, false,
+                "proj-b", "c", None, None, None, false, "ready", false, None, None, false, None,
+                false,
             )
             .unwrap();
 
@@ -3635,6 +3762,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3688,6 +3817,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert_eq!(parent.state, "interactive");
@@ -3707,6 +3838,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3731,6 +3864,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -3746,6 +3881,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3772,6 +3909,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "ready");
@@ -3789,6 +3928,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "planning");
@@ -3804,6 +3945,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3825,6 +3968,8 @@ mod tests {
                 "bogus",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3851,6 +3996,8 @@ mod tests {
                 "interactive",
                 true,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3886,6 +4033,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert!(!task.require_approval);
@@ -3906,6 +4055,8 @@ mod tests {
                 false,
                 None,
                 Some("restricted"),
+                false,
+                None,
                 false,
             )
             .unwrap();
@@ -3940,6 +4091,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert!(task.sandbox_profile.is_none());
@@ -3959,6 +4112,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4001,6 +4156,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4047,6 +4204,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert!(task.branch.is_none());
@@ -4078,6 +4237,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4115,6 +4276,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4155,6 +4318,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_worktree_path(t1.id, "/tmp/wt-1").unwrap();
@@ -4180,6 +4345,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4209,6 +4376,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -4233,6 +4402,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4286,6 +4457,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -4309,6 +4482,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "task-1").unwrap();
@@ -4324,6 +4499,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4349,6 +4526,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         // Don't set a branch on parent — should fall back to "main"
@@ -4364,6 +4543,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4396,6 +4577,8 @@ mod tests {
                 Some("develop"),
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -4419,6 +4602,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "task-1").unwrap();
@@ -4435,6 +4620,8 @@ mod tests {
                 "planning",
                 false,
                 Some("main"),
+                None,
+                false,
                 None,
                 false,
             )
@@ -4460,6 +4647,8 @@ mod tests {
                 Some("release/v2"),
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -4480,6 +4669,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4520,6 +4711,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert!(task.merge_target.is_none());
@@ -4539,6 +4732,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_branch(parent.id, "feature-branch").unwrap();
@@ -4554,6 +4749,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4577,6 +4774,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4849,6 +5048,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -4872,6 +5073,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4885,6 +5088,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4916,6 +5121,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4929,6 +5136,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4958,6 +5167,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4971,6 +5182,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5000,6 +5213,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5015,6 +5230,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t3 = db
@@ -5028,6 +5245,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5058,6 +5277,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5071,6 +5292,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5099,6 +5322,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5112,6 +5337,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5136,6 +5363,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5149,6 +5378,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5176,6 +5407,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5189,6 +5422,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5206,6 +5441,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t4 = db
@@ -5219,6 +5456,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5274,6 +5513,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let b = db
@@ -5287,6 +5528,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5304,6 +5547,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let d = db
@@ -5317,6 +5562,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5345,6 +5592,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.add_relation(d.id, e.id, "depends_on").unwrap();
@@ -5368,6 +5617,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let b = db
@@ -5381,6 +5632,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5398,6 +5651,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let d = db
@@ -5413,6 +5668,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let e = db
@@ -5426,6 +5683,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5457,6 +5716,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let b = db
@@ -5470,6 +5731,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5497,6 +5760,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let b = db
@@ -5512,6 +5777,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let c = db
@@ -5525,6 +5792,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5544,6 +5813,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5578,6 +5849,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5601,6 +5874,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5636,6 +5911,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5690,6 +5967,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5723,6 +6002,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5776,6 +6057,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -5809,6 +6092,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5859,6 +6144,7 @@ mod tests {
             sandbox_profile: None,
             held: false,
             placeholder_session_id: None,
+            auto_downgraded_from_ready: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -5945,6 +6231,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let child1 = db
@@ -5960,6 +6248,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let child2 = db
@@ -5973,6 +6263,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6001,6 +6293,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let child = db
@@ -6016,6 +6310,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let grandchild = db
@@ -6029,6 +6325,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6057,6 +6355,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -6080,6 +6380,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6130,6 +6432,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "s1").unwrap();
@@ -6161,6 +6465,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6409,6 +6715,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         assert_eq!(task.state, "interactive");
@@ -6488,6 +6796,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -6522,6 +6832,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -6552,6 +6864,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6594,6 +6908,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6651,6 +6967,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6711,6 +7029,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -6763,6 +7083,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6827,6 +7149,8 @@ mod tests {
                     "interactive",
                     false,
                     None,
+                    None,
+                    false,
                     None,
                     false,
                 )
@@ -6904,6 +7228,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -6939,6 +7265,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -6965,6 +7293,7 @@ mod tests {
         let task = db
             .create_task(
                 project, "Do work", None, None, None, false, "ready", false, None, None, false,
+                None, false,
             )
             .unwrap();
         // Assign to move to active
@@ -6991,6 +7320,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7015,6 +7346,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -7146,7 +7479,8 @@ mod tests {
         let task = db
             .create_task(
                 "proj", "Parked", None, None, None, false, "ready", false, None, None,
-                true, // held
+                true, // held,
+                None, false,
             )
             .unwrap();
 
@@ -7161,11 +7495,13 @@ mod tests {
         let visible = db
             .create_task(
                 "proj", "Visible", None, None, None, false, "ready", false, None, None, false,
+                None, false,
             )
             .unwrap();
         let parked = db
             .create_task(
-                "proj", "Parked", None, None, None, false, "ready", false, None, None, true,
+                "proj", "Parked", None, None, None, false, "ready", false, None, None, true, None,
+                false,
             )
             .unwrap();
 
@@ -7186,7 +7522,8 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task(
-                "proj", "Toggle", None, None, None, false, "ready", false, None, None, true,
+                "proj", "Toggle", None, None, None, false, "ready", false, None, None, true, None,
+                false,
             )
             .unwrap();
         assert!(task.held);
@@ -7363,7 +7700,8 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
         let task = db
             .create_task(
-                "proj", "p", None, None, None, false, "ready", false, None, None, false,
+                "proj", "p", None, None, None, false, "ready", false, None, None, false, None,
+                false,
             )
             .unwrap();
         assert!(task.placeholder_session_id.is_none());
@@ -7397,6 +7735,8 @@ mod tests {
                     None,
                     None,
                     false,
+                    None,
+                    false,
                 )
                 .unwrap();
             // Directly set state + updated_at to sidestep state-machine checks.
@@ -7423,6 +7763,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         // And a merged task in a different project that should be excluded.
@@ -7437,6 +7779,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )

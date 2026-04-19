@@ -2603,6 +2603,8 @@ fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
                 None,
                 None,
                 false,
+                None,
+                false,
             )?;
             println!("created task #{}: {}", task.id, task.title);
         }

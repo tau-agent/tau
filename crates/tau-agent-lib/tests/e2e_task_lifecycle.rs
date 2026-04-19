@@ -680,7 +680,9 @@ fn skip_planning_subtask_starts_ready() {
     );
     let parent_id = parent["id"].as_i64().unwrap();
 
-    // Create subtask with skip_planning=true
+    // Create subtask with initial_state=ready. Pass affected_files so
+    // the auto-downgrade (task #596) doesn't kick in — we want to test
+    // the ready-state subtask path here.
     let subtask = exec_tool_ok(
         &server,
         &sid,
@@ -689,6 +691,7 @@ fn skip_planning_subtask_starts_ready() {
             "title": "Skip planning subtask",
             "parent_id": parent_id,
             "initial_state": "ready",
+            "affected_files": ["src/skip_planning_subtask.rs"],
             "message": "Do the work directly",
         }),
     );
@@ -999,6 +1002,7 @@ fn review_transition_without_rebase() {
             "title": "No rebase needed for review",
             "parent_id": parent_id,
             "initial_state": "ready",
+            "affected_files": ["feature.txt"],
             "message": "Test that review works without rebase",
         }),
     );
@@ -1086,6 +1090,7 @@ fn active_to_approved_requires_skip_review() {
             "title": "No skip_review subtask",
             "parent_id": parent_id,
             "initial_state": "ready",
+            "affected_files": ["src/no_skip_review.rs"],
             "message": "Test skip_review enforcement",
         }),
     );
@@ -1287,9 +1292,12 @@ fn ready_to_active_file_less_task_spawns_worker_session() {
 
     let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
 
-    // File a `ready` task with no affected_files. The file-less scheduling
-    // rule only schedules one such task at a time; we have a fresh DB so
-    // this task is the file-less slot.
+    // File a `ready` task with the explicit `["*"]` file-less marker
+    // (task #596). The file-less scheduling rule only schedules one such
+    // task at a time; we have a fresh DB so this task is the file-less
+    // slot. Without the marker the task would be auto-routed through
+    // planning (task #596) — we want to test the file-less ready path,
+    // which is exactly what `["*"]` selects.
     let task = exec_tool_ok(
         &server,
         &sid,
@@ -1297,6 +1305,7 @@ fn ready_to_active_file_less_task_spawns_worker_session() {
         serde_json::json!({
             "title": "File-less auto-dispatch test",
             "initial_state": "ready",
+            "affected_files": ["*"],
             "message": "no files involved",
         }),
     );

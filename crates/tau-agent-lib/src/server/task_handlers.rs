@@ -256,6 +256,8 @@ pub fn handle_task_create(
         None,
         sandbox_profile,
         false,
+        None,
+        false,
     ) {
         Ok(task) => Response::TaskUpdated {
             task: task_to_info(task),

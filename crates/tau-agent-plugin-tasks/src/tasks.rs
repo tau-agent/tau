@@ -233,6 +233,11 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "hold": {
                         "type": "boolean",
                         "description": "When true, the task is created but NOT scheduled for dispatch, even if initial_state='ready'. Release by calling task_update with hold=false. Useful for batch-seeding a task board before manually choosing dispatch order. Default: false."
+                    },
+                    "affected_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Files this task is expected to touch. Used by the scheduler to run disjoint tasks in parallel. Pass `[\"*\"]` to mark a task whose file set is genuinely unpredictable (e.g. a codebase-wide survey) — the scheduler will serialise it. If `initial_state='ready'` is set without this list (and without the `[\"*\"]` marker), the task is auto-routed through planning so the file set can be populated."
                     }
                 },
                 "required": ["title"]
@@ -245,6 +250,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "Top-level and subtask behaviour is identical on the initial-state axis. Use parent_id for grouping and parallelisation, not to control dispatch.".into(),
                 "Sessions dispatched for top-level tasks are automatically parented under the project's root (user-facing) session, so new work surfaces in the user's session tree regardless of where in the session tree task_create was called.".into(),
                 "Pass hold=true to create a task without scheduling it. Useful for batch-seeding a backlog on a greenfield project: file N tasks at once, review, then release them in considered order via task_update(hold=false). Held tasks are visible in task_list/task_status with a held indicator but the scheduler skips them.".into(),
+                "When filing with initial_state=\"ready\", pass `affected_files` (the files the work will touch) so the scheduler can run your task in parallel with disjoint tasks. Omit it only if the file set is genuinely unpredictable — in which case the task is auto-routed through a focused planning phase that populates the list. Use `affected_files: [\"*\"]` as the explicit \"touches everything / unknowable\" marker; that bypasses planning but keeps the task serialised against all other work.".into(),
             ],
         },
         PluginToolDef {
@@ -616,7 +622,7 @@ fn handle_task_create(
 
     // New explicit initial_state argument. Default to "planning" — the
     // previous top-level / subtask asymmetry is gone: the caller chooses.
-    let initial_state = match args.get("initial_state") {
+    let mut initial_state = match args.get("initial_state") {
         None => "planning",
         Some(v) => match v.as_str() {
             Some(s @ ("interactive" | "planning" | "ready")) => s,
@@ -644,6 +650,55 @@ fn handle_task_create(
     let merge_target = args.get("merge_target").and_then(|v| v.as_str());
     let sandbox_profile = args.get("sandbox_profile").and_then(|v| v.as_str());
 
+    // affected_files (task #596): callers may pre-declare the file set so
+    // the scheduler can run the task in parallel with disjoint tasks.
+    // Validate that it's an array of strings (or absent).
+    let affected_files_arg = match args.get("affected_files") {
+        None => None,
+        Some(v) => match v.as_array() {
+            Some(arr) => {
+                if arr.iter().any(|x| !x.is_string()) {
+                    return tool_err(tool_call_id, "affected_files must be an array of strings");
+                }
+                Some(v.clone())
+            }
+            None => {
+                return tool_err(tool_call_id, "affected_files must be an array of strings");
+            }
+        },
+    };
+
+    // Auto-downgrade (task #596): a `ready`-state task without a usable
+    // `affected_files` list serialises against every other file-less
+    // task in the scheduler's "at most one file-less task per project"
+    // rule. Auto-route such tasks through the normal planning flow so
+    // the planner can populate the file list (and produce a plan)
+    // before dispatch. The explicit `["*"]` marker is the escape hatch
+    // for tasks that genuinely cannot predict their file set
+    // (codebase-wide surveys etc.) — those stay in `ready` and are
+    // serialised as before.
+    //
+    // Note: planning and review are orthogonal phases. The caller's
+    // `initial_state = ready` meant "skip planning"; we can't honour
+    // that (we need the file list), so we route through planning. But
+    // we do NOT touch `skip_review` — review is a separate quality
+    // gate and inheriting a velocity inference into it would conflate
+    // the two.
+    let star_marker = matches!(
+        affected_files_arg.as_ref(),
+        Some(serde_json::Value::Array(arr))
+            if arr.len() == 1
+                && arr[0].as_str() == Some("*")
+    );
+    let has_concrete_files = matches!(
+        affected_files_arg.as_ref(),
+        Some(serde_json::Value::Array(arr)) if !arr.is_empty()
+    ) && !star_marker;
+    let auto_downgrade = initial_state == "ready" && !has_concrete_files && !star_marker;
+    if auto_downgrade {
+        initial_state = "planning";
+    }
+
     match db.create_task(
         project_name,
         title,
@@ -656,6 +711,8 @@ fn handle_task_create(
         merge_target,
         sandbox_profile,
         hold,
+        affected_files_arg.as_ref(),
+        auto_downgrade,
     ) {
         Ok(task) => {
             // Task #561: every new task gets a non-LLM placeholder
@@ -680,6 +737,31 @@ fn handle_task_create(
             // with a clear summary of the task at creation time. No-op
             // if placeholder creation failed above.
             crate::tasks_notify::notify_task_created(&task, writer, reader);
+
+            // Task #596: when we auto-routed a `ready` task through
+            // planning to populate `affected_files`, leave a system
+            // breadcrumb explaining what happened. The planner reads
+            // the spec via task_get, so this message will surface to it
+            // as well as to the human auditing the task timeline.
+            //
+            // Note: only the state was changed. `skip_review` was
+            // honoured exactly as the caller specified (planning and
+            // review are orthogonal; routing through one shouldn't
+            // implicitly skip the other).
+            if auto_downgrade {
+                let note = "Auto-routed through planning: caller requested `ready` but didn't \
+                     declare `affected_files`. The task will go through the normal \
+                     planning → refining → ready flow so the planner can populate the \
+                     file list (which lets the scheduler run this task in parallel with \
+                     disjoint tasks). `skip_review` was left as the caller specified — \
+                     planning and review are orthogonal phases.";
+                if let Err(e) = db.add_message(task.id, note, Some("system")) {
+                    eprintln!(
+                        "tasks: failed to record auto-downgrade note on task {}: {}",
+                        task.id, e
+                    );
+                }
+            }
 
             // Subtasks start in ready or planning state — trigger a schedule pass.
             // Held tasks stay parked: the scheduler skips them until released
@@ -4101,6 +4183,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -4114,6 +4198,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4149,6 +4235,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4438,7 +4526,7 @@ mod tests {
         // Create subtask with initial_state="ready" — should start in ready state
         let result = handle_task_create(
             &db,
-            &serde_json::json!({"title": "Subtask skip plan", "parent_id": parent_id, "initial_state": "ready"}),
+            &serde_json::json!({"title": "Subtask skip plan", "parent_id": parent_id, "initial_state": "ready", "affected_files": ["src/sub.rs"]}),
             &ToolCtx {
                 project_name: Some("test-project"),
                 session_id: Some("s1"),
@@ -4452,6 +4540,328 @@ mod tests {
         assert!(!result.is_error);
         let subtask2: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(subtask2["state"], "ready");
+    }
+
+    // ---------------------------------------------------------------
+    // Auto-downgrade `ready` without `affected_files` (task #596)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_ready_without_affected_files_auto_downgrades_to_planning() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Auto-downgraded",
+                "initial_state": "ready",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "create should succeed");
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(
+            task["state"], "planning",
+            "should auto-downgrade to planning"
+        );
+        // skip_review is left at the default (false). Planning and review
+        // are orthogonal phases (task #596 design correction): routing
+        // through planning to populate the file list shouldn't implicitly
+        // skip the review phase.
+        assert_eq!(task["skip_review"], false);
+        assert_eq!(
+            task["auto_downgraded_from_ready"], true,
+            "flag should be persisted on the task"
+        );
+
+        // System breadcrumb message should be visible in the task timeline.
+        let task_id = task["id"].as_i64().unwrap();
+        let messages = db.get_messages(task_id).unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.author.as_deref() == Some("system")
+                    && m.content.contains("Auto-routed through planning")),
+            "expected an auto-routed system message, got {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn test_ready_with_explicit_affected_files_stays_ready() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Ready with files",
+                "initial_state": "ready",
+                "affected_files": ["src/foo.rs", "src/bar.rs"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(task["state"], "ready", "concrete files should stay ready");
+        assert_eq!(task["skip_review"], false, "skip_review should not flip");
+        assert_eq!(task["auto_downgraded_from_ready"], false);
+        assert_eq!(
+            task["affected_files"],
+            serde_json::json!(["src/foo.rs", "src/bar.rs"])
+        );
+    }
+
+    #[test]
+    fn test_ready_with_star_marker_stays_ready() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Survey task",
+                "initial_state": "ready",
+                "affected_files": ["*"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(
+            task["state"], "ready",
+            "`[\"*\"]` is the explicit escape hatch — stay in ready"
+        );
+        assert_eq!(task["auto_downgraded_from_ready"], false);
+        assert_eq!(task["affected_files"], serde_json::json!(["*"]));
+    }
+
+    #[test]
+    fn test_ready_with_explicit_skip_review_false_is_honoured() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Reviewer please",
+                "initial_state": "ready",
+                "skip_review": false,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        // Auto-downgrade still happens (no affected_files given)
+        assert_eq!(task["state"], "planning");
+        assert_eq!(task["auto_downgraded_from_ready"], true);
+        // skip_review stays false because the caller said so.
+        assert_eq!(
+            task["skip_review"], false,
+            "explicit skip_review=false must be honoured"
+        );
+    }
+
+    #[test]
+    fn test_ready_with_explicit_skip_review_true_is_preserved() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Skip review",
+                "initial_state": "ready",
+                "skip_review": true,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(task["state"], "planning");
+        assert_eq!(task["auto_downgraded_from_ready"], true);
+        assert_eq!(task["skip_review"], true);
+    }
+
+    #[test]
+    fn test_ready_with_auto_skip_review_default_on_downgrade() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // skip_review entirely unspecified — we do NOT touch it. Planning
+        // and review are orthogonal phases (task #596 design correction):
+        // routing through planning to populate the file list shouldn't
+        // implicitly skip the review phase.
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Default review",
+                "initial_state": "ready",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(task["state"], "planning");
+        assert_eq!(
+            task["skip_review"], false,
+            "unspecified skip_review must remain at the default (false) \
+             — planning and review are orthogonal phases"
+        );
+    }
+
+    #[test]
+    fn test_planning_initial_state_unaffected_by_downgrade_logic() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Plain planning, no affected_files. Should stay planning,
+        // skip_review default (false), no auto-downgrade flag.
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Plain plan",
+                "initial_state": "planning",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(task["state"], "planning");
+        assert_eq!(task["skip_review"], false);
+        assert_eq!(task["auto_downgraded_from_ready"], false);
+
+        let task_id = task["id"].as_i64().unwrap();
+        let messages = db.get_messages(task_id).unwrap();
+        assert!(
+            !messages.iter().any(|m| m.content.contains("Auto-routed")),
+            "plain planning task should not get an auto-route note"
+        );
+    }
+
+    #[test]
+    fn test_ready_with_empty_affected_files_array_auto_downgrades() {
+        // An empty array is treated the same as no affected_files.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Empty list",
+                "initial_state": "ready",
+                "affected_files": [],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(task["state"], "planning");
+        assert_eq!(task["auto_downgraded_from_ready"], true);
+    }
+
+    #[test]
+    fn test_affected_files_must_be_array_of_strings() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Bad files",
+                "initial_state": "ready",
+                "affected_files": [123, "valid"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(result.is_error);
+        assert!(
+            extract_text(&result).contains("affected_files"),
+            "error should mention affected_files: {}",
+            extract_text(&result)
+        );
     }
 
     #[test]
@@ -4472,6 +4882,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4537,6 +4949,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -4583,6 +4997,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -4617,6 +5033,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4692,6 +5110,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4771,6 +5191,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4854,6 +5276,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "s-any", "worker").unwrap();
@@ -4935,6 +5359,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5028,6 +5454,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "s-planner", "planner").unwrap();
@@ -5103,6 +5531,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -5171,6 +5601,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5249,6 +5681,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -5309,7 +5743,7 @@ mod tests {
             .map(|t| t.prompt_guidelines.len())
             .sum();
         assert!(
-            total < 18,
+            total < 19,
             "task_* prompt_guidelines total should stay small; got {}",
             total
         );
@@ -5438,6 +5872,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -5484,6 +5920,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -5512,6 +5950,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5525,6 +5965,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5554,6 +5996,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5567,6 +6011,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5606,6 +6052,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -5619,6 +6067,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5652,6 +6102,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5707,6 +6159,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.add_relation(task.id, dep.id, "depends_on").unwrap();
@@ -5738,6 +6192,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5751,6 +6207,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5784,6 +6242,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5797,6 +6257,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5831,6 +6293,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5844,6 +6308,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5880,6 +6346,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let t2 = db
@@ -5893,6 +6361,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6518,6 +6988,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "legacy-planner", "planner")
@@ -6574,6 +7046,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_placeholder_session_id(task.id, "placeholder-sid")
@@ -6628,6 +7102,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6698,6 +7174,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6779,6 +7257,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
 
@@ -6818,6 +7298,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -6915,6 +7397,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -6931,6 +7415,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -7004,6 +7490,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -7150,6 +7638,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7201,6 +7691,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -7260,6 +7752,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -7363,6 +7857,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_session_id(task.id, "worker-session").unwrap();
@@ -7441,6 +7937,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7505,6 +8003,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -7572,6 +8072,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -7642,6 +8144,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7705,6 +8209,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -7827,6 +8333,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -7943,6 +8451,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -7956,6 +8466,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8067,6 +8579,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -8080,6 +8594,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8191,6 +8707,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -8204,6 +8722,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8324,6 +8844,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -8337,6 +8859,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8395,6 +8919,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -8408,6 +8934,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8475,6 +9003,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -8488,6 +9018,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8560,6 +9092,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8650,6 +9184,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8857,6 +9393,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -8870,6 +9408,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -8942,6 +9482,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -8955,6 +9497,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -9165,6 +9709,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -9178,6 +9724,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -9255,6 +9803,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -9268,6 +9818,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -9424,6 +9976,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -9437,6 +9991,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -9561,6 +10117,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -9658,6 +10216,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -9731,6 +10291,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -9744,6 +10306,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -9835,6 +10399,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -9890,6 +10456,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -9973,6 +10541,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -9986,6 +10556,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -10031,6 +10603,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -10091,6 +10665,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db
@@ -10104,6 +10680,8 @@ mod tests {
                 "ready", // initial_state="ready" → starts in ready
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -10160,6 +10738,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -10411,6 +10991,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_branch(stuck_b.id, &format!("task-{}", stuck_b.id))
@@ -10520,6 +11102,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.create_task(
@@ -10532,6 +11116,8 @@ mod tests {
             "planning",
             false,
             None,
+            None,
+            false,
             None,
             false,
         )
@@ -10577,7 +11163,8 @@ mod tests {
     ) -> crate::tasks_db::Task {
         let task = db
             .create_task(
-                project, title, None, None, None, false, "ready", false, None, None, false,
+                project, title, None, None, None, false, "ready", false, None, None, false, None,
+                false,
             )
             .expect("create task");
         db.set_session_id(task.id, stale_sid)
@@ -10620,6 +11207,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -10833,6 +11422,7 @@ mod tests {
                 "title": "Parked",
                 "initial_state": "ready",
                 "hold": true,
+                "affected_files": ["src/parked.rs"],
             }),
             &ToolCtx {
                 project_name: Some("test-project"),
@@ -10888,6 +11478,8 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
+                false,
             )
             .unwrap();
 

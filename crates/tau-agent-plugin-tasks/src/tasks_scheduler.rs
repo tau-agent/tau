@@ -1052,6 +1052,24 @@ fn build_planning_message(task: &Task, project_instructions: &str, merge_target:
         String::new()
     };
 
+    // Task #596: gentle nudge for tasks auto-routed from `ready`. The
+    // caller thought their spec was complete; the planner should still
+    // do the full planning exploration but should treat the caller's
+    // scope as authoritative rather than re-litigating it.
+    let auto_downgrade_nudge = if task.auto_downgraded_from_ready {
+        "\n## Note: this task was auto-routed from `ready`\n\
+         \n\
+         The caller filed this task with `initial_state = ready` but didn't \
+         declare `affected_files`, so it was auto-routed through planning so \
+         the file list could be populated (which lets the scheduler run \
+         disjoint tasks in parallel). Treat the caller's spec and scope as \
+         authoritative — they thought the work was self-contained — but still \
+         do the full planning exploration: read the code, identify the files, \
+         produce a plan, transition to refining as usual.\n"
+    } else {
+        ""
+    };
+
     let mut msg = format!(
         "You are in the PLANNING phase for task {id}: {title}\n\
          \n\
@@ -1060,6 +1078,7 @@ fn build_planning_message(task: &Task, project_instructions: &str, merge_target:
          {nested}\
          Use the task_get tool to read the full specification:\n\
          - Call `task_get` with arguments: {{\"id\": {id}}}\n\
+         {nudge}\
          \n\
          ## Your mission\n\
          \n\
@@ -1080,6 +1099,7 @@ fn build_planning_message(task: &Task, project_instructions: &str, merge_target:
         branch = branch,
         target = merge_target,
         nested = nested_warning,
+        nudge = auto_downgrade_nudge,
     );
 
     if !project_instructions.is_empty() {
@@ -2934,6 +2954,7 @@ mod tests {
             sandbox_profile: None,
             held: false,
             placeholder_session_id: None,
+            auto_downgraded_from_ready: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -3610,6 +3631,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -3793,6 +3816,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.update_task(
@@ -3857,6 +3882,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -3936,6 +3963,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -4007,6 +4036,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         // interactive -> ready
@@ -4070,6 +4101,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -4086,6 +4119,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4141,6 +4176,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         db.record_session(task.id, "planner-session", "planner")
@@ -4191,6 +4228,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4255,6 +4294,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let task = db.get_task(task.id).unwrap().unwrap();
@@ -4300,6 +4341,8 @@ mod tests {
                 "ready",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4482,6 +4525,137 @@ mod tests {
     }
 
     #[test]
+    fn test_build_planning_message_auto_downgraded_emits_gentle_nudge() {
+        // Task #596: when the task carries the auto-downgrade flag, the
+        // planner gets a gentle nudge mentioning that the caller filed
+        // the task as ready (so its scope should be treated as
+        // authoritative). The standard planning instructions still
+        // apply — the planner should do full exploration and transition
+        // to refining as usual.
+        let mut task = make_task(42, 0, None);
+        task.title = "Auto-routed work".into();
+        task.auto_downgraded_from_ready = true;
+        let msg = build_planning_message(&task, "", "main");
+
+        // Gentle nudge present.
+        assert!(
+            msg.contains("auto-routed from `ready`"),
+            "expected auto-route nudge, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("authoritative"),
+            "expected nudge to flag scope as authoritative, got: {}",
+            msg
+        );
+
+        // Standard planning prompt still present — full exploration,
+        // transition to refining.
+        assert!(msg.contains("PLANNING phase"));
+        assert!(msg.contains("Your mission"));
+        assert!(
+            msg.contains("\"state\": \"refining\""),
+            "auto-downgraded planning still goes through refining, got: {}",
+            msg
+        );
+        assert!(msg.contains("task_message"));
+        assert!(msg.contains("affected_files"));
+    }
+
+    #[test]
+    fn test_build_planning_message_default_does_not_have_auto_route_nudge() {
+        let task = make_task(42, 0, None);
+        // Default task: auto_downgraded_from_ready is false.
+        assert!(!task.auto_downgraded_from_ready);
+        let msg = build_planning_message(&task, "", "main");
+        assert!(
+            !msg.contains("auto-routed from `ready`"),
+            "plain planning task should not get the auto-route nudge"
+        );
+        // Standard planning flow with refining transition.
+        assert!(msg.contains("refining"));
+    }
+
+    #[test]
+    fn test_auto_downgraded_task_walks_normal_planning_to_ready_path() {
+        // Task #596 (corrected): auto-downgraded tasks walk the normal
+        // planning → refining → ready path, just like any other
+        // planning-originated task. The auto-downgrade flag is purely
+        // informational (drives the planner-prompt nudge); it does not
+        // unlock a planning → ready shortcut.
+        use crate::tasks_db::TaskUpdate;
+
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Auto-downgraded",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                true, // auto_downgraded_from_ready
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+        assert!(task.auto_downgraded_from_ready);
+
+        // Direct planning -> ready is rejected (just like any other
+        // planning task).
+        let bad = db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                affected_files: Some(serde_json::json!(["src/foo.rs"])),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(
+            bad.is_err(),
+            "planning -> ready should be rejected for auto-downgraded tasks too: {:?}",
+            bad
+        );
+
+        // Normal planning → refining → ready works.
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                affected_files: Some(serde_json::json!(["src/foo.rs"])),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let updated = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("ready".into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated.state, "ready");
+        assert!(
+            updated.auto_downgraded_from_ready,
+            "flag persists across the planning flow"
+        );
+        assert_eq!(
+            updated.affected_files,
+            Some(serde_json::json!(["src/foo.rs"]))
+        );
+    }
+
+    #[test]
     fn test_build_review_message() {
         let mut task = make_task(10, 0, None);
         task.branch = Some("task-1-10".into());
@@ -4595,6 +4769,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let child = db
@@ -4608,6 +4784,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4635,6 +4813,8 @@ mod tests {
                 "interactive",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -4687,6 +4867,8 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
+                false,
             )
             .unwrap();
 
@@ -4733,6 +4915,8 @@ mod tests {
                 None,
                 None,
                 true,
+                None,
+                false,
             )
             .unwrap();
 
@@ -4828,6 +5012,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .unwrap();
         let child = db
@@ -4841,6 +5027,8 @@ mod tests {
                 "planning",
                 false,
                 None,
+                None,
+                false,
                 None,
                 false,
             )
@@ -5383,6 +5571,8 @@ mod tests {
                 None,
                 None,
                 /* held */ true,
+                None,
+                false,
             )
             .unwrap();
 
@@ -5630,7 +5820,7 @@ mod tests {
         let db = TasksDb::open_memory().expect("db");
         let task = db
             .create_task(
-                "p", "t", None, None, None, false, "ready", false, None, None, false,
+                "p", "t", None, None, None, false, "ready", false, None, None, false, None, false,
             )
             .expect("create");
         db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
@@ -5711,7 +5901,7 @@ mod tests {
         let db = TasksDb::open_memory().expect("db");
         let task = db
             .create_task(
-                "p", "t", None, None, None, false, "ready", false, None, None, false,
+                "p", "t", None, None, None, false, "ready", false, None, None, false, None, false,
             )
             .expect("create");
         db.set_placeholder_session_id(task.id, "s-ph").expect("ph");

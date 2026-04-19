@@ -605,6 +605,8 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
+                false,
             )
             .expect("create task");
         // interactive -> ready -> active -> review -> approved
