@@ -1956,8 +1956,6 @@ impl TasksDb {
         Ok(())
     }
 
-    /// Find tasks in terminal states (merged/closed/failed) that still have a worktree_path set.
-    /// Used for startup cleanup of stale worktrees.
     /// Find tasks that appear to be stuck: in `active` state with
     /// `session_id IS NULL` and `updated_at` older than `max_age_ms`
     /// milliseconds before `now_ms`.
@@ -2004,6 +2002,8 @@ impl TasksDb {
         Ok(tasks)
     }
 
+    /// Find tasks in terminal states (merged/closed/failed) that still have a worktree_path set.
+    /// Used for startup cleanup of stale worktrees.
     pub fn get_stale_worktree_tasks(&self) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
