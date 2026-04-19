@@ -4912,3 +4912,170 @@ fn subscriber_sees_error_then_agent_done_on_no_api_key() {
         events
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task #590 regression: CreateSession must not silently inherit a
+// no-agent-loop (log) model from its parent.
+// ---------------------------------------------------------------------------
+
+/// Spin up a test server registered with BOTH the mock provider (as the
+/// default model) and the log provider. Needed for task #590: we want to
+/// create a `log`-model placeholder session and then verify that a child
+/// created with `model = None` does NOT inherit `log` from the parent.
+fn start_mock_plus_log_test_server() -> (tempfile::TempDir, std::path::PathBuf) {
+    use tau_agent_lib::providers::log::{LogProvider, log_model};
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-test.sock");
+    let db_path = dir.path().join("test.db");
+    let sock_clone = sock_path.clone();
+
+    let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![]));
+    registry.register(LogProvider);
+
+    // mock_model() is listed first so it becomes the server's default_model;
+    // log_model() is registered so that explicit `model: "log"` requests
+    // resolve correctly.
+    let config = tau_agent_lib::server::TestServerConfig {
+        registry,
+        models: vec![mock_model(), log_model()],
+        socket_path: sock_clone,
+        db_path,
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    std::thread::spawn(move || {
+        smol::block_on(async {
+            if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
+                eprintln!("test server error: {}", e);
+            }
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sock_path.exists(), "server socket did not appear");
+    (dir, sock_path)
+}
+
+/// Regression for task #590.
+///
+/// Before the fix, creating a session with `model = None` and a `log`-
+/// provider parent silently inherited `log` as the new session's model.
+/// That made the child a second placeholder (no-agent-loop), silently
+/// bricking worker dispatches when the scheduler ran without a triggering
+/// session id.
+///
+/// After the fix, inheriting from a `needs_api_key == false` parent is
+/// suppressed server-side: the new session falls back to the server's
+/// configured default model instead.
+#[test]
+fn create_session_with_none_model_and_log_parent_uses_default() {
+    use tau_agent_lib::providers::log::log_model;
+
+    let (_dir, sock_path) = start_mock_plus_log_test_server();
+
+    // Create a log-provider parent session (simulates the task placeholder).
+    let parent_conn = UnixStream::connect(&sock_path).unwrap();
+    parent_conn
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let parent_id = match send_recv(
+        &parent_conn,
+        &Request::CreateSession {
+            model: Some("log".into()),
+            provider: Some("log".into()),
+            system_prompt: None,
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 4,
+            tagline: Some("placeholder".into()),
+            auto_archive: false,
+            notify_parent: false,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Sanity-check: the parent really is the log model.
+    let info_conn = UnixStream::connect(&sock_path).unwrap();
+    info_conn
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    match send_recv(
+        &info_conn,
+        &Request::GetSessionInfo {
+            session_id: parent_id.clone(),
+        },
+    ) {
+        Response::SessionInfo { info } => assert_eq!(info.model, log_model().id),
+        other => panic!("expected SessionInfo, got {:?}", other),
+    }
+
+    // Create a child with no explicit model. Historically this inherited
+    // the parent's model (log) and bricked the child.
+    let child_conn = UnixStream::connect(&sock_path).unwrap();
+    child_conn
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let child_id = match send_recv(
+        &child_conn,
+        &Request::CreateSession {
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: Some("/tmp".into()),
+            parent_id: Some(parent_id.clone()),
+            child_budget: 0,
+            tagline: Some("worker".into()),
+            auto_archive: false,
+            notify_parent: false,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // The child must NOT be a log session: it should have fallen back to
+    // the server's default model (the mock model).
+    let info_conn = UnixStream::connect(&sock_path).unwrap();
+    info_conn
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    match send_recv(
+        &info_conn,
+        &Request::GetSessionInfo {
+            session_id: child_id.clone(),
+        },
+    ) {
+        Response::SessionInfo { info } => {
+            assert_ne!(
+                info.model, "log",
+                "child must not inherit log model from placeholder parent"
+            );
+            assert_eq!(
+                info.model,
+                mock_model().id,
+                "child should fall back to default model when parent is a no-agent-loop session"
+            );
+        }
+        other => panic!("expected SessionInfo, got {:?}", other),
+    }
+
+    // Shutdown.
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send_recv(&conn, &Request::Shutdown { restart: false });
+}

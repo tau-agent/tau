@@ -118,6 +118,20 @@ pub(super) fn create_session_impl(
     // while we hold the state lock. This mirrors how
     // `load_project_instructions` is invoked from the task scheduler —
     // see models_config.rs for the rationale.
+    //
+    // Defence-in-depth (task #590): never inherit a model from a
+    // "no-agent-loop" parent (e.g. the `log` placeholder) — doing so
+    // bricks the new session because no provider will run an agent turn.
+    // When the parent's provider reports `needs_api_key() == false`, we
+    // treat the parent as if it had no model for inheritance purposes and
+    // fall back to the server-wide default instead.
+    let inheritable_parent_model = parent.as_ref().and_then(|p| {
+        if st.registry.needs_api_key(&p.model.api) {
+            Some(p.model.clone())
+        } else {
+            None
+        }
+    });
     let model = if let Some(mid) = model_id {
         let project_aliases = cwd
             .as_deref()
@@ -152,17 +166,13 @@ pub(super) fn create_session_impl(
             Err(crate::model_resolve::ResolveError::UnknownModel { .. }) => {
                 // Not an alias and not a known model id — preserve the
                 // historical fall-through to parent / default.
-                parent
-                    .as_ref()
-                    .map(|p| p.model.clone())
+                inheritable_parent_model
+                    .clone()
                     .unwrap_or_else(|| st.default_model.clone())
             }
         }
     } else {
-        parent
-            .as_ref()
-            .map(|p| p.model.clone())
-            .unwrap_or_else(|| st.default_model.clone())
+        inheritable_parent_model.unwrap_or_else(|| st.default_model.clone())
     };
 
     let id = match st.db.next_session_id() {

@@ -586,6 +586,48 @@ pub fn get_session_model(
     }
 }
 
+/// Look up a session's parent session id via GetSessionInfo.
+///
+/// Returns `None` if the request fails, the session is not found, or the
+/// session is a root session (no parent).
+pub fn get_session_parent(
+    session_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<String> {
+    let req = tau_agent_plugin::Request::GetSessionInfo {
+        session_id: session_id.to_string(),
+    };
+    match server_request(writer, reader, req) {
+        Ok(tau_agent_plugin::Response::SessionInfo { info }) => info.parent_id,
+        _ => None,
+    }
+}
+
+/// Last-resort fallback for `resolve_model_source`: when no planner,
+/// session_id, parent-task session, or explicit triggering session is
+/// available, walk up the task's placeholder-session parent chain.
+///
+/// Placeholders are created anchored on a real (non-log) session (the
+/// root of the creator's session tree — see `find_root_session` in
+/// `tasks.rs`), so the placeholder's own `parent_id` points at a
+/// session whose model is appropriate to inherit.
+///
+/// This fixes the bug where top-level ready tasks auto-dispatched with
+/// `parent_session_id = None` ended up with the placeholder's own model
+/// (`log`) silently inherited on the worker — see task #590.
+///
+/// Returns `None` if the task has no placeholder, the placeholder lookup
+/// fails, or the placeholder is a root session itself (no parent).
+fn resolve_placeholder_model_source(
+    task: &Task,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<String> {
+    let placeholder_sid = task.placeholder_session_id.as_deref()?;
+    get_session_parent(placeholder_sid, writer, reader)
+}
+
 /// Walk up the session parent chain and return the topmost (root) session's
 /// ID.
 ///
@@ -732,7 +774,8 @@ pub fn dispatch(
 
     // Model inheritance: use the triggering session (e.g. the refiner that
     // moved the task to ready), falling back through the hierarchy.
-    let model_source = resolve_model_source(db, &task, parent_session_id);
+    let model_source = resolve_model_source(db, &task, parent_session_id)
+        .or_else(|| resolve_placeholder_model_source(&task, writer, reader));
     let model = model_source
         .as_deref()
         .and_then(|sid| get_session_model(sid, writer, reader));
@@ -880,7 +923,8 @@ fn dispatch_planning(
     }
 
     // Model inheritance: use the triggering session for model.
-    let model_source = resolve_model_source(db, task, parent_session_id);
+    let model_source = resolve_model_source(db, task, parent_session_id)
+        .or_else(|| resolve_placeholder_model_source(task, writer, reader));
     let model = model_source
         .as_deref()
         .and_then(|sid| get_session_model(sid, writer, reader));
@@ -1143,7 +1187,8 @@ pub fn dispatch_review(
 
     // Model inheritance: use the triggering session for model, falling back
     // through the hierarchy.
-    let model_source = resolve_model_source(db, task, parent_session_id);
+    let model_source = resolve_model_source(db, task, parent_session_id)
+        .or_else(|| resolve_placeholder_model_source(task, writer, reader));
     let model = model_source
         .as_deref()
         .and_then(|sid| get_session_model(sid, writer, reader));
@@ -1378,7 +1423,8 @@ pub fn dispatch_refining(
 
     // Model inheritance: use the triggering session for model, falling back
     // through the hierarchy.
-    let model_source = resolve_model_source(db, task, parent_session_id);
+    let model_source = resolve_model_source(db, task, parent_session_id)
+        .or_else(|| resolve_placeholder_model_source(task, writer, reader));
     let model = model_source
         .as_deref()
         .and_then(|sid| get_session_model(sid, writer, reader));
@@ -4103,6 +4149,174 @@ mod tests {
         );
     }
 
+    /// Regression for task #590.
+    ///
+    /// When the scheduler auto-dispatches a top-level, file-less task with
+    /// `parent_session_id = None` and no planner/session_id/parent-task
+    /// session available, `resolve_model_source` returns `None`. The server
+    /// would then inherit the placeholder's `log` model onto the worker and
+    /// silently brick it.
+    ///
+    /// The fix adds `resolve_placeholder_model_source` as a final fallback
+    /// that walks up the placeholder's parent chain (one hop) to find a
+    /// real (non-log) session to inherit from.
+    #[test]
+    fn test_resolve_placeholder_model_source_walks_up_placeholder_parent() {
+        use std::io::BufReader;
+
+        let db = TasksDb::open_memory().unwrap();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Top-level file-less task",
+                Some(5),
+                None, // parent_id: top-level
+                None,
+                true,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.set_placeholder_session_id(task.id, "s-placeholder")
+            .unwrap();
+
+        let task = db.get_task(task.id).unwrap().unwrap();
+
+        // Without the fallback, the existing resolver returns None: no
+        // planner, no session_id, no parent task.
+        assert_eq!(
+            resolve_model_source(&db, &task, None),
+            None,
+            "baseline: auto-dispatched top-level task has no model source"
+        );
+
+        // The placeholder was anchored on the creator's root session
+        // ("s-root") when the task was filed. `resolve_placeholder_model_source`
+        // walks one hop up and returns that root as the model source.
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(SessionInfoMock {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            responses: std::collections::HashMap::from([(
+                "s-placeholder".to_string(),
+                session_info("s-placeholder", Some("s-root"), false),
+            )]),
+        }));
+        let mut writer = MockSessionInfoWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockSessionInfoReader {
+            shared: shared.clone(),
+        };
+        let mut reader_buf = BufReader::new(reader);
+
+        assert_eq!(
+            resolve_placeholder_model_source(&task, &mut writer, &mut reader_buf),
+            Some("s-root".to_string()),
+            "should walk up placeholder parent chain to the creator's root session"
+        );
+    }
+
+    /// `resolve_placeholder_model_source` returns `None` when the task has
+    /// no placeholder — in that case the caller has no better option than
+    /// to let the server fall back to its configured default model.
+    #[test]
+    fn test_resolve_placeholder_model_source_none_without_placeholder() {
+        use std::io::BufReader;
+
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Task without placeholder",
+                Some(5),
+                None,
+                None,
+                true,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let task = db.get_task(task.id).unwrap().unwrap();
+        assert!(task.placeholder_session_id.is_none());
+
+        // No network round-trip expected: mock with no canned responses.
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(SessionInfoMock {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            responses: std::collections::HashMap::new(),
+        }));
+        let mut writer = MockSessionInfoWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockSessionInfoReader {
+            shared: shared.clone(),
+        };
+        let mut reader_buf = BufReader::new(reader);
+
+        assert_eq!(
+            resolve_placeholder_model_source(&task, &mut writer, &mut reader_buf),
+            None,
+            "no placeholder → no placeholder-derived model source"
+        );
+    }
+
+    /// `resolve_placeholder_model_source` returns `None` when the
+    /// placeholder is itself a root session (no parent) — the caller then
+    /// delegates to the server-wide default.
+    #[test]
+    fn test_resolve_placeholder_model_source_none_when_placeholder_is_root() {
+        use std::io::BufReader;
+
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Task with root-placeholder",
+                Some(5),
+                None,
+                None,
+                true,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.set_placeholder_session_id(task.id, "s-placeholder")
+            .unwrap();
+        let task = db.get_task(task.id).unwrap().unwrap();
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(SessionInfoMock {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            responses: std::collections::HashMap::from([(
+                "s-placeholder".to_string(),
+                session_info("s-placeholder", None, false),
+            )]),
+        }));
+        let mut writer = MockSessionInfoWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockSessionInfoReader {
+            shared: shared.clone(),
+        };
+        let mut reader_buf = BufReader::new(reader);
+
+        assert_eq!(
+            resolve_placeholder_model_source(&task, &mut writer, &mut reader_buf),
+            None,
+            "root placeholder has no parent to inherit from"
+        );
+    }
+
     /// Verify that `server_request` handles a concurrent `ToolCall` arriving
     /// while waiting for a `ServerResponse`.
     ///
@@ -4982,6 +5196,95 @@ mod tests {
         };
         let mut reader_buf = BufReader::new(reader);
         super::find_root_session(session_id, &mut writer, &mut reader_buf)
+    }
+
+    /// Mock for `GetSessionInfo` round-trips (used by `get_session_model`
+    /// and `get_session_parent`). Canned `SessionInfo` responses keyed by
+    /// session id; a missing id yields a `SessionInfo` response for a
+    /// synthetic empty session (which produces the same "no parent, model
+    /// unknown" outcome as the server would for a missing id, for test
+    /// simplicity).
+    struct SessionInfoMock {
+        write_buf: Vec<u8>,
+        read_buf: Vec<u8>,
+        responses: std::collections::HashMap<String, tau_agent_plugin::SessionInfo>,
+    }
+
+    impl SessionInfoMock {
+        fn process(&mut self) {
+            use tau_agent_base::plugin_protocol::{PluginMessage, PluginRequest};
+            let buf = std::mem::take(&mut self.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let Ok(msg) = serde_json::from_str::<PluginMessage>(line) else {
+                    continue;
+                };
+                let PluginMessage::ServerRequest {
+                    request_id,
+                    request,
+                } = msg
+                else {
+                    continue;
+                };
+                let tau_agent_plugin::Request::GetSessionInfo { session_id } = request else {
+                    continue;
+                };
+                let response = match self.responses.get(&session_id) {
+                    Some(info) => tau_agent_plugin::Response::SessionInfo { info: info.clone() },
+                    None => tau_agent_plugin::Response::Error {
+                        message: format!("session {} not found", session_id),
+                    },
+                };
+                let resp = PluginRequest::ServerResponse {
+                    request_id,
+                    response,
+                };
+                if let Ok(mut json) = serde_json::to_string(&resp) {
+                    json.push('\n');
+                    self.read_buf.extend_from_slice(json.as_bytes());
+                }
+            }
+        }
+    }
+
+    struct MockSessionInfoWriter {
+        shared: std::sync::Arc<std::sync::Mutex<SessionInfoMock>>,
+    }
+    impl std::io::Write for MockSessionInfoWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.shared
+                .lock()
+                .expect("mock writer lock")
+                .write_buf
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MockSessionInfoReader {
+        shared: std::sync::Arc<std::sync::Mutex<SessionInfoMock>>,
+    }
+    impl std::io::Read for MockSessionInfoReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut shared = self.shared.lock().expect("mock reader lock");
+            shared.process();
+            if shared.read_buf.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no more mock responses",
+                ));
+            }
+            let n = std::cmp::min(buf.len(), shared.read_buf.len());
+            buf[..n].copy_from_slice(&shared.read_buf[..n]);
+            shared.read_buf.drain(..n);
+            Ok(n)
+        }
     }
 
     #[test]
