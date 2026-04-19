@@ -386,9 +386,6 @@ pub fn notify_state_change_split(
     }
 }
 
-/// (Removed `is_terminal_state` helper — replaced by
-/// [`TaskState::is_terminal`] on the enum itself; see `tasks_state.rs`.)
-
 /// Format the human-readable terminal summary posted to the placeholder
 /// on transitions into `merged` / `closed` / `failed`.
 ///
