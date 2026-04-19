@@ -1,9 +1,9 @@
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 
 use async_trait::async_trait;
 
 use super::anthropic_types::*;
-use super::common::{self, StreamCtx, send_event};
+use super::common::{self, PreparedStream, StreamCtx, open_sse_stream, send_event};
 use crate::provider::{EventReceiver, EventSender, Provider};
 use tau_agent_base::types::*;
 
@@ -94,63 +94,33 @@ fn run_stream(
     let url = format!("{}/v1/messages", ctx.base_url.trim_end_matches('/'));
 
     let is_oauth = tau_agent_base::subscription_usage::is_oauth_token(ctx.api_key);
-    let mut req = ureq::post(&url)
-        .header("content-type", "application/json")
-        .header("anthropic-version", "2023-06-01")
-        .header("accept", "application/json");
 
+    // Locals must outlive the &str borrows in `extra_headers`. OAuth header
+    // ordering below is load-bearing — preserve it exactly.
+    let oauth_auth;
+    let mut extra_headers: Vec<(&str, &str)> = Vec::with_capacity(8);
+    extra_headers.push(("anthropic-version", "2023-06-01"));
+    extra_headers.push(("accept", "application/json"));
     if is_oauth {
-        req = req
-            .header("authorization", &format!("Bearer {}", ctx.api_key))
-            .header(
-                "anthropic-beta",
-                "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
-            )
-            .header("user-agent", "claude-cli/2.1.75")
-            .header("x-app", "cli")
-            .header("anthropic-dangerous-direct-browser-access", "true");
+        oauth_auth = format!("Bearer {}", ctx.api_key);
+        extra_headers.push(("authorization", oauth_auth.as_str()));
+        extra_headers.push((
+            "anthropic-beta",
+            "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
+        ));
+        extra_headers.push(("user-agent", "claude-cli/2.1.75"));
+        extra_headers.push(("x-app", "cli"));
+        extra_headers.push(("anthropic-dangerous-direct-browser-access", "true"));
     } else {
-        req = req
-            .header("x-api-key", ctx.api_key)
-            .header("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
+        extra_headers.push(("x-api-key", ctx.api_key));
+        extra_headers.push(("anthropic-beta", "fine-grained-tool-streaming-2025-05-14"));
     }
 
-    let mut resp = req
-        .config()
-        .timeout_connect(Some(common::TIMEOUT_CONNECT))
-        .timeout_send_request(Some(common::TIMEOUT_SEND_REQUEST))
-        .timeout_send_body(Some(common::TIMEOUT_SEND_BODY))
-        .timeout_recv_response(Some(ctx.recv_response_timeout))
-        .http_status_as_error(false)
-        .build()
-        .send_json(body)
-        .map_err(|e| tau_agent_base::Error::Http(e.to_string()))?;
-
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-        use std::io::Read;
-        let mut body_text = String::new();
-        let _ = resp.body_mut().as_reader().read_to_string(&mut body_text);
-        return Err(tau_agent_base::Error::HttpStatus {
-            status,
-            message: body_text,
-            retry_after,
-        });
-    }
-
-    let reader = BufReader::new(resp.body_mut().as_reader());
-    let mut output = AssistantMessage::empty(ctx.api_id, ctx.provider_name, ctx.model_id);
-    send_event(
-        tx,
-        StreamEvent::Start {
-            partial: output.clone(),
-        },
-    )?;
+    let PreparedStream {
+        body_reader,
+        initial_message: mut output,
+    } = open_sse_stream(ctx, &url, &extra_headers, body, tx)?;
+    let reader = body_reader;
 
     let mut block_index_map: Vec<(u64, usize)> = Vec::new();
     let mut current_event_type = String::new();
