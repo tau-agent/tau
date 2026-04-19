@@ -53,6 +53,33 @@ impl ArchiveRetryPolicy {
     }
 }
 
+/// Enqueue a post-idle action for `session_id`, then drain inline if the
+/// session is not currently running an agent turn.
+///
+/// Background: the queue is normally drained when the target session's
+/// own agent loop completes.  But callers like reviewer sessions that
+/// only mark a task `approved` and then sit idle never get another turn,
+/// so without an inline drain the action would sit forever (task #594).
+/// The session being absent from `live_sessions` means there is no agent
+/// loop to race with, so executing the action right now is safe.
+pub(super) async fn enqueue_and_maybe_drain(
+    state: &SharedState,
+    session_id: &str,
+    action: PostIdleAction,
+) {
+    let should_drain_inline = {
+        let mut st = lock_state(state);
+        st.post_idle_queue
+            .entry(session_id.to_string())
+            .or_default()
+            .push(action);
+        !st.live_sessions.contains(session_id)
+    };
+    if should_drain_inline {
+        drain(state, session_id).await;
+    }
+}
+
 /// Drain all post-idle actions enqueued for `session_id`.  Call this after
 /// the agent loop has exited and the session's lock has been released.
 pub(super) async fn drain(state: &SharedState, session_id: &str) {
@@ -434,6 +461,57 @@ mod tests {
                 !st.post_idle_queue.contains_key("s-caller"),
                 "queue entry should be drained"
             );
+        });
+    }
+
+    /// `enqueue_and_maybe_drain` drains inline when the target session is
+    /// not currently running an agent turn (the task #594 fix path).
+    /// We use a task_id with no sessions in the on-disk tasks DB — the
+    /// archive action becomes a no-op but the queue entry is still
+    /// drained, proving the inline drain ran.
+    #[test]
+    fn enqueue_and_maybe_drain_runs_inline_when_session_idle() {
+        smol::block_on(async {
+            let state = mk_state();
+            // Session not in live_sessions → should drain inline.
+            enqueue_and_maybe_drain(
+                &state,
+                "s-idle",
+                PostIdleAction::ArchiveTaskSessions { task_id: i64::MAX },
+            )
+            .await;
+            let st = lock_state(&state);
+            assert!(
+                !st.post_idle_queue.contains_key("s-idle"),
+                "queue should have been drained inline"
+            );
+        });
+    }
+
+    /// `enqueue_and_maybe_drain` defers to the normal turn-completion
+    /// drain when the target session IS currently running a turn.  The
+    /// queue entry must remain so the running agent loop's exit drain
+    /// picks it up; running it inline would race with the agent.
+    #[test]
+    fn enqueue_and_maybe_drain_defers_when_session_live() {
+        smol::block_on(async {
+            let state = mk_state();
+            {
+                let mut st = lock_state(&state);
+                st.live_sessions.insert("s-busy".into());
+            }
+            enqueue_and_maybe_drain(
+                &state,
+                "s-busy",
+                PostIdleAction::ArchiveTaskSessions { task_id: i64::MAX },
+            )
+            .await;
+            let st = lock_state(&state);
+            let queued = st
+                .post_idle_queue
+                .get("s-busy")
+                .expect("entry should remain queued for live session");
+            assert_eq!(queued.len(), 1, "exactly one action queued");
         });
     }
 }

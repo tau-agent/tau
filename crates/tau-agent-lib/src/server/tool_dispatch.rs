@@ -513,13 +513,7 @@ pub(super) async fn handle_server_request(
             Response::Ok
         }
         Request::EnqueuePostIdleAction { session_id, action } => {
-            {
-                let mut st = lock_state(state);
-                st.post_idle_queue
-                    .entry(session_id.clone())
-                    .or_default()
-                    .push(action.clone());
-            }
+            super::post_idle::enqueue_and_maybe_drain(state, session_id, action.clone()).await;
             Response::Ok
         }
         Request::ArchiveSession {
