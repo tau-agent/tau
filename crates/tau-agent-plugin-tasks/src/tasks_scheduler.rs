@@ -708,6 +708,329 @@ pub fn find_root_session(
     Some(last.id.clone())
 }
 
+// ---------------------------------------------------------------------------
+// Task phase orchestration (shared by worker / planner / reviewer / refiner)
+// ---------------------------------------------------------------------------
+
+/// Which lifecycle phase a dispatch is for. Encodes the per-phase axes of
+/// variation consumed by [`dispatch_task_phase`].
+///
+/// The four variants map onto the four `dispatch_*` public functions —
+/// `dispatch` (worker), `dispatch_planning`, `dispatch_review`,
+/// `dispatch_refining`. The enum deliberately keeps all per-phase
+/// policy (DB role name, cwd, parent-resolution rule, reuse-resume
+/// message, whether to overwrite `task.session_id`, whether to emit a
+/// `ready → active` notification, which `build_*_message` to call) in a
+/// single place so adding a new phase is a one-variant change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskPhase {
+    Worker,
+    Planner,
+    Reviewer,
+    Refiner,
+}
+
+impl TaskPhase {
+    /// DB role used with `find_latest_session_by_role` and
+    /// `record_session`.
+    fn db_role(&self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Planner => "planner",
+            Self::Reviewer => "reviewer",
+            Self::Refiner => "refiner",
+        }
+    }
+
+    /// Human-facing phase name — the `role` passed to `TaskSessionSpec`
+    /// (and thus `task_session_tagline`) and the instructions key for
+    /// `tasks_config::load_project_instructions`.
+    fn phase_name(&self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Planner => "planning",
+            Self::Reviewer => "review",
+            Self::Refiner => "refining",
+        }
+    }
+
+    /// Working directory for the phase's session.
+    ///
+    /// - Worker: the task's worktree (may be `None` if not yet created).
+    /// - Planner, Refiner: the project root (read-only phases, no worktree).
+    /// - Reviewer: the task's worktree, falling back to the project root
+    ///   (reviewers read the diff — the worktree is the right place, but
+    ///   they tolerate a missing worktree).
+    fn cwd(&self, task: &Task, project_path: &str) -> Option<String> {
+        match self {
+            Self::Worker => task.worktree_path.clone(),
+            Self::Planner | Self::Refiner => Some(project_path.to_string()),
+            Self::Reviewer => task
+                .worktree_path
+                .clone()
+                .or_else(|| Some(project_path.to_string())),
+        }
+    }
+
+    /// Per-phase fallback for the hierarchy parent (before the top-level
+    /// root-session re-parenting rule is applied).
+    ///
+    /// Planner differs: it skips the planner-hop that
+    /// [`resolve_hierarchy_parent`] performs, because the planner *is*
+    /// itself the planner — re-using the stale prior planner session as
+    /// its own parent is incorrect. Instead it uses the explicit
+    /// triggering session (if any), falling back to the parent task's
+    /// session.
+    fn hierarchy_parent(
+        &self,
+        db: &TasksDb,
+        task: &Task,
+        parent_session_id: Option<&str>,
+    ) -> Option<String> {
+        match self {
+            Self::Planner => parent_session_id
+                .map(str::to_string)
+                .or_else(|| resolve_parent_session(db, task)),
+            Self::Worker | Self::Reviewer | Self::Refiner => resolve_hierarchy_parent(db, task),
+        }
+    }
+
+    /// Whether a top-level task with no placeholder should re-parent its
+    /// new session onto the triggering session's root (task #512). Only
+    /// applies to the entry phases (worker + planner); review/refining
+    /// only run once the task already has a session chain, so the
+    /// hierarchy parent is always appropriate.
+    fn top_level_root_fallback(&self) -> bool {
+        matches!(self, Self::Worker | Self::Planner)
+    }
+
+    /// QueueMessage content to send when reusing an existing session.
+    /// Worker reuse is a silent short-circuit (the worker should already
+    /// be mid-work; waking it up with a message would duplicate work),
+    /// so this returns `None` for `Worker`.
+    ///
+    /// The other three phases send a phase-appropriate "resume" message
+    /// so the idle session notices the backward transition and picks up
+    /// the latest feedback. Without this the task would stall (bug #589
+    /// for the planner; planner/reviewer/refiner all now behave the
+    /// same way).
+    fn reuse_resume_message(&self, task_id: i64) -> Option<String> {
+        match self {
+            Self::Worker => None,
+            Self::Planner => Some(format!(
+                "Task {id} has been moved back to planning for further work. \
+                 Please run task_get to read the latest feedback and revise the plan, \
+                 then transition the task forward again.\n\
+                 - Call `task_get` with arguments: {{\"id\": {id}}}",
+                id = task_id,
+            )),
+            Self::Reviewer => Some(format!(
+                "Task {id} has been re-submitted for review. \
+                 Please run task_get to read the latest changes and review feedback, \
+                 then re-review the work.\n\
+                 - Call `task_get` with arguments: {{\"id\": {id}}}",
+                id = task_id,
+            )),
+            Self::Refiner => Some(format!(
+                "Task {id} has been re-submitted for refining. \
+                 The plan has been revised. Please run task_get to read the updated \
+                 plan and re-evaluate it.\n\
+                 - Call `task_get` with arguments: {{\"id\": {id}}}",
+                id = task_id,
+            )),
+        }
+    }
+
+    /// Whether the newly-created session id should overwrite
+    /// `task.session_id`. Only worker + planner do this; review and
+    /// refining leave the planner's/worker's session in place so the UI
+    /// keeps pointing at the primary session for the current phase.
+    fn sets_task_session_id(&self) -> bool {
+        matches!(self, Self::Worker | Self::Planner)
+    }
+
+    /// Whether to emit a `ready → active` `notify_state_change` after
+    /// creation. Worker-only — the `ready → active` transition is the
+    /// only one the scheduler applies inside `dispatch`; the other three
+    /// phases transition via `task_update` which has its own notifier.
+    fn emits_ready_to_active_notify(&self) -> bool {
+        matches!(self, Self::Worker)
+    }
+
+    /// Build the initial Chat message for this phase.
+    fn build_chat_message(
+        &self,
+        task: &Task,
+        project_instructions: &str,
+        merge_target: &str,
+        checklist: &[crate::tasks_merge::CheckItem],
+    ) -> String {
+        match self {
+            Self::Worker => {
+                build_initial_message(task, merge_target, project_instructions, checklist)
+            }
+            Self::Planner => build_planning_message(task, project_instructions, merge_target),
+            Self::Reviewer => {
+                build_review_message(task, project_instructions, merge_target, checklist)
+            }
+            Self::Refiner => build_refining_message(task, project_instructions, merge_target),
+        }
+    }
+}
+
+/// Send the initial Chat to a freshly-created session. Extracted because
+/// all four phases used to open-code the same `Request::Chat` + match
+/// ladder and the only variation was a log label. Errors map to
+/// `Error::Io` with a message that names the phase + session id for
+/// easier log triage.
+fn send_initial_chat(
+    session_id: &str,
+    phase_role: &str,
+    text: String,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> tau_agent_plugin::Result<()> {
+    let chat_req = tau_agent_plugin::Request::Chat {
+        session_id: session_id.to_string(),
+        text,
+    };
+    match server_request(writer, reader, chat_req) {
+        Ok(tau_agent_plugin::Response::Ok) => Ok(()),
+        Ok(tau_agent_plugin::Response::Error { message }) => {
+            Err(tau_agent_plugin::Error::Io(format!(
+                "{} session {} created but chat failed: {}",
+                phase_role, session_id, message
+            )))
+        }
+        Ok(other) => Err(tau_agent_plugin::Error::Io(format!(
+            "{} session {} created but unexpected chat response: {:?}",
+            phase_role, session_id, other
+        ))),
+        Err(e) => Err(tau_agent_plugin::Error::Io(format!(
+            "{} session {} created but chat failed: {}",
+            phase_role, session_id, e
+        ))),
+    }
+}
+
+/// Shared orchestration body for the four phase-dispatch functions.
+///
+/// Handles session reuse, model + parent resolution, session creation
+/// (via [`crate::tasks_session::create_task_session`]), the initial
+/// chat, and the DB writes + notifications each phase needs.
+/// Phase-specific decisions are delegated to [`TaskPhase`] methods.
+///
+/// Returns the session id of the new (or reused) session.
+pub(crate) fn dispatch_task_phase(
+    db: &TasksDb,
+    task: &Task,
+    phase: TaskPhase,
+    parent_session_id: Option<&str>,
+    project_path: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> tau_agent_plugin::Result<String> {
+    let task_id = task.id;
+
+    // --- 1. Reuse path -----------------------------------------------------
+    if let Some(existing_sid) = find_reusable_session(db, task_id, phase.db_role(), writer, reader)
+    {
+        if let Some(msg) = phase.reuse_resume_message(task_id) {
+            resume_session(&existing_sid, task_id, &msg, writer, reader)?;
+        }
+        eprintln!(
+            "tasks scheduler: task {} already has a live {} session {}, reusing",
+            task_id,
+            phase.db_role(),
+            existing_sid
+        );
+        crate::tasks_notify::set_session_tagline(
+            &existing_sid,
+            &crate::tasks_notify::task_session_tagline(task, phase.phase_name()),
+            writer,
+            reader,
+        );
+        return Ok(existing_sid);
+    }
+
+    // --- 2. Stale session_id log ------------------------------------------
+    // Worker + planner used to log this explicitly; review + refining never
+    // did (they don't overwrite session_id below, so the prior id is still
+    // correct). Keep the log gated on phases that actually overwrite
+    // session_id to preserve previous behaviour byte-for-byte.
+    if phase.sets_task_session_id() {
+        if let Some(ref existing_sid) = task.session_id {
+            eprintln!(
+                "tasks scheduler: task {} replacing previous session {} with new {} dispatch",
+                task_id,
+                existing_sid,
+                phase.db_role()
+            );
+        }
+    }
+
+    // --- 3. Model inheritance ---------------------------------------------
+    let model_source = resolve_model_source(db, task, parent_session_id)
+        .or_else(|| resolve_placeholder_model_source(task, writer, reader));
+    let model = model_source
+        .as_deref()
+        .and_then(|sid| get_session_model(sid, writer, reader));
+
+    // --- 4. Parent resolution ---------------------------------------------
+    let hierarchy_parent = phase.hierarchy_parent(db, task, parent_session_id);
+    let session_parent = task.placeholder_session_id.clone().or_else(|| {
+        if task.parent_id.is_none() && phase.top_level_root_fallback() {
+            parent_session_id.and_then(|sid| find_root_session(sid, writer, reader))
+        } else {
+            hierarchy_parent.clone()
+        }
+    });
+
+    // --- 5. Create session ------------------------------------------------
+    let session_id = crate::tasks_session::create_task_session(
+        crate::tasks_session::TaskSessionSpec {
+            task,
+            role: phase.phase_name(),
+            model,
+            cwd: phase.cwd(task, project_path),
+            parent_id: session_parent,
+            child_budget: 16,
+            sandbox_profile: task.sandbox_profile.clone(),
+        },
+        writer,
+        reader,
+    )?;
+
+    // --- 6. Initial chat --------------------------------------------------
+    let merge_target = db
+        .get_merge_target(task_id)
+        .unwrap_or_else(|_| "main".into());
+    let project_instructions = tasks_config::load_project_instructions(
+        project_path,
+        Some(&task.project_name),
+        phase.phase_name(),
+    )
+    .unwrap_or_default();
+    let checklist = crate::tasks_merge::load_checklist(project_path, Some(&task.project_name));
+    let chat_msg = phase.build_chat_message(task, &project_instructions, &merge_target, &checklist);
+    send_initial_chat(&session_id, phase.phase_name(), chat_msg, writer, reader)?;
+
+    // --- 7. DB writes -----------------------------------------------------
+    if phase.sets_task_session_id() {
+        db.set_session_id(task_id, &session_id)?;
+    }
+    db.record_session(task_id, &session_id, phase.db_role())?;
+
+    // --- 8. Optional ready → active notification --------------------------
+    if phase.emits_ready_to_active_notify() {
+        if let Ok(Some(updated)) = db.get_task(task_id) {
+            crate::tasks_notify::notify_state_change(db, &updated, "ready", None, writer, reader);
+        }
+    }
+
+    Ok(session_id)
+}
+
 /// Dispatch a single task: create a session via ServerRequest, send initial
 /// chat, and update the task with the session ID.
 ///
@@ -766,128 +1089,15 @@ pub fn dispatch(
         tau_agent_plugin::Error::Io(format!("task {} not found after prepare", task_id))
     })?;
 
-    // If there is already a live worker session for this task, reuse it
-    // instead of creating a duplicate.  This makes dispatch idempotent:
-    // calling it twice (e.g. from a second schedule pass after a partial
-    // failure, or via a manual task_dispatch call) will not spawn a second
-    // session.
-    if let Some(existing_sid) = find_reusable_session(db, task_id, "worker", writer, reader) {
-        eprintln!(
-            "tasks scheduler: task {} already has a live worker session {}, reusing",
-            task_id, existing_sid
-        );
-        crate::tasks_notify::set_session_tagline(
-            &existing_sid,
-            &crate::tasks_notify::task_session_tagline(&task, "worker"),
-            writer,
-            reader,
-        );
-        return Ok(existing_sid);
-    }
-
-    // If the task has a session_id from a previous lifecycle phase (e.g. a
-    // planner or refiner session), log and continue — the old session is
-    // already recorded in the task_sessions table, and set_session_id below
-    // will overwrite with the new worker session.
-    if let Some(ref existing_sid) = task.session_id {
-        eprintln!(
-            "tasks scheduler: task {} replacing previous session {} with new worker dispatch",
-            task_id, existing_sid
-        );
-    }
-
-    let cwd = task.worktree_path.clone();
-
-    // Model inheritance: use the triggering session (e.g. the refiner that
-    // moved the task to ready), falling back through the hierarchy.
-    let model_source = resolve_model_source(db, &task, parent_session_id)
-        .or_else(|| resolve_placeholder_model_source(&task, writer, reader));
-    let model = model_source
-        .as_deref()
-        .and_then(|sid| get_session_model(sid, writer, reader));
-
-    // Session parenting: use the task's planner session (the orchestrator),
-    // not the refiner/reviewer that triggered the state change.
-    let hierarchy_parent = resolve_hierarchy_parent(db, &task);
-
-    // Task #561: prefer the task's placeholder. Otherwise fall back to
-    // the legacy rule: top-level tasks re-parent new worker sessions
-    // onto the triggering session's root so they surface in the user's
-    // primary session tree regardless of where in the tree the task was
-    // dispatched from (task #512). Subtasks keep the hierarchy parent.
-    let session_parent = task.placeholder_session_id.clone().or_else(|| {
-        if task.parent_id.is_none() {
-            parent_session_id.and_then(|sid| find_root_session(sid, writer, reader))
-        } else {
-            hierarchy_parent.clone()
-        }
-    });
-
-    // Create session via ServerRequest.
-    let session_id = crate::tasks_session::create_task_session(
-        crate::tasks_session::TaskSessionSpec {
-            task: &task,
-            role: "worker",
-            model,
-            cwd,
-            parent_id: session_parent,
-            child_budget: 16,
-            sandbox_profile: task.sandbox_profile.clone(),
-        },
+    dispatch_task_phase(
+        db,
+        &task,
+        TaskPhase::Worker,
+        parent_session_id,
+        project_path,
         writer,
         reader,
-    )?;
-
-    // Send initial chat message.
-    let merge_target = db
-        .get_merge_target(task_id)
-        .unwrap_or_else(|_| "main".into());
-    let project_instructions =
-        tasks_config::load_project_instructions(project_path, Some(&task.project_name), "worker")
-            .unwrap_or_default();
-    let checklist = crate::tasks_merge::load_checklist(project_path, Some(&task.project_name));
-    let chat_msg = build_initial_message(&task, &merge_target, &project_instructions, &checklist);
-    let chat_req = tau_agent_plugin::Request::Chat {
-        session_id: session_id.clone(),
-        text: chat_msg,
-    };
-
-    match server_request(writer, reader, chat_req) {
-        Ok(tau_agent_plugin::Response::Ok) => {}
-        Ok(tau_agent_plugin::Response::Error { message }) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "session {} created but chat failed: {}",
-                session_id, message
-            )));
-        }
-        Ok(other) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "session {} created but unexpected chat response: {:?}",
-                session_id, other
-            )));
-        }
-        Err(e) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "session {} created but chat failed: {}",
-                session_id, e
-            )));
-        }
-    }
-
-    // Update task with session info.
-    db.set_session_id(task_id, &session_id)?;
-    db.record_session(task_id, &session_id, "worker")?;
-
-    // Emit a ready → active state-change InfoMessage.  The worker session
-    // has been recorded above so it participates in the broadcast.  This
-    // covers both the scheduler-driven path (prepare_task transitioned
-    // ready → active earlier in schedule()) and the inline-prepare path
-    // (task.state == "ready" branch above).
-    if let Ok(Some(updated)) = db.get_task(task_id) {
-        crate::tasks_notify::notify_state_change(db, &updated, "ready", None, writer, reader);
-    }
-
-    Ok(session_id)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -904,131 +1114,15 @@ fn dispatch_planning(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<String> {
-    let task_id = task.id;
-
-    // If there is already a live planner session for this task, reuse it
-    // instead of creating a duplicate.  This makes dispatch idempotent when
-    // the schedule pass runs more than once while the task is still planning.
-    if let Some(existing_sid) = find_reusable_session(db, task_id, "planner", writer, reader) {
-        // The reuse branch is hit when the task is moved back to planning
-        // (e.g. `refining → planning` because the refiner requested plan
-        // changes). The existing planner session is idle and won't notice
-        // the new state on its own — we must send it a resume message so
-        // it picks up the latest feedback and revises the plan. Without
-        // this, the task stalls indefinitely in `planning` (bug #589).
-        let msg = format!(
-            "Task {} has been moved back to planning for further work. \
-             Please run task_get to read the latest feedback and revise the plan, \
-             then transition the task forward again.\n\
-             - Call `task_get` with arguments: {{\"id\": {}}}",
-            task_id, task_id
-        );
-        resume_session(&existing_sid, task_id, &msg, writer, reader)?;
-        eprintln!(
-            "tasks scheduler: planning task {} already has a live planner session {}, reusing",
-            task_id, existing_sid
-        );
-        crate::tasks_notify::set_session_tagline(
-            &existing_sid,
-            &crate::tasks_notify::task_session_tagline(task, "planning"),
-            writer,
-            reader,
-        );
-        return Ok(existing_sid);
-    }
-
-    // If the task has a session_id from a previous lifecycle phase, log and
-    // continue — the old session is already recorded in task_sessions.
-    if let Some(ref existing_sid) = task.session_id {
-        eprintln!(
-            "tasks scheduler: planning task {} replacing previous session {} with new dispatch",
-            task_id, existing_sid
-        );
-    }
-
-    // Model inheritance: use the triggering session for model.
-    let model_source = resolve_model_source(db, task, parent_session_id)
-        .or_else(|| resolve_placeholder_model_source(task, writer, reader));
-    let model = model_source
-        .as_deref()
-        .and_then(|sid| get_session_model(sid, writer, reader));
-
-    // Session parenting: the planner is the root session for this task,
-    // so its parent is the parent *task*'s session.
-    let hierarchy_parent = parent_session_id
-        .map(str::to_string)
-        .or_else(|| resolve_parent_session(db, task));
-
-    // Task #561: prefer the task's placeholder. Otherwise fall back to
-    // the legacy rule: top-level tasks re-parent onto the triggering
-    // session's root so new planning sessions surface in the user's
-    // primary tree (task #512). Subtasks keep the parent task's session
-    // as hierarchy parent.
-    let session_parent = task.placeholder_session_id.clone().or_else(|| {
-        if task.parent_id.is_none() {
-            parent_session_id.and_then(|sid| find_root_session(sid, writer, reader))
-        } else {
-            hierarchy_parent.clone()
-        }
-    });
-
-    // Planning sessions use the project directory as cwd (no worktree).
-    let session_id = crate::tasks_session::create_task_session(
-        crate::tasks_session::TaskSessionSpec {
-            task,
-            role: "planning",
-            model,
-            cwd: Some(project_path.to_string()),
-            parent_id: session_parent,
-            child_budget: 16,
-            sandbox_profile: task.sandbox_profile.clone(),
-        },
+    dispatch_task_phase(
+        db,
+        task,
+        TaskPhase::Planner,
+        parent_session_id,
+        project_path,
         writer,
         reader,
-    )?;
-
-    // Load project-specific planning instructions
-    let project_instructions =
-        tasks_config::load_project_instructions(project_path, Some(&task.project_name), "planning")
-            .unwrap_or_default();
-
-    let merge_target = db
-        .get_merge_target(task_id)
-        .unwrap_or_else(|_| "main".into());
-
-    // Send planning-specific initial message.
-    let chat_msg = build_planning_message(task, &project_instructions, &merge_target);
-    let chat_req = tau_agent_plugin::Request::Chat {
-        session_id: session_id.clone(),
-        text: chat_msg,
-    };
-
-    match server_request(writer, reader, chat_req) {
-        Ok(tau_agent_plugin::Response::Ok) => {}
-        Ok(tau_agent_plugin::Response::Error { message }) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "planning session {} created but chat failed: {}",
-                session_id, message
-            )));
-        }
-        Ok(other) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "planning session {} created but unexpected chat response: {:?}",
-                session_id, other
-            )));
-        }
-        Err(e) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "planning session {} created but chat failed: {}",
-                session_id, e
-            )));
-        }
-    }
-
-    db.set_session_id(task_id, &session_id)?;
-    db.record_session(task_id, &session_id, "planner")?;
-
-    Ok(session_id)
+    )
 }
 
 /// Build the initial message for a planning-state task.
@@ -1179,108 +1273,15 @@ pub fn dispatch_review(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<String> {
-    let task_id = task.id;
-
-    // Try to reuse an existing reviewer session.
-    if let Some(existing_sid) = find_reusable_session(db, task_id, "reviewer", writer, reader) {
-        let msg = format!(
-            "Task {} has been re-submitted for review. \
-             Please run task_get to read the latest changes and review feedback, \
-             then re-review the work.\n\
-             - Call `task_get` with arguments: {{\"id\": {}}}",
-            task_id, task_id
-        );
-        resume_session(&existing_sid, task_id, &msg, writer, reader)?;
-        eprintln!(
-            "tasks: reusing existing reviewer session {} for task {}",
-            existing_sid, task_id
-        );
-        crate::tasks_notify::set_session_tagline(
-            &existing_sid,
-            &crate::tasks_notify::task_session_tagline(task, "review"),
-            writer,
-            reader,
-        );
-        return Ok(existing_sid);
-    }
-
-    // No reusable session found — create a new one.
-
-    // Model inheritance: use the triggering session for model, falling back
-    // through the hierarchy.
-    let model_source = resolve_model_source(db, task, parent_session_id)
-        .or_else(|| resolve_placeholder_model_source(task, writer, reader));
-    let model = model_source
-        .as_deref()
-        .and_then(|sid| get_session_model(sid, writer, reader));
-
-    // Session parenting: use the planner (orchestrator), not the worker that
-    // triggered the review.
-    let hierarchy_parent = resolve_hierarchy_parent(db, task);
-
-    // Task #561: prefer the task's placeholder.
-    let session_parent = task.placeholder_session_id.clone().or(hierarchy_parent);
-
-    // Review sessions use the task's worktree as cwd.
-    let cwd = task
-        .worktree_path
-        .clone()
-        .or(Some(project_path.to_string()));
-
-    let session_id = crate::tasks_session::create_task_session(
-        crate::tasks_session::TaskSessionSpec {
-            task,
-            role: "review",
-            model,
-            cwd,
-            parent_id: session_parent,
-            child_budget: 16,
-            sandbox_profile: task.sandbox_profile.clone(),
-        },
+    dispatch_task_phase(
+        db,
+        task,
+        TaskPhase::Reviewer,
+        parent_session_id,
+        project_path,
         writer,
         reader,
-    )?;
-
-    // Load project-specific review instructions
-    let project_instructions =
-        tasks_config::load_project_instructions(project_path, Some(&task.project_name), "review")
-            .unwrap_or_default();
-
-    let merge_target = db
-        .get_merge_target(task.id)
-        .unwrap_or_else(|_| "main".into());
-    let checklist = crate::tasks_merge::load_checklist(project_path, Some(&task.project_name));
-    let chat_msg = build_review_message(task, &project_instructions, &merge_target, &checklist);
-    let chat_req = tau_agent_plugin::Request::Chat {
-        session_id: session_id.clone(),
-        text: chat_msg,
-    };
-
-    match server_request(writer, reader, chat_req) {
-        Ok(tau_agent_plugin::Response::Ok) => {}
-        Ok(tau_agent_plugin::Response::Error { message }) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "review session {} created but chat failed: {}",
-                session_id, message
-            )));
-        }
-        Ok(other) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "review session {} created but unexpected chat response: {:?}",
-                session_id, other
-            )));
-        }
-        Err(e) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "review session {} created but chat failed: {}",
-                session_id, e
-            )));
-        }
-    }
-
-    db.record_session(task_id, &session_id, "reviewer")?;
-
-    Ok(session_id)
+    )
 }
 
 /// Build the initial message for a review session.
@@ -1399,102 +1400,15 @@ pub fn dispatch_refining(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<String> {
-    let task_id = task.id;
-
-    // Try to reuse an existing refiner session.
-    if let Some(existing_sid) = find_reusable_session(db, task_id, "refiner", writer, reader) {
-        let msg = format!(
-            "Task {} has been re-submitted for refining. \
-             The plan has been revised. Please run task_get to read the updated \
-             plan and re-evaluate it.\n\
-             - Call `task_get` with arguments: {{\"id\": {}}}",
-            task_id, task_id
-        );
-        resume_session(&existing_sid, task_id, &msg, writer, reader)?;
-        eprintln!(
-            "tasks: reusing existing refiner session {} for task {}",
-            existing_sid, task_id
-        );
-        crate::tasks_notify::set_session_tagline(
-            &existing_sid,
-            &crate::tasks_notify::task_session_tagline(task, "refining"),
-            writer,
-            reader,
-        );
-        return Ok(existing_sid);
-    }
-
-    // No reusable session found — create a new one.
-
-    // Model inheritance: use the triggering session for model, falling back
-    // through the hierarchy.
-    let model_source = resolve_model_source(db, task, parent_session_id)
-        .or_else(|| resolve_placeholder_model_source(task, writer, reader));
-    let model = model_source
-        .as_deref()
-        .and_then(|sid| get_session_model(sid, writer, reader));
-
-    // Session parenting: use the planner (orchestrator), not whatever
-    // session triggered the refining state change.
-    let hierarchy_parent = resolve_hierarchy_parent(db, task);
-
-    // Task #561: prefer the task's placeholder.
-    let session_parent = task.placeholder_session_id.clone().or(hierarchy_parent);
-
-    let session_id = crate::tasks_session::create_task_session(
-        crate::tasks_session::TaskSessionSpec {
-            task,
-            role: "refining",
-            model,
-            cwd: Some(project_path.to_string()),
-            parent_id: session_parent,
-            child_budget: 16,
-            sandbox_profile: task.sandbox_profile.clone(),
-        },
+    dispatch_task_phase(
+        db,
+        task,
+        TaskPhase::Refiner,
+        parent_session_id,
+        project_path,
         writer,
         reader,
-    )?;
-
-    // Load project-specific refining instructions
-    let project_instructions =
-        tasks_config::load_project_instructions(project_path, Some(&task.project_name), "refining")
-            .unwrap_or_default();
-
-    let merge_target = db
-        .get_merge_target(task_id)
-        .unwrap_or_else(|_| "main".into());
-
-    let chat_msg = build_refining_message(task, &project_instructions, &merge_target);
-    let chat_req = tau_agent_plugin::Request::Chat {
-        session_id: session_id.clone(),
-        text: chat_msg,
-    };
-
-    match server_request(writer, reader, chat_req) {
-        Ok(tau_agent_plugin::Response::Ok) => {}
-        Ok(tau_agent_plugin::Response::Error { message }) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "refining session {} created but chat failed: {}",
-                session_id, message
-            )));
-        }
-        Ok(other) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "refining session {} created but unexpected chat response: {:?}",
-                session_id, other
-            )));
-        }
-        Err(e) => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "refining session {} created but chat failed: {}",
-                session_id, e
-            )));
-        }
-    }
-
-    db.record_session(task_id, &session_id, "refiner")?;
-
-    Ok(session_id)
+    )
 }
 
 /// Build the initial message for a refining session.
@@ -6140,5 +6054,560 @@ mod tests {
         std::io::BufReader<mock_io::MockReader>,
     ) {
         mock_io::make_io()
+    }
+
+    // -----------------------------------------------------------------
+    // Phase-dispatch unit tests (task #605)
+    //
+    // Richer mock IO that understands CreateSession / GetSessionInfo /
+    // QueueMessage etc., so we can exercise `dispatch_task_phase` in
+    // isolation from tasks.rs's harness.
+    // -----------------------------------------------------------------
+
+    mod phase_mock_io {
+        use std::collections::HashSet;
+        use std::io::{BufReader, Read, Write};
+        use std::sync::{Arc, Mutex};
+        use tau_agent_plugin::{PluginMessage, PluginRequest, Request, Response};
+
+        pub struct PhaseMockShared {
+            write_buf: Vec<u8>,
+            read_buf: Vec<u8>,
+            pub session_counter: u32,
+            pub archived_sessions: HashSet<String>,
+            pub written_lines: Vec<String>,
+            /// Parent id returned for every `GetSessionInfo` response
+            /// (the tests that care set this explicitly).
+            pub session_parent_id: Option<String>,
+        }
+
+        impl PhaseMockShared {
+            pub fn new() -> Self {
+                Self {
+                    write_buf: Vec::new(),
+                    read_buf: Vec::new(),
+                    session_counter: 0,
+                    archived_sessions: HashSet::new(),
+                    written_lines: Vec::new(),
+                    session_parent_id: None,
+                }
+            }
+
+            fn process_pending(&mut self) {
+                let buf = std::mem::take(&mut self.write_buf);
+                let text = String::from_utf8_lossy(&buf);
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    self.written_lines.push(line.to_string());
+                    let msg: PluginMessage = match serde_json::from_str(line) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let (request_id, request) = match msg {
+                        PluginMessage::ServerRequest {
+                            request_id,
+                            request,
+                        } => (request_id, request),
+                        _ => continue,
+                    };
+                    let response = match request {
+                        Request::CreateSession { .. } => {
+                            self.session_counter += 1;
+                            Response::SessionCreated {
+                                session_id: format!("mock-s{}", self.session_counter),
+                            }
+                        }
+                        Request::GetSessionInfo { session_id } => {
+                            let is_archived = self.archived_sessions.contains(&session_id);
+                            Response::SessionInfo {
+                                info: tau_agent_plugin::SessionInfo {
+                                    id: session_id,
+                                    model: "mock-model".to_string(),
+                                    provider: "mock".to_string(),
+                                    cwd: None,
+                                    message_count: 0,
+                                    stats: Default::default(),
+                                    last_activity: 0,
+                                    parent_id: self.session_parent_id.clone(),
+                                    child_count: 0,
+                                    child_budget: 16,
+                                    tagline: None,
+                                    state: "idle".to_string(),
+                                    context_pct: None,
+                                    archived: is_archived,
+                                    last_exit_status: None,
+                                    is_live: false,
+                                    project_name: None,
+                                },
+                            }
+                        }
+                        Request::GetSessionAncestors { session_id } => Response::SessionAncestors {
+                            sessions: vec![tau_agent_plugin::SessionInfo {
+                                id: session_id.clone(),
+                                model: "mock-model".to_string(),
+                                provider: "mock".to_string(),
+                                cwd: None,
+                                message_count: 0,
+                                stats: Default::default(),
+                                last_activity: 0,
+                                parent_id: None,
+                                child_count: 0,
+                                child_budget: 16,
+                                tagline: None,
+                                state: "idle".to_string(),
+                                context_pct: None,
+                                archived: self.archived_sessions.contains(&session_id),
+                                last_exit_status: None,
+                                is_live: false,
+                                project_name: None,
+                            }],
+                        },
+                        _ => Response::Ok,
+                    };
+                    let reply = PluginRequest::ServerResponse {
+                        request_id,
+                        response,
+                    };
+                    if let Ok(mut json) = serde_json::to_string(&reply) {
+                        json.push('\n');
+                        self.read_buf.extend_from_slice(json.as_bytes());
+                    }
+                }
+            }
+        }
+
+        pub struct PhaseMockWriter {
+            pub shared: Arc<Mutex<PhaseMockShared>>,
+        }
+        impl Write for PhaseMockWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.shared
+                    .lock()
+                    .expect("phase mock writer lock")
+                    .write_buf
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        pub struct PhaseMockReader {
+            pub shared: Arc<Mutex<PhaseMockShared>>,
+        }
+        impl Read for PhaseMockReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let mut shared = self.shared.lock().expect("phase mock reader lock");
+                shared.process_pending();
+                if shared.read_buf.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "no mock responses left",
+                    ));
+                }
+                let n = std::cmp::min(buf.len(), shared.read_buf.len());
+                buf[..n].copy_from_slice(&shared.read_buf[..n]);
+                shared.read_buf.drain(..n);
+                Ok(n)
+            }
+        }
+
+        pub fn make_io() -> (
+            Arc<Mutex<PhaseMockShared>>,
+            PhaseMockWriter,
+            BufReader<PhaseMockReader>,
+        ) {
+            let shared = Arc::new(Mutex::new(PhaseMockShared::new()));
+            let writer = PhaseMockWriter {
+                shared: shared.clone(),
+            };
+            let reader = BufReader::new(PhaseMockReader {
+                shared: shared.clone(),
+            });
+            (shared, writer, reader)
+        }
+
+        /// Drain any writes still in `write_buf` into `written_lines`
+        /// (without waiting for a read) so tests can inspect the full
+        /// transcript after a dispatch call returns.
+        pub fn drain_written(shared: &Arc<Mutex<PhaseMockShared>>) -> Vec<String> {
+            let mut s = shared.lock().expect("phase mock shared");
+            let buf = std::mem::take(&mut s.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    s.written_lines.push(line.to_string());
+                }
+            }
+            s.written_lines.clone()
+        }
+    }
+
+    fn phase_test_task(db: &TasksDb, title: &str, initial_state: &str) -> Task {
+        // `create_task` only accepts ready/planning/interactive as the
+        // initial state — that's fine for these tests because
+        // `dispatch_task_phase` doesn't gate on `task.state` (the
+        // `dispatch` wrapper does).
+        db.create_task(
+            "test-project",
+            title,
+            Some(1),
+            None,
+            None,
+            false,
+            initial_state,
+            false,
+            None,
+            None,
+            false,
+            None,
+            false,
+        )
+        .expect("create test task")
+    }
+
+    #[test]
+    fn dispatch_task_phase_worker_happy_path_sets_session_id() {
+        let db = TasksDb::open_memory().expect("open memory db");
+        let mut task = phase_test_task(&db, "worker happy", "ready");
+        // Pretend prepare_task already set a worktree.
+        db.set_worktree_path(task.id, "/tmp/wt-605")
+            .expect("set wt");
+        task = db
+            .get_task(task.id)
+            .expect("get task")
+            .expect("task exists");
+
+        let (shared, mut writer, mut reader) = phase_mock_io::make_io();
+        let sid = dispatch_task_phase(
+            &db,
+            &task,
+            TaskPhase::Worker,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        )
+        .expect("worker dispatch ok");
+        assert_eq!(sid, "mock-s1");
+
+        // Worker overwrites task.session_id.
+        let after = db
+            .get_task(task.id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(after.session_id.as_deref(), Some("mock-s1"));
+
+        // A worker row must be recorded in task_sessions.
+        let recorded = db
+            .find_latest_session_by_role(task.id, "worker")
+            .expect("find worker session");
+        assert_eq!(recorded.as_deref(), Some("mock-s1"));
+
+        // Verify the emitted CreateSession used the worker's worktree cwd.
+        let written = phase_mock_io::drain_written(&shared).join("\n");
+        assert!(
+            written.contains("/tmp/wt-605"),
+            "worker CreateSession should include the worktree path, got:\n{}",
+            written
+        );
+    }
+
+    #[test]
+    fn dispatch_task_phase_worker_reuse_is_silent() {
+        let db = TasksDb::open_memory().expect("open memory db");
+        let task = phase_test_task(&db, "worker reuse", "ready");
+        // Record a live worker session.
+        db.record_session(task.id, "existing-worker", "worker")
+            .expect("record worker");
+
+        let (shared, mut writer, mut reader) = phase_mock_io::make_io();
+        let sid = dispatch_task_phase(
+            &db,
+            &task,
+            TaskPhase::Worker,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        )
+        .expect("worker reuse ok");
+        assert_eq!(sid, "existing-worker");
+
+        // Worker reuse must NOT queue a resume message.
+        let written = phase_mock_io::drain_written(&shared).join("\n");
+        assert!(
+            !written.contains("queue_message"),
+            "worker reuse must not send a QueueMessage, got:\n{}",
+            written
+        );
+    }
+
+    #[test]
+    fn dispatch_task_phase_planner_reuse_sends_resume() {
+        let db = TasksDb::open_memory().expect("open memory db");
+        let task = phase_test_task(&db, "planner reuse", "planning");
+        db.record_session(task.id, "existing-planner", "planner")
+            .expect("record planner");
+
+        let (shared, mut writer, mut reader) = phase_mock_io::make_io();
+        let sid = dispatch_task_phase(
+            &db,
+            &task,
+            TaskPhase::Planner,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        )
+        .expect("planner reuse ok");
+        assert_eq!(sid, "existing-planner");
+
+        let written = phase_mock_io::drain_written(&shared).join("\n");
+        assert!(
+            written.contains("queue_message"),
+            "planner reuse must send a QueueMessage, got:\n{}",
+            written
+        );
+        assert!(
+            written.contains("moved back to planning"),
+            "planner resume body should explain the backward transition, got:\n{}",
+            written
+        );
+    }
+
+    #[test]
+    fn dispatch_task_phase_reviewer_reuse_sends_resume() {
+        let db = TasksDb::open_memory().expect("open memory db");
+        let task = phase_test_task(&db, "reviewer reuse", "ready");
+        db.record_session(task.id, "existing-reviewer", "reviewer")
+            .expect("record reviewer");
+
+        let (shared, mut writer, mut reader) = phase_mock_io::make_io();
+        let sid = dispatch_task_phase(
+            &db,
+            &task,
+            TaskPhase::Reviewer,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        )
+        .expect("reviewer reuse ok");
+        assert_eq!(sid, "existing-reviewer");
+
+        let written = phase_mock_io::drain_written(&shared).join("\n");
+        assert!(
+            written.contains("queue_message"),
+            "reviewer reuse must send a QueueMessage, got:\n{}",
+            written
+        );
+        assert!(
+            written.contains("re-submitted for review"),
+            "reviewer resume body should mention re-submission, got:\n{}",
+            written
+        );
+    }
+
+    #[test]
+    fn dispatch_task_phase_refiner_reuse_sends_resume() {
+        let db = TasksDb::open_memory().expect("open memory db");
+        let task = phase_test_task(&db, "refiner reuse", "ready");
+        db.record_session(task.id, "existing-refiner", "refiner")
+            .expect("record refiner");
+
+        let (shared, mut writer, mut reader) = phase_mock_io::make_io();
+        let sid = dispatch_task_phase(
+            &db,
+            &task,
+            TaskPhase::Refiner,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        )
+        .expect("refiner reuse ok");
+        assert_eq!(sid, "existing-refiner");
+
+        let written = phase_mock_io::drain_written(&shared).join("\n");
+        assert!(
+            written.contains("queue_message"),
+            "refiner reuse must send a QueueMessage, got:\n{}",
+            written
+        );
+        assert!(
+            written.contains("re-submitted for refining"),
+            "refiner resume body should mention refining re-submission, got:\n{}",
+            written
+        );
+    }
+
+    #[test]
+    fn dispatch_task_phase_reviewer_does_not_set_session_id() {
+        let db = TasksDb::open_memory().expect("open memory db");
+        let task = phase_test_task(&db, "review ssid", "ready");
+        // Pretend a prior worker session already claimed task.session_id.
+        db.set_session_id(task.id, "prior-worker")
+            .expect("set session id");
+        let task = db
+            .get_task(task.id)
+            .expect("get task")
+            .expect("task exists");
+
+        let (_shared, mut writer, mut reader) = phase_mock_io::make_io();
+        let sid = dispatch_task_phase(
+            &db,
+            &task,
+            TaskPhase::Reviewer,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        )
+        .expect("reviewer dispatch ok");
+        assert_eq!(sid, "mock-s1");
+
+        // Reviewer must NOT overwrite task.session_id.
+        let after = db
+            .get_task(task.id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(
+            after.session_id.as_deref(),
+            Some("prior-worker"),
+            "reviewer dispatch must leave task.session_id untouched"
+        );
+    }
+
+    #[test]
+    fn dispatch_task_phase_refiner_does_not_set_session_id() {
+        let db = TasksDb::open_memory().expect("open memory db");
+        let task = phase_test_task(&db, "refine ssid", "ready");
+        db.set_session_id(task.id, "prior-planner")
+            .expect("set session id");
+        let task = db
+            .get_task(task.id)
+            .expect("get task")
+            .expect("task exists");
+
+        let (_shared, mut writer, mut reader) = phase_mock_io::make_io();
+        let sid = dispatch_task_phase(
+            &db,
+            &task,
+            TaskPhase::Refiner,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        )
+        .expect("refiner dispatch ok");
+        assert_eq!(sid, "mock-s1");
+
+        let after = db
+            .get_task(task.id)
+            .expect("get task")
+            .expect("task exists");
+        assert_eq!(
+            after.session_id.as_deref(),
+            Some("prior-planner"),
+            "refiner dispatch must leave task.session_id untouched"
+        );
+    }
+
+    #[test]
+    fn dispatch_task_phase_planner_uses_project_cwd() {
+        let db = TasksDb::open_memory().expect("open memory db");
+        let task = phase_test_task(&db, "planner cwd", "planning");
+
+        let (shared, mut writer, mut reader) = phase_mock_io::make_io();
+        let _sid = dispatch_task_phase(
+            &db,
+            &task,
+            TaskPhase::Planner,
+            None,
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        )
+        .expect("planner dispatch ok");
+
+        let written = phase_mock_io::drain_written(&shared).join("\n");
+        assert!(
+            written.contains("\"cwd\":\"/test/project\""),
+            "planner CreateSession should carry project_path as cwd, got:\n{}",
+            written
+        );
+    }
+
+    /// Regression guard for catalog #2 (#573) / this task: after the
+    /// refactor, the only `Request::CreateSession { ... }` construction
+    /// site in the scheduler must be inside the phase helper (it lives in
+    /// `tasks_session.rs` — see task #604), so this file should contain
+    /// zero bare construction sites.
+    #[test]
+    fn scheduler_has_no_bare_create_session_literal() {
+        let src = include_str!("tasks_scheduler.rs");
+        // Build the match needle at runtime so our own scanner doesn't
+        // count as a literal.  The sister test in `tasks_session.rs` does
+        // the same thing for the same reason.
+        let needle = concat!("Request::", "CreateSession {");
+        let mut count = 0;
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            // Skip destructuring / match patterns.
+            if line.contains(concat!("Request::", "CreateSession { .. }")) {
+                continue;
+            }
+            // Skip the scanner lines that construct the needles themselves.
+            if line.contains("concat!(\"") {
+                continue;
+            }
+            if line.contains(needle) {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 0,
+            "scheduler must not contain any bare Request::CreateSession literal \
+             (it lives in tasks_session.rs::create_task_session); found {}",
+            count
+        );
+    }
+
+    /// Regression guard: the four `dispatch*` public wrappers must remain
+    /// thin — none of them should contain its own `Request::CreateSession`
+    /// literal or open-code the reuse ladder. We check this indirectly by
+    /// counting the `dispatch_task_phase(` call sites: exactly four (one
+    /// per wrapper) are expected, plus the helper's own definition for a
+    /// total of five matches, three of which can be in comments/doctests.
+    #[test]
+    fn four_dispatch_wrappers_delegate_to_helper() {
+        let src = include_str!("tasks_scheduler.rs");
+        let mut call_sites = 0;
+        for line in src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") || trimmed.starts_with("///") {
+                continue;
+            }
+            // Definition line itself.
+            if trimmed.starts_with("pub(crate) fn dispatch_task_phase(") {
+                continue;
+            }
+            if line.contains("dispatch_task_phase(") {
+                call_sites += 1;
+            }
+        }
+        assert!(
+            call_sites >= 4,
+            "expected at least 4 dispatch_task_phase(...) call sites \
+             (one per wrapper), found {}",
+            call_sites
+        );
     }
 }
