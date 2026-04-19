@@ -1109,3 +1109,301 @@ fn active_to_approved_requires_skip_review() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Auto-dispatch assertions (task #588).
+//
+// These tests guard against the silent-dispatch-failure regressions that
+// shipped as #572, #577, #584, and #587. The flagship lifecycle test above
+// drives state transitions manually via ExecuteTool and never asserts that
+// `task.session_id` becomes non-null after a transition that *should*
+// auto-spawn a worker — which is exactly how those bugs slipped through.
+//
+// Each test below files a task, waits for the scheduler to auto-dispatch a
+// worker, then asserts:
+//   * `task.session_id` is non-null (the dispatch path completed),
+//   * the referenced session actually exists on the server,
+//   * the session has the expected tagline prefix `[task N] worker:`,
+//   * the session is parented under the task's placeholder.
+// ---------------------------------------------------------------------------
+
+/// Poll `task_get` until the task has a non-null `session_id`, then
+/// return the parsed JSON.  Panics with the current task state on timeout.
+fn wait_for_task_session_id(
+    server: &TestServer,
+    session_id: &str,
+    task_id: i64,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let task = exec_tool_ok(
+            server,
+            session_id,
+            "task_get",
+            serde_json::json!({"id": task_id}),
+        );
+        if task["task"]["session_id"].as_str().is_some() {
+            return task;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "task {} did not get a non-null session_id within {:?}\ntask: {}",
+                task_id,
+                timeout,
+                serde_json::to_string_pretty(&task).unwrap()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Shared assertion: given a `task_get` payload for an auto-dispatched task,
+/// verify the recorded session_id refers to a real worker session with
+/// the expected tagline prefix and parent (the task's placeholder).
+fn assert_worker_session_dispatched(server: &TestServer, task_payload: &serde_json::Value) {
+    let task_id = task_payload["task"]["id"]
+        .as_i64()
+        .expect("task.id should be an integer");
+    let session_id = task_payload["task"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "task {} has null session_id after auto-dispatch — \
+                 this is the #572/#577/#584/#587 bug class.\ntask: {}",
+                task_id,
+                serde_json::to_string_pretty(task_payload).unwrap()
+            )
+        });
+    assert!(
+        !session_id.is_empty(),
+        "task {} has empty session_id after auto-dispatch",
+        task_id
+    );
+
+    let placeholder_session_id = task_payload["task"]["placeholder_session_id"]
+        .as_str()
+        .map(str::to_string);
+
+    let info = common::assert_session_exists(
+        server,
+        session_id,
+        placeholder_session_id.as_deref(),
+        Some(&format!("[task {}] worker:", task_id)),
+    );
+
+    // The session must NOT be the placeholder itself — the placeholder is a
+    // grouping anchor, not the worker.
+    if let Some(ref ph) = placeholder_session_id {
+        assert_ne!(
+            session_id, ph,
+            "task {} session_id ({}) should be a worker, not the placeholder ({})",
+            task_id, session_id, ph
+        );
+    }
+
+    // The auto-dispatched session should not have inherited the `log` model
+    // from the placeholder (regression for the s2094 / log-provider chain).
+    assert_ne!(
+        info.model, "log",
+        "task {} worker session {} unexpectedly uses the `log` model — \
+         this would surface as a NoApiKey error at runtime",
+        task_id, session_id
+    );
+    assert_ne!(
+        info.provider, "log",
+        "task {} worker session {} unexpectedly uses the `log` provider",
+        task_id, session_id
+    );
+}
+
+/// File a `ready` task with `affected_files` set and assert that the
+/// scheduler actually creates a worker session.
+///
+/// Catches the #572/#577/#584/#587 bug class where a task transitioned to
+/// `active` but no session was ever spawned.
+#[test]
+fn ready_to_active_transition_spawns_worker_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    // Generous mock-response budget for any agent turns the dispatched
+    // session may execute before we shut down.
+    let server = start_server_with_tasks(
+        &repo,
+        (0..16)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    // File a task directly as `ready` with affected_files set.
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "Auto-dispatch worker session test",
+            "initial_state": "ready",
+            "message": "do the thing",
+            "affected_files": ["dispatched.txt"],
+        }),
+    );
+    let task_id = task["id"].as_i64().unwrap();
+    assert_eq!(task["state"].as_str().unwrap(), "ready");
+
+    // Wait for the scheduler to pick it up and reach `active`.
+    let _ = wait_for_task_state(&server, &sid, task_id, "active", Duration::from_secs(10));
+
+    // Then wait for the auto-dispatch to populate session_id.
+    let task_payload = wait_for_task_session_id(&server, &sid, task_id, Duration::from_secs(10));
+
+    // Critical assertions that would have caught #572/#577/#584/#587.
+    assert_worker_session_dispatched(&server, &task_payload);
+
+    server.shutdown();
+}
+
+/// File-less variant: file a `ready` task with no `affected_files` and
+/// assert the scheduler still auto-dispatches a worker.
+///
+/// File-less tasks are governed by a separate scheduling rule that #584
+/// briefly broke; this guards against future regressions of that path.
+#[test]
+fn ready_to_active_file_less_task_spawns_worker_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    let server = start_server_with_tasks(
+        &repo,
+        (0..16)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    // File a `ready` task with no affected_files. The file-less scheduling
+    // rule only schedules one such task at a time; we have a fresh DB so
+    // this task is the file-less slot.
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "File-less auto-dispatch test",
+            "initial_state": "ready",
+            "message": "no files involved",
+        }),
+    );
+    let task_id = task["id"].as_i64().unwrap();
+    assert_eq!(task["state"].as_str().unwrap(), "ready");
+
+    let _ = wait_for_task_state(&server, &sid, task_id, "active", Duration::from_secs(10));
+    let task_payload = wait_for_task_session_id(&server, &sid, task_id, Duration::from_secs(10));
+
+    assert_worker_session_dispatched(&server, &task_payload);
+
+    // Confirm worktree was also created for a file-less task.
+    let worktree = task_payload["task"]["worktree_path"]
+        .as_str()
+        .expect("file-less task should still get a worktree on active");
+    assert!(
+        std::path::Path::new(worktree).exists(),
+        "file-less task worktree should exist at {}",
+        worktree
+    );
+
+    server.shutdown();
+}
+
+/// Assert the placeholder session actually receives state-transition
+/// info messages (#574, Phase-2 placeholder messaging).
+///
+/// Drives a task through ready → active and verifies the placeholder's
+/// message history contains the expected `[task #N] ... ready → active`
+/// transition line.  Catches regressions where the `collect_recipients`
+/// fix from #574 gets reverted or a new transition path bypasses the
+/// notify pipeline.
+#[test]
+fn placeholder_session_receives_state_transition_messages() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    let server = start_server_with_tasks(
+        &repo,
+        (0..16)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "Placeholder message test",
+            "initial_state": "ready",
+            "message": "drive the placeholder timeline",
+            "affected_files": ["placeholder_test.txt"],
+        }),
+    );
+    let task_id = task["id"].as_i64().unwrap();
+
+    // Wait for scheduler to take it active.
+    let task_payload =
+        wait_for_task_state(&server, &sid, task_id, "active", Duration::from_secs(10));
+    let placeholder_sid = task_payload["task"]["placeholder_session_id"]
+        .as_str()
+        .expect("every task should have a placeholder_session_id (task #561)")
+        .to_string();
+
+    // The state-transition `ready → active` notification is delivered as a
+    // `QueueInfo` Tier-2 action; allow a brief window for it to land in the
+    // placeholder's message history.
+    let messages = common::poll_until(
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+        "placeholder did not receive any messages",
+        || {
+            let msgs = common::get_session_messages(&server, &placeholder_sid);
+            if msgs.is_empty() { None } else { Some(msgs) }
+        },
+    );
+
+    // Expect at least one info message tagged with the task id.
+    let needle = format!("[task #{}]", task_id);
+    let has_task_tag = messages.iter().any(|m| match m {
+        tau_agent_lib::types::Message::Info(info) => info.text.contains(&needle),
+        _ => false,
+    });
+    assert!(
+        has_task_tag,
+        "placeholder session {} message history should contain `{}` lines, got:\n{:#?}",
+        placeholder_sid, needle, messages
+    );
+
+    // And specifically the ready → active transition line.
+    let has_ready_to_active = messages.iter().any(|m| match m {
+        tau_agent_lib::types::Message::Info(info) => {
+            info.text.contains(&needle) && info.text.contains("ready → active")
+        }
+        _ => false,
+    });
+    assert!(
+        has_ready_to_active,
+        "placeholder session {} should have received the `ready → active` info line, got:\n{:#?}",
+        placeholder_sid, messages
+    );
+
+    server.shutdown();
+}
