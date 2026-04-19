@@ -983,7 +983,7 @@ fn create_interactive_session(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> Option<String> {
-    use tau_agent_plugin::{Request, Response};
+    use tau_agent_plugin::Request;
 
     // Resolve the project path for the session's working directory.
     let project_path = match resolver.resolve(&task.project_name) {
@@ -1017,56 +1017,25 @@ fn create_interactive_session(
         }
     });
 
-    let create_req = Request::CreateSession {
-        model,
-        provider: None,
-        system_prompt: None,
-        cwd: Some(project_path.clone()),
-        parent_id: session_parent,
-        child_budget: 16,
-        tagline: Some(crate::tasks_notify::task_session_tagline(
+    let new_sid = match crate::tasks_session::create_task_session(
+        crate::tasks_session::TaskSessionSpec {
             task,
-            "interactive",
-        )),
-        auto_archive: false,
-        notify_parent: false,
-        project_name: Some(task.project_name.clone()),
-        sandbox_profile: task.sandbox_profile.clone(),
-    };
-
-    let new_sid = match crate::tasks_scheduler::server_request(writer, reader, create_req) {
-        Ok(Response::SessionCreated { session_id }) => session_id,
-        Ok(Response::Error { message }) => {
-            eprintln!(
-                "tasks: failed to create interactive session for task {}: {}",
-                task.id, message
-            );
-            let _ = db.add_message(
-                task.id,
-                &format!(
-                    "⚠️ Failed to create interactive session: {}. \
-                     Task is in interactive state but has no session.",
-                    message
-                ),
-                Some("system"),
-            );
-            return None;
-        }
-        Ok(_) => {
-            eprintln!(
-                "tasks: unexpected response creating session for task {}",
-                task.id
-            );
-            let _ = db.add_message(
-                task.id,
-                "⚠️ Failed to create interactive session: unexpected server response. \
-                 Task is in interactive state but has no session.",
-                Some("system"),
-            );
-            return None;
-        }
+            role: "interactive",
+            model,
+            cwd: Some(project_path.clone()),
+            parent_id: session_parent,
+            child_budget: 16,
+            sandbox_profile: task.sandbox_profile.clone(),
+        },
+        writer,
+        reader,
+    ) {
+        Ok(sid) => sid,
         Err(e) => {
-            eprintln!("tasks: error creating session for task {}: {}", task.id, e);
+            eprintln!(
+                "tasks: error creating interactive session for task {}: {}",
+                task.id, e
+            );
             let _ = db.add_message(
                 task.id,
                 &format!(

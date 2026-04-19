@@ -824,35 +824,19 @@ pub fn dispatch(
     });
 
     // Create session via ServerRequest.
-    let create_req = tau_agent_plugin::Request::CreateSession {
-        model,
-        provider: None,
-        system_prompt: None,
-        cwd,
-        parent_id: session_parent,
-        child_budget: 16,
-        tagline: Some(crate::tasks_notify::task_session_tagline(&task, "worker")),
-        auto_archive: false,
-        notify_parent: false,
-        project_name: Some(task.project_name.clone()),
-        sandbox_profile: task.sandbox_profile.clone(),
-    };
-
-    let session_id = match server_request(writer, reader, create_req)? {
-        tau_agent_plugin::Response::SessionCreated { session_id } => session_id,
-        tau_agent_plugin::Response::Error { message } => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "create session for task {}: {}",
-                task_id, message
-            )));
-        }
-        other => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "unexpected response creating session for task {}: {:?}",
-                task_id, other
-            )));
-        }
-    };
+    let session_id = crate::tasks_session::create_task_session(
+        crate::tasks_session::TaskSessionSpec {
+            task: &task,
+            role: "worker",
+            model,
+            cwd,
+            parent_id: session_parent,
+            child_budget: 16,
+            sandbox_profile: task.sandbox_profile.clone(),
+        },
+        writer,
+        reader,
+    )?;
 
     // Send initial chat message.
     let merge_target = db
@@ -989,35 +973,19 @@ fn dispatch_planning(
     });
 
     // Planning sessions use the project directory as cwd (no worktree).
-    let create_req = tau_agent_plugin::Request::CreateSession {
-        model,
-        provider: None,
-        system_prompt: None,
-        cwd: Some(project_path.to_string()),
-        parent_id: session_parent,
-        child_budget: 16,
-        tagline: Some(crate::tasks_notify::task_session_tagline(task, "planning")),
-        auto_archive: false,
-        notify_parent: false,
-        project_name: Some(task.project_name.clone()),
-        sandbox_profile: task.sandbox_profile.clone(),
-    };
-
-    let session_id = match server_request(writer, reader, create_req)? {
-        tau_agent_plugin::Response::SessionCreated { session_id } => session_id,
-        tau_agent_plugin::Response::Error { message } => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "create planning session for task {}: {}",
-                task_id, message
-            )));
-        }
-        other => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "unexpected response creating planning session for task {}: {:?}",
-                task_id, other
-            )));
-        }
-    };
+    let session_id = crate::tasks_session::create_task_session(
+        crate::tasks_session::TaskSessionSpec {
+            task,
+            role: "planning",
+            model,
+            cwd: Some(project_path.to_string()),
+            parent_id: session_parent,
+            child_budget: 16,
+            sandbox_profile: task.sandbox_profile.clone(),
+        },
+        writer,
+        reader,
+    )?;
 
     // Load project-specific planning instructions
     let project_instructions =
@@ -1259,35 +1227,19 @@ pub fn dispatch_review(
         .clone()
         .or(Some(project_path.to_string()));
 
-    let create_req = tau_agent_plugin::Request::CreateSession {
-        model,
-        provider: None,
-        system_prompt: None,
-        cwd,
-        parent_id: session_parent,
-        child_budget: 16,
-        tagline: Some(crate::tasks_notify::task_session_tagline(task, "review")),
-        auto_archive: false,
-        notify_parent: false,
-        project_name: Some(task.project_name.clone()),
-        sandbox_profile: task.sandbox_profile.clone(),
-    };
-
-    let session_id = match server_request(writer, reader, create_req)? {
-        tau_agent_plugin::Response::SessionCreated { session_id } => session_id,
-        tau_agent_plugin::Response::Error { message } => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "create review session for task {}: {}",
-                task_id, message
-            )));
-        }
-        other => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "unexpected response creating review session for task {}: {:?}",
-                task_id, other
-            )));
-        }
-    };
+    let session_id = crate::tasks_session::create_task_session(
+        crate::tasks_session::TaskSessionSpec {
+            task,
+            role: "review",
+            model,
+            cwd,
+            parent_id: session_parent,
+            child_budget: 16,
+            sandbox_profile: task.sandbox_profile.clone(),
+        },
+        writer,
+        reader,
+    )?;
 
     // Load project-specific review instructions
     let project_instructions =
@@ -1489,35 +1441,19 @@ pub fn dispatch_refining(
     // Task #561: prefer the task's placeholder.
     let session_parent = task.placeholder_session_id.clone().or(hierarchy_parent);
 
-    let create_req = tau_agent_plugin::Request::CreateSession {
-        model,
-        provider: None,
-        system_prompt: None,
-        cwd: Some(project_path.to_string()),
-        parent_id: session_parent,
-        child_budget: 16,
-        tagline: Some(crate::tasks_notify::task_session_tagline(task, "refining")),
-        auto_archive: false,
-        notify_parent: false,
-        project_name: Some(task.project_name.clone()),
-        sandbox_profile: task.sandbox_profile.clone(),
-    };
-
-    let session_id = match server_request(writer, reader, create_req)? {
-        tau_agent_plugin::Response::SessionCreated { session_id } => session_id,
-        tau_agent_plugin::Response::Error { message } => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "create refining session for task {}: {}",
-                task_id, message
-            )));
-        }
-        other => {
-            return Err(tau_agent_plugin::Error::Io(format!(
-                "unexpected response creating refining session for task {}: {:?}",
-                task_id, other
-            )));
-        }
-    };
+    let session_id = crate::tasks_session::create_task_session(
+        crate::tasks_session::TaskSessionSpec {
+            task,
+            role: "refining",
+            model,
+            cwd: Some(project_path.to_string()),
+            parent_id: session_parent,
+            child_budget: 16,
+            sandbox_profile: task.sandbox_profile.clone(),
+        },
+        writer,
+        reader,
+    )?;
 
     // Load project-specific refining instructions
     let project_instructions =

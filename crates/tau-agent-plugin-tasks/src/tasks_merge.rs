@@ -247,34 +247,24 @@ pub fn merge_task_for_caller(
     // it nests with the rest of the task's sessions and is cascade-
     // archived with the placeholder subtree. Pre-561 tasks (no
     // placeholder) get the legacy `None` parenting.
-    let log_session = match server_request(
-        writer,
-        reader,
-        Request::CreateSession {
+    let log_session = match crate::tasks_session::create_task_session(
+        crate::tasks_session::TaskSessionSpec {
+            task: &task,
+            role: "merge",
             model: Some("log".into()),
-            provider: None,
-            system_prompt: None,
             cwd: Some(worktree_path.clone()),
             parent_id: task.placeholder_session_id.clone(),
             child_budget: 0,
-            tagline: Some(crate::tasks_notify::task_session_tagline(&task, "merge")),
-            auto_archive: false,
-            notify_parent: false,
-            project_name: Some(task.project_name.clone()),
             sandbox_profile: None,
         },
-    )? {
-        Response::SessionCreated { session_id } => session_id,
-        Response::Error { message } => {
+        writer,
+        reader,
+    ) {
+        Ok(sid) => sid,
+        Err(e) => {
             return Ok(MergeResult {
                 success: false,
-                log: format!("Failed to create log session: {}", message),
-            });
-        }
-        other => {
-            return Ok(MergeResult {
-                success: false,
-                log: format!("Unexpected response creating log session: {:?}", other),
+                log: format!("Failed to create log session: {}", e),
             });
         }
     };
