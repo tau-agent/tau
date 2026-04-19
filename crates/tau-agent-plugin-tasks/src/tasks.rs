@@ -184,7 +184,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
     vec![
         PluginToolDef {
             name: "task_create".into(),
-            description: "Create a new task in the project task board.".into(),
+            description: "Create a new task in the project task board. Prefer passing `affected_files` when the file set is known — it unlocks parallel scheduling and skips the planning phase for already-scoped work.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -5811,6 +5811,111 @@ mod tests {
             "task_create guidelines should mention root-session parenting: {}",
             joined
         );
+    }
+
+    /// Regression test for task #601: the `task_create` tool schema must
+    /// advertise `affected_files` as a documented, typed parameter so
+    /// orchestrator LLMs and human callers discover they can declare the
+    /// file set at creation time. Also pins the top-level description and
+    /// prompt_guidelines to nudge callers toward populating it.
+    #[test]
+    fn test_task_create_schema_documents_affected_files() {
+        let tools = tasks_tools();
+        let task_create = tools
+            .iter()
+            .find(|t| t.name == "task_create")
+            .expect("task_create tool def");
+
+        // 1. Schema: `parameters.properties.affected_files` exists, is an
+        //    array of strings, and has a non-empty description.
+        let props = task_create
+            .parameters
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("task_create parameters.properties is an object");
+        let affected = props
+            .get("affected_files")
+            .expect("task_create schema must document affected_files");
+        assert_eq!(
+            affected.get("type").and_then(|v| v.as_str()),
+            Some("array"),
+            "affected_files must be typed as array; got {:?}",
+            affected.get("type"),
+        );
+        assert_eq!(
+            affected
+                .get("items")
+                .and_then(|i| i.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("string"),
+            "affected_files items must be typed as string; got {:?}",
+            affected.get("items"),
+        );
+        let desc = affected
+            .get("description")
+            .and_then(|v| v.as_str())
+            .expect("affected_files must carry a description");
+        assert!(
+            !desc.trim().is_empty(),
+            "affected_files description must be non-empty"
+        );
+
+        // 2. Top-level description should nudge callers to supply
+        //    affected_files when the file set is known.
+        assert!(
+            task_create.description.contains("affected_files"),
+            "task_create top-level description should mention affected_files: {}",
+            task_create.description,
+        );
+
+        // 3. prompt_guidelines include guidance about populating
+        //    affected_files for parallel scheduling, and mention the
+        //    `["*"]` escape hatch for genuinely unpredictable file sets.
+        let joined = task_create.prompt_guidelines.join("\n");
+        assert!(
+            joined.contains("affected_files"),
+            "task_create guidelines should mention affected_files: {}",
+            joined,
+        );
+        assert!(
+            joined.contains("[\"*\"]"),
+            "task_create guidelines should document the [\"*\"] wildcard: {}",
+            joined,
+        );
+    }
+
+    /// Regression test for task #601 audit step: `task_update` also
+    /// accepts `affected_files` and must surface it in its schema so
+    /// callers can amend the list mid-flight.
+    #[test]
+    fn test_task_update_schema_documents_affected_files() {
+        let tools = tasks_tools();
+        let task_update = tools
+            .iter()
+            .find(|t| t.name == "task_update")
+            .expect("task_update tool def");
+
+        let props = task_update
+            .parameters
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .expect("task_update parameters.properties is an object");
+        let affected = props
+            .get("affected_files")
+            .expect("task_update schema must document affected_files");
+        assert_eq!(affected.get("type").and_then(|v| v.as_str()), Some("array"),);
+        assert_eq!(
+            affected
+                .get("items")
+                .and_then(|i| i.get("type"))
+                .and_then(|v| v.as_str()),
+            Some("string"),
+        );
+        let desc = affected
+            .get("description")
+            .and_then(|v| v.as_str())
+            .expect("affected_files must carry a description");
+        assert!(!desc.trim().is_empty());
     }
 
     /// Spec-required regression test (task #512): `handle_task_create`
