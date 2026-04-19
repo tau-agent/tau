@@ -8532,6 +8532,157 @@ mod tests {
         assert_eq!(updated["state"], "planning");
     }
 
+    /// Bug #589: when `dispatch_planning` reuses an existing planner session
+    /// (the `refining → planning` backward transition), it MUST send a
+    /// resume QueueMessage to the idle planner. Without this, the planner
+    /// sits idle forever and the task stalls indefinitely in `planning`.
+    ///
+    /// Mirrors the analogous tests for `dispatch_review` and
+    /// `dispatch_refining` reuse paths, which already worked correctly.
+    #[test]
+    fn test_dispatch_planning_reuse_sends_resume_message() {
+        let db = TasksDb::open_memory().unwrap();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a planning task and record a planner session for it. We
+        // call dispatch directly (state=planning routes to
+        // dispatch_planning) so we exercise the reuse branch in isolation,
+        // matching the pattern used by
+        // `test_dispatch_reuses_existing_worker_session_via_mock_io`.
+        let task = db
+            .create_task(
+                "test-project",
+                "Planning reuse test",
+                Some(5),
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.state, "planning");
+        // Record a live planner session that find_reusable_session will pick up.
+        db.record_session(task.id, "existing-planner-session", "planner")
+            .unwrap();
+        // The task's session_id may have been cleared/reassigned to a refiner
+        // when it transitioned planning → refining → planning. Set it to a
+        // stale refiner id to mirror the real bug-trigger conditions.
+        db.set_session_id(task.id, "stale-refiner-session").unwrap();
+
+        // Dispatch — should reuse the planner and send it a resume message.
+        let result = tasks_scheduler::dispatch(
+            &db,
+            task.id,
+            Some("caller-session"),
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        );
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        assert_eq!(
+            result.unwrap(),
+            "existing-planner-session",
+            "dispatch_planning should reuse the existing planner session"
+        );
+
+        // Flush any unprocessed writes and inspect what the plugin sent.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let buf = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let all_written = writer.shared.lock().unwrap().written_lines.join("\n");
+
+        // The resume message must have been queued to the planner session
+        // (NOT to the stale refiner session).
+        assert!(
+            all_written.contains("queue_message"),
+            "expected a QueueMessage to be sent on planner reuse, got:\n{}",
+            all_written
+        );
+        assert!(
+            all_written.contains("existing-planner-session"),
+            "resume QueueMessage should target the planner session, got:\n{}",
+            all_written
+        );
+        assert!(
+            !all_written.contains("\"target_session_id\":\"stale-refiner-session\""),
+            "resume must NOT target the stale refiner session_id, got:\n{}",
+            all_written
+        );
+        assert!(
+            all_written.contains("moved back to planning"),
+            "resume body should explain the backward transition, got:\n{}",
+            all_written
+        );
+        assert!(
+            all_written.contains("task_get"),
+            "resume body should instruct the planner to call task_get, got:\n{}",
+            all_written
+        );
+    }
+
+    /// Companion to the bug-#589 test: an archived planner must NOT be
+    /// reused (find_reusable_session returns None) — we should fall through
+    /// to creating a new session instead. This guards against the bug fix
+    /// accidentally widening the reuse criteria.
+    #[test]
+    fn test_dispatch_planning_archived_planner_creates_new_session() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Archived planner test",
+                Some(5),
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.record_session(task.id, "old-planner-session", "planner")
+            .unwrap();
+
+        let mut archived = std::collections::HashSet::new();
+        archived.insert("old-planner-session".to_string());
+        let (mut writer, mut reader) = mock_io_with_archived(archived);
+
+        let result = tasks_scheduler::dispatch(
+            &db,
+            task.id,
+            Some("caller-session"),
+            "/test/project",
+            &mut writer,
+            &mut reader,
+        );
+        // We don't care whether downstream Chat/CreateSession succeeds in
+        // mock; we only need to confirm the result is NOT the archived
+        // planner session (which would prove the reuse branch wrongly fired).
+        match result {
+            Ok(sid) => assert_ne!(
+                sid, "old-planner-session",
+                "archived planner must not be reused"
+            ),
+            Err(_) => {
+                // Acceptable: the create-new path can fail in the mock.
+            }
+        }
+    }
+
     // ----- subtree claiming tests -----
 
     #[test]

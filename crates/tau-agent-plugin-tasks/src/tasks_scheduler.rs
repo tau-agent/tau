@@ -900,6 +900,20 @@ fn dispatch_planning(
     // instead of creating a duplicate.  This makes dispatch idempotent when
     // the schedule pass runs more than once while the task is still planning.
     if let Some(existing_sid) = find_reusable_session(db, task_id, "planner", writer, reader) {
+        // The reuse branch is hit when the task is moved back to planning
+        // (e.g. `refining → planning` because the refiner requested plan
+        // changes). The existing planner session is idle and won't notice
+        // the new state on its own — we must send it a resume message so
+        // it picks up the latest feedback and revises the plan. Without
+        // this, the task stalls indefinitely in `planning` (bug #589).
+        let msg = format!(
+            "Task {} has been moved back to planning for further work. \
+             Please run task_get to read the latest feedback and revise the plan, \
+             then transition the task forward again.\n\
+             - Call `task_get` with arguments: {{\"id\": {}}}",
+            task_id, task_id
+        );
+        resume_session(&existing_sid, task_id, &msg, writer, reader)?;
         eprintln!(
             "tasks scheduler: planning task {} already has a live planner session {}, reusing",
             task_id, existing_sid
