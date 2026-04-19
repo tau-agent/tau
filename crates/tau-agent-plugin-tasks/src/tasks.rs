@@ -685,6 +685,10 @@ fn handle_task_create(
             // Held tasks stay parked: the scheduler skips them until released
             // via task_update(hold=false).
             if (task.state == "ready" || task.state == "planning") && !task.held {
+                eprintln!(
+                    "tasks scheduler: task_create {} (state='{}') → enqueue ScheduleNeeded for project '{}'",
+                    task.id, task.state, project_name
+                );
                 pending_events.push(SchedulerEvent::ScheduleNeeded(
                     project_name.to_string(),
                     session_id.map(String::from),
@@ -697,10 +701,25 @@ fn handle_task_create(
             if task.state == "interactive" {
                 match create_interactive_session(db, &task, resolver, session_id, writer, reader) {
                     Some(new_sid) => {
-                        let _ = db.set_session_id(task.id, &new_sid);
-                        let _ = db.record_session(task.id, &new_sid, "interactive");
+                        if let Err(e) = db.set_session_id(task.id, &new_sid) {
+                            eprintln!(
+                                "tasks: failed to set session_id on interactive task {}: {}",
+                                task.id, e
+                            );
+                        }
+                        if let Err(e) = db.record_session(task.id, &new_sid, "interactive") {
+                            eprintln!(
+                                "tasks: failed to record interactive session {} on task {}: {}",
+                                new_sid, task.id, e
+                            );
+                        }
                         if let Some(creator_sid) = session_id {
-                            let _ = db.record_session(task.id, creator_sid, "creator");
+                            if let Err(e) = db.record_session(task.id, creator_sid, "creator") {
+                                eprintln!(
+                                    "tasks: failed to record creator session {} on interactive task {}: {}",
+                                    creator_sid, task.id, e
+                                );
+                            }
                         }
                     }
                     None => {
@@ -1383,9 +1402,17 @@ fn handle_task_update(
             // hold=false will (see below).
             match task.state.as_str() {
                 "approved" => {
+                    eprintln!(
+                        "tasks scheduler: task {} (old_state={:?}, new='approved') → enqueue MergeNeeded",
+                        task.id, old_state
+                    );
                     pending_events.push(SchedulerEvent::MergeNeeded(session_id.map(String::from)));
                 }
                 "ready" | "planning" if !task.held => {
+                    eprintln!(
+                        "tasks scheduler: task {} (old_state={:?}, new='{}') → enqueue ScheduleNeeded for project '{}'",
+                        task.id, old_state, task.state, task.project_name
+                    );
                     pending_events.push(SchedulerEvent::ScheduleNeeded(
                         task.project_name.clone(),
                         session_id.map(String::from),
@@ -1394,6 +1421,10 @@ fn handle_task_update(
                 "merged" | "closed" => {
                     // Dependents may have been blocked on this task — re-
                     // evaluate schedulability on the next scheduler pass.
+                    eprintln!(
+                        "tasks scheduler: task {} (old_state={:?}, new='{}') → enqueue ScheduleNeeded for project '{}' (unblock dependents)",
+                        task.id, old_state, task.state, task.project_name
+                    );
                     pending_events.push(SchedulerEvent::ScheduleNeeded(
                         task.project_name.clone(),
                         session_id.map(String::from),
@@ -1593,10 +1624,25 @@ fn handle_task_update(
                         db, &task, resolver, session_id, writer, reader,
                     ) {
                         Some(new_sid) => {
-                            let _ = db.set_session_id(task.id, &new_sid);
-                            let _ = db.record_session(task.id, &new_sid, "interactive");
+                            if let Err(e) = db.set_session_id(task.id, &new_sid) {
+                                eprintln!(
+                                    "tasks: failed to set session_id on interactive task {}: {}",
+                                    task.id, e
+                                );
+                            }
+                            if let Err(e) = db.record_session(task.id, &new_sid, "interactive") {
+                                eprintln!(
+                                    "tasks: failed to record interactive session {} on task {}: {}",
+                                    new_sid, task.id, e
+                                );
+                            }
                             if let Some(creator_sid) = session_id {
-                                let _ = db.record_session(task.id, creator_sid, "creator");
+                                if let Err(e) = db.record_session(task.id, creator_sid, "creator") {
+                                    eprintln!(
+                                        "tasks: failed to record creator session {} on interactive task {}: {}",
+                                        creator_sid, task.id, e
+                                    );
+                                }
                             }
                         }
                         None => {
@@ -2306,7 +2352,7 @@ fn handle_task_merge(
 /// a state transition requires follow-up work. The main loop drains
 /// pending events after each tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SchedulerEvent {
+pub(crate) enum SchedulerEvent {
     /// A task moved to `approved` — run the merge queue.  The optional
     /// session id is the caller that triggered the event; it's threaded
     /// through to [`tasks_merge::merge_task_for_caller`] so archival of
@@ -2886,6 +2932,8 @@ fn drain_scheduler_events(
 
     let batch = std::mem::take(events);
 
+    eprintln!("tasks scheduler: draining {} pending event(s)", batch.len());
+
     let mut need_merge = false;
     let mut merge_caller: Option<String> = None;
     let mut schedule_projects: Vec<(String, Option<String>)> = Vec::new();
@@ -2893,6 +2941,7 @@ fn drain_scheduler_events(
     for ev in batch {
         match ev {
             SchedulerEvent::MergeNeeded(caller) => {
+                eprintln!("tasks scheduler: drained MergeNeeded (caller={:?})", caller);
                 need_merge = true;
                 // A single tool-call batch can only originate from one
                 // caller session, so we keep the first non-None caller
@@ -2903,6 +2952,10 @@ fn drain_scheduler_events(
                 }
             }
             SchedulerEvent::ScheduleNeeded(project_name, session_id) => {
+                eprintln!(
+                    "tasks scheduler: drained ScheduleNeeded (project='{}', session={:?})",
+                    project_name, session_id
+                );
                 if !schedule_projects.iter().any(|(p, _)| p == &project_name) {
                     schedule_projects.push((project_name, session_id));
                 }
@@ -3095,7 +3148,7 @@ fn run_merge_pass(
 /// failure leaves the task stuck in `ready` with no future scheduler
 /// pass queued — the user has to hand-roll a `task_dispatch` to recover.
 /// See task #572 (and the investigation for #534).
-fn run_schedule_pass(
+pub(crate) fn run_schedule_pass(
     db: &TasksDb,
     project_name: &str,
     resolver: &ProjectResolver,
@@ -3104,6 +3157,10 @@ fn run_schedule_pass(
     reader: &mut impl BufRead,
     pending_events: &mut Vec<SchedulerEvent>,
 ) -> Vec<String> {
+    eprintln!(
+        "tasks scheduler: run_schedule_pass for project '{}' (triggering session={:?})",
+        project_name, session_id
+    );
     let project_path = match resolver.resolve(project_name) {
         Ok(p) => p,
         Err(e) => {
@@ -3143,14 +3200,19 @@ fn run_schedule_pass(
                     // scheduler can retry on the next pass.
                     let is_planning = st.branch.is_empty();
                     if !is_planning {
-                        let _ = db.update_task(
+                        if let Err(revert_err) = db.update_task(
                             st.id,
                             &TaskUpdate {
                                 state: Some("ready".to_string()),
                                 ..Default::default()
                             },
                             None,
-                        );
+                        ) {
+                            eprintln!(
+                                "tasks scheduler: failed to revert task {} to ready after dispatch failure: {}",
+                                st.id, revert_err
+                            );
+                        }
                     }
 
                     let revert_note = if is_planning {
@@ -3162,7 +3224,12 @@ fn run_schedule_pass(
                         "⚠️ Auto-dispatch of session failed for task {} ({}): {}. {}",
                         st.id, st.title, e, revert_note
                     );
-                    let _ = db.add_message(st.id, &warn_msg, Some("system"));
+                    if let Err(msg_err) = db.add_message(st.id, &warn_msg, Some("system")) {
+                        eprintln!(
+                            "tasks scheduler: failed to persist dispatch-failure message on task {}: {}",
+                            st.id, msg_err
+                        );
+                    }
                     warnings.push(warn_msg.clone());
 
                     // Re-queue a ScheduleNeeded event so the current drain

@@ -310,7 +310,7 @@ fn run_one_job<W>(
     ) {
         Ok(result) => {
             if result.success {
-                finish_success(db, job.task_id, &project_dir, writer, reader);
+                finish_success(db, resolver, job.task_id, &project_dir, writer, reader);
             } else {
                 finish_failure(db, &task, job.task_id, &result.log, writer, reader);
             }
@@ -356,6 +356,7 @@ fn run_one_job<W>(
 
 fn finish_success<W>(
     db: &TasksDb,
+    resolver: &ProjectResolver,
     task_id: i64,
     project_dir: &str,
     writer: &mut W,
@@ -377,10 +378,13 @@ fn finish_success<W>(
         );
     }
 
-    if let Ok(Some(t)) = db.get_task(task_id) {
+    let merged_project: Option<String> = if let Ok(Some(t)) = db.get_task(task_id) {
         let ctx = crate::tasks_scheduler::extract_merge_commit(project_dir, &t);
         crate::tasks_notify::notify_state_change(db, &t, "merging", ctx.as_deref(), writer, reader);
-    }
+        Some(t.project_name)
+    } else {
+        None
+    };
 
     crate::tasks_merge::notify_parent_of_subtask_done(db, task_id, writer, reader);
     if let Err(e) = crate::tasks_merge::notify_parent_if_all_done(db, task_id, writer, reader) {
@@ -391,6 +395,56 @@ fn finish_success<W>(
     }
 
     eprintln!("tasks merge worker: task {} merged successfully", task_id);
+
+    // Root cause of task #584: before this code existed, the merge
+    // worker's `→ merged` transition bypassed the main-loop's
+    // `SchedulerEvent::ScheduleNeeded` push (the main loop only pushes
+    // ScheduleNeeded from tool-handler `task_update` paths; the merge
+    // worker calls `db.update_task` directly). Result: ready tasks
+    // that were previously filtered out by `select_non_conflicting`
+    // (typically file-less tasks blocked by any in-flight task) would
+    // remain in `ready` forever unless some *other* tool call on the
+    // same project happened to fire a fresh schedule pass.
+    //
+    // Fix: after every successful merge, run a schedule pass for the
+    // merged task's project right here on the worker thread. The
+    // worker already has its own DB + resolver + writer/reader and
+    // uses the `merge-sr` RPC prefix, so dispatch() succeeds from this
+    // thread just as well as from the main loop.
+    if let Some(project) = merged_project {
+        let mut events: Vec<crate::tasks::SchedulerEvent> = Vec::new();
+        let warnings = crate::tasks::run_schedule_pass(
+            db,
+            &project,
+            resolver,
+            None,
+            writer,
+            reader,
+            &mut events,
+        );
+        for w in warnings {
+            eprintln!("tasks merge worker: post-merge schedule: {}", w);
+        }
+        // Any follow-up ScheduleNeeded pushed onto `events` (dispatch
+        // failure retry) is drained here inline — we don't have the
+        // main loop to do it for us.
+        for ev in std::mem::take(&mut events) {
+            if let crate::tasks::SchedulerEvent::ScheduleNeeded(p, sid) = ev {
+                let warnings = crate::tasks::run_schedule_pass(
+                    db,
+                    &p,
+                    resolver,
+                    sid.as_deref(),
+                    writer,
+                    reader,
+                    &mut events,
+                );
+                for w in warnings {
+                    eprintln!("tasks merge worker: post-merge schedule retry: {}", w);
+                }
+            }
+        }
+    }
 }
 
 fn finish_failure<W>(

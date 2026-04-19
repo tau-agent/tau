@@ -45,25 +45,78 @@ pub fn select_non_conflicting<'a>(
     tasks: &'a [Task],
     active_files: &[(i64, Vec<String>)],
 ) -> Vec<&'a Task> {
+    let (selected, _skipped) = select_non_conflicting_with_reasons(tasks, active_files);
+    selected
+}
+
+/// Why a ready task was skipped by [`select_non_conflicting_with_reasons`].
+///
+/// Returned alongside the chosen batch so the caller (run_schedule_pass,
+/// wait-reason reporter) can surface the reason in logs and on the task
+/// itself — without that, file-less tasks silently stall whenever any
+/// other task is in-flight (root cause of task #584).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Task has no `affected_files` declared and another task is already
+    /// active (with or without files), so the "schedule file-less alone"
+    /// rule rejects it.  `with_task_id` is an arbitrary representative of
+    /// the tasks blocking it (the first one encountered).
+    EmptyAffectedFilesNotAlone { with_task_id: Option<i64> },
+    /// Task has no `affected_files` and another file-less task has already
+    /// been selected in this same batch.
+    EmptyAffectedFilesBatchFull { with_task_id: i64 },
+    /// Task's declared files overlap with an active or already-selected
+    /// task's files.
+    FileConflict {
+        with_task_id: i64,
+        overlapping: Vec<String>,
+    },
+    /// An earlier task in this batch had no `affected_files` (and so was
+    /// treated as "claim everything"), blocking further selections.
+    BatchBlockedByUnbounded { with_task_id: i64 },
+}
+
+/// Like [`select_non_conflicting`] but also returns the reason each
+/// non-selected task was skipped, so callers can log per-task decisions
+/// and expose wait-reasons on stuck tasks.
+///
+/// Added in task #584 to make scheduler decisions observable.  The
+/// selection algorithm is identical to [`select_non_conflicting`].
+pub fn select_non_conflicting_with_reasons<'a>(
+    tasks: &'a [Task],
+    active_files: &[(i64, Vec<String>)],
+) -> (Vec<&'a Task>, Vec<(&'a Task, SkipReason)>) {
     let mut sorted: Vec<&Task> = tasks.iter().collect();
     sorted.sort_by(|a, b| b.priority.cmp(&a.priority));
 
-    // Pre-populate claimed_files with files from already-active tasks.
-    let mut claimed_files: HashSet<String> = HashSet::new();
+    // Pre-populate claimed_files with files from already-active tasks,
+    // and track which active task each file belongs to so we can report
+    // a specific conflict partner.
+    let mut claimed_by: HashMap<String, i64> = HashMap::new();
     let mut has_unbounded_active = false;
-    for (_id, files) in active_files {
+    let mut unbounded_active_id: Option<i64> = None;
+    let mut any_active_id: Option<i64> = active_files.first().map(|(id, _)| *id);
+    for (id, files) in active_files {
         if files.is_empty() {
             // An active task without affected_files is unbounded — it
             // potentially conflicts with everything.
             has_unbounded_active = true;
+            if unbounded_active_id.is_none() {
+                unbounded_active_id = Some(*id);
+            }
         }
         for f in files {
-            claimed_files.insert(f.clone());
+            claimed_by.entry(f.clone()).or_insert(*id);
+        }
+        if any_active_id.is_none() {
+            any_active_id = Some(*id);
         }
     }
 
     let mut selected: Vec<&Task> = Vec::new();
+    let mut skipped: Vec<(&Task, SkipReason)> = Vec::new();
     let mut has_unbounded = has_unbounded_active;
+    let mut unbounded_selected_id: Option<i64> = None;
 
     for task in &sorted {
         let files = extract_files(&task.affected_files);
@@ -72,32 +125,73 @@ pub fn select_non_conflicting<'a>(
             // No affected_files declared — treat as potentially conflicting
             // with everything. Only schedule alone and only if no active tasks
             // have claimed files.
-            if selected.is_empty() && !has_unbounded && claimed_files.is_empty() {
+            if selected.is_empty() && !has_unbounded && claimed_by.is_empty() {
                 selected.push(task);
                 has_unbounded = true;
+                unbounded_selected_id = Some(task.id);
                 // Don't break — but the flag prevents any further additions.
+                continue;
             }
-            // Skip if we already have selections or an unbounded active task.
+            // Report a specific reason.
+            let reason = if unbounded_selected_id.is_some() {
+                SkipReason::EmptyAffectedFilesBatchFull {
+                    with_task_id: unbounded_selected_id.expect("just checked Some"),
+                }
+            } else {
+                SkipReason::EmptyAffectedFilesNotAlone {
+                    with_task_id: unbounded_active_id
+                        .or(any_active_id)
+                        .or_else(|| claimed_by.values().next().copied())
+                        .or_else(|| selected.first().map(|t| t.id)),
+                }
+            };
+            skipped.push((task, reason));
             continue;
         }
 
         // If we already selected an unbounded task (or an active task is
         // unbounded), skip everything else.
         if has_unbounded {
+            let with_id = unbounded_selected_id
+                .or(unbounded_active_id)
+                .or(any_active_id)
+                .unwrap_or(0);
+            skipped.push((
+                task,
+                SkipReason::BatchBlockedByUnbounded {
+                    with_task_id: with_id,
+                },
+            ));
             continue;
         }
 
         // Check overlap with already-claimed files (includes active tasks).
-        let overlaps = files.iter().any(|f| claimed_files.contains(f));
-        if !overlaps {
+        let overlapping: Vec<String> = files
+            .iter()
+            .filter(|f| claimed_by.contains_key(*f))
+            .cloned()
+            .collect();
+        if overlapping.is_empty() {
             for f in files {
-                claimed_files.insert(f);
+                claimed_by.insert(f, task.id);
             }
             selected.push(task);
+        } else {
+            let with_task_id = overlapping
+                .first()
+                .and_then(|f| claimed_by.get(f).copied())
+                .unwrap_or(0);
+            skipped.push((
+                task,
+                SkipReason::FileConflict {
+                    with_task_id,
+                    overlapping,
+                },
+            ));
         }
     }
 
-    selected
+    (selected, skipped)
 }
 
 /// Extract file paths from the `affected_files` JSON value.
@@ -172,11 +266,23 @@ pub fn schedule(
     // Check how many tasks are already in-flight.
     let inflight = db.count_inflight_tasks(project_name)?;
     if inflight >= MAX_CONCURRENT_TASKS {
+        eprintln!(
+            "tasks scheduler: schedule pass for project '{}' — in-flight budget exhausted ({} / {}), skipping",
+            project_name, inflight, MAX_CONCURRENT_TASKS
+        );
         return Ok(Vec::new());
     }
     let remaining_capacity = MAX_CONCURRENT_TASKS - inflight;
 
     let schedulable_tasks = db.get_schedulable_tasks(project_name)?;
+
+    eprintln!(
+        "tasks scheduler: schedule pass for project '{}' — in-flight={} / {}, schedulable candidates={}",
+        project_name,
+        inflight,
+        MAX_CONCURRENT_TASKS,
+        schedulable_tasks.len(),
+    );
 
     if schedulable_tasks.is_empty() {
         return Ok(Vec::new());
@@ -200,8 +306,16 @@ pub fn schedule(
     for task in &planning_tasks {
         // Skip if already has a session (already dispatched)
         if task.session_id.is_some() {
+            eprintln!(
+                "tasks scheduler: skipping planning task {} — already has session {:?}",
+                task.id, task.session_id
+            );
             continue;
         }
+        eprintln!(
+            "tasks scheduler: selected planning task {} ('{}') for dispatch",
+            task.id, task.title
+        );
         scheduled.push(ScheduledTask {
             id: task.id,
             title: task.title.clone(),
@@ -220,23 +334,46 @@ pub fn schedule(
             .map(|t| (t.id, extract_files(&t.affected_files)))
             .collect();
 
-        let batch = select_non_conflicting(&ready_tasks, &active_files);
+        let (batch, skipped) = select_non_conflicting_with_reasons(&ready_tasks, &active_files);
+
+        for (task, reason) in &skipped {
+            eprintln!(
+                "tasks scheduler: skipped ready task {} ('{}'): {}",
+                task.id,
+                task.title,
+                describe_skip_reason(reason)
+            );
+            // Surface the wait reason on the task itself so `task_get`
+            // shows why it's stalled. Best-effort — DB errors are logged
+            // by the helper.
+            record_skip_reason(db, task, reason);
+        }
+
         if !batch.is_empty() {
             // We need the repo root to create branches and worktrees.
             let repo_root = tasks_git::get_repo_root(project_path)?;
 
             for task in batch {
+                eprintln!(
+                    "tasks scheduler: selected ready task {} ('{}') for dispatch",
+                    task.id, task.title
+                );
                 match prepare_task(db, task, &repo_root) {
                     Ok(st) => scheduled.push(st),
                     Err(e) => {
                         // Log but don't fail the whole batch.
                         eprintln!("tasks scheduler: failed to prepare task {}: {}", task.id, e);
                         // Add a visible message to the task so the error is discoverable.
-                        let _ = db.add_message(
+                        if let Err(log_err) = db.add_message(
                             task.id,
                             &format!("⚠️ Scheduling failed: {}", e),
                             Some("system"),
-                        );
+                        ) {
+                            eprintln!(
+                                "tasks scheduler: failed to persist schedule-error message for task {}: {}",
+                                task.id, log_err
+                            );
+                        }
                     }
                 }
             }
@@ -247,6 +384,71 @@ pub fn schedule(
     scheduled.truncate(remaining_capacity);
 
     Ok(scheduled)
+}
+
+/// Human-readable explanation of a [`SkipReason`], suitable for logging and
+/// for posting as a system message on the stalled task.  Kept terse because
+/// it shows up both in `server.log` (per pass, multi-task) and in
+/// `task_get`.
+fn describe_skip_reason(reason: &SkipReason) -> String {
+    match reason {
+        SkipReason::EmptyAffectedFilesNotAlone { with_task_id } => match with_task_id {
+            Some(id) if *id != 0 => format!(
+                "no affected_files declared, but task {} is in-flight (file-less tasks only schedule when no other task is active)",
+                id
+            ),
+            _ => "no affected_files declared; another task is in-flight (file-less tasks only schedule when the project is idle)".to_string(),
+        },
+        SkipReason::EmptyAffectedFilesBatchFull { with_task_id } => format!(
+            "no affected_files declared; task {} was already selected in this batch as the file-less slot",
+            with_task_id
+        ),
+        SkipReason::FileConflict { with_task_id, overlapping } => format!(
+            "file conflict with task {} on {:?}",
+            with_task_id, overlapping
+        ),
+        SkipReason::BatchBlockedByUnbounded { with_task_id } => format!(
+            "task {} has no affected_files and was selected first (or is in-flight), blocking further file-scoped tasks this pass",
+            with_task_id
+        ),
+    }
+}
+
+/// Surface a scheduler skip reason on the task itself as a dedup'd system
+/// message, so users see why a task is not dispatching.
+///
+/// The message is only appended if the most recent system message with the
+/// `[scheduler-skip]` sentinel does not already carry the same reason —
+/// otherwise a busy scheduler would spam the task's transcript every pass.
+fn record_skip_reason(db: &TasksDb, task: &Task, reason: &SkipReason) {
+    const SENTINEL: &str = "[scheduler-skip]";
+    let body = describe_skip_reason(reason);
+    let new_msg = format!("{} {}", SENTINEL, body);
+
+    // Check the existing messages to dedup.
+    match db.get_messages(task.id) {
+        Ok(msgs) => {
+            if let Some(latest_skip) = msgs.iter().rev().find(|m| m.content.starts_with(SENTINEL)) {
+                if latest_skip.content == new_msg {
+                    return; // same reason as before; don't duplicate
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "tasks scheduler: failed to read messages for task {} while deduping skip reason: {}",
+                task.id, e
+            );
+            // Fall through and still attempt to write the message.
+        }
+    }
+
+    if let Err(e) = db.add_message(task.id, &new_msg, Some("system")) {
+        eprintln!(
+            "tasks scheduler: failed to record skip reason on task {}: {}",
+            task.id, e
+        );
+    }
 }
 
 /// Prepare a single task for dispatch: create branch, worktree, update DB.
@@ -2662,6 +2864,99 @@ mod tests {
         ];
         let batch = select_non_conflicting(&tasks, &[]);
         assert_eq!(batch.len(), 3);
+    }
+
+    // ----- skip-reason tests (task #584) -----
+
+    #[test]
+    fn test_with_reasons_file_conflict_reports_partner() {
+        let tasks = vec![make_task(1, 5, Some(vec!["src/a.rs"]))];
+        let active_files = vec![(77, vec!["src/a.rs".to_string()])];
+        let (selected, skipped) = select_non_conflicting_with_reasons(&tasks, &active_files);
+        assert!(selected.is_empty());
+        assert_eq!(skipped.len(), 1);
+        match &skipped[0].1 {
+            SkipReason::FileConflict {
+                with_task_id,
+                overlapping,
+            } => {
+                assert_eq!(*with_task_id, 77);
+                assert_eq!(overlapping, &vec!["src/a.rs".to_string()]);
+            }
+            other => panic!("unexpected skip reason {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_with_reasons_file_less_blocked_by_active_reports_task_id() {
+        // Root-cause scenario for task #584: a ready task with no
+        // affected_files can't schedule when any task is in-flight.
+        let tasks = vec![make_task(1, 5, None)];
+        let active_files = vec![(42, vec!["src/something.rs".to_string()])];
+        let (selected, skipped) = select_non_conflicting_with_reasons(&tasks, &active_files);
+        assert!(selected.is_empty());
+        assert_eq!(skipped.len(), 1);
+        match &skipped[0].1 {
+            SkipReason::EmptyAffectedFilesNotAlone { with_task_id } => {
+                assert_eq!(*with_task_id, Some(42));
+            }
+            other => panic!("unexpected skip reason {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_with_reasons_file_less_blocked_by_unbounded_active() {
+        // An active task with no affected_files is "unbounded" — it
+        // conflicts with everything, including other file-less tasks.
+        let tasks = vec![make_task(1, 5, None)];
+        let active_files = vec![(42, vec![])];
+        let (selected, skipped) = select_non_conflicting_with_reasons(&tasks, &active_files);
+        assert!(selected.is_empty());
+        assert_eq!(skipped.len(), 1);
+        match &skipped[0].1 {
+            SkipReason::EmptyAffectedFilesNotAlone { with_task_id } => {
+                assert_eq!(*with_task_id, Some(42));
+            }
+            other => panic!("unexpected skip reason {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_with_reasons_second_file_less_blocked_by_first() {
+        // Two ready tasks both lacking affected_files: the first wins
+        // (highest priority), the second is skipped with a reason that
+        // points at the one that was selected.
+        let tasks = vec![make_task(1, 5, None), make_task(2, 3, None)];
+        let (selected, skipped) = select_non_conflicting_with_reasons(&tasks, &[]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 1);
+        assert_eq!(skipped.len(), 1);
+        match &skipped[0].1 {
+            SkipReason::EmptyAffectedFilesBatchFull { with_task_id } => {
+                assert_eq!(*with_task_id, 1);
+            }
+            other => panic!("unexpected skip reason {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_with_reasons_batch_blocked_by_selected_unbounded() {
+        // A file-less task selected first makes the batch unbounded;
+        // subsequent file-scoped tasks are skipped.
+        let tasks = vec![
+            make_task(1, 10, None),
+            make_task(2, 5, Some(vec!["src/a.rs"])),
+        ];
+        let (selected, skipped) = select_non_conflicting_with_reasons(&tasks, &[]);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, 1);
+        assert_eq!(skipped.len(), 1);
+        match &skipped[0].1 {
+            SkipReason::BatchBlockedByUnbounded { with_task_id } => {
+                assert_eq!(*with_task_id, 1);
+            }
+            other => panic!("unexpected skip reason {:?}", other),
+        }
     }
 
     #[test]
