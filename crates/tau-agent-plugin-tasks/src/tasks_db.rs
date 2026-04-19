@@ -1958,6 +1958,52 @@ impl TasksDb {
 
     /// Find tasks in terminal states (merged/closed/failed) that still have a worktree_path set.
     /// Used for startup cleanup of stale worktrees.
+    /// Find tasks that appear to be stuck: in `active` state with
+    /// `session_id IS NULL` and `updated_at` older than `max_age_ms`
+    /// milliseconds before `now_ms`.
+    ///
+    /// The task scheduler's watchdog uses this to detect the
+    /// "scheduler prepared a task for dispatch but the worker session
+    /// was never created" failure mode: `prepare_task` atomically
+    /// flips the state to `active` and creates the branch/worktree,
+    /// but the subsequent `dispatch()` call — which creates the
+    /// worker session and writes `session_id` — may never run (e.g.
+    /// because the enclosing schedule pass crashed, the plugin was
+    /// restarted, or a hook delivering `ScheduleNeeded` was dropped).
+    /// A task sitting in this state for more than a handful of
+    /// seconds almost certainly needs a re-dispatch nudge.
+    ///
+    /// See task #572.
+    pub fn get_stuck_active_tasks(
+        &self,
+        now_ms: i64,
+        max_age_ms: i64,
+    ) -> tau_agent_plugin::Result<Vec<Task>> {
+        let cutoff = now_ms.saturating_sub(max_age_ms);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        created_at, updated_at
+                 FROM tasks
+                 WHERE state = 'active' AND session_id IS NULL AND updated_at <= ?1",
+            )
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare stuck active query: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![cutoff], row_to_task)
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("query stuck active: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("read stuck active task: {}", e))
+            })?);
+        }
+        Ok(tasks)
+    }
+
     pub fn get_stale_worktree_tasks(&self) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn

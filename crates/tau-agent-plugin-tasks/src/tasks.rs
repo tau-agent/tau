@@ -2508,6 +2508,19 @@ pub fn run_tasks_plugin() {
         }
     }
 
+    // Startup watchdog: the scheduler may have prepared a task for
+    // dispatch (state=active, worktree created) in the previous
+    // server process but crashed before the worker session was
+    // created.  Any such tasks are stuck with session_id=NULL.  Run
+    // the watchdog once at startup so the user doesn't have to wait
+    // for an unrelated scheduler event to fire.  See task #572.
+    {
+        let warnings = run_watchdog_pass_all(&db, &resolver, &mut writer, &mut chan_reader);
+        for w in warnings {
+            eprintln!("tasks startup watchdog: {}", w);
+        }
+    }
+
     // Handle requests — blocks on recv() until the router forwards
     // the next PluginRequest or closes the channel on EOF / router shutdown.
     while let Ok(req) = main_req_rx.recv() {
@@ -2876,8 +2889,21 @@ fn drain_scheduler_events(
             session_id.as_deref(),
             writer,
             reader,
+            events,
         ));
     }
+
+    // Watchdog: after running the scheduled passes, look for any task
+    // stuck in `active` with `session_id = NULL`.  Such tasks are
+    // halfway-dispatched (branch + worktree exist, placeholder set,
+    // but no worker session) and, absent this sweep, sit indefinitely
+    // without any user-visible signal.  See task #572.
+    //
+    // We scan globally (not just projects in `schedule_projects`) so
+    // that a tool call originating in project A still recovers a
+    // stuck task in project B.  The DB query is cheap and stuck
+    // tasks are expected to be rare.
+    warnings.extend(run_watchdog_pass_all(db, resolver, writer, reader));
     warnings
 }
 
@@ -2965,7 +2991,7 @@ fn run_merge_pass(
                 }
             }
             for project in &merged_projects {
-                run_schedule_pass(db, project, resolver, None, writer, reader);
+                run_schedule_pass(db, project, resolver, None, writer, reader, &mut Vec::new());
             }
             for a in &attempts {
                 if !a.success {
@@ -2988,6 +3014,13 @@ fn run_merge_pass(
 /// prepare branches/worktrees, and dispatch sessions for them.
 ///
 /// Triggered when a task transitions to `ready` or `planning`.
+///
+/// If a dispatch fails for a non-planning task, it is reverted to `ready`
+/// **and** a fresh `ScheduleNeeded` event is pushed into `pending_events`
+/// so the current drain loop retries.  Without this, a single transient
+/// failure leaves the task stuck in `ready` with no future scheduler
+/// pass queued — the user has to hand-roll a `task_dispatch` to recover.
+/// See task #572 (and the investigation for #534).
 fn run_schedule_pass(
     db: &TasksDb,
     project_name: &str,
@@ -2995,6 +3028,7 @@ fn run_schedule_pass(
     session_id: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
+    pending_events: &mut Vec<SchedulerEvent>,
 ) -> Vec<String> {
     let project_path = match resolver.resolve(project_name) {
         Ok(p) => p,
@@ -3057,6 +3091,25 @@ fn run_schedule_pass(
                     let _ = db.add_message(st.id, &warn_msg, Some("system"));
                     warnings.push(warn_msg.clone());
 
+                    // Re-queue a ScheduleNeeded event so the current drain
+                    // loop retries.  Bug 2 from the #534 investigation:
+                    // without this the task sits in ready (or planning)
+                    // until some unrelated event fires a schedule pass.
+                    // The drain loop already deduplicates same-project
+                    // schedule events, so at most one retry pass runs
+                    // per drain cycle regardless of batch size.
+                    if !pending_events.iter().any(|e| {
+                        matches!(
+                            e,
+                            SchedulerEvent::ScheduleNeeded(p, _) if p == project_name
+                        )
+                    }) {
+                        pending_events.push(SchedulerEvent::ScheduleNeeded(
+                            project_name.to_string(),
+                            session_id.map(String::from),
+                        ));
+                    }
+
                     // Notify the triggering session so the user/agent that
                     // created the task sees the failure inline.
                     if let Some(sid) = session_id {
@@ -3078,6 +3131,220 @@ fn run_schedule_pass(
         Err(e) => {
             eprintln!("tasks scheduler: schedule pass error: {}", e);
         }
+    }
+    warnings
+}
+
+// ---------------------------------------------------------------------------
+// Stuck-task watchdog (task #572)
+// ---------------------------------------------------------------------------
+
+/// Tasks in `active` state with `session_id = NULL` for longer than this
+/// are treated as stuck by the watchdog and retried.
+///
+/// A normal dispatch completes well under a second: `prepare_task`
+/// creates the branch/worktree and flips the state to `active`, then
+/// `dispatch()` immediately creates the worker session and writes
+/// `session_id` before the enclosing tool call returns.  60 s is a
+/// generous threshold chosen to stay well clear of any legitimately
+/// slow dispatch while still reacting to the bug within one minute
+/// (the observed failure in task #570 sat in this state for ~20
+/// minutes before manual intervention).
+const STUCK_TASK_THRESHOLD_MS: i64 = 60_000;
+
+/// Maximum number of consecutive watchdog-driven dispatch attempts
+/// for a given task before giving up and transitioning it to
+/// `failed`.
+///
+/// Counted by scanning the task's own messages for the sentinel
+/// `WATCHDOG_ATTEMPT_MARKER` that the watchdog appends after every
+/// attempt, so the counter is durable across plugin restarts.
+const MAX_WATCHDOG_ATTEMPTS: usize = 3;
+
+/// Sentinel string appended to the watchdog's task-message after
+/// every retry attempt.  Used as the attempt counter —
+/// [`count_watchdog_attempts`] greps messages for this marker.
+const WATCHDOG_ATTEMPT_MARKER: &str = "[watchdog-dispatch-attempt]";
+
+/// Count how many times the watchdog has previously tried to
+/// re-dispatch this task.  Returns 0 on any DB error (callers fall
+/// back to "treat as fresh" rather than blocking retries).
+fn count_watchdog_attempts(db: &TasksDb, task_id: i64) -> usize {
+    match db.get_messages(task_id) {
+        Ok(msgs) => msgs
+            .iter()
+            .filter(|m| m.content.contains(WATCHDOG_ATTEMPT_MARKER))
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// Scan for tasks stuck in `active` with `session_id = NULL` and try
+/// to re-dispatch them.  Piggybacks on the periodic scheduler drain
+/// so no new background thread is needed.
+///
+/// Recovery rules:
+///
+/// - If the task has been halfway-dispatched (worktree/branch already
+///   on disk), call [`tasks_scheduler::dispatch`] directly.  It's
+///   idempotent — it reuses an existing live worker if one somehow
+///   materialised in the interim.
+/// - If dispatch fails [`MAX_WATCHDOG_ATTEMPTS`] times in a row, flip
+///   the task to `failed` with an explanatory message so a human
+///   notices.
+///
+/// Returns human-readable warnings for any action taken, so the
+/// enclosing tool call can surface them to the LLM.
+fn run_watchdog_pass(
+    db: &TasksDb,
+    project_name: &str,
+    resolver: &ProjectResolver,
+    session_id: Option<&str>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Vec<String> {
+    let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+    let stuck = match db.get_stuck_active_tasks(now_ms, STUCK_TASK_THRESHOLD_MS) {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("tasks watchdog: failed to query stuck tasks: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut warnings = Vec::new();
+
+    for task in stuck {
+        // Watchdog is per-project: skip tasks that belong to a
+        // different project than the triggering event.  (Stuck tasks
+        // in other projects will be picked up when a scheduler event
+        // fires for *their* project.)
+        if task.project_name != project_name {
+            continue;
+        }
+
+        let prior_attempts = count_watchdog_attempts(db, task.id);
+
+        if prior_attempts >= MAX_WATCHDOG_ATTEMPTS {
+            // Give up — surface loudly and transition to `failed`.
+            let msg = format!(
+                "⚠️ Watchdog giving up on task {} ({}) after {} re-dispatch attempts. \
+                 The task was stuck in `active` with no session_id. \
+                 Transitioning to `failed` so a human can take over.",
+                task.id, task.title, prior_attempts
+            );
+            eprintln!("tasks watchdog: {}", msg);
+            let _ = db.add_message(task.id, &msg, Some("system"));
+            warnings.push(msg);
+
+            if let Err(e) = db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some("failed".to_string()),
+                    ..Default::default()
+                },
+                None,
+            ) {
+                eprintln!(
+                    "tasks watchdog: failed to transition task {} to failed: {}",
+                    task.id, e
+                );
+            }
+            continue;
+        }
+
+        let attempt_num = prior_attempts + 1;
+        let attempt_msg = format!(
+            "{} Watchdog detected task {} ({}) stuck in `active` with session_id=NULL \
+             for >={}s; attempt {}/{} to re-dispatch.",
+            WATCHDOG_ATTEMPT_MARKER,
+            task.id,
+            task.title,
+            STUCK_TASK_THRESHOLD_MS / 1000,
+            attempt_num,
+            MAX_WATCHDOG_ATTEMPTS,
+        );
+        eprintln!("tasks watchdog: {}", attempt_msg);
+        let _ = db.add_message(task.id, &attempt_msg, Some("system"));
+
+        let project_path = match resolver.resolve(&task.project_name) {
+            Ok(p) => p,
+            Err(e) => {
+                let warn = format!(
+                    "⚠️ Watchdog: task {} ({}) cannot resolve project '{}': {}",
+                    task.id, task.title, task.project_name, e
+                );
+                eprintln!("tasks watchdog: {}", warn);
+                let _ = db.add_message(task.id, &warn, Some("system"));
+                warnings.push(warn);
+                continue;
+            }
+        };
+
+        match tasks_scheduler::dispatch(db, task.id, session_id, &project_path, writer, reader) {
+            Ok(sid) => {
+                let msg = format!(
+                    "✅ Watchdog re-dispatched stuck task {} ({}): session {}",
+                    task.id, task.title, sid
+                );
+                eprintln!("tasks watchdog: {}", msg);
+                let _ = db.add_message(task.id, &msg, Some("system"));
+                warnings.push(msg);
+            }
+            Err(e) => {
+                let warn = format!(
+                    "⚠️ Watchdog re-dispatch of stuck task {} ({}) failed on attempt {}/{}: {}",
+                    task.id, task.title, attempt_num, MAX_WATCHDOG_ATTEMPTS, e
+                );
+                eprintln!("tasks watchdog: {}", warn);
+                let _ = db.add_message(task.id, &warn, Some("system"));
+                warnings.push(warn);
+                // Leave the task in `active` with no session — the next
+                // watchdog pass will either retry or give up.
+            }
+        }
+    }
+
+    warnings
+}
+
+/// Run the watchdog across every project that has at least one
+/// stuck active task.  Used by `drain_scheduler_events` so the
+/// sweep is not tied to which project triggered the event.
+fn run_watchdog_pass_all(
+    db: &TasksDb,
+    resolver: &ProjectResolver,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Vec<String> {
+    let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+    let stuck = match db.get_stuck_active_tasks(now_ms, STUCK_TASK_THRESHOLD_MS) {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("tasks watchdog: failed to query stuck tasks: {}", e);
+            return Vec::new();
+        }
+    };
+
+    // Group by project so we can dispatch one `run_watchdog_pass`
+    // call per project (dedup any repeats).
+    let mut projects: Vec<String> = Vec::new();
+    for task in &stuck {
+        if !projects.iter().any(|p| p == &task.project_name) {
+            projects.push(task.project_name.clone());
+        }
+    }
+
+    let mut warnings = Vec::new();
+    for project_name in &projects {
+        warnings.extend(run_watchdog_pass(
+            db,
+            project_name,
+            resolver,
+            None,
+            writer,
+            reader,
+        ));
     }
     warnings
 }
@@ -8864,6 +9131,7 @@ mod tests {
             Some("trigger-session"),
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
         );
 
         // run_schedule_pass should return warnings for dispatch failures.
@@ -9243,6 +9511,427 @@ mod tests {
         assert_eq!(
             reverted.state, "ready",
             "active → ready transition should succeed for dispatch-failure recovery"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Stuck-task watchdog (task #572)
+    // ---------------------------------------------------------------
+
+    /// Build a task that looks exactly like the "scheduled but never
+    /// dispatched" failure mode: branch + worktree recorded, state
+    /// advanced to `active`, but `session_id` still NULL and
+    /// `updated_at` older than the watchdog threshold.
+    fn make_stuck_active_task(db: &TasksDb, title: &str, age_ms: i64) -> crate::tasks_db::Task {
+        let task = db
+            .create_task(
+                "test-project",
+                title,
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .expect("create task");
+        db.set_branch(task.id, &format!("task-{}", task.id))
+            .expect("set_branch");
+        db.set_worktree_path(task.id, "/tmp/fake-wt")
+            .expect("set_worktree_path");
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("update to active");
+
+        // Age the row by back-dating updated_at directly.  update_task
+        // touches updated_at, so we have to do this last.
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        let backdated = now_ms.saturating_sub(age_ms);
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![backdated, task.id],
+            )
+            .expect("backdate updated_at");
+
+        db.get_task(task.id).expect("get").expect("task exists")
+    }
+
+    #[test]
+    fn test_get_stuck_active_tasks_threshold() {
+        // Only tasks older than the threshold should be returned, and
+        // only those in `active` with session_id IS NULL.
+        let db = TasksDb::open_memory().unwrap();
+
+        let fresh = make_stuck_active_task(&db, "fresh", 5_000);
+        let old = make_stuck_active_task(&db, "old", 120_000);
+
+        // A task with a session set should never be considered stuck.
+        let assigned = make_stuck_active_task(&db, "assigned", 120_000);
+        db.set_session_id(assigned.id, "s-worker")
+            .expect("set_session_id");
+        // re-backdate because set_session_id bumps updated_at
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now_ms - 120_000, assigned.id],
+            )
+            .unwrap();
+
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        let stuck = db
+            .get_stuck_active_tasks(now_ms, STUCK_TASK_THRESHOLD_MS)
+            .expect("query stuck");
+        let ids: Vec<i64> = stuck.iter().map(|t| t.id).collect();
+        assert!(
+            ids.contains(&old.id),
+            "old stuck task should be returned, got {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&fresh.id),
+            "fresh active task should NOT be returned, got {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&assigned.id),
+            "task with session_id set should NOT be returned, got {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn test_watchdog_redispatches_stuck_active_task() {
+        // Scenario: task was halfway-dispatched (scheduler prepared it,
+        // flipped state to active, but the worker session was never
+        // created).  The watchdog should detect this and call dispatch
+        // which will create a fresh worker session.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = make_stuck_active_task(&db, "stuck-task", 120_000);
+        assert!(task.session_id.is_none());
+        assert_eq!(task.state, "active");
+
+        let warnings = run_watchdog_pass(
+            &db,
+            "test-project",
+            &resolver,
+            Some("trigger-session"),
+            &mut writer,
+            &mut reader,
+        );
+
+        // Expect a success warning that the watchdog re-dispatched.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Watchdog re-dispatched")),
+            "expected watchdog success warning, got {:?}",
+            warnings
+        );
+
+        // Task should now have a worker session recorded.
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert!(
+            updated.session_id.is_some(),
+            "task should have session_id after watchdog re-dispatch"
+        );
+        let sessions = db.get_sessions(task.id).unwrap();
+        assert!(
+            sessions.iter().any(|s| s.role == "worker"),
+            "expected a worker session to be recorded, got {:?}",
+            sessions
+        );
+
+        // The attempt marker should have been written exactly once.
+        assert_eq!(
+            count_watchdog_attempts(&db, task.id),
+            1,
+            "expected exactly one watchdog attempt marker"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_skips_fresh_active_tasks() {
+        // A task that just transitioned to active must not be touched
+        // — normal dispatch may still be in flight.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let _fresh = make_stuck_active_task(&db, "fresh", 1_000);
+
+        let warnings = run_watchdog_pass(
+            &db,
+            "test-project",
+            &resolver,
+            None,
+            &mut writer,
+            &mut reader,
+        );
+        assert!(
+            warnings.is_empty(),
+            "watchdog must not act on fresh active tasks, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_watchdog_skips_other_project() {
+        // Watchdog runs per-project: stuck tasks in a different project
+        // must be ignored by this pass (they will be picked up when a
+        // schedule event fires for their own project).
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let _stuck = make_stuck_active_task(&db, "stuck", 120_000);
+
+        let warnings = run_watchdog_pass(
+            &db,
+            "other-project",
+            &resolver,
+            None,
+            &mut writer,
+            &mut reader,
+        );
+        assert!(
+            warnings.is_empty(),
+            "watchdog must only touch tasks in its own project, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_watchdog_transitions_to_failed_after_max_attempts() {
+        // After MAX_WATCHDOG_ATTEMPTS failed re-dispatches, the
+        // watchdog should transition the task to `failed` and stop
+        // trying.  We simulate this by pre-populating the task with
+        // MAX_WATCHDOG_ATTEMPTS attempt markers.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = make_stuck_active_task(&db, "persistently-stuck", 120_000);
+
+        for i in 0..MAX_WATCHDOG_ATTEMPTS {
+            db.add_message(
+                task.id,
+                &format!("{} attempt {}", WATCHDOG_ATTEMPT_MARKER, i + 1),
+                Some("system"),
+            )
+            .unwrap();
+        }
+        assert_eq!(count_watchdog_attempts(&db, task.id), MAX_WATCHDOG_ATTEMPTS);
+
+        let warnings = run_watchdog_pass(
+            &db,
+            "test-project",
+            &resolver,
+            None,
+            &mut writer,
+            &mut reader,
+        );
+
+        // Watchdog should have surfaced a giving-up warning.
+        assert!(
+            warnings.iter().any(|w| w.contains("giving up")),
+            "expected give-up warning, got {:?}",
+            warnings
+        );
+
+        // Task must now be in `failed`.
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated.state, "failed",
+            "task should be transitioned to failed after giving up"
+        );
+    }
+
+    #[test]
+    fn test_watchdog_all_scans_every_project() {
+        // run_watchdog_pass_all is what drain_scheduler_events calls
+        // — it must pick up stuck tasks regardless of which project
+        // triggered the surrounding schedule event.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a stuck task in test-project using the helper...
+        let stuck_a = make_stuck_active_task(&db, "stuck-a", 120_000);
+        // ...and one in project-b by inserting + back-dating directly.
+        let stuck_b = db
+            .create_task(
+                "project-b",
+                "stuck-b",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.set_branch(stuck_b.id, &format!("task-{}", stuck_b.id))
+            .unwrap();
+        db.set_worktree_path(stuck_b.id, "/tmp/fake-wt-b").unwrap();
+        db.update_task(
+            stuck_b.id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now_ms - 120_000, stuck_b.id],
+            )
+            .unwrap();
+
+        let warnings = run_watchdog_pass_all(&db, &resolver, &mut writer, &mut reader);
+
+        // Both stuck tasks should have been re-dispatched.
+        let updated_a = db.get_task(stuck_a.id).unwrap().unwrap();
+        let updated_b = db.get_task(stuck_b.id).unwrap().unwrap();
+        assert!(
+            updated_a.session_id.is_some(),
+            "stuck task in test-project should have been re-dispatched"
+        );
+        assert!(
+            updated_b.session_id.is_some(),
+            "stuck task in project-b should have been re-dispatched"
+        );
+        assert!(
+            warnings
+                .iter()
+                .filter(|w| w.contains("re-dispatched"))
+                .count()
+                >= 2,
+            "expected two re-dispatch warnings, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_watchdog_surfaces_dispatch_failure() {
+        // If dispatch keeps failing (but hasn't hit the retry cap
+        // yet), the watchdog should record an attempt + warning but
+        // leave the task in `active` for the next pass to retry.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 16 active children, budget is 16");
+
+        let task = make_stuck_active_task(&db, "stuck-failing", 120_000);
+
+        let warnings = run_watchdog_pass(
+            &db,
+            "test-project",
+            &resolver,
+            None,
+            &mut writer,
+            &mut reader,
+        );
+
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Watchdog re-dispatch") && w.contains("failed")),
+            "expected a re-dispatch failure warning, got {:?}",
+            warnings
+        );
+
+        // Task stays in active, no session set.
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(updated.state, "active");
+        assert!(updated.session_id.is_none());
+
+        // An attempt marker should have been written.
+        assert_eq!(count_watchdog_attempts(&db, task.id), 1);
+    }
+
+    #[test]
+    fn test_schedule_pass_dispatch_failure_requeues_schedule_event() {
+        // Bug 2 from the #534 investigation: when dispatch fails and
+        // the task is reverted to ready, run_schedule_pass must push
+        // a ScheduleNeeded event so the current drain loop retries.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) =
+            mock_io_failing_session("child budget exceeded: 16 active children, budget is 16");
+
+        // Planning task — simplest path that exercises the dispatch
+        // revert (no git ops required).
+        let parent = db
+            .create_task(
+                "test-project",
+                "Parent",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.create_task(
+            "test-project",
+            "Planning fails",
+            None,
+            Some(parent.id),
+            None,
+            false,
+            "planning",
+            false,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let mut pending: Vec<SchedulerEvent> = Vec::new();
+        let warnings = run_schedule_pass(
+            &db,
+            "test-project",
+            &resolver,
+            Some("trigger-session"),
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        assert!(!warnings.is_empty(), "dispatch should have failed");
+
+        // The schedule pass must have pushed a fresh ScheduleNeeded so
+        // a subsequent drain cycle retries.
+        assert!(
+            pending.iter().any(|e| matches!(
+                e,
+                SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project"
+            )),
+            "expected ScheduleNeeded to be re-queued after dispatch failure, got {:?}",
+            pending
         );
     }
 
