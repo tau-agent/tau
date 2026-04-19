@@ -3,11 +3,11 @@
 //! Also used for OpenAI-compatible APIs (Qwen, local models, etc.)
 //! via different base_url and model settings.
 
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 
 use async_trait::async_trait;
 
-use super::common::{self, StreamCtx, send_event};
+use super::common::{self, PreparedStream, StreamCtx, open_sse_stream, send_event};
 use super::openai_types;
 use crate::provider::{EventReceiver, EventSender, Provider};
 use tau_agent_base::types::*;
@@ -96,51 +96,20 @@ fn run_stream(
 ) -> tau_agent_base::Result<()> {
     let url = format!("{}/chat/completions", ctx.base_url.trim_end_matches('/'));
 
-    let mut req = ureq::post(&url)
-        .header("content-type", "application/json")
-        .header("accept", "text/event-stream");
-
+    // Local must outlive the &str borrow in `extra_headers`.
+    let bearer;
+    let mut extra_headers: Vec<(&str, &str)> = Vec::with_capacity(2);
+    extra_headers.push(("accept", "text/event-stream"));
     if !ctx.api_key.is_empty() {
-        req = req.header("authorization", &format!("Bearer {}", ctx.api_key));
+        bearer = format!("Bearer {}", ctx.api_key);
+        extra_headers.push(("authorization", bearer.as_str()));
     }
 
-    let mut resp = req
-        .config()
-        .timeout_connect(Some(common::TIMEOUT_CONNECT))
-        .timeout_send_request(Some(common::TIMEOUT_SEND_REQUEST))
-        .timeout_send_body(Some(common::TIMEOUT_SEND_BODY))
-        .timeout_recv_response(Some(ctx.recv_response_timeout))
-        .http_status_as_error(false)
-        .build()
-        .send_json(body)
-        .map_err(|e| tau_agent_base::Error::Http(e.to_string()))?;
-
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        let retry_after = resp
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-        use std::io::Read;
-        let mut body_text = String::new();
-        let _ = resp.body_mut().as_reader().read_to_string(&mut body_text);
-        return Err(tau_agent_base::Error::HttpStatus {
-            status,
-            message: body_text,
-            retry_after,
-        });
-    }
-
-    let reader = BufReader::new(resp.body_mut().as_reader());
-    let mut output = AssistantMessage::empty(ctx.api_id, ctx.provider_name, ctx.model_id);
-
-    send_event(
-        tx,
-        StreamEvent::Start {
-            partial: output.clone(),
-        },
-    )?;
+    let PreparedStream {
+        body_reader,
+        initial_message: mut output,
+    } = open_sse_stream(ctx, &url, &extra_headers, body, tx)?;
+    let reader = body_reader;
 
     // Track tool calls by index (OpenAI streams them incrementally)
     struct ToolAccum {
