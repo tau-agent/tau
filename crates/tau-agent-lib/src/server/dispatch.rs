@@ -533,11 +533,19 @@ pub(super) async fn handle_client(
             }
             crate::protocol::Request::Chat { session_id, text } => {
                 if shutdown.is_shutting_down() {
+                    // Emit the terminal pair (Error, AgentDone) even on
+                    // shutdown so any subscribed TUI transitions out of
+                    // Streaming mode and back to Input. Skipping AgentDone
+                    // here used to leave the TUI's state machine waiting
+                    // indefinitely for a turn that will never complete.
                     let resp = Response::Error {
                         message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
                     };
                     broadcast_to_subscribers(&state, &session_id, &resp);
+                    let done_resp = Response::AgentDone;
+                    broadcast_to_subscribers_and_wait(&state, &session_id, &done_resp).await;
                     send(&mut writer, &resp).await.ok();
+                    send(&mut writer, &done_resp).await.ok();
                     continue;
                 }
 

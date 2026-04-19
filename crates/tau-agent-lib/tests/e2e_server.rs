@@ -4667,3 +4667,248 @@ fn seamless_restart_rejects_new_chat_during_drain() {
     chat_handle.join().ok();
     assert!(signalled, "expected server-shutting-down signal");
 }
+
+// ---------------------------------------------------------------------------
+// Bug #583 regression: every `Err` return from the agent runner must emit
+// both `Response::Error` and `Response::AgentDone` so the TUI / other
+// subscribers never get stuck waiting for a terminal event.
+// ---------------------------------------------------------------------------
+
+/// Start a test server configured with a mock-API model whose `provider`
+/// slug is a bogus/unregistered string so `resolve_api_key` returns
+/// `None` and the agent-runner early-returns `Err(NoApiKey)` at
+/// `agent_runner.rs:344`. This exercises the most common "error before
+/// streaming started" code path.
+fn start_server_without_api_key() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-noapikey-test.sock");
+    let db_path = dir.path().join("test.db");
+    let sock_clone = sock_path.clone();
+
+    // Register MockProvider under the "mock" api id so `needs_api_key`
+    // returns true. The model below uses a bogus provider slug that is
+    // guaranteed not to match any auth entry or env var — so the
+    // preflight `resolve_api_key` returns None and we hit NoApiKey.
+    let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
+    registry.register(MockProvider::new(vec![]));
+
+    let mut model = mock_model();
+    model.id = "needs-key-model-583".into();
+    model.provider = "bogus-provider-583-no-such-key".into();
+
+    let config = tau_agent_lib::server::TestServerConfig {
+        registry,
+        models: vec![model],
+        socket_path: sock_clone,
+        db_path,
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    std::thread::spawn(move || {
+        smol::block_on(async {
+            if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
+                eprintln!("test server error: {}", e);
+            }
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sock_path.exists(), "server socket did not appear");
+    (dir, sock_path)
+}
+
+/// A `Chat` request on a session whose provider has no API key must emit
+/// **both** `Response::Error` and `Response::AgentDone` (in that order),
+/// and the Error must precede AgentDone on the subscription stream. This
+/// is the server-side invariant the TUI relies on to leave Streaming
+/// mode.
+#[test]
+fn chat_no_api_key_emits_error_and_agent_done_in_order() {
+    let (_dir, sock_path) = start_server_without_api_key();
+
+    // Create a session using the key-less model.
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let sid = match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: Some("needs-key-model-583".into()),
+            provider: Some("bogus-provider-583-no-such-key".into()),
+            system_prompt: Some("t".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Chat — should return Error + AgentDone.
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let responses = send_recv_all(
+        &conn,
+        &Request::Chat {
+            session_id: sid,
+            text: "hi".into(),
+        },
+    );
+
+    let err_idx = responses
+        .iter()
+        .position(|r| matches!(r, Response::Error { .. }));
+    let done_idx = responses
+        .iter()
+        .position(|r| matches!(r, Response::AgentDone));
+
+    assert!(
+        err_idx.is_some(),
+        "expected Response::Error for NoApiKey, got: {:?}",
+        responses
+    );
+    assert!(
+        done_idx.is_some(),
+        "expected Response::AgentDone after Error, got: {:?}",
+        responses
+    );
+    assert!(
+        err_idx.unwrap() < done_idx.unwrap(),
+        "Error must precede AgentDone, got: {:?}",
+        responses
+    );
+
+    // The Error message mentions the missing API key — confirm it's
+    // the right error and not some other failure.
+    let err_msg = responses
+        .iter()
+        .find_map(|r| match r {
+            Response::Error { message } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("error message");
+    assert!(
+        err_msg.to_lowercase().contains("api key"),
+        "error should be about missing API key, got: {}",
+        err_msg
+    );
+}
+
+/// Same invariant verified via a subscribed side channel: a second
+/// connection subscribed to the session must observe Error then
+/// AgentDone even though Chat itself is what triggered the failure.
+/// This is the code path the TUI actually uses (Subscribe + fire
+/// Chat on a separate connection).
+#[test]
+fn subscriber_sees_error_then_agent_done_on_no_api_key() {
+    let (_dir, sock_path) = start_server_without_api_key();
+
+    let conn_create = UnixStream::connect(&sock_path).unwrap();
+    conn_create
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let sid = match send_recv(
+        &conn_create,
+        &Request::CreateSession {
+            model: Some("needs-key-model-583".into()),
+            provider: Some("bogus-provider-583-no-such-key".into()),
+            system_prompt: Some("t".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Subscriber connection (TUI analogue).
+    use std::io::{BufRead, BufReader};
+    let sub_conn = UnixStream::connect(&sock_path).unwrap();
+    sub_conn
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let sub_sid = sid.clone();
+    let sub_handle = std::thread::spawn(move || {
+        let mut s = sub_conn;
+        let sub_req = Request::Subscribe {
+            session_id: sub_sid,
+        };
+        let line = format!("{}\n", serde_json::to_string(&sub_req).unwrap());
+        s.write_all(line.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let reader = BufReader::new(s);
+        let mut collected: Vec<Response> = Vec::new();
+        for line_res in reader.lines() {
+            let Ok(line) = line_res else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(resp) = serde_json::from_str::<Response>(&line) else {
+                continue;
+            };
+            let is_done = matches!(resp, Response::AgentDone);
+            collected.push(resp);
+            if is_done {
+                break;
+            }
+        }
+        collected
+    });
+
+    // Give the subscriber a moment to register.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Trigger a Chat on a separate connection — fire-and-forget style.
+    let chat_conn = UnixStream::connect(&sock_path).unwrap();
+    chat_conn
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let _ = send_recv_all(
+        &chat_conn,
+        &Request::Chat {
+            session_id: sid,
+            text: "hi".into(),
+        },
+    );
+
+    let events = sub_handle.join().expect("subscriber thread panicked");
+    let err_idx = events
+        .iter()
+        .position(|r| matches!(r, Response::Error { .. }));
+    let done_idx = events.iter().position(|r| matches!(r, Response::AgentDone));
+    assert!(
+        err_idx.is_some(),
+        "subscriber should observe Error, got: {:?}",
+        events
+    );
+    assert!(
+        done_idx.is_some(),
+        "subscriber should observe AgentDone, got: {:?}",
+        events
+    );
+    assert!(
+        err_idx.unwrap() < done_idx.unwrap(),
+        "subscriber must see Error *before* AgentDone, got: {:?}",
+        events
+    );
+}

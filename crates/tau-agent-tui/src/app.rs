@@ -198,6 +198,13 @@ pub struct App {
     pub tick_counter: usize,
     /// Last escape press time for double-escape detection.
     pub last_escape: std::time::Instant,
+    /// Last Ctrl-C press time for double-Ctrl-C detection while streaming.
+    /// A second Ctrl-C within the debounce window forces the TUI back to
+    /// Input mode even if the server never sent a terminal
+    /// `AgentDone`/`Cancelled`/`Error` — the emergency-escape hatch that
+    /// guarantees the TUI can never get permanently stuck in Streaming
+    /// mode because of a server-side invariant violation.
+    pub last_ctrl_c: std::time::Instant,
     /// Command history index (None = composing new, Some(i) = browsing history).
     pub history_index: Option<usize>,
     /// Saved text when entering history browse (restored on down past end).
@@ -341,6 +348,9 @@ impl App {
             spinner_frame: 0,
             tick_counter: 0,
             last_escape: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(10))
+                .expect("10s subtraction should not underflow Instant"),
+            last_ctrl_c: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(10))
                 .expect("10s subtraction should not underflow Instant"),
             history_index: None,
@@ -1848,11 +1858,33 @@ impl App {
                 self.last_escape = now;
                 None
             }
-            // Ctrl+C during streaming: cancel
+            // Ctrl+C during streaming: cancel. A *second* Ctrl-C within
+            // 1s is an emergency force-reset: even if the server never
+            // sent a terminal `Cancelled`/`AgentDone`/`Error` (bug #583),
+            // the TUI transitions back to Input mode locally so the user
+            // can keep typing. The cancel request is still sent so the
+            // server-side turn is torn down when it next checks the flag.
             (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.messages.push(MessageItem::Status {
-                    text: "[cancelling...]".into(),
-                });
+                let now = std::time::Instant::now();
+                let is_double =
+                    now.duration_since(self.last_ctrl_c) < std::time::Duration::from_secs(1);
+                self.last_ctrl_c = now;
+                if is_double {
+                    // Force-reset locally so a stuck streaming state can
+                    // never wedge the TUI past a double Ctrl-C.
+                    self.finalize_in_flight();
+                    self.messages.push(MessageItem::Status {
+                        text: "[force reset \u{2014} no server response; returning to input]"
+                            .into(),
+                    });
+                    self.phase = AgentPhase::Idle;
+                    self.set_mode(AppMode::Input);
+                    self.pending_steer = None;
+                } else {
+                    self.messages.push(MessageItem::Status {
+                        text: "[cancelling... press Ctrl-C again to force reset]".into(),
+                    });
+                }
                 Some(Action::CancelChat)
             }
             // Ctrl+D during streaming: quit
@@ -5828,5 +5860,138 @@ mod tests {
         assert_eq!(format_u64_commas(1_000), "1,000");
         assert_eq!(format_u64_commas(12_345), "12,345");
         assert_eq!(format_u64_commas(1_234_567), "1,234,567");
+    }
+
+    // ---- Bug #583 regression: TUI must stay responsive when the
+    // server-side agent loop returns an error.
+
+    /// An `Error` arriving in Streaming mode with no preceding `Start`
+    /// or `AssistantChunk` (i.e. the turn failed before any streaming
+    /// output) must still transition the app back to Input mode, so the
+    /// next keypress is handled by `handle_input_key`.
+    #[test]
+    fn error_without_preceding_start_returns_to_input_mode() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        // No Start / AssistantChunk / ToolCall have been observed — this
+        // models the NoApiKey early-return path on the server.
+        app.handle_server_response(Response::Error {
+            message: "no API key for provider: log".into(),
+        });
+        assert_eq!(
+            app.mode,
+            AppMode::Input,
+            "Error should always return to Input mode"
+        );
+        assert_eq!(app.phase, AgentPhase::Idle);
+        // The error text is visible to the user.
+        let has_err = app
+            .messages
+            .iter()
+            .any(|m| matches!(m, MessageItem::Error { text } if text.contains("no API key")));
+        assert!(has_err, "error message should be appended");
+
+        // And a subsequent keypress is now routed to handle_input_key:
+        // typing into the textarea works.
+        let key = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        app.handle_input_key(&key);
+        let typed = app.textarea.lines().iter().any(|l| l.contains('x'));
+        assert!(typed, "textarea should accept input after Error");
+    }
+
+    /// `Error` followed by `AgentDone` (server-side invariant) should
+    /// leave the app in Input mode exactly once — neither the `Error`
+    /// nor the trailing `AgentDone` should flip the mode back to
+    /// Streaming.
+    #[test]
+    fn error_then_agent_done_stays_in_input_mode() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+
+        app.handle_server_response(Response::Error {
+            message: "boom".into(),
+        });
+        assert_eq!(app.mode, AppMode::Input);
+
+        app.handle_server_response(Response::AgentDone);
+        assert_eq!(
+            app.mode,
+            AppMode::Input,
+            "trailing AgentDone must not re-enter Streaming"
+        );
+    }
+
+    /// Emergency force-reset: a *second* Ctrl-C within 1s while
+    /// streaming forces mode back to Input even if the server never
+    /// sent a terminal event. This is the user-facing escape hatch that
+    /// guarantees the TUI can't get permanently stuck in Streaming mode
+    /// (bug #583).
+    #[test]
+    fn double_ctrl_c_force_resets_streaming_mode() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.phase = AgentPhase::Thinking;
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        // First press: cancel action, still in Streaming mode.
+        let a1 = app.handle_streaming_key(&key);
+        assert!(matches!(a1, Some(Action::CancelChat)));
+        assert_eq!(app.mode, AppMode::Streaming, "first Ctrl-C doesn't reset");
+
+        // Second press within 1s: force-reset to Input.
+        let a2 = app.handle_streaming_key(&key);
+        assert!(
+            matches!(a2, Some(Action::CancelChat)),
+            "cancel action still dispatched on force-reset"
+        );
+        assert_eq!(
+            app.mode,
+            AppMode::Input,
+            "double Ctrl-C must force mode to Input"
+        );
+        assert_eq!(app.phase, AgentPhase::Idle);
+    }
+
+    /// If the two Ctrl-C presses are >1s apart, each one only cancels
+    /// (no force-reset) — the debounce protects accidental slow
+    /// presses from wiping state when the server is merely slow to
+    /// respond.
+    #[test]
+    fn slow_ctrl_c_does_not_force_reset() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let _ = app.handle_streaming_key(&key);
+        // Back-date the last press so the next one is outside the window.
+        app.last_ctrl_c = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(5))
+            .expect("5s subtraction should not underflow Instant");
+        let _ = app.handle_streaming_key(&key);
+        assert_eq!(
+            app.mode,
+            AppMode::Streaming,
+            "slow second Ctrl-C should not force-reset"
+        );
+    }
+
+    /// After a force-reset via double Ctrl-C the input textarea must
+    /// still be usable — regression check that we didn't leave the app
+    /// in a weird in-between state.
+    #[test]
+    fn input_still_works_after_force_reset() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let _ = app.handle_streaming_key(&key);
+        let _ = app.handle_streaming_key(&key);
+        assert_eq!(app.mode, AppMode::Input);
+
+        // Type something in input mode.
+        let key_h = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE);
+        app.handle_input_key(&key_h);
+        let typed = app.textarea.lines().iter().any(|l| l.contains('h'));
+        assert!(typed, "textarea should accept input after force reset");
     }
 }
