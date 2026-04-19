@@ -600,32 +600,15 @@ async fn cmd_default() -> tau_agent_lib::Result<()> {
     };
 
     // Create session (needed for TUI initialization)
-    client
-        .send(&tau_agent_lib::protocol::Request::CreateSession {
+    let session_id = client
+        .create_user_session(tau_agent_lib::client::UserSessionSpec {
             model: Some(model_id),
             provider,
-            system_prompt: None,
             cwd,
             parent_id: None,
             child_budget: 16,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
         })
         .await?;
-
-    let mut created_id = None;
-    client
-        .recv_streaming(|resp| {
-            if let tau_agent_lib::protocol::Response::SessionCreated { session_id } = resp {
-                created_id = Some(session_id.clone());
-            }
-        })
-        .await?;
-    let session_id =
-        created_id.ok_or_else(|| tau_agent_lib::Error::Io("failed to create session".into()))?;
 
     // Track the active session so the SIGTERM/SIGHUP handler can cancel it.
     set_active_chat_session(Some(session_id.clone()));
@@ -881,32 +864,15 @@ async fn cmd_chat(
         let cwd = std::env::current_dir()
             .ok()
             .and_then(|p| p.to_str().map(String::from));
-        client
-            .send(&tau_agent_lib::protocol::Request::CreateSession {
+        let id = client
+            .create_user_session(tau_agent_lib::client::UserSessionSpec {
                 model: Some(model_id),
                 provider,
-                system_prompt: None,
                 cwd,
                 parent_id: None,
                 child_budget,
-                tagline: None,
-                auto_archive: false,
-                notify_parent: true,
-                project_name: None,
-                sandbox_profile: None,
             })
             .await?;
-
-        let mut created_id = None;
-        client
-            .recv_streaming(|resp| {
-                if let tau_agent_lib::protocol::Response::SessionCreated { session_id } = resp {
-                    created_id = Some(session_id.clone());
-                }
-            })
-            .await?;
-        let id = created_id
-            .ok_or_else(|| tau_agent_lib::Error::Io("failed to create session".into()))?;
         (id, false)
     };
 
@@ -1011,31 +977,14 @@ async fn cli_create_session(
     child_budget: u32,
 ) -> tau_agent_lib::Result<String> {
     client
-        .send(&tau_agent_lib::protocol::Request::CreateSession {
+        .create_user_session(tau_agent_lib::client::UserSessionSpec {
             model,
             provider: None,
-            system_prompt: None,
             cwd,
             parent_id,
             child_budget,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
         })
-        .await?;
-
-    let mut created_id = None;
-    client
-        .recv_streaming(|resp| {
-            if let tau_agent_lib::protocol::Response::SessionCreated { session_id } = resp {
-                created_id = Some(session_id.clone());
-            }
-        })
-        .await?;
-
-    created_id.ok_or_else(|| tau_agent_lib::Error::Io("failed to create session".into()))
+        .await
 }
 
 async fn send_and_print(

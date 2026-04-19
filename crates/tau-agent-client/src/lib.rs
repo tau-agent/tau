@@ -155,6 +155,54 @@ impl Client {
             async { result }
         })
     }
+    /// Create a user-facing session and return its id.
+    ///
+    /// Centralises the invariants shared by every CLI/TUI entry point that
+    /// opens a session on the user's behalf:
+    ///
+    /// - `system_prompt: None` (use the server/agent default)
+    /// - `tagline: None` (no task-style role suffix)
+    /// - `auto_archive: false`
+    /// - `notify_parent: true` (user-facing sessions surface completion)
+    /// - `project_name: None` (picked up from cwd by the server)
+    /// - `sandbox_profile: None` (no task-config override)
+    ///
+    /// Only the fields that actually vary per call site — `model`,
+    /// `provider`, `cwd`, `parent_id`, `child_budget` — appear on
+    /// [`UserSessionSpec`]. Sessions spawned by the task plugin use a
+    /// different helper (`tau_agent_plugin_tasks::tasks_session`) because
+    /// their invariants diverge (`notify_parent: false`, role tagline,
+    /// task-derived `project_name`).
+    pub async fn create_user_session(
+        &mut self,
+        spec: UserSessionSpec,
+    ) -> tau_agent_base::Result<String> {
+        self.send(&Request::CreateSession {
+            model: spec.model,
+            provider: spec.provider,
+            system_prompt: None,
+            cwd: spec.cwd,
+            parent_id: spec.parent_id,
+            child_budget: spec.child_budget,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        })
+        .await?;
+
+        let mut created_id = None;
+        self.recv_streaming(|resp| {
+            if let Response::SessionCreated { session_id } = resp {
+                created_id = Some(session_id.clone());
+            }
+        })
+        .await?;
+
+        created_id.ok_or_else(|| tau_agent_base::Error::Io("failed to create session".into()))
+    }
+
     /// Execute a tool directly on a session (no LLM involved).
     /// Returns `(content, is_error)`.
     pub async fn execute_tool(
@@ -178,6 +226,18 @@ impl Client {
         .await?;
         result.ok_or_else(|| tau_agent_base::Error::Io("no ToolExecuted response received".into()))
     }
+}
+
+/// Fields that vary between user-facing [`Client::create_user_session`]
+/// call sites. Every other `Request::CreateSession` field is pinned by
+/// the helper — see its doc comment.
+#[derive(Debug, Clone, Default)]
+pub struct UserSessionSpec {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub cwd: Option<String>,
+    pub parent_id: Option<String>,
+    pub child_budget: u32,
 }
 
 /// Spawn the server as a background daemon process.

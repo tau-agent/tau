@@ -24,7 +24,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use smol::channel::{self, Sender};
 
-use tau_agent_lib::client::Client;
+use tau_agent_lib::client::{Client, UserSessionSpec};
 use tau_agent_lib::protocol::{Request, Response};
 
 use crate::app::{Action, App, AppMode};
@@ -944,31 +944,14 @@ async fn create_session(
 ) -> tau_agent_lib::Result<String> {
     let mut client = Client::connect().await?;
     client
-        .send(&Request::CreateSession {
+        .create_user_session(UserSessionSpec {
             model,
             provider: None,
-            system_prompt: None,
             cwd,
             parent_id,
             child_budget,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
         })
-        .await?;
-
-    let mut created_id = None;
-    client
-        .recv_streaming(|resp| {
-            if let Response::SessionCreated { session_id } = resp {
-                created_id = Some(session_id.clone());
-            }
-        })
-        .await?;
-
-    created_id.ok_or_else(|| tau_agent_lib::Error::Io("failed to create session".into()))
+        .await
 }
 
 /// Fetch message history for a session (blocking request/response).
