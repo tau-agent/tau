@@ -1289,9 +1289,16 @@ fn handle_task_update(
         held: args.get("hold").and_then(|v| v.as_bool()),
     };
 
-    // Track session as reviewer if transitioning to review or approved
+    // Track session as reviewer if it approves the task — the transition
+    // to `approved` can only be made by a session that reviewed the work,
+    // so recording the caller as reviewer is accurate.
+    //
+    // Do NOT record on `→ review`: any session can legitimately move a
+    // task into review (worker signalling "done", orchestrator routing,
+    // human via TUI) and none of those are reviewers. The real reviewer
+    // session is recorded at dispatch time in tasks_scheduler.rs.
     if let (Some(sid), Some(new_state)) = (session_id, &update.state)
-        && (new_state == "review" || new_state == "approved")
+        && new_state == "approved"
         && let Err(e) = db.record_session(id, sid, "reviewer")
     {
         return tool_err(tool_call_id, &format!("record session: {}", e));
@@ -4516,11 +4523,13 @@ mod tests {
         .unwrap();
         db.assign_task(task.id, "worker-s").unwrap();
 
-        // Update to review with a different session
+        // Update to review with a different session (acting as orchestrator,
+        // NOT as a reviewer). The caller must not be recorded as a reviewer
+        // — only the auto-dispatched review session should hold that role.
         let result = handle_task_update(
             &db,
             &serde_json::json!({"id": task.id, "state": "review"}),
-            Some("reviewer-session"),
+            Some("orchestrator-session"),
             "tc1",
             &resolver,
             &mut writer,
@@ -4535,8 +4544,99 @@ mod tests {
             .iter()
             .map(|s| (s.session_id.as_str(), s.role.as_str()))
             .collect();
+        // Worker is still recorded.
         assert!(roles.contains(&("worker-s", "worker")));
-        assert!(roles.contains(&("reviewer-session", "reviewer")));
+        // The orchestrator caller of `task_update` must NOT be recorded
+        // as a reviewer — that row would poison `find_reusable_session`.
+        assert!(
+            !roles
+                .iter()
+                .any(|(sid, role)| *sid == "orchestrator-session" && *role == "reviewer"),
+            "orchestrator session must not be recorded as reviewer, got: {:?}",
+            roles
+        );
+        // The auto-dispatched review session should be recorded as reviewer.
+        assert!(
+            roles.iter().any(|(_, role)| *role == "reviewer"),
+            "expected the auto-dispatched review session to be recorded as reviewer, got: {:?}",
+            roles
+        );
+    }
+
+    /// `task_update(state=approved)` must record the caller as a reviewer:
+    /// only a reviewer session legitimately approves a task, so the caller
+    /// session id is an accurate signal of "this session reviewed and
+    /// approved the work".
+    #[test]
+    fn test_session_tracking_on_update_to_approved() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let task = db
+            .create_task(
+                "test-project",
+                "Approved track",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        // Walk the state machine into `review` without going through the
+        // handler, so the only reviewer row recorded here is the one we
+        // are testing (from the `→ approved` transition).
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "worker-s").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("review".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "approved"}),
+            Some("s-reviewer"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+
+        let sessions = db.get_sessions(task.id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.contains(&("s-reviewer", "reviewer")),
+            "expected approving session to be recorded as reviewer, got: {:?}",
+            roles
+        );
     }
 
     /// End-to-end wiring: handle_task_update defers the self-recipient
