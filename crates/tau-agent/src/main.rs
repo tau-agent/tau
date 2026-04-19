@@ -2597,6 +2597,14 @@ fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
             title,
             priority,
         } => {
+            let state = match state {
+                None => None,
+                Some(s) => Some(
+                    tau_agent_lib::tasks_state::TaskState::from_db_str(&s).map_err(|_| {
+                        tau_agent_lib::Error::Io(format!("invalid task state '{}'", s))
+                    })?,
+                ),
+            };
             let update = tau_agent_lib::tasks_db::TaskUpdate {
                 state,
                 title,
@@ -2612,7 +2620,7 @@ fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
         }
         TaskAction::Approve { id } => {
             let update = tau_agent_lib::tasks_db::TaskUpdate {
-                state: Some("approved".to_string()),
+                state: Some(tau_agent_lib::tasks_state::TaskState::Approved),
                 ..Default::default()
             };
             let task = db.update_task(id, &update, None)?;
@@ -2624,7 +2632,7 @@ fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
         }
         TaskAction::Ready { id } => {
             let update = tau_agent_lib::tasks_db::TaskUpdate {
-                state: Some("ready".to_string()),
+                state: Some(tau_agent_lib::tasks_state::TaskState::Ready),
                 ..Default::default()
             };
             let task = db.update_task(id, &update, None)?;

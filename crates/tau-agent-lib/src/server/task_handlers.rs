@@ -14,7 +14,7 @@ fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
         id: t.id,
         project_name: t.project_name,
         title: t.title,
-        state: t.state,
+        state: t.state.as_str().to_string(),
         priority: t.priority,
         parent_id: t.parent_id,
         tags: t.tags,
@@ -283,6 +283,17 @@ pub fn handle_task_update(
     let db = match open_tasks_db() {
         Ok(db) => db,
         Err(resp) => return resp,
+    };
+    let new_state = match new_state {
+        None => None,
+        Some(s) => match crate::tasks_state::TaskState::from_db_str(&s) {
+            Ok(st) => Some(st),
+            Err(_) => {
+                return Response::Error {
+                    message: format!("invalid task state '{}'", s),
+                };
+            }
+        },
     };
     let update = crate::tasks_db::TaskUpdate {
         state: new_state,

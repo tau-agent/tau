@@ -23,6 +23,7 @@ use crate::err::plugin_io_err;
 use crate::tasks_config;
 use crate::tasks_db::{Task, TaskUpdate, TasksDb};
 use crate::tasks_git;
+use crate::tasks_state::TaskState;
 use tau_agent_plugin::PluginMessage;
 
 // ---------------------------------------------------------------------------
@@ -312,7 +313,7 @@ pub fn schedule(
     let mut planning_tasks = Vec::new();
     let mut ready_tasks = Vec::new();
     for task in &schedulable_tasks {
-        if task.state == "planning" {
+        if task.state == TaskState::Planning {
             planning_tasks.push(task);
         } else {
             ready_tasks.push(task.clone());
@@ -523,7 +524,7 @@ fn prepare_task(
     db.update_task(
         task.id,
         &TaskUpdate {
-            state: Some("active".to_string()),
+            state: Some(TaskState::Active),
             ..Default::default()
         },
         None,
@@ -1025,7 +1026,14 @@ pub(crate) fn dispatch_task_phase(
     // --- 8. Optional ready → active notification --------------------------
     if phase.emits_ready_to_active_notify() {
         if let Ok(Some(updated)) = db.get_task(task_id) {
-            crate::tasks_notify::notify_state_change(db, &updated, "ready", None, writer, reader);
+            crate::tasks_notify::notify_state_change(
+                db,
+                &updated,
+                TaskState::Ready,
+                None,
+                writer,
+                reader,
+            );
         }
     }
 
@@ -1068,17 +1076,17 @@ pub fn dispatch(
     );
 
     // Handle planning-state dispatch (no worktree, read-only session)
-    if task.state == "planning" {
+    if task.state == TaskState::Planning {
         return dispatch_planning(db, &task, parent_session_id, project_path, writer, reader);
     }
 
     // Task must be active (prepared by schedule) or ready (we'll prepare it).
-    if task.state == "ready" {
+    if task.state == TaskState::Ready {
         // Not yet prepared — do it inline.
         let repo_root = tasks_git::get_repo_root(project_path)?;
         prepare_task(db, &task, &repo_root)?;
         // Re-read after prepare.
-    } else if task.state != "active" {
+    } else if task.state != TaskState::Active {
         return Err(tau_agent_plugin::Error::Io(format!(
             "task {} is in state '{}', must be 'ready', 'active', or 'planning' to dispatch",
             task_id, task.state
@@ -1624,7 +1632,7 @@ fn merge_one_task(
         }
     };
 
-    if current.state != "approved" {
+    if current.state != TaskState::Approved {
         return MergeAttempt {
             task_id,
             title,
@@ -1637,7 +1645,7 @@ fn merge_one_task(
     if let Err(e) = db.update_task(
         task_id,
         &TaskUpdate {
-            state: Some("merging".into()),
+            state: Some(TaskState::Merging),
             ..Default::default()
         },
         None,
@@ -1652,7 +1660,7 @@ fn merge_one_task(
 
     // Broadcast approved -> merging to all involved sessions.
     if let Ok(Some(t)) = db.get_task(task_id) {
-        crate::tasks_notify::notify_state_change(db, &t, "approved", None, writer, reader);
+        crate::tasks_notify::notify_state_change(db, &t, TaskState::Approved, None, writer, reader);
     }
 
     eprintln!("tasks scheduler: auto-merging task {} ({})", task_id, title);
@@ -1683,7 +1691,7 @@ fn merge_one_task(
                 if let Err(e) = db.update_task(
                     task_id,
                     &TaskUpdate {
-                        state: Some("merged".into()),
+                        state: Some(TaskState::Merged),
                         ..Default::default()
                     },
                     None,
@@ -1701,7 +1709,7 @@ fn merge_one_task(
                     crate::tasks_notify::notify_state_change(
                         db,
                         &t,
-                        "merging",
+                        TaskState::Merging,
                         ctx.as_deref(),
                         writer,
                         reader,
@@ -1733,7 +1741,7 @@ fn merge_one_task(
                 if let Err(e) = db.update_task(
                     task_id,
                     &TaskUpdate {
-                        state: Some("active".into()),
+                        state: Some(TaskState::Active),
                         ..Default::default()
                     },
                     None,
@@ -1749,7 +1757,7 @@ fn merge_one_task(
                     crate::tasks_notify::notify_state_change(
                         db,
                         &t,
-                        "merging",
+                        TaskState::Merging,
                         Some("merge failed — reverted to active"),
                         writer,
                         reader,
@@ -1788,7 +1796,7 @@ fn merge_one_task(
             if let Err(te) = db.update_task(
                 task_id,
                 &TaskUpdate {
-                    state: Some("active".into()),
+                    state: Some(TaskState::Active),
                     ..Default::default()
                 },
                 None,
@@ -1804,7 +1812,7 @@ fn merge_one_task(
                 crate::tasks_notify::notify_state_change(
                     db,
                     &t,
-                    "merging",
+                    TaskState::Merging,
                     Some(&format!("merge error: {}", e)),
                     writer,
                     reader,
@@ -2365,10 +2373,7 @@ pub fn get_status(
     let all_tasks = db.list_tasks(project_name, None, None, None, None)?;
 
     // Collect active tasks (in-flight working states).
-    let inflight_states: HashSet<&str> = ["active", "review", "merging", "refining"]
-        .iter()
-        .copied()
-        .collect();
+    // `TaskState::is_inflight` is the canonical predicate (task #611).
 
     let mut active = Vec::new();
     let mut queued_planning = Vec::new();
@@ -2379,12 +2384,12 @@ pub fn get_status(
     // Build a map of active task IDs to their affected files for conflict detection.
     let active_tasks_files: Vec<(i64, Vec<String>)> = all_tasks
         .iter()
-        .filter(|t| inflight_states.contains(t.state.as_str()))
+        .filter(|t| t.state.is_inflight())
         .map(|t| (t.id, extract_files(&t.affected_files)))
         .collect();
 
     for task in all_tasks {
-        if inflight_states.contains(task.state.as_str()) {
+        if task.state.is_inflight() {
             // Active/in-flight task.
             // Check if it's waiting on dependencies even though it's active.
             let deps = db.get_blocking_dependencies(task.id)?;
@@ -2393,7 +2398,7 @@ pub fn get_status(
                 .map(|d| WaitReason::Dependency {
                     task_id: d.id,
                     title: d.title.clone(),
-                    state: d.state.clone(),
+                    state: d.state.as_str().to_string(),
                     project_name: d.project_name.clone(),
                 })
                 .collect();
@@ -2402,7 +2407,7 @@ pub fn get_status(
                 task,
                 wait_reasons,
             });
-        } else if task.state == "ready" || task.state == "planning" {
+        } else if task.state == TaskState::Ready || task.state == TaskState::Planning {
             // Check blocking dependencies first.
             let deps = db.get_blocking_dependencies(task.id)?;
             if !deps.is_empty() {
@@ -2412,7 +2417,7 @@ pub fn get_status(
                     .map(|d| WaitReason::Dependency {
                         task_id: d.id,
                         title: d.title.clone(),
-                        state: d.state.clone(),
+                        state: d.state.as_str().to_string(),
                         project_name: d.project_name.clone(),
                     })
                     .collect();
@@ -2426,7 +2431,7 @@ pub fn get_status(
                 let mut wait_reasons = Vec::new();
 
                 // Check file conflicts (only for ready tasks with affected_files).
-                if task.state == "ready" {
+                if task.state == TaskState::Ready {
                     let task_files = extract_files(&task.affected_files);
                     if !task_files.is_empty() {
                         for (active_id, active_files) in &active_tasks_files {
@@ -2446,7 +2451,7 @@ pub fn get_status(
                 }
 
                 // Check merge_target branch existence (only for ready tasks).
-                if task.state == "ready" {
+                if task.state == TaskState::Ready {
                     if let Some(path) = project_path {
                         let merge_target = db
                             .get_merge_target(task.id)
@@ -2484,7 +2489,7 @@ pub fn get_status(
                     // skips them regardless of other state. Surface them in
                     // a dedicated section instead of "about to be dispatched".
                     held.push(status);
-                } else if task.state == "planning" {
+                } else if task.state == TaskState::Planning {
                     queued_planning.push(status);
                 } else {
                     queued_ready.push(status);
@@ -2691,7 +2696,7 @@ fn task_to_info_with_live(
         id: t.id,
         project_name: t.project_name,
         title: t.title,
-        state: t.state,
+        state: t.state.as_str().to_string(),
         priority: t.priority,
         parent_id: t.parent_id,
         tags: t.tags,
@@ -2804,7 +2809,7 @@ mod tests {
             id,
             project_name: "test-project".to_string(),
             title: format!("Task {}", id),
-            state: "ready".to_string(),
+            state: TaskState::Ready,
             priority,
             parent_id: None,
             tags: None,
@@ -3584,7 +3589,7 @@ mod tests {
         db.update_task(
             task.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 affected_files: files.cloned(),
                 ..Default::default()
             },
@@ -3598,13 +3603,13 @@ mod tests {
     fn move_to_merged(db: &TasksDb, task_id: i64) {
         // Must be in ready → assign → active → approved → merging → merged
         let task = db.get_task(task_id).unwrap().unwrap();
-        if task.state == "ready" {
+        if task.state == TaskState::Ready {
             db.assign_task(task_id, "test-session").unwrap();
         }
         db.update_task(
             task_id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -3613,7 +3618,7 @@ mod tests {
         db.update_task(
             task_id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -3622,7 +3627,7 @@ mod tests {
         db.update_task(
             task_id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("merged".into()),
+                state: Some(TaskState::Merged),
                 ..Default::default()
             },
             None,
@@ -3768,7 +3773,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -3778,7 +3783,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -3789,7 +3794,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
@@ -3836,7 +3841,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -3846,7 +3851,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -3872,7 +3877,7 @@ mod tests {
 
         // Task should be back to active (merge_one_task transitions back on failure)
         let updated = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(updated.state, "active");
+        assert_eq!(updated.state, TaskState::Active);
     }
 
     #[test]
@@ -3916,7 +3921,7 @@ mod tests {
         db.update_task(
             task.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -3989,7 +3994,7 @@ mod tests {
         db.update_task(
             task.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -4593,7 +4598,7 @@ mod tests {
                 true, // auto_downgraded_from_ready
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
         assert!(task.auto_downgraded_from_ready);
 
         // Direct planning -> ready is rejected (just like any other
@@ -4601,7 +4606,7 @@ mod tests {
         let bad = db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 affected_files: Some(serde_json::json!(["src/foo.rs"])),
                 ..Default::default()
             },
@@ -4617,7 +4622,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 affected_files: Some(serde_json::json!(["src/foo.rs"])),
                 ..Default::default()
             },
@@ -4628,13 +4633,13 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("ready".into()),
+                    state: Some(TaskState::Ready),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
-        assert_eq!(updated.state, "ready");
+        assert_eq!(updated.state, TaskState::Ready);
         assert!(
             updated.auto_downgraded_from_ready,
             "flag persists across the planning flow"
@@ -4780,7 +4785,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(child.state, "planning");
+        assert_eq!(child.state, TaskState::Planning);
 
         // get_schedulable_tasks should include planning tasks
         let schedulable = db.get_schedulable_tasks("test-project").unwrap();
@@ -4812,7 +4817,7 @@ mod tests {
         db.update_task(
             task.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -4822,7 +4827,7 @@ mod tests {
         let schedulable = db.get_schedulable_tasks("test-project").unwrap();
         assert_eq!(schedulable.len(), 1);
         assert_eq!(schedulable[0].id, task.id);
-        assert_eq!(schedulable[0].state, "planning");
+        assert_eq!(schedulable[0].state, TaskState::Planning);
     }
 
     #[test]
@@ -5023,7 +5028,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(child.state, "planning");
+        assert_eq!(child.state, TaskState::Planning);
 
         let status = get_status(&db, "test-project", None).unwrap();
         // child should be in queued_planning
@@ -5853,7 +5858,7 @@ mod tests {
 
         // Task moves to active → wait cleared.
         let mut task_active = task.clone();
-        task_active.state = "active".into();
+        task_active.state = TaskState::Active;
         let status_active = SchedulerStatus {
             active: vec![TaskStatus {
                 task: task_active,

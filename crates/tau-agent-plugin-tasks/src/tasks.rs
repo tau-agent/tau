@@ -22,6 +22,7 @@ use crate::tasks_db::{TaskUpdate, TasksDb};
 use crate::tasks_merge;
 use crate::tasks_merge_worker::{MergeJob, MergeWorker};
 use crate::tasks_scheduler;
+use crate::tasks_state::TaskState;
 use tau_agent_plugin::ToolResultContent;
 use tau_agent_plugin::tunnel::SharedStdout;
 use tau_agent_plugin::{
@@ -767,7 +768,7 @@ fn handle_task_create(
             // Subtasks start in ready or planning state — trigger a schedule pass.
             // Held tasks stay parked: the scheduler skips them until released
             // via task_update(hold=false).
-            if (task.state == "ready" || task.state == "planning") && !task.held {
+            if (task.state == TaskState::Ready || task.state == TaskState::Planning) && !task.held {
                 eprintln!(
                     "tasks scheduler: task_create {} (state='{}') → enqueue ScheduleNeeded for project '{}'",
                     task.id, task.state, project_name
@@ -781,7 +782,7 @@ fn handle_task_create(
             let mut dispatch_warnings: Vec<String> = Vec::new();
 
             // Interactive tasks get a fresh session for the user to drive
-            if task.state == "interactive" {
+            if task.state == TaskState::Interactive {
                 match create_interactive_session(db, &task, resolver, session_id, writer, reader) {
                     Some(new_sid) => {
                         if let Err(e) = db.set_session_id(task.id, &new_sid) {
@@ -1148,7 +1149,7 @@ fn handle_task_assign(
             // For interactive tasks with a changed session, reparent sessions via RPC.
             // The DB updates (session_id on task + all descendants) were already done
             // atomically inside assign_task's transaction.
-            if task.state == "interactive"
+            if task.state == TaskState::Interactive
                 && let Some(ref old_sid) = result.old_session_id
                 && old_sid != sid
             {
@@ -1186,8 +1187,8 @@ fn handle_task_assign(
             }
             // Emit state-change InfoMessage if the assign actually changed
             // the task's state (ready → active).
-            if let Some(ref old) = pre_state
-                && old != &result.task.state
+            if let Some(old) = pre_state
+                && old != result.task.state
             {
                 crate::tasks_notify::notify_state_change(
                     db,
@@ -1263,7 +1264,8 @@ fn handle_task_get(db: &TasksDb, args: &serde_json::Value, tool_call_id: &str) -
                 // For depends_on relations where this task is the dependent,
                 // include whether the dependency is satisfied or blocking.
                 if rel.relation == "depends_on" && rel.from_task == id {
-                    let satisfied = other_task.state == "merged" || other_task.state == "closed";
+                    let satisfied = other_task.state == TaskState::Merged
+                        || other_task.state == TaskState::Closed;
                     obj["dependency_status"] = if satisfied {
                         serde_json::json!("satisfied")
                     } else {
@@ -1347,9 +1349,28 @@ fn handle_task_update(
         );
     }
 
+    // Parse the `state` arg into a `TaskState` up-front so we can
+    // surface a clear error for typos.  The update_task validator will
+    // still reject forbidden transitions using the same enum value.
+    let state_arg = match args.get("state").and_then(|v| v.as_str()) {
+        None => None,
+        Some(s) => match TaskState::from_db_str(s) {
+            Ok(st) => Some(st),
+            Err(_) => {
+                return tool_err(
+                    tool_call_id,
+                    &format!(
+                        "invalid state '{}': expected one of interactive, planning, refining, ready, active, review, approved, merging, failed, merged, closed",
+                        s
+                    ),
+                );
+            }
+        },
+    };
+
     let update = TaskUpdate {
         title: args.get("title").and_then(|v| v.as_str()).map(String::from),
-        state: args.get("state").and_then(|v| v.as_str()).map(String::from),
+        state: state_arg,
         priority: args.get("priority").and_then(|v| v.as_i64()),
         tags: args.get("tags").cloned(),
         affected_files: args.get("affected_files").cloned(),
@@ -1375,7 +1396,7 @@ fn handle_task_update(
     // human via TUI) and none of those are reviewers. The real reviewer
     // session is recorded at dispatch time in tasks_scheduler.rs.
     if let (Some(sid), Some(new_state)) = (session_id, &update.state)
-        && new_state == "approved"
+        && *new_state == TaskState::Approved
         && let Err(e) = db.record_session(id, sid, "reviewer")
     {
         return tool_err(tool_call_id, &format!("record session: {}", e));
@@ -1383,13 +1404,13 @@ fn handle_task_update(
 
     // Capture the old state before updating, so we can detect review → active.
     let old_task = db.get_task(id).ok().flatten();
-    let old_state = old_task.as_ref().map(|t| t.state.clone());
+    let old_state = old_task.as_ref().map(|t| t.state);
 
     // Rebase enforcement: active → review requires branch to be rebased on
     // merge target. This prevents merges from failing due to conflicts.
     if let (Some(new_state), Some(old_s)) = (&update.state, &old_state)
-        && new_state == "review"
-        && old_s == "active"
+        && *new_state == TaskState::Review
+        && *old_s == TaskState::Active
     {
         if let Some(ref task) = old_task {
             if task.branch.is_some() && task.worktree_path.is_some() {
@@ -1452,15 +1473,22 @@ fn handle_task_update(
             // Trigger scheduler events based on the new state.
             // Held tasks do not trigger schedule passes — releasing via
             // hold=false will (see below).
-            match task.state.as_str() {
-                "approved" => {
+            //
+            // Exhaustive match on `TaskState` (task #611): the compiler
+            // now reminds us to revisit this ladder whenever a new
+            // variant is added.  States that should not emit any
+            // scheduler event (`interactive`, `refining`, `active`,
+            // `review`, `merging`, `failed`) are listed explicitly
+            // instead of falling through a wildcard.
+            match task.state {
+                TaskState::Approved => {
                     eprintln!(
                         "tasks scheduler: task {} (old_state={:?}, new='approved') → enqueue MergeNeeded",
                         task.id, old_state
                     );
                     pending_events.push(SchedulerEvent::MergeNeeded(session_id.map(String::from)));
                 }
-                "ready" | "planning" if !task.held => {
+                TaskState::Ready | TaskState::Planning if !task.held => {
                     eprintln!(
                         "tasks scheduler: task {} (old_state={:?}, new='{}') → enqueue ScheduleNeeded for project '{}'",
                         task.id, old_state, task.state, task.project_name
@@ -1470,7 +1498,7 @@ fn handle_task_update(
                         session_id.map(String::from),
                     ));
                 }
-                "merged" | "closed" => {
+                TaskState::Merged | TaskState::Closed => {
                     // Dependents may have been blocked on this task — re-
                     // evaluate schedulability on the next scheduler pass.
                     eprintln!(
@@ -1482,7 +1510,14 @@ fn handle_task_update(
                         session_id.map(String::from),
                     ));
                 }
-                _ => {}
+                TaskState::Interactive
+                | TaskState::Planning
+                | TaskState::Refining
+                | TaskState::Ready
+                | TaskState::Active
+                | TaskState::Review
+                | TaskState::Merging
+                | TaskState::Failed => {}
             }
 
             // Releasing a held task (hold=false) on a schedulable state
@@ -1492,7 +1527,7 @@ fn handle_task_update(
             // state change; this branch handles the pure release.
             if matches!(update.held, Some(false))
                 && !task.held
-                && (task.state == "ready" || task.state == "planning")
+                && (task.state == TaskState::Ready || task.state == TaskState::Planning)
                 && !pending_events.iter().any(|e| {
                     matches!(e,
                     SchedulerEvent::ScheduleNeeded(p, _) if p == &task.project_name)
@@ -1515,8 +1550,8 @@ fn handle_task_update(
 
             // When a task transitions from review back to active (changes
             // requested), notify the worker session so it knows to resume.
-            if task.state == "active"
-                && old_state.as_deref() == Some("review")
+            if task.state == TaskState::Active
+                && old_state == Some(TaskState::Review)
                 && let Some(ref sid) = task.session_id
             {
                 let msg = format!(
@@ -1540,7 +1575,7 @@ fn handle_task_update(
 
             // Automated review dispatch: when transitioning to review,
             // auto-launch a review session.
-            if task.state == "review" && old_state.as_deref() == Some("active") {
+            if task.state == TaskState::Review && old_state == Some(TaskState::Active) {
                 match resolver.resolve(&task.project_name) {
                     Ok(project_path) => {
                         match tasks_scheduler::dispatch_review(
@@ -1583,9 +1618,9 @@ fn handle_task_update(
 
             // Automated refining dispatch: when transitioning to refining,
             // auto-launch a refining session.
-            if task.state == "refining"
-                && (old_state.as_deref() == Some("planning")
-                    || old_state.as_deref() == Some("interactive"))
+            if task.state == TaskState::Refining
+                && (old_state == Some(TaskState::Planning)
+                    || old_state == Some(TaskState::Interactive))
             {
                 match resolver.resolve(&task.project_name) {
                     Ok(project_path) => {
@@ -1629,8 +1664,8 @@ fn handle_task_update(
 
             // Session reuse: when refining → planning, resume the planning
             // session by sending it a message with the refining feedback.
-            if task.state == "planning"
-                && old_state.as_deref() == Some("refining")
+            if task.state == TaskState::Planning
+                && old_state == Some(TaskState::Refining)
                 && let Some(ref sid) = task.session_id
             {
                 let msg = format!(
@@ -1657,7 +1692,7 @@ fn handle_task_update(
             // `any→interactive` override and `refining→interactive` scope
             // expansion. The creating session (for parent_id) is the session
             // that triggered the transition.
-            if task.state == "interactive" && old_state.as_deref() != Some("interactive") {
+            if task.state == TaskState::Interactive && old_state != Some(TaskState::Interactive) {
                 let needs_session = match &task.session_id {
                     None => true,
                     Some(sid) => {
@@ -1719,7 +1754,7 @@ fn handle_task_update(
                     task.session_id.clone()
                 };
                 if let Some(ref target_sid) = notify_sid {
-                    let prev = old_state.as_deref().unwrap_or("unknown");
+                    let prev = old_state.map(|s| s.as_str()).unwrap_or("unknown");
                     let msg = format!(
                         "Task #{id} returned to interactive from {prev}. \
                          Review the latest task messages for context:\n\
@@ -1761,13 +1796,11 @@ fn handle_task_update(
             // filtered out of the recipient set.
             if let Some(ref old) = old_state
                 && &task.state != old
-                && task.state != "merged"
-                && task.state != "closed"
-                && task.state != "failed"
+                && !task.state.is_terminal()
             {
-                let context = match (old.as_str(), task.state.as_str()) {
-                    ("review", "active") => Some("rework requested"),
-                    ("refining", "interactive") => Some("scope expansion"),
+                let context = match (*old, task.state) {
+                    (TaskState::Review, TaskState::Active) => Some("rework requested"),
+                    (TaskState::Refining, TaskState::Interactive) => Some("scope expansion"),
                     _ => None,
                 };
                 // Re-fetch so newly set session_id (interactive case) is
@@ -1776,7 +1809,7 @@ fn handle_task_update(
                 crate::tasks_notify::notify_state_change_split(
                     db,
                     &fresh,
-                    old,
+                    *old,
                     context,
                     session_id,
                     writer,
@@ -1795,7 +1828,7 @@ fn handle_task_update(
             // session is dispatched (since `find_reusable_session`
             // filters out archived sessions); it will parent onto the
             // now-archived placeholder, which the server tolerates.
-            if task.state == "merged" || task.state == "closed" || task.state == "failed" {
+            if task.state.is_terminal() {
                 // Emit observational state-change broadcast BEFORE archiving
                 // so the still-live worker/reviewer/... sessions receive the
                 // terminal info-message in their own history.  (Archived
@@ -1806,7 +1839,7 @@ fn handle_task_update(
                     crate::tasks_notify::notify_state_change_split(
                         db,
                         &task,
-                        old,
+                        *old,
                         None,
                         session_id,
                         writer,
@@ -1832,12 +1865,13 @@ fn handle_task_update(
 
             // Re-fetch task if we may have updated session_id after the
             // initial update_task call (e.g. interactive session creation).
-            let final_task =
-                if task.state == "interactive" && old_state.as_deref() != Some("interactive") {
-                    db.get_task(task.id).ok().flatten().unwrap_or(task)
-                } else {
-                    task
-                };
+            let final_task = if task.state == TaskState::Interactive
+                && old_state != Some(TaskState::Interactive)
+            {
+                db.get_task(task.id).ok().flatten().unwrap_or(task)
+            } else {
+                task
+            };
 
             let mut changes = Vec::new();
             if let Some(state) = args.get("state").and_then(|v| v.as_str()) {
@@ -2233,7 +2267,7 @@ fn handle_task_merge(
         Err(e) => return tool_err(tool_call_id, &format!("get task: {}", e)),
     };
 
-    if task.state != "approved" {
+    if task.state != TaskState::Approved {
         return tool_err(
             tool_call_id,
             &format!(
@@ -2247,7 +2281,7 @@ fn handle_task_merge(
     if let Err(e) = db.update_task(
         id,
         &TaskUpdate {
-            state: Some("merging".into()),
+            state: Some(TaskState::Merging),
             ..Default::default()
         },
         session_id,
@@ -2257,7 +2291,7 @@ fn handle_task_merge(
 
     // Broadcast approved -> merging.
     if let Ok(Some(t)) = db.get_task(id) {
-        crate::tasks_notify::notify_state_change(db, &t, "approved", None, writer, reader);
+        crate::tasks_notify::notify_state_change(db, &t, TaskState::Approved, None, writer, reader);
     }
 
     // Run the merge
@@ -2272,7 +2306,7 @@ fn handle_task_merge(
                 if let Err(e) = db.update_task(
                     id,
                     &TaskUpdate {
-                        state: Some("merged".into()),
+                        state: Some(TaskState::Merged),
                         ..Default::default()
                     },
                     session_id,
@@ -2289,7 +2323,7 @@ fn handle_task_merge(
                     crate::tasks_notify::notify_state_change(
                         db,
                         &t,
-                        "merging",
+                        TaskState::Merging,
                         ctx.as_deref(),
                         writer,
                         reader,
@@ -2317,7 +2351,7 @@ fn handle_task_merge(
                 if let Err(e) = db.update_task(
                     id,
                     &TaskUpdate {
-                        state: Some("active".into()),
+                        state: Some(TaskState::Active),
                         ..Default::default()
                     },
                     session_id,
@@ -2333,7 +2367,7 @@ fn handle_task_merge(
                     crate::tasks_notify::notify_state_change(
                         db,
                         &t,
-                        "merging",
+                        TaskState::Merging,
                         Some("merge failed — reverted to active"),
                         writer,
                         reader,
@@ -2367,7 +2401,7 @@ fn handle_task_merge(
             if let Err(te) = db.update_task(
                 id,
                 &TaskUpdate {
-                    state: Some("failed".into()),
+                    state: Some(TaskState::Failed),
                     ..Default::default()
                 },
                 session_id,
@@ -2381,7 +2415,7 @@ fn handle_task_merge(
                 crate::tasks_notify::notify_state_change(
                     db,
                     &t,
-                    "merging",
+                    TaskState::Merging,
                     Some(&format!("merge error: {}", e)),
                     writer,
                     reader,
@@ -2805,24 +2839,39 @@ pub fn run_tasks_plugin() {
             }
             PluginRequest::Hook { name, data } => {
                 if name == "task_state_changed" {
-                    let new_state = data.get("new_state").and_then(|v| v.as_str()).unwrap_or("");
+                    let new_state_str =
+                        data.get("new_state").and_then(|v| v.as_str()).unwrap_or("");
                     let task_id = data.get("task_id").and_then(|v| v.as_i64()).unwrap_or(0);
-                    match new_state {
-                        "approved" => {
-                            pending_events.push(SchedulerEvent::MergeNeeded(None));
-                        }
-                        "ready" | "planning" => {
-                            // Look up the task's project for the schedule pass.
-                            if let Ok(Some(task)) = db.get_task(task_id)
-                                && !task.held
-                            {
-                                pending_events.push(SchedulerEvent::ScheduleNeeded(
-                                    task.project_name.clone(),
-                                    None,
-                                ));
+                    // Parse the hook's `new_state` string into the typed
+                    // enum so the match below is exhaustive at the
+                    // compiler level (task #611).  Unknown strings
+                    // silently fall through — the hook is an
+                    // observational side-channel, not a validator.
+                    if let Ok(new_state) = TaskState::from_db_str(new_state_str) {
+                        match new_state {
+                            TaskState::Approved => {
+                                pending_events.push(SchedulerEvent::MergeNeeded(None));
                             }
+                            TaskState::Ready | TaskState::Planning => {
+                                // Look up the task's project for the schedule pass.
+                                if let Ok(Some(task)) = db.get_task(task_id)
+                                    && !task.held
+                                {
+                                    pending_events.push(SchedulerEvent::ScheduleNeeded(
+                                        task.project_name.clone(),
+                                        None,
+                                    ));
+                                }
+                            }
+                            TaskState::Interactive
+                            | TaskState::Refining
+                            | TaskState::Active
+                            | TaskState::Review
+                            | TaskState::Merging
+                            | TaskState::Failed
+                            | TaskState::Merged
+                            | TaskState::Closed => {}
                         }
-                        _ => {}
                     }
                     let _ = drain_scheduler_events(
                         &mut pending_events,
@@ -3277,7 +3326,7 @@ pub(crate) fn run_schedule_pass(
                             if let Err(revert_err) = db.update_task(
                                 st.id,
                                 &TaskUpdate {
-                                    state: Some("ready".to_string()),
+                                    state: Some(TaskState::Ready),
                                     ..Default::default()
                                 },
                                 None,
@@ -3469,7 +3518,7 @@ fn run_watchdog_pass(
             if let Err(e) = db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("failed".to_string()),
+                    state: Some(TaskState::Failed),
                     ..Default::default()
                 },
                 None,
@@ -4861,7 +4910,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -4926,7 +4975,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5012,7 +5061,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5092,7 +5141,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5102,7 +5151,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("review".into()),
+                state: Some(TaskState::Review),
                 ..Default::default()
             },
             None,
@@ -5584,7 +5633,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -6186,7 +6235,7 @@ mod tests {
         db.update_task(
             dep.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -6196,7 +6245,7 @@ mod tests {
         db.update_task(
             dep.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -6205,7 +6254,7 @@ mod tests {
         db.update_task(
             dep.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -6214,7 +6263,7 @@ mod tests {
         db.update_task(
             dep.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("merged".into()),
+                state: Some(TaskState::Merged),
                 ..Default::default()
             },
             None,
@@ -7259,7 +7308,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -7269,7 +7318,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -7278,7 +7327,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -7383,7 +7432,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -7403,7 +7452,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -7412,7 +7461,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -7574,7 +7623,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -7720,7 +7769,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -7772,11 +7821,16 @@ mod tests {
                 false,
             )
             .unwrap();
-        for next in ["ready", "active", "approved", "merging"] {
+        for next in [
+            TaskState::Ready,
+            TaskState::Active,
+            TaskState::Approved,
+            TaskState::Merging,
+        ] {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some(next.into()),
+                    state: Some(next),
                     ..Default::default()
                 },
                 None,
@@ -7836,7 +7890,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -7940,7 +7994,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -7950,7 +8004,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("review".into()),
+                state: Some(TaskState::Review),
                 ..Default::default()
             },
             None,
@@ -8019,7 +8073,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -8031,7 +8085,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("review".into()),
+                state: Some(TaskState::Review),
                 ..Default::default()
             },
             None,
@@ -8088,7 +8142,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -8098,7 +8152,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -8156,7 +8210,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -8226,7 +8280,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -8293,7 +8347,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -8336,7 +8390,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
@@ -8415,7 +8469,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -8455,7 +8509,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
@@ -8547,7 +8601,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
 
         db.set_session_id(task.id, "planning-session").unwrap();
 
@@ -8585,7 +8639,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -8709,7 +8763,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -8803,7 +8857,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
 
         // Set a session_id on the task (simulating planning session)
         db.set_session_id(task.id, "planning-session").unwrap();
@@ -8940,13 +8994,13 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
 
         // planning -> refining
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -9029,7 +9083,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -9105,7 +9159,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -9173,7 +9227,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
         // Record a live planner session that find_reusable_session will pick up.
         db.record_session(task.id, "existing-planner-session", "planner")
             .unwrap();
@@ -9489,7 +9543,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
         assert!(task.session_id.is_none());
 
         // planning -> interactive (scope expansion) should create a session
@@ -9578,7 +9632,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
         assert!(task.session_id.is_none());
 
         // planning -> interactive without session context
@@ -9724,7 +9778,7 @@ mod tests {
         db.update_task(
             task_id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -9808,7 +9862,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -9899,7 +9953,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
 
         // planning -> interactive: should create session AND send info message
         let mut events = Vec::new();
@@ -10075,7 +10129,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -10199,7 +10253,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -10298,7 +10352,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -10387,7 +10441,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
 
         let warnings = run_schedule_pass(
             &db,
@@ -10413,7 +10467,7 @@ mod tests {
         // Task should still be in planning state (planning tasks don't get
         // transitioned to active by schedule()).
         let updated = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(updated.state, "planning");
+        assert_eq!(updated.state, TaskState::Planning);
 
         // A warning message should be recorded on the task.
         let messages = db.get_messages(task.id).unwrap();
@@ -10481,7 +10535,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -10637,7 +10691,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
 
         let mut events = Vec::new();
         let result = handle_task_update(
@@ -10687,7 +10741,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -10761,26 +10815,26 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "ready");
+        assert_eq!(task.state, TaskState::Ready);
 
         // Simulate prepare_task: transition to active.
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("active".to_string()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
         let active_task = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(active_task.state, "active");
+        assert_eq!(active_task.state, TaskState::Active);
 
         // Now revert active → ready (the transition this fix enables).
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".to_string()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -10788,7 +10842,8 @@ mod tests {
         .unwrap();
         let reverted = db.get_task(task.id).unwrap().unwrap();
         assert_eq!(
-            reverted.state, "ready",
+            reverted.state,
+            TaskState::Ready,
             "active → ready transition should succeed for dispatch-failure recovery"
         );
     }
@@ -10826,7 +10881,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
@@ -10903,7 +10958,7 @@ mod tests {
 
         let task = make_stuck_active_task(&db, "stuck-task", 120_000);
         assert!(task.session_id.is_none());
-        assert_eq!(task.state, "active");
+        assert_eq!(task.state, TaskState::Active);
 
         let warnings = run_watchdog_pass(
             &db,
@@ -11036,7 +11091,8 @@ mod tests {
         // Task must now be in `failed`.
         let updated = db.get_task(task.id).unwrap().unwrap();
         assert_eq!(
-            updated.state, "failed",
+            updated.state,
+            TaskState::Failed,
             "task should be transitioned to failed after giving up"
         );
     }
@@ -11076,7 +11132,7 @@ mod tests {
         db.update_task(
             stuck_b.id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
@@ -11145,7 +11201,7 @@ mod tests {
 
         // Task stays in active, no session set.
         let updated = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(updated.state, "active");
+        assert_eq!(updated.state, TaskState::Active);
         assert!(updated.session_id.is_none());
 
         // An attempt marker should have been written.
@@ -11364,7 +11420,7 @@ mod tests {
             "watchdog must clear stale session_id, still {:?}",
             updated.session_id
         );
-        assert_eq!(updated.state, "ready");
+        assert_eq!(updated.state, TaskState::Ready);
 
         // A ScheduleNeeded event must have been queued so the drain
         // loop dispatches the task on the same pass.
@@ -11525,7 +11581,7 @@ mod tests {
             .list_tasks("test-project", None, None, None, None)
             .unwrap();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].state, "ready");
+        assert_eq!(tasks[0].state, TaskState::Ready);
         assert!(tasks[0].held);
 
         // The scheduler must refuse to schedule it.

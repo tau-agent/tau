@@ -46,6 +46,7 @@ pub use tau_agent_plugin_tasks::tasks_db;
 pub use tau_agent_plugin_tasks::tasks_git;
 pub use tau_agent_plugin_tasks::tasks_merge;
 pub use tau_agent_plugin_tasks::tasks_scheduler;
+pub use tau_agent_plugin_tasks::tasks_state;
 
 // Re-export from tau-agent-client for backward compatibility
 pub use tau_agent_client as client;

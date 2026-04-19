@@ -38,6 +38,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tasks_db::{TaskSession, TasksDb};
+use crate::tasks_state::TaskState;
 use tau_agent_plugin::{Request, Response};
 
 /// Session roles that should be archived when a task merges.
@@ -222,7 +223,7 @@ pub fn merge_task_for_caller(
         .get_task(task_id)?
         .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
-    if task.state != "merging" {
+    if task.state != TaskState::Merging {
         return Err(tau_agent_plugin::Error::Io(format!(
             "task {} is in state '{}', must be 'merging'",
             task_id, task.state
@@ -721,7 +722,7 @@ pub fn notify_parent_if_all_done(
     let all_done = !subtasks.is_empty()
         && subtasks
             .iter()
-            .all(|t| t.state == "merged" || t.state == "closed");
+            .all(|t| t.state == TaskState::Merged || t.state == TaskState::Closed);
 
     if !all_done {
         return Ok(());
@@ -1330,7 +1331,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -1342,7 +1343,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -1352,7 +1353,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -1419,7 +1420,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -1429,7 +1430,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -1438,7 +1439,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -1480,7 +1481,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -1490,7 +1491,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -1499,7 +1500,7 @@ command = "cargo test"
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -1587,7 +1588,7 @@ command = "cargo test"
             db.update_task(
                 child_id,
                 &TaskUpdate {
-                    state: Some("review".into()),
+                    state: Some(TaskState::Review),
                     ..Default::default()
                 },
                 None,
@@ -1596,7 +1597,7 @@ command = "cargo test"
             db.update_task(
                 child_id,
                 &TaskUpdate {
-                    state: Some("approved".into()),
+                    state: Some(TaskState::Approved),
                     ..Default::default()
                 },
                 None,
@@ -1605,7 +1606,7 @@ command = "cargo test"
             db.update_task(
                 child_id,
                 &TaskUpdate {
-                    state: Some("merging".into()),
+                    state: Some(TaskState::Merging),
                     ..Default::default()
                 },
                 None,
@@ -1614,7 +1615,7 @@ command = "cargo test"
             db.update_task(
                 child_id,
                 &TaskUpdate {
-                    state: Some("merged".into()),
+                    state: Some(TaskState::Merged),
                     ..Default::default()
                 },
                 None,
@@ -1698,7 +1699,7 @@ command = "cargo test"
         db.update_task(
             child1.id,
             &TaskUpdate {
-                state: Some("review".into()),
+                state: Some(TaskState::Review),
                 ..Default::default()
             },
             None,
@@ -1707,7 +1708,7 @@ command = "cargo test"
         db.update_task(
             child1.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -1716,7 +1717,7 @@ command = "cargo test"
         db.update_task(
             child1.id,
             &TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -1725,7 +1726,7 @@ command = "cargo test"
         db.update_task(
             child1.id,
             &TaskUpdate {
-                state: Some("merged".into()),
+                state: Some(TaskState::Merged),
                 ..Default::default()
             },
             None,
@@ -1818,7 +1819,7 @@ command = "cargo test"
         db.update_task(
             child.id,
             &TaskUpdate {
-                state: Some("review".into()),
+                state: Some(TaskState::Review),
                 ..Default::default()
             },
             None,
@@ -1827,7 +1828,7 @@ command = "cargo test"
         db.update_task(
             child.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -1836,7 +1837,7 @@ command = "cargo test"
         db.update_task(
             child.id,
             &TaskUpdate {
-                state: Some("merging".into()),
+                state: Some(TaskState::Merging),
                 ..Default::default()
             },
             None,
@@ -1845,7 +1846,7 @@ command = "cargo test"
         db.update_task(
             child.id,
             &TaskUpdate {
-                state: Some("merged".into()),
+                state: Some(TaskState::Merged),
                 ..Default::default()
             },
             None,
@@ -1938,11 +1939,16 @@ command = "cargo test"
 
         // Move child to merged
         db.assign_task(child.id, "s1").unwrap();
-        for state in ["review", "approved", "merging", "merged"] {
+        for state in [
+            TaskState::Review,
+            TaskState::Approved,
+            TaskState::Merging,
+            TaskState::Merged,
+        ] {
             db.update_task(
                 child.id,
                 &TaskUpdate {
-                    state: Some(state.into()),
+                    state: Some(state),
                     ..Default::default()
                 },
                 None,
@@ -2060,7 +2066,7 @@ command = "cargo test"
         let task_id = make_merging_task(&db);
 
         let task = db.get_task(task_id).unwrap().unwrap();
-        assert_eq!(task.state, "merging");
+        assert_eq!(task.state, TaskState::Merging);
         assert_eq!(task.branch.as_deref(), Some("task-1"));
         assert_eq!(task.worktree_path.as_deref(), Some("/tmp/wt-1"));
     }
@@ -2074,7 +2080,7 @@ command = "cargo test"
         db.update_task(
             task_id,
             &TaskUpdate {
-                state: Some("merged".into()),
+                state: Some(TaskState::Merged),
                 ..Default::default()
             },
             None,
@@ -2082,7 +2088,7 @@ command = "cargo test"
         .unwrap();
 
         let task = db.get_task(task_id).unwrap().unwrap();
-        assert_eq!(task.state, "merged");
+        assert_eq!(task.state, TaskState::Merged);
     }
 
     #[test]
@@ -2094,7 +2100,7 @@ command = "cargo test"
         db.update_task(
             task_id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
@@ -2102,7 +2108,7 @@ command = "cargo test"
         .unwrap();
 
         let task = db.get_task(task_id).unwrap().unwrap();
-        assert_eq!(task.state, "active");
+        assert_eq!(task.state, TaskState::Active);
     }
 
     #[test]
@@ -2114,7 +2120,7 @@ command = "cargo test"
         db.update_task(
             task_id,
             &TaskUpdate {
-                state: Some("failed".into()),
+                state: Some(TaskState::Failed),
                 ..Default::default()
             },
             None,
@@ -2122,13 +2128,13 @@ command = "cargo test"
         .unwrap();
 
         let task = db.get_task(task_id).unwrap().unwrap();
-        assert_eq!(task.state, "failed");
+        assert_eq!(task.state, TaskState::Failed);
 
         // failed -> active (manual recovery)
         db.update_task(
             task_id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
@@ -2136,7 +2142,7 @@ command = "cargo test"
         .unwrap();
 
         let task = db.get_task(task_id).unwrap().unwrap();
-        assert_eq!(task.state, "active");
+        assert_eq!(task.state, TaskState::Active);
     }
 
     // -----------------------------------------------------------------

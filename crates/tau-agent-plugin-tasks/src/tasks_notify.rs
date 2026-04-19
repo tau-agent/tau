@@ -27,6 +27,7 @@ use std::io::{BufRead, Write};
 
 use crate::tasks_db::{Task, TasksDb};
 use crate::tasks_scheduler::{find_root_session, server_request};
+use crate::tasks_state::TaskState;
 
 /// Truncate a title to at most `MAX_TITLE_LEN` chars, replacing the tail
 /// with an ellipsis if it overflows. Character-count based (Unicode scalar
@@ -124,11 +125,14 @@ pub fn set_session_tagline(
 }
 
 /// Classify a transition target for root-broadcast purposes.
-fn broadcasts_to_root(to: &str) -> bool {
+fn broadcasts_to_root(to: TaskState) -> bool {
     // Terminal states that the user should see regardless of where the
     // action happened.  `closed` is excluded on purpose: it's "we're
     // dropping this", not actionable.
-    matches!(to, "merged" | "failed" | "interactive")
+    matches!(
+        to,
+        TaskState::Merged | TaskState::Failed | TaskState::Interactive
+    )
 }
 
 /// Build the one-line info-message text for a transition.
@@ -136,9 +140,9 @@ fn broadcasts_to_root(to: &str) -> bool {
 /// * `* → merged`: `[task #{id}] {title}: merged`  (elides `from →`)
 /// * otherwise:    `[task #{id}] {title}: {from} → {to}`
 /// * with context: append ` ({context})` at the end.
-fn format_message(task: &Task, from: &str, context: Option<&str>) -> String {
+fn format_message(task: &Task, from: TaskState, context: Option<&str>) -> String {
     let title = capped_title(&task.title);
-    let body = if task.state == "merged" {
+    let body = if task.state == TaskState::Merged {
         format!("[task #{}] {}: merged", task.id, title)
     } else {
         format!("[task #{}] {}: {} → {}", task.id, title, from, task.state)
@@ -192,7 +196,7 @@ fn collect_recipients(
     }
 
     // 4. Root broadcast for terminal / interactive transitions.
-    if broadcasts_to_root(&task.state) {
+    if broadcasts_to_root(task.state) {
         if let Some(root) = resolve_root_session(db, task, writer, reader) {
             set.insert(root);
         }
@@ -293,7 +297,7 @@ fn is_session_archived(
 pub fn notify_state_change(
     db: &TasksDb,
     task: &Task,
-    from: &str,
+    from: TaskState,
     context: Option<&str>,
     writer: &mut impl Write,
     reader: &mut impl BufRead,
@@ -321,7 +325,7 @@ pub fn notify_state_change(
 pub fn notify_state_change_split(
     db: &TasksDb,
     task: &Task,
-    from: &str,
+    from: TaskState,
     context: Option<&str>,
     caller_session_id: Option<&str>,
     writer: &mut impl Write,
@@ -360,7 +364,7 @@ pub fn notify_state_change_split(
     // terminal state, post a closing summary to the placeholder so the
     // timeline has a clean final line. Skip if the placeholder has
     // been archived externally (consistent with `collect_recipients`).
-    if is_terminal_state(&task.state) {
+    if task.state.is_terminal() {
         if let Some(ref placeholder_sid) = task.placeholder_session_id {
             if !is_session_archived(placeholder_sid, writer, reader) {
                 let summary = format_terminal_summary(db, task);
@@ -382,10 +386,8 @@ pub fn notify_state_change_split(
     }
 }
 
-/// True when `state` is one of the task state-machine's terminal states.
-fn is_terminal_state(state: &str) -> bool {
-    matches!(state, "merged" | "closed" | "failed")
-}
+/// (Removed `is_terminal_state` helper — replaced by
+/// [`TaskState::is_terminal`] on the enum itself; see `tasks_state.rs`.)
 
 /// Format the human-readable terminal summary posted to the placeholder
 /// on transitions into `merged` / `closed` / `failed`.
@@ -767,9 +769,9 @@ mod tests {
     fn format_non_terminal_transition() {
         let db = TasksDb::open_memory().expect("db");
         let mut task = create_task(&db, "Demo", None, "ready");
-        task.state = "active".into();
+        task.state = TaskState::Active;
         assert_eq!(
-            format_message(&task, "ready", None),
+            format_message(&task, TaskState::Ready, None),
             format!("[task #{}] Demo: ready → active", task.id)
         );
     }
@@ -778,9 +780,9 @@ mod tests {
     fn format_terminal_merged_elides_from() {
         let db = TasksDb::open_memory().expect("db");
         let mut task = create_task(&db, "Demo", None, "ready");
-        task.state = "merged".into();
+        task.state = TaskState::Merged;
         assert_eq!(
-            format_message(&task, "merging", None),
+            format_message(&task, TaskState::Merging, None),
             format!("[task #{}] Demo: merged", task.id)
         );
     }
@@ -789,14 +791,14 @@ mod tests {
     fn format_with_context_appends_suffix() {
         let db = TasksDb::open_memory().expect("db");
         let mut task = create_task(&db, "Demo", None, "ready");
-        task.state = "merged".into();
+        task.state = TaskState::Merged;
         assert_eq!(
-            format_message(&task, "merging", Some("commit abc1234")),
+            format_message(&task, TaskState::Merging, Some("commit abc1234")),
             format!("[task #{}] Demo: merged (commit abc1234)", task.id)
         );
-        task.state = "active".into();
+        task.state = TaskState::Active;
         assert_eq!(
-            format_message(&task, "review", Some("rework requested")),
+            format_message(&task, TaskState::Review, Some("rework requested")),
             format!(
                 "[task #{}] Demo: review → active (rework requested)",
                 task.id
@@ -837,11 +839,11 @@ mod tests {
         db.record_session(task.id, "s-worker", "worker")
             .expect("rec");
         db.set_session_id(task.id, "s-worker").expect("sid");
-        task.state = "active".into();
+        task.state = TaskState::Active;
         task.session_id = Some("s-worker".into());
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
 
         let calls = captured_sorted(&shared);
         assert_eq!(calls.len(), 1, "calls: {:?}", calls);
@@ -864,7 +866,7 @@ mod tests {
         db.record_session(task.id, "s-other", "refiner")
             .expect("rec other");
         db.set_session_id(task.id, "s-worker").expect("sid");
-        task.state = "active".into();
+        task.state = TaskState::Active;
         task.session_id = Some("s-worker".into());
 
         let (shared, mut w, mut r) = make_io();
@@ -872,7 +874,7 @@ mod tests {
         notify_state_change_split(
             &db,
             &task,
-            "ready",
+            TaskState::Ready,
             None,
             Some("s-worker"),
             &mut w,
@@ -921,14 +923,14 @@ mod tests {
             .expect("rec");
         db.record_session(task.id, "s-other", "refiner")
             .expect("rec2");
-        task.state = "active".into();
+        task.state = TaskState::Active;
 
         let (shared, mut w, mut r) = make_io();
         let mut post_persist: Vec<tau_agent_plugin::PostPersistAction> = Vec::new();
         notify_state_change_split(
             &db,
             &task,
-            "ready",
+            TaskState::Ready,
             None,
             None,
             &mut w,
@@ -957,10 +959,10 @@ mod tests {
         db.record_session(task.id, "s-one", "worker").expect("rec2");
         db.set_session_id(task.id, "s-one").expect("sid");
         task.session_id = Some("s-one".into());
-        task.state = "active".into();
+        task.state = TaskState::Active;
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
 
         let calls = captured_sorted(&shared);
         assert_eq!(calls.len(), 1, "expected one dedup'd call, got {:?}", calls);
@@ -975,7 +977,7 @@ mod tests {
             .expect("rec1");
         db.record_session(task.id, "s-dead", "reviewer")
             .expect("rec2");
-        task.state = "review".into();
+        task.state = TaskState::Review;
 
         let (shared, mut w, mut r) = make_io();
         shared
@@ -984,7 +986,7 @@ mod tests {
             .archived_sessions
             .insert("s-dead".into());
 
-        notify_state_change(&db, &task, "active", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Active, None, &mut w, &mut r);
 
         let calls = captured_sorted(&shared);
         let sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
@@ -1001,10 +1003,10 @@ mod tests {
         let db = TasksDb::open_memory().expect("db");
         let mut task = create_task(&db, "Same", None, "ready");
         db.record_session(task.id, "s-any", "worker").expect("rec");
-        task.state = "ready".into();
+        task.state = TaskState::Ready;
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
 
         assert!(captured_sorted(&shared).is_empty());
     }
@@ -1027,10 +1029,10 @@ mod tests {
             .expect("rec");
         db.set_session_id(child.id, "s-worker").expect("sid");
         child.session_id = Some("s-worker".into());
-        child.state = "active".into();
+        child.state = TaskState::Active;
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &child, "ready", None, &mut w, &mut r);
+        notify_state_change(&db, &child, TaskState::Ready, None, &mut w, &mut r);
 
         let sids: Vec<String> = captured_sorted(&shared)
             .into_iter()
@@ -1058,7 +1060,7 @@ mod tests {
             .expect("rec");
         db.set_session_id(task.id, "s-worker").expect("sid");
         task.session_id = Some("s-worker".into());
-        task.state = "merged".into();
+        task.state = TaskState::Merged;
 
         let (shared, mut w, mut r) = make_io();
         shared.lock().expect("lock").ancestors.insert(
@@ -1072,7 +1074,7 @@ mod tests {
         notify_state_change(
             &db,
             &task,
-            "merging",
+            TaskState::Merging,
             Some("commit deadbeef"),
             &mut w,
             &mut r,
@@ -1097,7 +1099,7 @@ mod tests {
             .expect("rec");
         db.set_session_id(task.id, "s-worker").expect("sid");
         task.session_id = Some("s-worker".into());
-        task.state = "failed".into();
+        task.state = TaskState::Failed;
 
         let (shared, mut w, mut r) = make_io();
         shared.lock().expect("lock").ancestors.insert(
@@ -1111,7 +1113,7 @@ mod tests {
         notify_state_change(
             &db,
             &task,
-            "merging",
+            TaskState::Merging,
             Some("checklist failed"),
             &mut w,
             &mut r,
@@ -1132,7 +1134,7 @@ mod tests {
         db.update_task(
             task.id,
             &crate::tasks_db::TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -1142,7 +1144,7 @@ mod tests {
             .expect("rec");
         db.set_session_id(task.id, "s-refiner").expect("sid");
         task.session_id = Some("s-refiner".into());
-        task.state = "interactive".into();
+        task.state = TaskState::Interactive;
 
         let (shared, mut w, mut r) = make_io();
         shared.lock().expect("lock").ancestors.insert(
@@ -1156,7 +1158,7 @@ mod tests {
         notify_state_change(
             &db,
             &task,
-            "refining",
+            TaskState::Refining,
             Some("scope expansion"),
             &mut w,
             &mut r,
@@ -1177,7 +1179,7 @@ mod tests {
             .expect("rec");
         db.set_session_id(task.id, "s-worker").expect("sid");
         task.session_id = Some("s-worker".into());
-        task.state = "closed".into();
+        task.state = TaskState::Closed;
 
         let (shared, mut w, mut r) = make_io();
         shared.lock().expect("lock").ancestors.insert(
@@ -1188,7 +1190,7 @@ mod tests {
             ],
         );
 
-        notify_state_change(&db, &task, "active", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Active, None, &mut w, &mut r);
 
         let sids: Vec<String> = captured_sorted(&shared)
             .into_iter()
@@ -1210,7 +1212,7 @@ mod tests {
             .expect("rec");
         db.set_session_id(task.id, "s-worker").expect("sid");
         task.session_id = Some("s-worker".into());
-        task.state = "merged".into();
+        task.state = TaskState::Merged;
 
         let (shared, mut w, mut r) = make_io();
         {
@@ -1225,7 +1227,7 @@ mod tests {
             );
         }
 
-        notify_state_change(&db, &task, "merging", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Merging, None, &mut w, &mut r);
 
         let sids: Vec<String> = captured_sorted(&shared)
             .into_iter()
@@ -1254,14 +1256,14 @@ mod tests {
         db.record_session(task.id, "s-a", "worker").expect("rec a");
         db.record_session(task.id, "s-b", "reviewer")
             .expect("rec b");
-        task.state = "review".into();
+        task.state = TaskState::Review;
         // Fabricate a parent_id pointing at nothing — get_sessions for
         // non-existent task returns Ok(empty) in the current impl, so
         // this exercises the "chain-element missing" path.
         task.parent_id = Some(999_999);
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &task, "active", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Active, None, &mut w, &mut r);
 
         let sids: Vec<String> = captured_sorted(&shared)
             .into_iter()
@@ -1289,17 +1291,21 @@ mod tests {
         let (shared, mut w, mut r) = make_io();
 
         let steps = [
-            ("planning", "refining", None),
-            ("refining", "ready", None),
-            ("ready", "active", None),
-            ("active", "review", None),
-            ("review", "approved", None),
-            ("approved", "merging", None),
-            ("merging", "merged", Some("commit cafef00d")),
+            (TaskState::Planning, TaskState::Refining, None),
+            (TaskState::Refining, TaskState::Ready, None),
+            (TaskState::Ready, TaskState::Active, None),
+            (TaskState::Active, TaskState::Review, None),
+            (TaskState::Review, TaskState::Approved, None),
+            (TaskState::Approved, TaskState::Merging, None),
+            (
+                TaskState::Merging,
+                TaskState::Merged,
+                Some("commit cafef00d"),
+            ),
         ];
 
         for (from, to, ctx) in steps {
-            task.state = to.to_string();
+            task.state = to;
             notify_state_change(&db, &task, from, ctx, &mut w, &mut r);
         }
 
@@ -1524,10 +1530,10 @@ mod tests {
         db.record_session(task.id, "s-worker", "worker")
             .expect("rec worker");
         task.placeholder_session_id = Some("s-ph".into());
-        task.state = "active".into();
+        task.state = TaskState::Active;
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
 
         let calls = captured_sorted(&shared);
         let sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
@@ -1553,10 +1559,10 @@ mod tests {
         let mut task = create_task(&db, "Same", None, "ready");
         db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
         task.placeholder_session_id = Some("s-ph".into());
-        task.state = "ready".into();
+        task.state = TaskState::Ready;
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
 
         assert!(captured_sorted(&shared).is_empty());
     }
@@ -1571,10 +1577,10 @@ mod tests {
         db.record_session(task.id, "s-worker", "worker")
             .expect("rec");
         task.placeholder_session_id = Some("s-ph".into());
-        task.state = "merged".into();
+        task.state = TaskState::Merged;
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &task, "merging", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Merging, None, &mut w, &mut r);
 
         let calls = shared.lock().expect("lock").queue_info_calls.clone();
         let ph_msgs: Vec<&str> = calls
@@ -1611,10 +1617,10 @@ mod tests {
         let mut task = create_task(&db, "NT", None, "ready");
         db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
         task.placeholder_session_id = Some("s-ph".into());
-        task.state = "active".into();
+        task.state = TaskState::Active;
 
         let (shared, mut w, mut r) = make_io();
-        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
 
         let calls = shared.lock().expect("lock").queue_info_calls.clone();
         let ph_msgs: Vec<&str> = calls
@@ -1634,7 +1640,7 @@ mod tests {
         let mut task = create_task(&db, "ArcTerm", None, "ready");
         db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
         task.placeholder_session_id = Some("s-ph".into());
-        task.state = "merged".into();
+        task.state = TaskState::Merged;
 
         let (shared, mut w, mut r) = make_io();
         shared
@@ -1643,7 +1649,7 @@ mod tests {
             .archived_sessions
             .insert("s-ph".into());
 
-        notify_state_change(&db, &task, "merging", None, &mut w, &mut r);
+        notify_state_change(&db, &task, TaskState::Merging, None, &mut w, &mut r);
 
         let calls = shared.lock().expect("lock").queue_info_calls.clone();
         let ph_msgs: Vec<&str> = calls

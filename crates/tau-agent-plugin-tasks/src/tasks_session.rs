@@ -88,6 +88,7 @@ pub(crate) fn create_task_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks_state::TaskState;
     use std::io::BufReader;
     use tau_agent_plugin::{PluginMessage, PluginRequest, Request, Response};
 
@@ -96,7 +97,7 @@ mod tests {
             id,
             project_name: "demo".to_string(),
             title: title.to_string(),
-            state: "ready".to_string(),
+            state: TaskState::Ready,
             priority: 0,
             parent_id: None,
             tags: None,

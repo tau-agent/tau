@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::err::plugin_io_err;
+use crate::tasks_state::{TaskState, should_clear_session_id_on_transition, validate_transition};
 
 // ---------------------------------------------------------------------------
 // Data types
@@ -15,7 +16,7 @@ pub struct Task {
     pub id: i64,
     pub project_name: String,
     pub title: String,
-    pub state: String,
+    pub state: TaskState,
     pub priority: i64,
     pub parent_id: Option<i64>,
     pub tags: Option<serde_json::Value>,
@@ -98,7 +99,7 @@ pub struct TaskHistoryEntry {
 #[derive(Debug, Clone, Default)]
 pub struct TaskUpdate {
     pub title: Option<String>,
-    pub state: Option<String>,
+    pub state: Option<TaskState>,
     pub priority: Option<i64>,
     pub tags: Option<serde_json::Value>,
     pub affected_files: Option<serde_json::Value>,
@@ -138,146 +139,12 @@ const TASK_COLUMNS: &str = "id, project_name, title, state, priority, \
     placeholder_session_id, auto_downgraded_from_ready, created_at, \
     updated_at";
 
-const VALID_STATES: &[&str] = &[
-    "interactive",
-    "planning",
-    "refining",
-    "ready",
-    "active",
-    "review",
-    "approved",
-    "merging",
-    "failed",
-    "merged",
-    "closed",
-];
-
-/// Check whether a state transition is allowed.
-///
-/// Forward (happy path):
-///   interactive -> planning -> refining -> ready -> active -> review -> approved -> merging -> merged
-///
-/// Planning/Refining cycle:
-///   interactive -> planning   (user wants autonomous planning)
-///   interactive -> refining   (user already wrote spec, wants LLM review)
-///   planning -> refining      (plan complete)
-///   refining -> planning      (plan needs revision, resume planning session)
-///   refining -> ready         (plan approved, proceed to work)
-///   refining -> interactive   (scope expansion needs human sign-off)
-///
-/// Shortcuts:
-///   interactive -> ready      (skip planning entirely)
-///   interactive -> approved   (skip straight to approval)
-///   active -> approved        (only when skip_review=true, enforced in update_task)
-///
-/// Backward (error recovery / human override):
-///   review -> active          (reviewer requests changes)
-///   approved -> active        (merge error, agent needs to fix)
-///   approved -> ready         (unapprove, send back to queue)
-///   approved -> interactive   (needs redesign / human intervention)
-///   merging -> active         (merge failure, rework)
-///
-/// Universal overrides (admin / bootstrap):
-///   any state -> closed       (manual close)
-///   any state -> interactive  (human takes over — except from merged)
-///   any state -> failed       (terminal error)
-///
-/// Terminal states:
-///   merged — fully terminal, no transitions out
-///   closed -> interactive     (reopen)
-///   failed -> closed          (give up)
-pub fn validate_state_transition(from: &str, to: &str) -> bool {
-    // merged is fully terminal — no transitions out at all
-    if from == "merged" {
-        return false;
-    }
-
-    // Universal: any state can go to closed, interactive, or failed (except self-loops)
-    if from != to && (to == "closed" || to == "interactive" || to == "failed") {
-        return true;
-    }
-
-    matches!(
-        (from, to),
-        // Planning/Refining transitions
-        ("interactive", "planning")
-            | ("interactive", "refining")
-            | ("planning", "refining")
-            | ("refining", "planning")
-            | ("refining", "ready")
-            // Forward transitions
-            | ("interactive", "ready")
-            | ("interactive", "approved")
-            | ("ready", "active")
-            | ("active", "review")
-            | ("active", "approved")
-            | ("review", "approved")
-            | ("approved", "merging")
-            | ("merging", "merged")
-            // Backward transitions (error recovery)
-            | ("active", "ready")
-            | ("review", "active")
-            | ("approved", "active")
-            | ("approved", "ready")
-            | ("approved", "interactive")
-            | ("merging", "active")
-            | ("merging", "failed")
-            | ("failed", "active")
-    )
-}
-
-/// Return `true` when transitioning `from -> to` means the task's
-/// current `session_id` no longer refers to the session that is now
-/// responsible for the task's phase.  On such transitions
-/// [`update_task`] clears `tasks.session_id` so the scheduler and
-/// downstream consumers no longer see a stale reference to a session
-/// that has already finished its work.
-///
-/// Rationale (task #577 — companion to #572):
-///
-/// The `tasks.session_id` field is written by [`set_session_id`] on
-/// initial dispatch (planner, worker, interactive) but never reset.
-/// When a planner finishes and the task progresses
-/// `planning -> refining -> ready`, the field still points at the
-/// planner; the scheduler then treats the task as "already has a
-/// session" for planning-state purposes, and logs confusing messages
-/// for the worker dispatch.  Clearing on phase completion keeps the
-/// field honest: it names the session that is *currently* the task's
-/// primary driver, not the last one that happened to touch it.  The
-/// immutable per-phase history lives in `task_sessions`.
-///
-/// The transitions that clear are the ones where the outgoing
-/// session's role ends and the next phase will either dispatch a
-/// fresh session or pick one up from `task_sessions` as needed:
-///
-/// - `planning -> refining` — planner done, refiner is separate.
-/// - `refining -> ready` — refiner done, worker will be new.
-/// - `active -> ready` — worker reverted, next dispatch is fresh.
-///
-/// Transitions NOT cleared — the current `session_id` is still the
-/// session that will continue the work:
-///
-/// - `refining -> planning` — handler resumes the planner via
-///   `task.session_id` (see `tasks::handle_task_update`).
-/// - `review -> active` — handler notifies the worker via
-///   `task.session_id`; the worker is still live.
-/// - any `* -> active` from prepare_task — `set_session_id` is called
-///   immediately by `dispatch()` to write the new worker id.
-/// - any `* -> interactive` — the interactive handler checks
-///   liveness itself and replaces as needed.
-///
-/// Transitions not in the validated state-machine (e.g. direct
-/// `planning -> ready` or `review -> ready`) are omitted here —
-/// they cannot fire, and the stale-ready watchdog
-/// ([`run_stale_ready_watchdog_pass`] in `tasks.rs`) catches any
-/// orphan ready tasks regardless of how their `session_id` got
-/// there.
-pub(crate) fn should_clear_session_id_on_transition(from: &str, to: &str) -> bool {
-    matches!(
-        (from, to),
-        ("planning", "refining") | ("refining", "ready") | ("active", "ready")
-    )
-}
+// The canonical valid-state set and transition predicates now live in
+// `crate::tasks_state` as exhaustive enum matches.  They are imported
+// at the top of this file and used throughout `update_task`, `assign_task`,
+// and the scheduler.  See the module docs and
+// [`crate::tasks_state::validate_transition`] for the state-machine
+// specification.
 
 // ---------------------------------------------------------------------------
 // Tree ordering
@@ -669,12 +536,21 @@ impl TasksDb {
             .map_err(|e| tau_agent_plugin::Error::Parse(e.to_string()))?;
 
         // Validate initial_state and apply uniformly regardless of parent_id.
-        let default_state = match initial_state {
-            "interactive" | "planning" | "ready" => initial_state,
-            other => {
+        // Only `interactive`, `planning`, and `ready` are valid initial
+        // states — the rest of the state machine is reachable only via
+        // `update_task`'s validated transitions.
+        let parsed = TaskState::from_db_str(initial_state).map_err(|_| {
+            tau_agent_plugin::Error::Parse(format!(
+                "invalid initial_state '{}': expected 'interactive', 'planning', or 'ready'",
+                initial_state
+            ))
+        })?;
+        let default_state = match parsed {
+            TaskState::Interactive | TaskState::Planning | TaskState::Ready => parsed,
+            _ => {
                 return Err(tau_agent_plugin::Error::Parse(format!(
                     "invalid initial_state '{}': expected 'interactive', 'planning', or 'ready'",
-                    other
+                    initial_state
                 )));
             }
         };
@@ -833,21 +709,18 @@ impl TasksDb {
             .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", id)))?;
 
         // Validate state transition
-        if let Some(ref new_state) = update.state {
-            if !VALID_STATES.contains(&new_state.as_str()) {
-                return Err(tau_agent_plugin::Error::Io(format!(
-                    "invalid state: {}",
-                    new_state
-                )));
-            }
-            if !validate_state_transition(&task.state, new_state) {
+        if let Some(new_state) = update.state {
+            if !validate_transition(task.state, new_state) {
                 return Err(tau_agent_plugin::Error::Io(format!(
                     "invalid state transition: {} -> {}",
                     task.state, new_state
                 )));
             }
             // active -> approved requires skip_review=true
-            if task.state == "active" && new_state == "approved" && !task.skip_review {
+            if task.state == TaskState::Active
+                && new_state == TaskState::Approved
+                && !task.skip_review
+            {
                 return Err(tau_agent_plugin::Error::Io(
                     "cannot transition active -> approved: skip_review is false, \
                      must go through review first"
@@ -855,7 +728,7 @@ impl TasksDb {
                 ));
             }
             // refining -> ready requires non-empty affected_files
-            if task.state == "refining" && new_state == "ready" {
+            if task.state == TaskState::Refining && new_state == TaskState::Ready {
                 let has_files = match &task.affected_files {
                     Some(serde_json::Value::Array(arr)) => !arr.is_empty(),
                     _ => false,
@@ -904,7 +777,7 @@ impl TasksDb {
         }
 
         update_field!(title, "title", Some(task.title.clone()));
-        update_field!(state, "state", Some(task.state.clone()));
+        update_field!(state, "state", Some(task.state.as_str().to_string()));
         update_field!(priority, "priority", Some(task.priority.to_string()));
 
         // Phase-completing transitions clear `tasks.session_id` so the
@@ -913,8 +786,8 @@ impl TasksDb {
         // [`should_clear_session_id_on_transition`] for the rationale and
         // the exhaustive list of transitions that trigger the clear.
         // Task #577 — companion to #572.
-        if let Some(ref new_state) = update.state
-            && should_clear_session_id_on_transition(&task.state, new_state)
+        if let Some(new_state) = update.state
+            && should_clear_session_id_on_transition(task.state, new_state)
             && task.session_id.is_some()
         {
             let old_sid = task.session_id.clone();
@@ -1530,7 +1403,7 @@ impl TasksDb {
             .get_task(task_id)?
             .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
 
-        if task.state != "ready" && task.state != "interactive" {
+        if task.state != TaskState::Ready && task.state != TaskState::Interactive {
             return Err(tau_agent_plugin::Error::Io(format!(
                 "cannot assign task {}: state is '{}', must be 'ready' or 'interactive'",
                 task_id, task.state
@@ -1539,10 +1412,10 @@ impl TasksDb {
 
         let now = tau_agent_plugin::timestamp_ms() as i64;
         // Interactive tasks stay interactive; ready tasks transition to active
-        let new_state = if task.state == "interactive" {
-            "interactive"
+        let new_state = if task.state == TaskState::Interactive {
+            TaskState::Interactive
         } else {
-            "active"
+            TaskState::Active
         };
 
         let old_session_id = task.session_id.clone();
@@ -1565,7 +1438,7 @@ impl TasksDb {
             tx.execute(
                 "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![task_id, "state", task.state, new_state, session_id, now],
+                params![task_id, "state", task.state.as_str(), new_state.as_str(), session_id, now],
             )
             .map_err(plugin_io_err("assign task history (state)"))?;
         }
@@ -1596,7 +1469,7 @@ impl TasksDb {
         // For interactive tasks with a changed session, update all descendant
         // tasks' session_id within this same transaction (atomic).
         let mut descendant_old_sessions = Vec::new();
-        if task.state == "interactive"
+        if task.state == TaskState::Interactive
             && session_changed
             && let Some(ref old_sid) = old_session_id
         {
@@ -2214,7 +2087,7 @@ mod tests {
 
         assert_eq!(task.project_name, "my-project");
         assert_eq!(task.title, "Build feature X");
-        assert_eq!(task.state, "interactive");
+        assert_eq!(task.state, TaskState::Interactive);
         assert_eq!(task.priority, 2);
         assert!(task.parent_id.is_none());
         assert!(!task.skip_review);
@@ -2315,7 +2188,7 @@ mod tests {
         db.update_task(
             t1.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -2445,83 +2318,85 @@ mod tests {
 
     #[test]
     fn test_state_transition_validation() {
+        use crate::tasks_state::TaskState::*;
+        use crate::tasks_state::validate_transition as v;
         // Forward transitions
-        assert!(validate_state_transition("interactive", "ready"));
-        assert!(validate_state_transition("interactive", "approved"));
-        assert!(validate_state_transition("ready", "active"));
-        assert!(validate_state_transition("active", "review"));
-        assert!(validate_state_transition("active", "approved"));
-        assert!(validate_state_transition("review", "approved"));
-        assert!(validate_state_transition("approved", "merging"));
-        assert!(validate_state_transition("merging", "merged"));
+        assert!(v(Interactive, Ready));
+        assert!(v(Interactive, Approved));
+        assert!(v(Ready, Active));
+        assert!(v(Active, Review));
+        assert!(v(Active, Approved));
+        assert!(v(Review, Approved));
+        assert!(v(Approved, Merging));
+        assert!(v(Merging, Merged));
 
         // Planning/Refining transitions
-        assert!(validate_state_transition("interactive", "planning"));
-        assert!(validate_state_transition("interactive", "refining"));
-        assert!(validate_state_transition("planning", "refining"));
-        assert!(validate_state_transition("refining", "planning"));
-        assert!(validate_state_transition("refining", "ready"));
+        assert!(v(Interactive, Planning));
+        assert!(v(Interactive, Refining));
+        assert!(v(Planning, Refining));
+        assert!(v(Refining, Planning));
+        assert!(v(Refining, Ready));
 
         // Backward transitions (error recovery)
-        assert!(validate_state_transition("active", "ready"));
-        assert!(validate_state_transition("review", "active"));
-        assert!(validate_state_transition("approved", "active"));
-        assert!(validate_state_transition("approved", "ready"));
-        assert!(validate_state_transition("approved", "interactive"));
-        assert!(validate_state_transition("merging", "active"));
-        assert!(validate_state_transition("merging", "failed"));
-        assert!(validate_state_transition("failed", "active"));
+        assert!(v(Active, Ready));
+        assert!(v(Review, Active));
+        assert!(v(Approved, Active));
+        assert!(v(Approved, Ready));
+        assert!(v(Approved, Interactive));
+        assert!(v(Merging, Active));
+        assert!(v(Merging, Failed));
+        assert!(v(Failed, Active));
 
         // Universal overrides: any state -> closed
-        assert!(validate_state_transition("interactive", "closed"));
-        assert!(validate_state_transition("planning", "closed"));
-        assert!(validate_state_transition("refining", "closed"));
-        assert!(validate_state_transition("ready", "closed"));
-        assert!(validate_state_transition("active", "closed"));
-        assert!(validate_state_transition("review", "closed"));
-        assert!(validate_state_transition("approved", "closed"));
-        assert!(validate_state_transition("failed", "closed"));
+        assert!(v(Interactive, Closed));
+        assert!(v(Planning, Closed));
+        assert!(v(Refining, Closed));
+        assert!(v(Ready, Closed));
+        assert!(v(Active, Closed));
+        assert!(v(Review, Closed));
+        assert!(v(Approved, Closed));
+        assert!(v(Failed, Closed));
 
         // Universal overrides: any state -> interactive
-        assert!(validate_state_transition("planning", "interactive"));
-        assert!(validate_state_transition("refining", "interactive"));
-        assert!(validate_state_transition("ready", "interactive"));
-        assert!(validate_state_transition("active", "interactive"));
-        assert!(validate_state_transition("review", "interactive"));
-        assert!(validate_state_transition("approved", "interactive"));
-        assert!(validate_state_transition("closed", "interactive"));
+        assert!(v(Planning, Interactive));
+        assert!(v(Refining, Interactive));
+        assert!(v(Ready, Interactive));
+        assert!(v(Active, Interactive));
+        assert!(v(Review, Interactive));
+        assert!(v(Approved, Interactive));
+        assert!(v(Closed, Interactive));
         // merged is fully terminal
-        assert!(!validate_state_transition("merged", "interactive"));
-        assert!(!validate_state_transition("merged", "closed"));
-        assert!(!validate_state_transition("merged", "failed"));
+        assert!(!v(Merged, Interactive));
+        assert!(!v(Merged, Closed));
+        assert!(!v(Merged, Failed));
 
         // Universal overrides: any state -> failed
-        assert!(validate_state_transition("planning", "failed"));
-        assert!(validate_state_transition("refining", "failed"));
-        assert!(validate_state_transition("active", "failed"));
-        assert!(validate_state_transition("review", "failed"));
+        assert!(v(Planning, Failed));
+        assert!(v(Refining, Failed));
+        assert!(v(Active, Failed));
+        assert!(v(Review, Failed));
 
         // Self-loops are not allowed
-        assert!(!validate_state_transition("merged", "merged"));
-        assert!(!validate_state_transition("closed", "closed"));
-        assert!(!validate_state_transition("interactive", "interactive"));
-        assert!(!validate_state_transition("planning", "planning"));
-        assert!(!validate_state_transition("refining", "refining"));
+        assert!(!v(Merged, Merged));
+        assert!(!v(Closed, Closed));
+        assert!(!v(Interactive, Interactive));
+        assert!(!v(Planning, Planning));
+        assert!(!v(Refining, Refining));
 
         // Skip transitions that don't make sense
-        assert!(!validate_state_transition("interactive", "active"));
-        assert!(!validate_state_transition("interactive", "merging"));
-        assert!(!validate_state_transition("planning", "active")); // must go through refining/ready
-        assert!(!validate_state_transition("planning", "review"));
-        assert!(!validate_state_transition("refining", "active")); // must go through ready
+        assert!(!v(Interactive, Active));
+        assert!(!v(Interactive, Merging));
+        assert!(!v(Planning, Active)); // must go through refining/ready
+        assert!(!v(Planning, Review));
+        assert!(!v(Refining, Active)); // must go through ready
 
         // failed state transitions
-        assert!(validate_state_transition("merging", "failed"));
-        assert!(validate_state_transition("failed", "active"));
-        assert!(validate_state_transition("failed", "closed")); // universal
-        assert!(validate_state_transition("failed", "interactive")); // universal
-        assert!(!validate_state_transition("failed", "merging"));
-        assert!(!validate_state_transition("failed", "approved"));
+        assert!(v(Merging, Failed));
+        assert!(v(Failed, Active));
+        assert!(v(Failed, Closed)); // universal
+        assert!(v(Failed, Interactive)); // universal
+        assert!(!v(Failed, Merging));
+        assert!(!v(Failed, Approved));
     }
 
     #[test]
@@ -2550,7 +2425,7 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("active".into()),
+                    state: Some(TaskState::Active),
                     ..Default::default()
                 },
                 None,
@@ -2562,7 +2437,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -2593,36 +2468,47 @@ mod tests {
             )
             .unwrap();
         // interactive -> ready -> active -> review -> approved
-        for state in ["ready", "active", "review", "approved"] {
+        for state in [
+            TaskState::Ready,
+            TaskState::Active,
+            TaskState::Review,
+            TaskState::Approved,
+        ] {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some(state.into()),
+                    state: Some(state),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
         }
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "approved");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Approved
+        );
 
         // approved -> active (merge error, agent needs to fix)
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "active");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Active
+        );
 
         // Back to approved via review
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("review".into()),
+                state: Some(TaskState::Review),
                 ..Default::default()
             },
             None,
@@ -2631,7 +2517,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -2642,20 +2528,23 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "ready");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Ready
+        );
 
         // ready -> active -> review -> approved
-        for state in ["active", "review", "approved"] {
+        for state in [TaskState::Active, TaskState::Review, TaskState::Approved] {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some(state.into()),
+                    state: Some(state),
                     ..Default::default()
                 },
                 None,
@@ -2667,13 +2556,16 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("interactive".into()),
+                state: Some(TaskState::Interactive),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "interactive");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Interactive
+        );
     }
 
     #[test]
@@ -2681,7 +2573,13 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
 
         // Any state -> closed should work
-        for start_state in ["interactive", "ready", "active", "review", "approved"] {
+        for start_state in [
+            TaskState::Interactive,
+            TaskState::Ready,
+            TaskState::Active,
+            TaskState::Review,
+            TaskState::Approved,
+        ] {
             let task = db
                 .create_task(
                     "test-project",
@@ -2701,19 +2599,24 @@ mod tests {
                 .unwrap();
 
             // Advance to the start state
-            let path_to_state: &[&str] = match start_state {
-                "interactive" => &[],
-                "ready" => &["ready"],
-                "active" => &["ready", "active"],
-                "review" => &["ready", "active", "review"],
-                "approved" => &["ready", "active", "review", "approved"],
+            let path_to_state: &[TaskState] = match start_state {
+                TaskState::Interactive => &[],
+                TaskState::Ready => &[TaskState::Ready],
+                TaskState::Active => &[TaskState::Ready, TaskState::Active],
+                TaskState::Review => &[TaskState::Ready, TaskState::Active, TaskState::Review],
+                TaskState::Approved => &[
+                    TaskState::Ready,
+                    TaskState::Active,
+                    TaskState::Review,
+                    TaskState::Approved,
+                ],
                 _ => unreachable!(),
             };
             for state in path_to_state {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some((*state).into()),
+                        state: Some(*state),
                         ..Default::default()
                     },
                     None,
@@ -2725,13 +2628,16 @@ mod tests {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("closed".into()),
+                    state: Some(TaskState::Closed),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
-            assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "closed");
+            assert_eq!(
+                db.get_task(task.id).unwrap().unwrap().state,
+                TaskState::Closed
+            );
         }
     }
 
@@ -2740,7 +2646,13 @@ mod tests {
         let db = TasksDb::open_memory().unwrap();
 
         // Any state -> interactive should work
-        for start_state in ["ready", "active", "review", "approved", "closed"] {
+        for start_state in [
+            TaskState::Ready,
+            TaskState::Active,
+            TaskState::Review,
+            TaskState::Approved,
+            TaskState::Closed,
+        ] {
             let task = db
                 .create_task(
                     "test-project",
@@ -2760,19 +2672,24 @@ mod tests {
                 .unwrap();
 
             // Advance to the start state
-            let path_to_state: &[&str] = match start_state {
-                "ready" => &["ready"],
-                "active" => &["ready", "active"],
-                "review" => &["ready", "active", "review"],
-                "approved" => &["ready", "active", "review", "approved"],
-                "closed" => &["closed"], // uses universal override
+            let path_to_state: &[TaskState] = match start_state {
+                TaskState::Ready => &[TaskState::Ready],
+                TaskState::Active => &[TaskState::Ready, TaskState::Active],
+                TaskState::Review => &[TaskState::Ready, TaskState::Active, TaskState::Review],
+                TaskState::Approved => &[
+                    TaskState::Ready,
+                    TaskState::Active,
+                    TaskState::Review,
+                    TaskState::Approved,
+                ],
+                TaskState::Closed => &[TaskState::Closed], // uses universal override
                 _ => unreachable!(),
             };
             for state in path_to_state {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some((*state).into()),
+                        state: Some(*state),
                         ..Default::default()
                     },
                     None,
@@ -2784,13 +2701,16 @@ mod tests {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("interactive".into()),
+                    state: Some(TaskState::Interactive),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
-            assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "interactive");
+            assert_eq!(
+                db.get_task(task.id).unwrap().unwrap().state,
+                TaskState::Interactive
+            );
         }
     }
 
@@ -2820,7 +2740,7 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("interactive".into()),
+                    state: Some(TaskState::Interactive),
                     ..Default::default()
                 },
                 None,
@@ -2829,38 +2749,19 @@ mod tests {
         assert!(err.to_string().contains("invalid state transition"));
     }
 
+    /// With the typed [`TaskState`] enum (task #611) an "invalid state
+    /// name" is now a compile-time error at every construction site, not
+    /// a runtime one.  The parsing path into the enum lives in
+    /// [`TaskState::from_db_str`]; see `tasks_state::tests` for coverage
+    /// of the unknown-string rejection.  This test keeps the historical
+    /// name and instead confirms that the parser returns an error (as
+    /// consumed by `handle_task_update`).
     #[test]
     fn test_invalid_state_name() {
-        let db = TasksDb::open_memory().unwrap();
-        let task = db
-            .create_task(
-                "test-project",
-                "Test",
-                None,
-                None,
-                None,
-                false,
-                "interactive",
-                false,
-                None,
-                None,
-                false,
-                None,
-                false,
-            )
-            .unwrap();
-
-        let err = db
-            .update_task(
-                task.id,
-                &TaskUpdate {
-                    state: Some("bogus".into()),
-                    ..Default::default()
-                },
-                None,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("invalid state"));
+        let _db = TasksDb::open_memory().unwrap();
+        let err = crate::tasks_state::TaskState::from_db_str("bogus").unwrap_err();
+        assert_eq!(err.0, "bogus");
+        assert!(format!("{}", err).contains("bogus"));
     }
 
     #[test]
@@ -3356,13 +3257,13 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "interactive");
+        assert_eq!(task.state, TaskState::Interactive);
 
         // Move to ready first
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -3371,7 +3272,7 @@ mod tests {
 
         // Assign
         let assigned = db.assign_task(task.id, "session-1").unwrap().task;
-        assert_eq!(assigned.state, "active");
+        assert_eq!(assigned.state, TaskState::Active);
         assert_eq!(assigned.session_id.as_deref(), Some("session-1"));
 
         // Check task_sessions
@@ -3423,7 +3324,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -3455,11 +3356,11 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "interactive");
+        assert_eq!(task.state, TaskState::Interactive);
 
         // Assigning an interactive task should succeed and stay interactive
         let assigned = db.assign_task(task.id, "s1").unwrap().task;
-        assert_eq!(assigned.state, "interactive");
+        assert_eq!(assigned.state, TaskState::Interactive);
         assert_eq!(assigned.session_id.as_deref(), Some("s1"));
     }
 
@@ -3565,7 +3466,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             Some("s2"),
@@ -3743,7 +3644,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(parent.state, "interactive");
+        assert_eq!(parent.state, TaskState::Interactive);
 
         // Subtasks default to planning state when initial_state="planning".
         // Post-task-#512, skip_review is NOT force-set to false for subtasks —
@@ -3766,7 +3667,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(child.state, "planning");
+        assert_eq!(child.state, TaskState::Planning);
         assert!(child.skip_review);
     }
 
@@ -3809,7 +3710,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(child.state, "ready");
+        assert_eq!(child.state, TaskState::Ready);
     }
 
     #[test]
@@ -3835,7 +3736,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "ready");
+        assert_eq!(task.state, TaskState::Ready);
 
         let task = db
             .create_task(
@@ -3854,7 +3755,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "planning");
+        assert_eq!(task.state, TaskState::Planning);
 
         let task = db
             .create_task(
@@ -3873,7 +3774,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "interactive");
+        assert_eq!(task.state, TaskState::Interactive);
     }
 
     #[test]
@@ -4043,7 +3944,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -4055,7 +3956,7 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("approved".into()),
+                    state: Some(TaskState::Approved),
                     ..Default::default()
                 },
                 Some("s1"),
@@ -4087,7 +3988,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -4099,13 +4000,13 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("approved".into()),
+                    state: Some(TaskState::Approved),
                     ..Default::default()
                 },
                 Some("s1"),
             )
             .unwrap();
-        assert_eq!(result.state, "approved");
+        assert_eq!(result.state, TaskState::Approved);
     }
 
     // ----- git integration tests -----
@@ -4248,7 +4149,7 @@ mod tests {
         db.update_task(
             t1.id,
             &TaskUpdate {
-                state: Some("closed".into()),
+                state: Some(TaskState::Closed),
                 ..Default::default()
             },
             None,
@@ -4277,7 +4178,7 @@ mod tests {
         db.update_task(
             t2.id,
             &TaskUpdate {
-                state: Some("failed".into()),
+                state: Some(TaskState::Failed),
                 ..Default::default()
             },
             None,
@@ -4305,7 +4206,7 @@ mod tests {
         db.update_task(
             t3.id,
             &TaskUpdate {
-                state: Some("closed".into()),
+                state: Some(TaskState::Closed),
                 ..Default::default()
             },
             None,
@@ -4334,7 +4235,7 @@ mod tests {
         db.update_task(
             t4.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -4702,22 +4603,22 @@ mod tests {
                 false,
             )
             .unwrap();
-        let transitions: &[&str] = match state {
+        let transitions: &[TaskState] = match state {
             "interactive" => &[],
-            "ready" => &["ready"],
-            "active" => &["ready"],
-            "review" => &["ready"],
-            "approved" => &["ready"],
-            "failed" => &["ready"],
-            "merged" => &["ready"],
-            "closed" => &["ready"],
+            "ready" => &[TaskState::Ready],
+            "active" => &[TaskState::Ready],
+            "review" => &[TaskState::Ready],
+            "approved" => &[TaskState::Ready],
+            "failed" => &[TaskState::Ready],
+            "merged" => &[TaskState::Ready],
+            "closed" => &[TaskState::Ready],
             _ => panic!("unsupported target state: {}", state),
         };
         for &s in transitions {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some(s.into()),
+                    state: Some(s),
                     ..Default::default()
                 },
                 None,
@@ -4734,7 +4635,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("review".into()),
+                        state: Some(TaskState::Review),
                         ..Default::default()
                     },
                     None,
@@ -4746,7 +4647,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("approved".into()),
+                        state: Some(TaskState::Approved),
                         ..Default::default()
                     },
                     None,
@@ -4758,7 +4659,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("approved".into()),
+                        state: Some(TaskState::Approved),
                         ..Default::default()
                     },
                     None,
@@ -4767,7 +4668,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("merging".into()),
+                        state: Some(TaskState::Merging),
                         ..Default::default()
                     },
                     None,
@@ -4776,7 +4677,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("failed".into()),
+                        state: Some(TaskState::Failed),
                         ..Default::default()
                     },
                     None,
@@ -4788,7 +4689,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("approved".into()),
+                        state: Some(TaskState::Approved),
                         ..Default::default()
                     },
                     None,
@@ -4797,7 +4698,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("merging".into()),
+                        state: Some(TaskState::Merging),
                         ..Default::default()
                     },
                     None,
@@ -4806,7 +4707,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("merged".into()),
+                        state: Some(TaskState::Merged),
                         ..Default::default()
                     },
                     None,
@@ -4817,7 +4718,7 @@ mod tests {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some("closed".into()),
+                        state: Some(TaskState::Closed),
                         ..Default::default()
                     },
                     None,
@@ -5778,7 +5679,7 @@ mod tests {
         db.update_task(
             t1.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5805,7 +5706,7 @@ mod tests {
         db.update_task(
             t2.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5815,7 +5716,7 @@ mod tests {
         db.update_task(
             t2.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -5842,7 +5743,7 @@ mod tests {
         db.update_task(
             t3.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5852,7 +5753,7 @@ mod tests {
         db.update_task(
             t3.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -5896,7 +5797,7 @@ mod tests {
         db.update_task(
             t1.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5906,7 +5807,7 @@ mod tests {
         db.update_task(
             t1.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -5933,7 +5834,7 @@ mod tests {
         db.update_task(
             t2.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5943,7 +5844,7 @@ mod tests {
         db.update_task(
             t2.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -5986,7 +5887,7 @@ mod tests {
         db.update_task(
             t1.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -5996,7 +5897,7 @@ mod tests {
         db.update_task(
             t1.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -6023,7 +5924,7 @@ mod tests {
         db.update_task(
             t2.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -6033,7 +5934,7 @@ mod tests {
         db.update_task(
             t2.id,
             &TaskUpdate {
-                state: Some("approved".into()),
+                state: Some(TaskState::Approved),
                 ..Default::default()
             },
             None,
@@ -6052,7 +5953,7 @@ mod tests {
             id,
             project_name: "test".into(),
             title: format!("Task {}", id),
-            state: "ready".into(),
+            state: TaskState::Ready,
             priority,
             parent_id,
             tags: None,
@@ -6311,7 +6212,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -6396,16 +6297,16 @@ mod tests {
         // Move through the states that are needed to reach `desired`.
         // `interactive -> desired` covers most one-hop transitions the
         // tests care about; for multi-hop chains we explicitly step.
-        let path: &[&str] = match desired {
-            "planning" => &["planning"],
-            "refining" => &["refining"],
-            "ready" => &["ready"],
-            "active" => &["ready", "active"],
-            "review" => &["ready", "active", "review"],
+        let path: &[TaskState] = match desired {
+            "planning" => &[TaskState::Planning],
+            "refining" => &[TaskState::Refining],
+            "ready" => &[TaskState::Ready],
+            "active" => &[TaskState::Ready, TaskState::Active],
+            "review" => &[TaskState::Ready, TaskState::Active, TaskState::Review],
             other => panic!("make_task_in_state: unsupported target {}", other),
         };
         for step in path {
-            let affected_files = if *step == "ready" {
+            let affected_files = if *step == TaskState::Ready {
                 Some(serde_json::json!(["src/lib.rs"]))
             } else {
                 None
@@ -6413,7 +6314,7 @@ mod tests {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some((*step).into()),
+                    state: Some(*step),
                     affected_files,
                     ..Default::default()
                 },
@@ -6433,7 +6334,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -6441,7 +6342,7 @@ mod tests {
         .unwrap();
 
         let got = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(got.state, "refining");
+        assert_eq!(got.state, TaskState::Refining);
         assert!(
             got.session_id.is_none(),
             "planning -> refining should clear session_id (was {:?})",
@@ -6481,7 +6382,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 affected_files: Some(serde_json::json!(["src/foo.rs"])),
                 ..Default::default()
             },
@@ -6490,7 +6391,7 @@ mod tests {
         .unwrap();
 
         let got = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(got.state, "ready");
+        assert_eq!(got.state, TaskState::Ready);
         assert!(
             got.session_id.is_none(),
             "refining -> ready should clear session_id (was {:?})",
@@ -6507,7 +6408,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -6529,8 +6430,14 @@ mod tests {
         // a future loosening of validation that would bypass the
         // clear (callers must add the transition to
         // `should_clear_session_id_on_transition` too).
-        assert!(!super::validate_state_transition("planning", "ready"));
-        assert!(!super::validate_state_transition("review", "ready"));
+        assert!(!crate::tasks_state::validate_transition(
+            TaskState::Planning,
+            TaskState::Ready
+        ));
+        assert!(!crate::tasks_state::validate_transition(
+            TaskState::Review,
+            TaskState::Ready
+        ));
     }
 
     #[test]
@@ -6544,7 +6451,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -6552,7 +6459,7 @@ mod tests {
         .unwrap();
 
         let got = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(got.state, "planning");
+        assert_eq!(got.state, TaskState::Planning);
         assert_eq!(
             got.session_id.as_deref(),
             Some("s-planner"),
@@ -6572,7 +6479,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("active".into()),
+                state: Some(TaskState::Active),
                 ..Default::default()
             },
             None,
@@ -6580,7 +6487,7 @@ mod tests {
         .unwrap();
 
         let got = db.get_task(task.id).unwrap().unwrap();
-        assert_eq!(got.state, "active");
+        assert_eq!(got.state, TaskState::Active);
         assert_eq!(got.session_id.as_deref(), Some("s-worker"));
     }
 
@@ -6596,7 +6503,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 affected_files: Some(serde_json::json!(["x.rs"])),
                 ..Default::default()
             },
@@ -6641,49 +6548,58 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(task.state, "interactive");
+        assert_eq!(task.state, TaskState::Interactive);
 
         // interactive -> planning
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "planning");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Planning
+        );
 
         // planning -> refining
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "refining");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Refining
+        );
 
         // refining -> planning (revision needed)
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "planning");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Planning
+        );
 
         // planning -> refining -> ready
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -6692,14 +6608,17 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 affected_files: Some(serde_json::json!(["src/main.rs"])),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "ready");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Ready
+        );
     }
 
     #[test]
@@ -6724,18 +6643,25 @@ mod tests {
             .unwrap();
 
         // interactive -> planning -> refining -> interactive (scope expansion)
-        for state in ["planning", "refining", "interactive"] {
+        for state in [
+            TaskState::Planning,
+            TaskState::Refining,
+            TaskState::Interactive,
+        ] {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some(state.into()),
+                    state: Some(state),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
         }
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "interactive");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Interactive
+        );
     }
 
     #[test]
@@ -6763,13 +6689,16 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
         )
         .unwrap();
-        assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "refining");
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Refining
+        );
     }
 
     #[test]
@@ -6795,7 +6724,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -6807,7 +6736,7 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("active".into()),
+                    state: Some(TaskState::Active),
                     ..Default::default()
                 },
                 None,
@@ -6841,7 +6770,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -6850,7 +6779,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -6862,7 +6791,7 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("ready".into()),
+                    state: Some(TaskState::Ready),
                     ..Default::default()
                 },
                 None,
@@ -6900,7 +6829,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 affected_files: Some(serde_json::json!([])),
                 ..Default::default()
             },
@@ -6910,7 +6839,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -6922,7 +6851,7 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("ready".into()),
+                    state: Some(TaskState::Ready),
                     ..Default::default()
                 },
                 None,
@@ -6960,7 +6889,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 affected_files: Some(serde_json::json!(["src/main.rs"])),
                 ..Default::default()
             },
@@ -6970,7 +6899,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -6982,13 +6911,13 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("ready".into()),
+                    state: Some(TaskState::Ready),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
-        assert_eq!(updated.state, "ready");
+        assert_eq!(updated.state, TaskState::Ready);
     }
 
     #[test]
@@ -7016,7 +6945,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -7025,7 +6954,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("refining".into()),
+                state: Some(TaskState::Refining),
                 ..Default::default()
             },
             None,
@@ -7037,14 +6966,14 @@ mod tests {
             .update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("ready".into()),
+                    state: Some(TaskState::Ready),
                     affected_files: Some(serde_json::json!(["src/lib.rs"])),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
-        assert_eq!(updated.state, "ready");
+        assert_eq!(updated.state, TaskState::Ready);
     }
 
     #[test]
@@ -7053,12 +6982,12 @@ mod tests {
 
         // Any state -> failed should work
         for start_state in [
-            "interactive",
-            "planning",
-            "refining",
-            "ready",
-            "active",
-            "review",
+            TaskState::Interactive,
+            TaskState::Planning,
+            TaskState::Refining,
+            TaskState::Ready,
+            TaskState::Active,
+            TaskState::Review,
         ] {
             let task = db
                 .create_task(
@@ -7078,20 +7007,20 @@ mod tests {
                 )
                 .unwrap();
 
-            let transitions: &[&str] = match start_state {
-                "interactive" => &[],
-                "planning" => &["planning"],
-                "refining" => &["planning", "refining"],
-                "ready" => &["ready"],
-                "active" => &["ready"],
-                "review" => &["ready"],
+            let transitions: &[TaskState] = match start_state {
+                TaskState::Interactive => &[],
+                TaskState::Planning => &[TaskState::Planning],
+                TaskState::Refining => &[TaskState::Planning, TaskState::Refining],
+                TaskState::Ready => &[TaskState::Ready],
+                TaskState::Active => &[TaskState::Ready],
+                TaskState::Review => &[TaskState::Ready],
                 _ => unreachable!(),
             };
             for &s in transitions {
                 db.update_task(
                     task.id,
                     &TaskUpdate {
-                        state: Some(s.into()),
+                        state: Some(s),
                         ..Default::default()
                     },
                     None,
@@ -7099,13 +7028,13 @@ mod tests {
                 .unwrap();
             }
             match start_state {
-                "active" | "review" => {
+                TaskState::Active | TaskState::Review => {
                     db.assign_task(task.id, "test-session").unwrap();
-                    if start_state == "review" {
+                    if start_state == TaskState::Review {
                         db.update_task(
                             task.id,
                             &TaskUpdate {
-                                state: Some("review".into()),
+                                state: Some(TaskState::Review),
                                 ..Default::default()
                             },
                             None,
@@ -7120,13 +7049,16 @@ mod tests {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some("failed".into()),
+                    state: Some(TaskState::Failed),
                     ..Default::default()
                 },
                 None,
             )
             .unwrap();
-            assert_eq!(db.get_task(task.id).unwrap().unwrap().state, "failed");
+            assert_eq!(
+                db.get_task(task.id).unwrap().unwrap().state,
+                TaskState::Failed
+            );
         }
     }
 
@@ -7157,7 +7089,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -7194,7 +7126,7 @@ mod tests {
         db.update_task(
             task.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,
@@ -7249,7 +7181,7 @@ mod tests {
         db.update_task(
             task_a.id,
             &TaskUpdate {
-                state: Some("ready".into()),
+                state: Some(TaskState::Ready),
                 ..Default::default()
             },
             None,
@@ -7277,7 +7209,7 @@ mod tests {
         db.update_task(
             task_b.id,
             &TaskUpdate {
-                state: Some("planning".into()),
+                state: Some(TaskState::Planning),
                 ..Default::default()
             },
             None,

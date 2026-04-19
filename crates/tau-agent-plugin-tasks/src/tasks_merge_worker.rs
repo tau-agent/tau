@@ -59,6 +59,7 @@ use std::sync::mpsc;
 use crate::err::plugin_io_err;
 use crate::tasks::{ChannelLineReader, ProjectResolver};
 use crate::tasks_db::{TaskUpdate, TasksDb};
+use crate::tasks_state::TaskState;
 
 /// A single unit of work for the merge worker: fully merge one approved
 /// task (rebase, checklist, fast-forward, cleanup).
@@ -249,7 +250,7 @@ fn run_one_job<W>(
         }
     };
 
-    if task.state != "approved" {
+    if task.state != TaskState::Approved {
         eprintln!(
             "tasks merge worker: task {} is now in state '{}' (not approved), skipping",
             job.task_id, task.state
@@ -263,7 +264,7 @@ fn run_one_job<W>(
     if let Err(e) = db.update_task(
         job.task_id,
         &TaskUpdate {
-            state: Some("merging".into()),
+            state: Some(TaskState::Merging),
             ..Default::default()
         },
         None,
@@ -276,7 +277,7 @@ fn run_one_job<W>(
     }
 
     if let Ok(Some(t)) = db.get_task(job.task_id) {
-        crate::tasks_notify::notify_state_change(db, &t, "approved", None, writer, reader);
+        crate::tasks_notify::notify_state_change(db, &t, TaskState::Approved, None, writer, reader);
     }
 
     let project_dir = match resolver.resolve(&task.project_name) {
@@ -291,7 +292,7 @@ fn run_one_job<W>(
             let _ = db.update_task(
                 job.task_id,
                 &TaskUpdate {
-                    state: Some("approved".into()),
+                    state: Some(TaskState::Approved),
                     ..Default::default()
                 },
                 None,
@@ -322,7 +323,7 @@ fn run_one_job<W>(
             if let Err(te) = db.update_task(
                 job.task_id,
                 &TaskUpdate {
-                    state: Some("active".into()),
+                    state: Some(TaskState::Active),
                     ..Default::default()
                 },
                 None,
@@ -336,7 +337,7 @@ fn run_one_job<W>(
                 crate::tasks_notify::notify_state_change(
                     db,
                     &t,
-                    "merging",
+                    TaskState::Merging,
                     Some(&format!("merge error: {}", e)),
                     writer,
                     reader,
@@ -368,7 +369,7 @@ fn finish_success<W>(
     if let Err(e) = db.update_task(
         task_id,
         &TaskUpdate {
-            state: Some("merged".into()),
+            state: Some(TaskState::Merged),
             ..Default::default()
         },
         None,
@@ -381,7 +382,14 @@ fn finish_success<W>(
 
     let merged_project: Option<String> = if let Ok(Some(t)) = db.get_task(task_id) {
         let ctx = crate::tasks_scheduler::extract_merge_commit(project_dir, &t);
-        crate::tasks_notify::notify_state_change(db, &t, "merging", ctx.as_deref(), writer, reader);
+        crate::tasks_notify::notify_state_change(
+            db,
+            &t,
+            TaskState::Merging,
+            ctx.as_deref(),
+            writer,
+            reader,
+        );
         Some(t.project_name)
     } else {
         None
@@ -461,7 +469,7 @@ fn finish_failure<W>(
     if let Err(e) = db.update_task(
         task_id,
         &TaskUpdate {
-            state: Some("active".into()),
+            state: Some(TaskState::Active),
             ..Default::default()
         },
         None,
@@ -476,7 +484,7 @@ fn finish_failure<W>(
         crate::tasks_notify::notify_state_change(
             db,
             &t,
-            "merging",
+            TaskState::Merging,
             Some("merge failed — reverted to active"),
             writer,
             reader,
@@ -611,11 +619,16 @@ mod tests {
             )
             .expect("create task");
         // interactive -> ready -> active -> review -> approved
-        for s in ["ready", "active", "review", "approved"] {
+        for s in [
+            TaskState::Ready,
+            TaskState::Active,
+            TaskState::Review,
+            TaskState::Approved,
+        ] {
             db.update_task(
                 task.id,
                 &TaskUpdate {
-                    state: Some(s.into()),
+                    state: Some(s),
                     ..Default::default()
                 },
                 None,
