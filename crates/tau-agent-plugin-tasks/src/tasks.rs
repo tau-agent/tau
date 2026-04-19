@@ -2514,10 +2514,40 @@ pub fn run_tasks_plugin() {
     // created.  Any such tasks are stuck with session_id=NULL.  Run
     // the watchdog once at startup so the user doesn't have to wait
     // for an unrelated scheduler event to fire.  See task #572.
+    //
+    // Also run the Scenario B watchdog (task #577) to clear stale
+    // `session_id` values left behind by plugin versions that
+    // didn't clear on phase-completing transitions.  We schedule a
+    // follow-up ScheduleNeeded per affected project via
+    // `drain_scheduler_events`, which will pick the cleaned task up
+    // on the next tool-call drain.
     {
         let warnings = run_watchdog_pass_all(&db, &resolver, &mut writer, &mut chan_reader);
         for w in warnings {
             eprintln!("tasks startup watchdog: {}", w);
+        }
+        let mut followup_events: Vec<SchedulerEvent> = Vec::new();
+        let stale_warnings =
+            run_stale_ready_watchdog_pass(&db, &mut followup_events, &mut writer, &mut chan_reader);
+        for w in stale_warnings {
+            eprintln!("tasks startup stale-ready watchdog: {}", w);
+        }
+        // Drain the follow-up events synchronously so recovered
+        // tasks are dispatched before we start servicing tool
+        // calls.  `drain_scheduler_events` is idempotent and will
+        // surface additional warnings via stderr.
+        if !followup_events.is_empty() {
+            let drain_warnings = drain_scheduler_events(
+                &mut followup_events,
+                &db,
+                &resolver,
+                merge_worker.as_ref(),
+                &mut writer,
+                &mut chan_reader,
+            );
+            for w in drain_warnings {
+                eprintln!("tasks startup stale-ready drain: {}", w);
+            }
         }
     }
 
@@ -2904,6 +2934,37 @@ fn drain_scheduler_events(
     // stuck task in project B.  The DB query is cheap and stuck
     // tasks are expected to be rare.
     warnings.extend(run_watchdog_pass_all(db, resolver, writer, reader));
+
+    // Stale-ready watchdog (task #577, companion to #572): find
+    // tasks stuck in `ready` with a non-NULL `session_id` that
+    // points at a finished planner / refiner / reviewer session.
+    // Clear the stale field and re-queue a `ScheduleNeeded` so the
+    // scheduler dispatches a worker this drain cycle.
+    //
+    // The watchdog pushes into a local event buffer; we then run a
+    // follow-up schedule pass for every project it recovered, so
+    // the user's original tool call surfaces the dispatch in its
+    // warnings (mirroring the #572 pattern).
+    let mut followup_events: Vec<SchedulerEvent> = Vec::new();
+    warnings.extend(run_stale_ready_watchdog_pass(
+        db,
+        &mut followup_events,
+        writer,
+        reader,
+    ));
+    for ev in std::mem::take(&mut followup_events) {
+        if let SchedulerEvent::ScheduleNeeded(project_name, sid) = ev {
+            warnings.extend(run_schedule_pass(
+                db,
+                &project_name,
+                resolver,
+                sid.as_deref(),
+                writer,
+                reader,
+                &mut followup_events,
+            ));
+        }
+    }
     warnings
 }
 
@@ -3345,6 +3406,149 @@ fn run_watchdog_pass_all(
             writer,
             reader,
         ));
+    }
+    warnings
+}
+
+// ---------------------------------------------------------------------------
+// Stale-ready watchdog (task #577) — companion to the #572 sweep above.
+// ---------------------------------------------------------------------------
+//
+// Scenario B (task #577) covers tasks stuck in `ready` with a non-NULL
+// `session_id` that still points at a finished planner / refiner /
+// reviewer session.  The root-cause fix (clearing `session_id` on
+// phase-completing transitions in `update_task`) prevents new stuck
+// tasks, but does nothing for tasks that were left behind by earlier
+// plugin versions — or for any future transition that slips past the
+// clear.  This watchdog is the safety net: it scans `ready` tasks with
+// a stale non-live `session_id`, clears the field, records a system
+// task_message, and queues a `ScheduleNeeded` event so the scheduler
+// picks the task up on the same drain cycle.
+
+/// Sentinel appended to the per-task message by the Scenario B
+/// watchdog after every recovery action.  Used to trace repeated
+/// fires through the task's own history (the same mechanism as
+/// `WATCHDOG_ATTEMPT_MARKER` for Scenario A).
+const STALE_READY_WATCHDOG_MARKER: &str = "[stale-ready-watchdog]";
+
+/// Check whether a session is "live" from the task system's
+/// perspective, i.e. still able to progress the task's current
+/// phase.  Matches the liveness rules used by
+/// [`tasks_scheduler::find_reusable_session`]: a non-archived
+/// session reply from `GetSessionInfo` counts as live; anything else
+/// (archived, error, not found) is treated as not-live.
+///
+/// Returns `None` if the server responds with something other than
+/// `SessionInfo` — callers should treat `None` as "unknown, do not
+/// touch" rather than assuming dead.  A transient RPC failure must
+/// not cause the watchdog to blow away a legitimately live
+/// `session_id`.
+fn session_is_live(
+    session_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<bool> {
+    let req = tau_agent_plugin::Request::GetSessionInfo {
+        session_id: session_id.to_string(),
+    };
+    match crate::tasks_scheduler::server_request(writer, reader, req) {
+        Ok(tau_agent_plugin::Response::SessionInfo { info }) => Some(!info.archived),
+        _ => None,
+    }
+}
+
+/// Scan every `ready` task with a non-NULL `session_id`, check
+/// whether that session is still live, and if not clear the field so
+/// the scheduler can dispatch a fresh worker.
+///
+/// Returns the list of per-task warnings (one per recovered or
+/// explicitly-skipped task) for surfacing in the enclosing tool
+/// response.
+///
+/// This is safety-net, not primary: the state-machine fix in
+/// [`should_clear_session_id_on_transition`] handles the common case
+/// already.  We use a generous threshold (same
+/// [`STUCK_TASK_THRESHOLD_MS`] as Scenario A) so we don't fight with
+/// tasks that are legitimately in-flight mid-transition.
+fn run_stale_ready_watchdog_pass(
+    db: &TasksDb,
+    pending_events: &mut Vec<SchedulerEvent>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Vec<String> {
+    let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+    let stuck = match db.get_stuck_ready_tasks(now_ms, STUCK_TASK_THRESHOLD_MS) {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!(
+                "tasks stale-ready watchdog: failed to query stuck tasks: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut warnings = Vec::new();
+    for task in stuck {
+        let Some(stale_sid) = task.session_id.clone() else {
+            // Belt-and-braces: the query already filters NULLs out.
+            continue;
+        };
+
+        match session_is_live(&stale_sid, writer, reader) {
+            Some(true) => {
+                // Session is alive — this is legitimate in-flight
+                // work (e.g. a planner has just returned the task
+                // to `ready` and the next drain will pick it up).
+                // Leave the field alone.
+                continue;
+            }
+            None => {
+                // RPC failure.  Don't clear — we'll try again on
+                // the next drain.
+                continue;
+            }
+            Some(false) => { /* fall through to recovery below */ }
+        }
+
+        let msg = format!(
+            "{} Stale-ready watchdog detected task {} ({}) in `ready` with session_id={} \
+             pointing at a non-live session; clearing session_id so the scheduler can \
+             dispatch a worker.",
+            STALE_READY_WATCHDOG_MARKER, task.id, task.title, stale_sid
+        );
+        eprintln!("tasks stale-ready watchdog: {}", msg);
+        let _ = db.add_message(task.id, &msg, Some("system"));
+
+        if let Err(e) = db.clear_session_id(task.id) {
+            let warn = format!(
+                "⚠️ Stale-ready watchdog: failed to clear session_id for task {} ({}): {}",
+                task.id, task.title, e
+            );
+            eprintln!("tasks stale-ready watchdog: {}", warn);
+            let _ = db.add_message(task.id, &warn, Some("system"));
+            warnings.push(warn);
+            continue;
+        }
+
+        // Re-queue a ScheduleNeeded event so this drain cycle also
+        // dispatches the recovered task.  Without it, the field is
+        // clean but the task won't move until some other event
+        // triggers a schedule pass for its project.
+        let already_queued = pending_events.iter().any(|e| {
+            matches!(
+                e,
+                SchedulerEvent::ScheduleNeeded(p, _) if p == &task.project_name
+            )
+        });
+        if !already_queued {
+            pending_events.push(SchedulerEvent::ScheduleNeeded(
+                task.project_name.clone(),
+                None,
+            ));
+        }
+
+        warnings.push(msg);
     }
     warnings
 }
@@ -9932,6 +10136,261 @@ mod tests {
             )),
             "expected ScheduleNeeded to be re-queued after dispatch failure, got {:?}",
             pending
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Stale-ready watchdog (task #577)
+    // ---------------------------------------------------------------
+
+    /// Build a task stuck in `ready` with a non-NULL `session_id`,
+    /// back-dated past the watchdog threshold.  Mirrors the stuck
+    /// scenario reported in the task #577 spec (iris orchestrator).
+    fn make_stuck_ready_task(
+        db: &TasksDb,
+        project: &str,
+        title: &str,
+        stale_sid: &str,
+        age_ms: i64,
+    ) -> crate::tasks_db::Task {
+        let task = db
+            .create_task(
+                project, title, None, None, None, false, "ready", false, None, None, false,
+            )
+            .expect("create task");
+        db.set_session_id(task.id, stale_sid)
+            .expect("set_session_id");
+
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        let backdated = now_ms.saturating_sub(age_ms);
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![backdated, task.id],
+            )
+            .expect("backdate updated_at");
+
+        db.get_task(task.id).expect("get").expect("task exists")
+    }
+
+    #[test]
+    fn test_get_stuck_ready_tasks_returns_only_old_tasks_with_stale_sid() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let old_with_sid =
+            make_stuck_ready_task(&db, "test-project", "old-with-sid", "s-dead", 120_000);
+
+        // Fresh task with a session_id — below the threshold,
+        // likely in the middle of a legitimate transition.
+        let fresh_with_sid =
+            make_stuck_ready_task(&db, "test-project", "fresh-with-sid", "s-fresh", 1_000);
+
+        // Old ready task with NULL session_id — not a Scenario B
+        // case (Scenario A handles session_id=NULL in `active`).
+        let old_null = db
+            .create_task(
+                "test-project",
+                "old-null",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now_ms - 120_000, old_null.id],
+            )
+            .unwrap();
+
+        // Held task with stale sid — scheduler would skip anyway,
+        // watchdog must not touch.
+        let held = make_stuck_ready_task(&db, "test-project", "held", "s-held", 120_000);
+        db.update_task(
+            held.id,
+            &TaskUpdate {
+                held: Some(true),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now_ms - 120_000, held.id],
+            )
+            .unwrap();
+
+        let stuck = db
+            .get_stuck_ready_tasks(now_ms, STUCK_TASK_THRESHOLD_MS)
+            .expect("query stuck ready");
+        let ids: Vec<i64> = stuck.iter().map(|t| t.id).collect();
+
+        assert!(
+            ids.contains(&old_with_sid.id),
+            "old ready task with stale sid must be returned, got {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&fresh_with_sid.id),
+            "fresh ready task must not be returned, got {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&old_null.id),
+            "ready task with NULL session_id must not be returned, got {:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&held.id),
+            "held ready task must not be returned, got {:?}",
+            ids
+        );
+    }
+
+    #[test]
+    fn test_stale_ready_watchdog_clears_session_id_for_archived_session() {
+        // Exactly the iris scenario: ready task whose `session_id`
+        // points at an archived/idle planner.  Watchdog must clear
+        // the field, add a system message, and queue a
+        // ScheduleNeeded event.
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_stuck_ready_task(&db, "test-project", "iris-lookalike", "s-dead", 120_000);
+
+        let mut archived = std::collections::HashSet::new();
+        archived.insert("s-dead".to_string());
+        let (mut writer, mut reader) = mock_io_with_archived(archived);
+
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let warnings = run_stale_ready_watchdog_pass(&db, &mut events, &mut writer, &mut reader);
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert!(
+            updated.session_id.is_none(),
+            "watchdog must clear stale session_id, still {:?}",
+            updated.session_id
+        );
+        assert_eq!(updated.state, "ready");
+
+        // A ScheduleNeeded event must have been queued so the drain
+        // loop dispatches the task on the same pass.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project"
+            )),
+            "expected ScheduleNeeded event, got {:?}",
+            events
+        );
+
+        // A system task-message must have been recorded and the
+        // watchdog marker must appear in the task history.
+        let msgs = db.get_messages(task.id).unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.content.contains(STALE_READY_WATCHDOG_MARKER)),
+            "expected stale-ready marker in task messages, got {:?}",
+            msgs.iter().map(|m| &m.content).collect::<Vec<_>>()
+        );
+
+        // Warnings surfaced to the enclosing tool call.
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("stale-ready") || w.contains("Stale-ready")),
+            "expected warning message, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_stale_ready_watchdog_skips_live_session() {
+        // Regression guard: a ready task whose session_id is still a
+        // live session (e.g. a planner that legitimately hasn't
+        // flipped the task to refining yet) must NOT be cleared.
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_stuck_ready_task(&db, "test-project", "still-planning", "s-alive", 120_000);
+
+        // No archived sessions — all sessions report as live.
+        let (mut writer, mut reader) = mock_io();
+
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let warnings = run_stale_ready_watchdog_pass(&db, &mut events, &mut writer, &mut reader);
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated.session_id.as_deref(),
+            Some("s-alive"),
+            "watchdog must not clear a live session_id"
+        );
+        assert!(
+            events.is_empty(),
+            "no ScheduleNeeded should be queued when session is live, got {:?}",
+            events
+        );
+        assert!(
+            warnings.is_empty(),
+            "no warnings should be surfaced when session is live, got {:?}",
+            warnings
+        );
+    }
+
+    #[test]
+    fn test_stale_ready_watchdog_skips_fresh_tasks() {
+        // A ready task whose `updated_at` is recent (e.g. a refiner
+        // just flipped it to ready and the drain is still in-flight)
+        // must not be touched.
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_stuck_ready_task(&db, "test-project", "just-flipped", "s-recent", 1_000);
+
+        let (mut writer, mut reader) = mock_io();
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let warnings = run_stale_ready_watchdog_pass(&db, &mut events, &mut writer, &mut reader);
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(updated.session_id.as_deref(), Some("s-recent"));
+        assert!(events.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_stale_ready_watchdog_dedups_schedule_events() {
+        // Multiple stale-ready tasks in the same project must
+        // produce only one ScheduleNeeded event.
+        let db = TasksDb::open_memory().unwrap();
+        make_stuck_ready_task(&db, "test-project", "one", "s-dead-1", 120_000);
+        make_stuck_ready_task(&db, "test-project", "two", "s-dead-2", 120_000);
+
+        let mut archived = std::collections::HashSet::new();
+        archived.insert("s-dead-1".to_string());
+        archived.insert("s-dead-2".to_string());
+        let (mut writer, mut reader) = mock_io_with_archived(archived);
+
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        run_stale_ready_watchdog_pass(&db, &mut events, &mut writer, &mut reader);
+
+        let sched_count = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project"
+                )
+            })
+            .count();
+        assert_eq!(
+            sched_count, 1,
+            "multiple stale tasks in one project must emit only one \
+             ScheduleNeeded event, got {} (all events: {:?})",
+            sched_count, events
         );
     }
 

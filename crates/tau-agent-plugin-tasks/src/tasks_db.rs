@@ -204,6 +204,59 @@ pub fn validate_state_transition(from: &str, to: &str) -> bool {
     )
 }
 
+/// Return `true` when transitioning `from -> to` means the task's
+/// current `session_id` no longer refers to the session that is now
+/// responsible for the task's phase.  On such transitions
+/// [`update_task`] clears `tasks.session_id` so the scheduler and
+/// downstream consumers no longer see a stale reference to a session
+/// that has already finished its work.
+///
+/// Rationale (task #577 — companion to #572):
+///
+/// The `tasks.session_id` field is written by [`set_session_id`] on
+/// initial dispatch (planner, worker, interactive) but never reset.
+/// When a planner finishes and the task progresses
+/// `planning -> refining -> ready`, the field still points at the
+/// planner; the scheduler then treats the task as "already has a
+/// session" for planning-state purposes, and logs confusing messages
+/// for the worker dispatch.  Clearing on phase completion keeps the
+/// field honest: it names the session that is *currently* the task's
+/// primary driver, not the last one that happened to touch it.  The
+/// immutable per-phase history lives in `task_sessions`.
+///
+/// The transitions that clear are the ones where the outgoing
+/// session's role ends and the next phase will either dispatch a
+/// fresh session or pick one up from `task_sessions` as needed:
+///
+/// - `planning -> refining` — planner done, refiner is separate.
+/// - `refining -> ready` — refiner done, worker will be new.
+/// - `active -> ready` — worker reverted, next dispatch is fresh.
+///
+/// Transitions NOT cleared — the current `session_id` is still the
+/// session that will continue the work:
+///
+/// - `refining -> planning` — handler resumes the planner via
+///   `task.session_id` (see `tasks::handle_task_update`).
+/// - `review -> active` — handler notifies the worker via
+///   `task.session_id`; the worker is still live.
+/// - any `* -> active` from prepare_task — `set_session_id` is called
+///   immediately by `dispatch()` to write the new worker id.
+/// - any `* -> interactive` — the interactive handler checks
+///   liveness itself and replaces as needed.
+///
+/// Transitions not in the validated state-machine (e.g. direct
+/// `planning -> ready` or `review -> ready`) are omitted here —
+/// they cannot fire, and the stale-ready watchdog
+/// ([`run_stale_ready_watchdog_pass`] in `tasks.rs`) catches any
+/// orphan ready tasks regardless of how their `session_id` got
+/// there.
+pub(crate) fn should_clear_session_id_on_transition(from: &str, to: &str) -> bool {
+    matches!(
+        (from, to),
+        ("planning", "refining") | ("refining", "ready") | ("active", "ready")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tree ordering
 // ---------------------------------------------------------------------------
@@ -813,6 +866,26 @@ impl TasksDb {
         update_field!(title, "title", Some(task.title.clone()));
         update_field!(state, "state", Some(task.state.clone()));
         update_field!(priority, "priority", Some(task.priority.to_string()));
+
+        // Phase-completing transitions clear `tasks.session_id` so the
+        // scheduler never sees a stale reference to a session that has
+        // already finished its phase.  See
+        // [`should_clear_session_id_on_transition`] for the rationale and
+        // the exhaustive list of transitions that trigger the clear.
+        // Task #577 — companion to #572.
+        if let Some(ref new_state) = update.state
+            && should_clear_session_id_on_transition(&task.state, new_state)
+            && task.session_id.is_some()
+        {
+            let old_sid = task.session_id.clone();
+            sets.push("session_id = NULL".to_string());
+            tx.execute(
+                "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, "session_id", old_sid, Option::<String>::None, session_id, now],
+            )
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+        }
 
         if let Some(ref val) = update.tags {
             let old_str = task.tags.as_ref().map(|v| v.to_string());
@@ -1997,6 +2070,49 @@ impl TasksDb {
         for row in rows {
             tasks.push(row.map_err(|e| {
                 tau_agent_plugin::Error::Io(format!("read stuck active task: {}", e))
+            })?);
+        }
+        Ok(tasks)
+    }
+
+    /// Find tasks in `ready` with a non-NULL `session_id` that have
+    /// been idle longer than `max_age_ms`.  Used by the Scenario B
+    /// watchdog (task #577) to recover tasks whose `session_id`
+    /// still points at a finished planner/refiner/reviewer and that
+    /// the caller believes the scheduler may be skipping.
+    ///
+    /// The query deliberately filters only on `state = 'ready'` and
+    /// `session_id IS NOT NULL` — not held, still non-terminal —
+    /// mirroring the schedulability conditions in
+    /// [`get_schedulable_tasks`].  Liveness of the referenced
+    /// session is checked by the caller via `GetSessionInfo`
+    /// because it is an RPC round-trip, not a DB property.
+    pub fn get_stuck_ready_tasks(
+        &self,
+        now_ms: i64,
+        max_age_ms: i64,
+    ) -> tau_agent_plugin::Result<Vec<Task>> {
+        let cutoff = now_ms.saturating_sub(max_age_ms);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
+                        created_at, updated_at
+                 FROM tasks
+                 WHERE state = 'ready' AND session_id IS NOT NULL
+                   AND NOT held AND updated_at <= ?1",
+            )
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare stuck ready query: {}", e)))?;
+
+        let rows = stmt
+            .query_map(params![cutoff], row_to_task)
+            .map_err(|e| tau_agent_plugin::Error::Io(format!("query stuck ready: {}", e)))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("read stuck ready task: {}", e))
             })?);
         }
         Ok(tasks)
@@ -6024,6 +6140,255 @@ mod tests {
 
         db.clear_session_id(task.id).unwrap();
         assert!(db.get_task(task.id).unwrap().unwrap().session_id.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // Task #577 — phase-completing transitions clear session_id
+    // ---------------------------------------------------------------
+
+    /// Helper: create a task with `initial_state = interactive`,
+    /// transition it to `desired` state, and seed a stale
+    /// `session_id` so tests can exercise the clearing logic.
+    fn make_task_in_state(db: &TasksDb, title: &str, desired: &str) -> Task {
+        let task = db
+            .create_task(
+                "test-project",
+                title,
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        // Move through the states that are needed to reach `desired`.
+        // `interactive -> desired` covers most one-hop transitions the
+        // tests care about; for multi-hop chains we explicitly step.
+        let path: &[&str] = match desired {
+            "planning" => &["planning"],
+            "refining" => &["refining"],
+            "ready" => &["ready"],
+            "active" => &["ready", "active"],
+            "review" => &["ready", "active", "review"],
+            other => panic!("make_task_in_state: unsupported target {}", other),
+        };
+        for step in path {
+            let affected_files = if *step == "ready" {
+                Some(serde_json::json!(["src/lib.rs"]))
+            } else {
+                None
+            };
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some((*step).into()),
+                    affected_files,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+        db.get_task(task.id).unwrap().unwrap()
+    }
+
+    #[test]
+    fn test_transition_planning_to_refining_clears_session_id() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_task_in_state(&db, "planning", "planning");
+        db.set_session_id(task.id, "s-planner").unwrap();
+
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("refining".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let got = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(got.state, "refining");
+        assert!(
+            got.session_id.is_none(),
+            "planning -> refining should clear session_id (was {:?})",
+            got.session_id
+        );
+
+        // History should contain a session_id clear entry.
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT field, old_value, new_value FROM task_history \
+                 WHERE task_id = ?1 AND field = 'session_id' ORDER BY id",
+            )
+            .unwrap();
+        let history: Vec<(String, Option<String>, Option<String>)> = stmt
+            .query_map(params![task.id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            history.iter().any(|(f, old, new)| f == "session_id"
+                && old.as_deref() == Some("s-planner")
+                && new.is_none()),
+            "expected a history entry clearing session_id from s-planner, got {:?}",
+            history
+        );
+    }
+
+    #[test]
+    fn test_transition_refining_to_ready_clears_session_id() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_task_in_state(&db, "refining", "refining");
+        db.set_session_id(task.id, "s-refiner").unwrap();
+
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                affected_files: Some(serde_json::json!(["src/foo.rs"])),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let got = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(got.state, "ready");
+        assert!(
+            got.session_id.is_none(),
+            "refining -> ready should clear session_id (was {:?})",
+            got.session_id
+        );
+    }
+
+    #[test]
+    fn test_transition_active_to_ready_clears_session_id() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_task_in_state(&db, "active", "active");
+        db.set_session_id(task.id, "s-worker").unwrap();
+
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let got = db.get_task(task.id).unwrap().unwrap();
+        assert!(
+            got.session_id.is_none(),
+            "active -> ready should clear session_id (was {:?})",
+            got.session_id
+        );
+    }
+
+    #[test]
+    fn test_direct_planning_to_ready_rejected_by_validator() {
+        // The validator doesn't allow this transition at all — the
+        // scheduler always routes through refining.  Guard against
+        // a future loosening of validation that would bypass the
+        // clear (callers must add the transition to
+        // `should_clear_session_id_on_transition` too).
+        assert!(!super::validate_state_transition("planning", "ready"));
+        assert!(!super::validate_state_transition("review", "ready"));
+    }
+
+    #[test]
+    fn test_transition_refining_to_planning_preserves_session_id() {
+        // `refining -> planning` resumes the planner session via
+        // `task.session_id` — must NOT clear.
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_task_in_state(&db, "resume", "refining");
+        db.set_session_id(task.id, "s-planner").unwrap();
+
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("planning".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let got = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(got.state, "planning");
+        assert_eq!(
+            got.session_id.as_deref(),
+            Some("s-planner"),
+            "refining -> planning must preserve session_id so the \
+             handler can resume the planner"
+        );
+    }
+
+    #[test]
+    fn test_transition_review_to_active_preserves_session_id() {
+        // `review -> active` lets the worker resume; handler queues a
+        // message at `task.session_id`, so must NOT clear.
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_task_in_state(&db, "rework", "review");
+        db.set_session_id(task.id, "s-worker").unwrap();
+
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("active".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let got = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(got.state, "active");
+        assert_eq!(got.session_id.as_deref(), Some("s-worker"));
+    }
+
+    #[test]
+    fn test_clear_on_transition_is_idempotent_when_already_null() {
+        // If `session_id` was already NULL (e.g. because a previous
+        // watchdog cleared it), the transition-level clear must be a
+        // no-op and not write a spurious history entry.
+        let db = TasksDb::open_memory().unwrap();
+        let task = make_task_in_state(&db, "clean", "refining");
+        assert!(task.session_id.is_none());
+
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some("ready".into()),
+                affected_files: Some(serde_json::json!(["x.rs"])),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT COUNT(*) FROM task_history \
+                 WHERE task_id = ?1 AND field = 'session_id'",
+            )
+            .unwrap();
+        let count: i64 = stmt.query_row(params![task.id], |row| row.get(0)).unwrap();
+        assert_eq!(
+            count, 0,
+            "no session_id history entries should be written when \
+             the field was already NULL"
+        );
     }
 
     // ----- planning/refining cycle tests -----
