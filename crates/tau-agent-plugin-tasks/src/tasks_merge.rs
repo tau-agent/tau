@@ -280,7 +280,12 @@ pub fn merge_task_for_caller(
         ),
     )?;
     if is_error {
-        archive_session(writer, reader, &log_session);
+        if let Err(e) = archive_session(writer, reader, &log_session) {
+            eprintln!(
+                "tasks: warning: failed to archive log session {}: {}",
+                log_session, e
+            );
+        }
         return Ok(MergeResult {
             success: false,
             log: format!(
@@ -307,7 +312,12 @@ pub fn merge_task_for_caller(
     if is_error {
         // Abort the rebase so we leave a clean state
         let _ = execute_bash(writer, reader, &log_session, "git rebase --abort");
-        archive_session(writer, reader, &log_session);
+        if let Err(e) = archive_session(writer, reader, &log_session) {
+            eprintln!(
+                "tasks: warning: failed to archive log session {}: {}",
+                log_session, e
+            );
+        }
         return Ok(MergeResult {
             success: false,
             log: format!("Rebase failed:\n{}", log),
@@ -323,7 +333,12 @@ pub fn merge_task_for_caller(
         log.push('\n');
 
         if is_error {
-            archive_session(writer, reader, &log_session);
+            if let Err(e) = archive_session(writer, reader, &log_session) {
+                eprintln!(
+                    "tasks: warning: failed to archive log session {}: {}",
+                    log_session, e
+                );
+            }
             return Ok(MergeResult {
                 success: false,
                 log: format!("Checklist '{}' failed:\n{}", item.name, log),
@@ -352,7 +367,12 @@ pub fn merge_task_for_caller(
     log.push('\n');
 
     if is_error {
-        archive_session(writer, reader, &log_session);
+        if let Err(e) = archive_session(writer, reader, &log_session) {
+            eprintln!(
+                "tasks: warning: failed to archive log session {}: {}",
+                log_session, e
+            );
+        }
         return Ok(MergeResult {
             success: false,
             log: format!("Merge failed:\n{}", log),
@@ -473,66 +493,68 @@ pub fn merge_task_for_caller(
     // records `interactive`, etc.), so a `task.session_id` missing from
     // `task_sessions` means we have no role information and cannot safely
     // decide to archive.
-    if let Some(ref placeholder_sid) = task.placeholder_session_id {
-        // Tier-3 check: if the caller is inside the placeholder's
-        // subtree, archiving it inline would race with the caller's
-        // own agent loop. Defer to post-idle. The post-idle path still
-        // archives via the role-filter (legacy) — but with the
-        // placeholder present, the subtree cascade covers it
-        // regardless.
-        let caller_inside =
-            caller_in_placeholder_subtree(writer, reader, caller_session_id, placeholder_sid);
-        if caller_inside {
-            if let Some(cid) = caller_session_id {
-                let _ = server_request(
-                    writer,
-                    reader,
-                    Request::EnqueuePostIdleAction {
-                        session_id: cid.to_string(),
-                        action: tau_agent_plugin::PostIdleAction::ArchiveTaskSessions { task_id },
-                    },
-                );
-                log.push_str(
-                    "Deferred task-subtree archival to post-idle (caller is in subtree)\n",
-                );
-            }
-        } else {
-            archive_session(writer, reader, placeholder_sid);
+    //
+    // Task #575: archival always goes through the post-idle retry path
+    // when we have a caller session — the server's `ArchiveSession`
+    // guard rejects any subtree where at least one session is still
+    // live (turn running), and the inline fire-and-forget path
+    // swallowed those errors silently, leaving subtrees un-archived
+    // indefinitely. The post-idle drain (see
+    // `crates/tau-agent-lib/src/server/post_idle.rs`) retries on
+    // transient busy errors and is the single source of truth for
+    // task-session archival. When there is no caller session
+    // (scheduler-tick or CLI merges) we fall back to the inline
+    // busy-retry helper so the same behaviour holds for those paths.
+    if let Some(cid) = caller_session_id {
+        let _ = server_request(
+            writer,
+            reader,
+            Request::EnqueuePostIdleAction {
+                session_id: cid.to_string(),
+                action: tau_agent_plugin::PostIdleAction::ArchiveTaskSessions { task_id },
+            },
+        );
+        if let Some(ref placeholder_sid) = task.placeholder_session_id {
             log.push_str(&format!(
-                "Archived placeholder session {} (cascades to subtree)\n",
+                "Deferred archival of placeholder session {} (cascades to subtree) to post-idle\n",
                 placeholder_sid
             ));
+        } else if let Ok(sessions) = db.get_sessions(task_id) {
+            let (to_archive, to_skip) = sessions_to_archive(&sessions);
+            log.push_str(&format!(
+                "Deferred archival of {} task session(s) to post-idle\n",
+                to_archive.len()
+            ));
+            for ts in to_skip {
+                log.push_str(&format!(
+                    "Preserved {} session {} (role not in archive list)\n",
+                    ts.role, ts.session_id
+                ));
+            }
+        }
+    } else if let Some(ref placeholder_sid) = task.placeholder_session_id {
+        // No caller context — inline archival with busy retry.
+        match archive_session_with_busy_retry(writer, reader, placeholder_sid) {
+            Ok(()) => log.push_str(&format!(
+                "Archived placeholder session {} (cascades to subtree)\n",
+                placeholder_sid
+            )),
+            Err(e) => log.push_str(&format!(
+                "WARNING: failed to archive placeholder session {}: {}\n",
+                placeholder_sid, e
+            )),
         }
     } else if let Ok(sessions) = db.get_sessions(task_id) {
         let (to_archive, to_skip) = sessions_to_archive(&sessions);
-
-        // Tier-3 check: if the caller's session is in the to-archive set,
-        // inline archival would race with the caller's own agent loop
-        // (lock still held).  Defer the whole task-archival batch to
-        // post-idle via EnqueuePostIdleAction so it runs after the
-        // caller's turn exits.
-        let caller_in_archive =
-            caller_session_id.is_some_and(|cid| to_archive.iter().any(|ts| ts.session_id == cid));
-
-        if caller_in_archive {
-            if let Some(cid) = caller_session_id {
-                let _ = server_request(
-                    writer,
-                    reader,
-                    Request::EnqueuePostIdleAction {
-                        session_id: cid.to_string(),
-                        action: tau_agent_plugin::PostIdleAction::ArchiveTaskSessions { task_id },
-                    },
-                );
-                log.push_str(&format!(
-                    "Deferred archival of {} task session(s) to post-idle (caller is in subtree)\n",
-                    to_archive.len()
-                ));
-            }
-        } else {
-            for ts in to_archive {
-                archive_session(writer, reader, &ts.session_id);
-                log.push_str(&format!("Archived {} session {}\n", ts.role, ts.session_id));
+        for ts in to_archive {
+            match archive_session_with_busy_retry(writer, reader, &ts.session_id) {
+                Ok(()) => {
+                    log.push_str(&format!("Archived {} session {}\n", ts.role, ts.session_id))
+                }
+                Err(e) => log.push_str(&format!(
+                    "WARNING: failed to archive {} session {}: {}\n",
+                    ts.role, ts.session_id, e
+                )),
             }
         }
         for ts in to_skip {
@@ -543,60 +565,102 @@ pub fn merge_task_for_caller(
         }
     }
 
-    // 8. Archive the log session. When the task has a placeholder, the
-    // log session is its descendant and was already cascade-archived
-    // above — archiving again is idempotent (already-archived sessions
-    // return success), so this line is safe either way.
-    archive_session(writer, reader, &log_session);
+    // 8. Archive the log session. When the task has a placeholder the
+    // log session is its descendant and will be cascade-archived by
+    // the post-idle drain (or by the inline busy-retry above); this
+    // call is idempotent — archiving an already-archived session is a
+    // no-op on the server side. For tasks without a placeholder, and
+    // for the no-caller path, this is the authoritative archival of
+    // the log session. We log any error rather than silently drop it
+    // (task #575).
+    if let Err(e) = archive_session(writer, reader, &log_session) {
+        log.push_str(&format!(
+            "WARNING: failed to archive log session {}: {}\n",
+            log_session, e
+        ));
+    }
 
     log.push_str("=== Merge complete ===\n");
 
     Ok(MergeResult { success: true, log })
 }
 
-/// Archive a session (best-effort, errors are ignored).
-fn archive_session(writer: &mut impl Write, reader: &mut impl BufRead, session_id: &str) {
-    let _ = server_request(
+/// Archive a session, returning an `Err(message)` on RPC or server
+/// failure.
+///
+/// Historically this was a fire-and-forget call that dropped every
+/// error — including the server's "cannot archive: session X is busy"
+/// error returned when a subtree session is still live. That silent
+/// drop was the root cause of task #575: whole task subtrees were
+/// never archived because one child hadn't finished unregistering
+/// when the merge ran. Callers must now explicitly handle or log
+/// any error, and the common caller (merge cleanup) routes archival
+/// through the post-idle retry path instead of calling this directly.
+fn archive_session(
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+    session_id: &str,
+) -> Result<(), String> {
+    match server_request(
         writer,
         reader,
         Request::ArchiveSession {
             session_id: session_id.to_string(),
             require_ancestor: None,
         },
-    );
+    ) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected ArchiveSession response: {:?}", other)),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
-/// Return `true` when `caller_session_id` is `placeholder_sid` itself or
-/// one of its descendants — i.e. archiving the placeholder would rip the
-/// caller's own session out from under it.
+/// Maximum attempts when retrying an `ArchiveSession` request that
+/// returns a transient "busy" error. Mirrors
+/// `post_idle::ARCHIVE_MAX_RETRIES`.
+const INLINE_ARCHIVE_MAX_RETRIES: u32 = 20;
+
+/// Delay between retry attempts, in milliseconds. Mirrors
+/// `post_idle::ARCHIVE_RETRY_DELAY_MS`.
+const INLINE_ARCHIVE_RETRY_DELAY_MS: u64 = 1000;
+
+/// Archive a session, retrying on transient "cannot archive: session X
+/// is busy" responses from the server.
 ///
-/// Walks up the caller's ancestor chain via `GetSessionAncestors`
-/// (leaf-first, depth-guarded server-side at 64). Best-effort: returns
-/// `false` on any RPC error, which causes the caller to archive inline
-/// — the retry logic in `post_idle` handles the resulting race.
-fn caller_in_placeholder_subtree(
+/// Used on merge paths that have no caller session and therefore
+/// cannot defer archival to the Tier-3 post-idle drain (e.g. CLI
+/// merges, scheduler-tick merges with no session context). The
+/// retry schedule matches the post-idle path so both routes recover
+/// from the same race window.
+fn archive_session_with_busy_retry(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
-    caller_session_id: Option<&str>,
-    placeholder_sid: &str,
-) -> bool {
-    let Some(caller) = caller_session_id else {
-        return false;
-    };
-    if caller == placeholder_sid {
-        return true;
+    session_id: &str,
+) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..INLINE_ARCHIVE_MAX_RETRIES {
+        match archive_session(writer, reader, session_id) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Only retry on the specific "busy" error — any other
+                // error (session not found, DB failure) is terminal.
+                if !e.contains("is busy") {
+                    return Err(e);
+                }
+                last_err = e;
+                if attempt + 1 < INLINE_ARCHIVE_MAX_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        INLINE_ARCHIVE_RETRY_DELAY_MS,
+                    ));
+                }
+            }
+        }
     }
-    let sessions = match server_request(
-        writer,
-        reader,
-        Request::GetSessionAncestors {
-            session_id: caller.to_string(),
-        },
-    ) {
-        Ok(Response::SessionAncestors { sessions }) => sessions,
-        _ => return false,
-    };
-    sessions.iter().any(|info| info.id == placeholder_sid)
+    Err(format!(
+        "giving up after {} busy-retries: {}",
+        INLINE_ARCHIVE_MAX_RETRIES, last_err
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1834,5 +1898,257 @@ command = "cargo test"
 
         let task = db.get_task(task_id).unwrap().unwrap();
         assert_eq!(task.state, "active");
+    }
+
+    // -----------------------------------------------------------------
+    // archive_session / archive_session_with_busy_retry (task #575)
+    //
+    // The bug: `archive_session` used to be fire-and-forget, silently
+    // dropping the server's "cannot archive: session X is busy" error
+    // and leaving merged task subtrees un-archived indefinitely.
+    //
+    // These tests exercise the helpers directly against an in-process
+    // mock "server" that runs in a worker thread and answers each
+    // request with a canned `Response`. The helpers' signatures now
+    // surface the error to the caller, and the retry variant loops on
+    // "busy" responses until success or max-retries.
+    // -----------------------------------------------------------------
+
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::thread;
+    use tau_agent_plugin::{PluginMessage, Request, Response};
+
+    /// Pipe-ish writer: every `write` call appends to a channel the
+    /// reader half can drain line-by-line. The merger sends requests
+    /// through this and the mock server pulls them out.
+    struct ChannelWriter {
+        tx: mpsc::Sender<Vec<u8>>,
+    }
+
+    impl Write for ChannelWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.tx
+                .send(buf.to_vec())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Pipe-ish reader fed by the mock server. Blocks in `read` until
+    /// data is available, matching how the plugin's `read_line` waits
+    /// on a real stdin.
+    struct ChannelReader {
+        rx: mpsc::Receiver<Vec<u8>>,
+        buf: Vec<u8>,
+    }
+
+    impl Read for ChannelReader {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            while self.buf.is_empty() {
+                match self.rx.recv() {
+                    Ok(chunk) => self.buf.extend_from_slice(&chunk),
+                    Err(_) => return Ok(0), // channel closed = EOF
+                }
+            }
+            let n = out.len().min(self.buf.len());
+            out[..n].copy_from_slice(&self.buf[..n]);
+            self.buf.drain(..n);
+            Ok(n)
+        }
+    }
+
+    /// Spawn a mock server that reads one line at a time from
+    /// `req_rx`, parses it as a `PluginMessage::ServerRequest`, invokes
+    /// `handler` to pick a `Response`, and writes the matching
+    /// `PluginRequest::ServerResponse` back through `resp_tx`. Returns
+    /// a join handle so the caller can assert on the request count.
+    fn spawn_mock_server<F>(
+        req_rx: mpsc::Receiver<Vec<u8>>,
+        resp_tx: mpsc::Sender<Vec<u8>>,
+        handler: F,
+    ) -> thread::JoinHandle<Vec<Request>>
+    where
+        F: Fn(usize, &Request) -> Response + Send + 'static,
+    {
+        thread::spawn(move || {
+            let mut pending = Vec::<u8>::new();
+            let mut seen = Vec::<Request>::new();
+            loop {
+                // Block for the next chunk.
+                match req_rx.recv() {
+                    Ok(chunk) => pending.extend_from_slice(&chunk),
+                    Err(_) => return seen,
+                }
+                // Drain any complete newline-terminated lines.
+                while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=nl).collect();
+                    let line_str = String::from_utf8_lossy(&line).to_string();
+                    let msg: PluginMessage = match serde_json::from_str(line_str.trim()) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let (request_id, request) = match msg {
+                        PluginMessage::ServerRequest {
+                            request_id,
+                            request,
+                        } => (request_id, request),
+                        _ => continue,
+                    };
+                    let idx = seen.len();
+                    let response = handler(idx, &request);
+                    seen.push(request);
+                    let resp = PluginRequest::ServerResponse {
+                        request_id,
+                        response,
+                    };
+                    let mut line = serde_json::to_vec(&resp).expect("serialize response");
+                    line.push(b'\n');
+                    if resp_tx.send(line).is_err() {
+                        return seen;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Wire up the merge code against a mock server parameterised by
+    /// `handler`. Returns the requests the server observed and any
+    /// result produced by `call` (typically `Result<(), String>`).
+    fn with_mock_server<F, G, R>(handler: F, call: G) -> (Vec<Request>, R)
+    where
+        F: Fn(usize, &Request) -> Response + Send + 'static,
+        G: FnOnce(&mut ChannelWriter, &mut std::io::BufReader<ChannelReader>) -> R,
+    {
+        let (req_tx, req_rx) = mpsc::channel::<Vec<u8>>();
+        let (resp_tx, resp_rx) = mpsc::channel::<Vec<u8>>();
+        let server = spawn_mock_server(req_rx, resp_tx, handler);
+        let mut writer = ChannelWriter { tx: req_tx };
+        let mut reader = std::io::BufReader::new(ChannelReader {
+            rx: resp_rx,
+            buf: Vec::new(),
+        });
+        let out = call(&mut writer, &mut reader);
+        // Drop writer to close the request channel so the mock server exits.
+        drop(writer);
+        drop(reader);
+        let seen = server.join().expect("mock server panicked");
+        (seen, out)
+    }
+
+    #[test]
+    fn archive_session_returns_ok_when_server_returns_ok() {
+        let (seen, result) = with_mock_server(
+            |_idx, _req| Response::Ok,
+            |w, r| archive_session(w, r, "s42"),
+        );
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        assert_eq!(seen.len(), 1);
+        match &seen[0] {
+            Request::ArchiveSession { session_id, .. } => {
+                assert_eq!(session_id, "s42")
+            }
+            other => panic!("unexpected request: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn archive_session_surfaces_server_error_instead_of_swallowing() {
+        // Regression for task #575: the old implementation dropped this
+        // error, leaving subtrees un-archived with no diagnostic.
+        let (seen, result) = with_mock_server(
+            |_idx, _req| Response::Error {
+                message: "cannot archive: session s42 is busy".into(),
+            },
+            |w, r| archive_session(w, r, "s42"),
+        );
+        assert_eq!(seen.len(), 1);
+        let err = result.expect_err("expected Err, got Ok");
+        assert!(
+            err.contains("is busy"),
+            "error should preserve server message, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn archive_session_with_busy_retry_succeeds_after_transient_busy() {
+        // First N attempts return busy, then the session unregisters
+        // and the server returns Ok. The retry helper must drive
+        // through the busy window rather than giving up on the first
+        // failure.
+        const BUSY_ATTEMPTS: usize = 3;
+        let (seen, result) = with_mock_server(
+            move |idx, _req| {
+                if idx < BUSY_ATTEMPTS {
+                    Response::Error {
+                        message: "cannot archive: session s99 is busy".into(),
+                    }
+                } else {
+                    Response::Ok
+                }
+            },
+            |w, r| archive_session_with_busy_retry_for_test(w, r, "s99"),
+        );
+        assert!(result.is_ok(), "expected eventual Ok, got {:?}", result);
+        assert_eq!(
+            seen.len(),
+            BUSY_ATTEMPTS + 1,
+            "expected {} retries + 1 success",
+            BUSY_ATTEMPTS
+        );
+        for req in &seen {
+            match req {
+                Request::ArchiveSession { session_id, .. } => assert_eq!(session_id, "s99"),
+                other => panic!("unexpected request: {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn archive_session_with_busy_retry_does_not_retry_terminal_errors() {
+        // A non-busy error (e.g. session not found, DB error) is
+        // terminal — the retry helper must not spin on it.
+        let (seen, result) = with_mock_server(
+            |_idx, _req| Response::Error {
+                message: "session not found: s-missing".into(),
+            },
+            |w, r| archive_session_with_busy_retry_for_test(w, r, "s-missing"),
+        );
+        assert_eq!(seen.len(), 1, "non-busy errors must not retry");
+        let err = result.expect_err("expected Err");
+        assert!(err.contains("not found"), "got: {}", err);
+    }
+
+    /// Test-only shim around `archive_session_with_busy_retry` that
+    /// collapses the sleep to zero so tests don't wait 20 seconds. The
+    /// production constants (`INLINE_ARCHIVE_MAX_RETRIES` / `_DELAY_MS`)
+    /// are intentionally left in production form; this helper simply
+    /// loops without sleeping between attempts.
+    fn archive_session_with_busy_retry_for_test(
+        writer: &mut impl std::io::Write,
+        reader: &mut impl std::io::BufRead,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let mut last_err = String::new();
+        for _ in 0..INLINE_ARCHIVE_MAX_RETRIES {
+            match archive_session(writer, reader, session_id) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if !e.contains("is busy") {
+                        return Err(e);
+                    }
+                    last_err = e;
+                    // No sleep — production sleeps INLINE_ARCHIVE_RETRY_DELAY_MS.
+                }
+            }
+        }
+        Err(format!(
+            "giving up after {} busy-retries: {}",
+            INLINE_ARCHIVE_MAX_RETRIES, last_err
+        ))
     }
 }
