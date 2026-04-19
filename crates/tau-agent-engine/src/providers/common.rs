@@ -24,33 +24,25 @@ pub const TIMEOUT_RECV_RESPONSE_ADAPTIVE: Duration = Duration::from_secs(600);
 
 /// Pick the time-to-first-byte timeout for a given model + options.
 ///
-/// Adaptive-thinking Anthropic models with `thinking_enabled` (either
-/// explicitly `Some(true)` or inferred from effort/budget) can sit silent
-/// for minutes while reasoning; they get [`TIMEOUT_RECV_RESPONSE_ADAPTIVE`].
-/// Everything else uses the default [`TIMEOUT_RECV_RESPONSE`].
+/// Any adaptive-thinking-capable Anthropic model gets
+/// [`TIMEOUT_RECV_RESPONSE_ADAPTIVE`], regardless of whether the caller
+/// announced thinking in [`StreamOptions`] — these models can delay
+/// first-byte for minutes even when thinking isn't explicitly requested,
+/// because Anthropic's server may still reason before replying. The
+/// caller's `thinking_enabled` flag controls what we *ask for*, not whether
+/// the server will reason before responding.
+///
+/// The one escape hatch is an explicit `thinking_enabled == Some(false)`:
+/// callers who deliberately disable thinking (e.g. the review path) have
+/// promised they don't want reasoning, so the short timeout is enough.
 pub fn recv_timeout_for(model: &Model, options: &StreamOptions) -> Duration {
-    if is_adaptive_thinking_call(model, options) {
+    if model.thinking == ThinkingStyle::Anthropic
+        && crate::providers::anthropic::supports_adaptive_thinking(&model.id)
+        && options.thinking_enabled != Some(false)
+    {
         TIMEOUT_RECV_RESPONSE_ADAPTIVE
     } else {
         TIMEOUT_RECV_RESPONSE
-    }
-}
-
-/// True when this call is an adaptive-thinking Anthropic request: the model
-/// has `ThinkingStyle::Anthropic`, supports adaptive thinking, and thinking
-/// is on (either explicit `thinking_enabled == Some(true)`, or inferred from
-/// the presence of a budget/effort with `thinking_enabled != Some(false)`).
-fn is_adaptive_thinking_call(model: &Model, options: &StreamOptions) -> bool {
-    if model.thinking != ThinkingStyle::Anthropic {
-        return false;
-    }
-    if !crate::providers::anthropic::supports_adaptive_thinking(&model.id) {
-        return false;
-    }
-    match options.thinking_enabled {
-        Some(true) => true,
-        Some(false) => false,
-        None => options.thinking_budget.is_some() || options.thinking_effort.is_some(),
     }
 }
 
@@ -155,9 +147,16 @@ mod tests {
     }
 
     #[test]
-    fn recv_timeout_default_when_no_thinking_signal() {
+    fn recv_timeout_adaptive_when_no_thinking_signal() {
+        // Regression test for task #569: planning/refining/merge-orchestration
+        // paths call with `StreamOptions::default()` (all three thinking fields
+        // None). Adaptive-capable models must still get the larger budget
+        // because the server can reason for minutes before first byte.
         let model = mk_model("claude-opus-4-7", ThinkingStyle::Anthropic);
         let options = StreamOptions::default();
-        assert_eq!(recv_timeout_for(&model, &options), TIMEOUT_RECV_RESPONSE);
+        assert_eq!(
+            recv_timeout_for(&model, &options),
+            TIMEOUT_RECV_RESPONSE_ADAPTIVE
+        );
     }
 }
