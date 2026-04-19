@@ -383,6 +383,13 @@ pub fn schedule(
     // Enforce the concurrent tasks limit.
     scheduled.truncate(remaining_capacity);
 
+    eprintln!(
+        "tasks scheduler: schedule() returning {} task(s) for project '{}': {:?}",
+        scheduled.len(),
+        project_name,
+        scheduled.iter().map(|s| s.id).collect::<Vec<_>>()
+    );
+
     Ok(scheduled)
 }
 
@@ -457,6 +464,10 @@ fn prepare_task(
     task: &Task,
     repo_root: &str,
 ) -> tau_agent_plugin::Result<ScheduledTask> {
+    eprintln!(
+        "tasks scheduler: prepare_task starting for task {} (state={}, parent_id={:?})",
+        task.id, task.state, task.parent_id
+    );
     let branch = tasks_git::task_branch_name(task.id, task.parent_id);
 
     // Determine the base branch: merge target (explicit override, parent's
@@ -498,6 +509,11 @@ fn prepare_task(
         },
         None,
     )?;
+
+    eprintln!(
+        "tasks scheduler: prepare_task success for task {} (branch={}, worktree={})",
+        task.id, branch, worktree_path
+    );
 
     Ok(ScheduledTask {
         id: task.id,
@@ -647,9 +663,17 @@ pub fn dispatch(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> tau_agent_plugin::Result<String> {
+    eprintln!(
+        "tasks scheduler: dispatch starting for task {} (parent_session_id={:?})",
+        task_id, parent_session_id
+    );
     let task = db
         .get_task(task_id)?
         .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))?;
+    eprintln!(
+        "tasks scheduler: dispatch task {} loaded (state={}, session_id={:?}, placeholder={:?})",
+        task_id, task.state, task.session_id, task.placeholder_session_id
+    );
 
     // Handle planning-state dispatch (no worktree, read-only session)
     if task.state == "planning" {

@@ -3175,6 +3175,12 @@ pub(crate) fn run_schedule_pass(
 
     match tasks_scheduler::schedule(db, project_name, &project_path) {
         Ok(scheduled) => {
+            eprintln!(
+                "tasks scheduler: run_schedule_pass received {} scheduled task(s) for project '{}': {:?}",
+                scheduled.len(),
+                project_name,
+                scheduled.iter().map(|s| s.id).collect::<Vec<_>>()
+            );
             for st in &scheduled {
                 if st.branch.is_empty() {
                     // Planning task — dispatch planning session
@@ -3190,81 +3196,98 @@ pub(crate) fn run_schedule_pass(
                 }
                 // Dispatch each scheduled task (create session + send initial message).
                 // Pass the triggering session_id so dispatch() can inherit its model.
-                if let Err(e) =
-                    tasks_scheduler::dispatch(db, st.id, session_id, &project_path, writer, reader)
-                {
-                    eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
+                eprintln!(
+                    "tasks scheduler: about to call dispatch for task {} (triggering session={:?})",
+                    st.id, session_id
+                );
+                match tasks_scheduler::dispatch(
+                    db,
+                    st.id,
+                    session_id,
+                    &project_path,
+                    writer,
+                    reader,
+                ) {
+                    Ok(session_id) => {
+                        eprintln!(
+                            "tasks scheduler: dispatch completed for task {} → session {}",
+                            st.id, session_id
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("tasks scheduler: dispatch failed for task {}: {}", st.id, e);
 
-                    // For non-planning tasks, schedule() already transitioned
-                    // to active via prepare_task().  Revert to ready so the
-                    // scheduler can retry on the next pass.
-                    let is_planning = st.branch.is_empty();
-                    if !is_planning {
-                        if let Err(revert_err) = db.update_task(
-                            st.id,
-                            &TaskUpdate {
-                                state: Some("ready".to_string()),
-                                ..Default::default()
-                            },
-                            None,
-                        ) {
+                        // For non-planning tasks, schedule() already transitioned
+                        // to active via prepare_task().  Revert to ready so the
+                        // scheduler can retry on the next pass.
+                        let is_planning = st.branch.is_empty();
+                        if !is_planning {
+                            if let Err(revert_err) = db.update_task(
+                                st.id,
+                                &TaskUpdate {
+                                    state: Some("ready".to_string()),
+                                    ..Default::default()
+                                },
+                                None,
+                            ) {
+                                eprintln!(
+                                    "tasks scheduler: failed to revert task {} to ready after dispatch failure: {}",
+                                    st.id, revert_err
+                                );
+                            }
+                        }
+
+                        let revert_note = if is_planning {
+                            "Task remains in planning state and will be retried."
+                        } else {
+                            "Task has been reverted to ready state and will be retried."
+                        };
+                        let warn_msg = format!(
+                            "⚠️ Auto-dispatch of session failed for task {} ({}): {}. {}",
+                            st.id, st.title, e, revert_note
+                        );
+                        if let Err(msg_err) = db.add_message(st.id, &warn_msg, Some("system")) {
                             eprintln!(
-                                "tasks scheduler: failed to revert task {} to ready after dispatch failure: {}",
-                                st.id, revert_err
+                                "tasks scheduler: failed to persist dispatch-failure message on task {}: {}",
+                                st.id, msg_err
                             );
                         }
-                    }
+                        warnings.push(warn_msg.clone());
 
-                    let revert_note = if is_planning {
-                        "Task remains in planning state and will be retried."
-                    } else {
-                        "Task has been reverted to ready state and will be retried."
-                    };
-                    let warn_msg = format!(
-                        "⚠️ Auto-dispatch of session failed for task {} ({}): {}. {}",
-                        st.id, st.title, e, revert_note
-                    );
-                    if let Err(msg_err) = db.add_message(st.id, &warn_msg, Some("system")) {
-                        eprintln!(
-                            "tasks scheduler: failed to persist dispatch-failure message on task {}: {}",
-                            st.id, msg_err
-                        );
-                    }
-                    warnings.push(warn_msg.clone());
+                        // Re-queue a ScheduleNeeded event so the current drain
+                        // loop retries.  Bug 2 from the #534 investigation:
+                        // without this the task sits in ready (or planning)
+                        // until some unrelated event fires a schedule pass.
+                        // The drain loop already deduplicates same-project
+                        // schedule events, so at most one retry pass runs
+                        // per drain cycle regardless of batch size.
+                        if !pending_events.iter().any(|e| {
+                            matches!(
+                                e,
+                                SchedulerEvent::ScheduleNeeded(p, _) if p == project_name
+                            )
+                        }) {
+                            pending_events.push(SchedulerEvent::ScheduleNeeded(
+                                project_name.to_string(),
+                                session_id.map(String::from),
+                            ));
+                        }
 
-                    // Re-queue a ScheduleNeeded event so the current drain
-                    // loop retries.  Bug 2 from the #534 investigation:
-                    // without this the task sits in ready (or planning)
-                    // until some unrelated event fires a schedule pass.
-                    // The drain loop already deduplicates same-project
-                    // schedule events, so at most one retry pass runs
-                    // per drain cycle regardless of batch size.
-                    if !pending_events.iter().any(|e| {
-                        matches!(
-                            e,
-                            SchedulerEvent::ScheduleNeeded(p, _) if p == project_name
-                        )
-                    }) {
-                        pending_events.push(SchedulerEvent::ScheduleNeeded(
-                            project_name.to_string(),
-                            session_id.map(String::from),
-                        ));
-                    }
-
-                    // Notify the triggering session so the user/agent that
-                    // created the task sees the failure inline.
-                    if let Some(sid) = session_id {
-                        let _ = tasks_scheduler::server_request(
-                            writer,
-                            reader,
-                            tau_agent_plugin::Request::QueueMessage {
-                                target_session_id: sid.to_string(),
-                                content: warn_msg,
-                                sender_info: "task-scheduler".to_string(),
-                                await_reply: false,
-                                reply_to: None,
-                            },
-                        );
+                        // Notify the triggering session so the user/agent that
+                        // created the task sees the failure inline.
+                        if let Some(sid) = session_id {
+                            let _ = tasks_scheduler::server_request(
+                                writer,
+                                reader,
+                                tau_agent_plugin::Request::QueueMessage {
+                                    target_session_id: sid.to_string(),
+                                    content: warn_msg,
+                                    sender_info: "task-scheduler".to_string(),
+                                    await_reply: false,
+                                    reply_to: None,
+                                },
+                            );
+                        }
                     }
                 }
             }
