@@ -882,6 +882,7 @@ async fn run_inner(
         }
 
         // Only tick when streaming (spinner animation + throttled redraws).
+        app.sync_streaming_timer();
         event_loop.set_ticking(app.mode == AppMode::Streaming);
 
         // Periodic subscription usage refresh (every 60s)

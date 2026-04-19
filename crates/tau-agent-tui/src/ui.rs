@@ -173,21 +173,31 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 
     // Add working indicator if streaming (but not for Idle phase —
-    // Idle means no active agent; spinner would be misleading).
+    // Idle means no active agent; spinner would be misleading). The
+    // spinner is also hidden for the first 1s of a turn so that fast
+    // replies never flash one — see task 570.
     if app.mode == AppMode::Streaming && app.phase != AgentPhase::Idle {
-        let needs_indicator = !matches!(
-            app.messages.last(),
-            Some(crate::message::MessageItem::AssistantStreaming { .. })
-        );
+        let elapsed = app
+            .streaming_started_at
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        let reveal =
+            app.streaming_started_at.is_some() && elapsed >= std::time::Duration::from_secs(1);
+        let needs_indicator = reveal
+            && !matches!(
+                app.messages.last(),
+                Some(crate::message::MessageItem::AssistantStreaming { .. })
+            );
         if needs_indicator {
             if !all_lines.is_empty() {
                 all_lines.push(Line::from(""));
             }
+            let elapsed_str = crate::render::format_duration_whole_seconds(elapsed);
             all_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(app.spinner().to_string(), theme.spinner_style()),
                 Span::styled(
-                    format!(" {}", app.phase.label()),
+                    format!(" {} {}", app.phase.label(), elapsed_str),
                     theme.spinner_message_style(),
                 ),
             ]));

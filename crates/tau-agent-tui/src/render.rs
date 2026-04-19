@@ -47,6 +47,25 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+/// Like `format_duration` but rounds to whole seconds below the minute
+/// boundary — so the ticker reads `0s, 1s, 2s, …` instead of
+/// `1.0s, 1.1s, 1.2s`. Used by the TUI's "Working... Xs" spinner counter
+/// where fractional seconds would jitter.
+pub(crate) fn format_duration_whole_seconds(d: Duration) -> String {
+    let total = d.as_secs();
+    if total < 60 {
+        format!("{}s", total)
+    } else if total < 3600 {
+        let m = total / 60;
+        let s = total % 60;
+        format!("{}m {}s", m, s)
+    } else {
+        let h = total / 3600;
+        let m = (total % 3600) / 60;
+        format!("{}h {}m", h, m)
+    }
+}
+
 /// Trait for rendering tool calls and results.
 #[allow(clippy::too_many_arguments)]
 pub trait ToolRenderer {
@@ -675,6 +694,59 @@ mod tests {
     #[test]
     fn format_duration_hours() {
         assert_eq!(format_duration(Duration::from_secs(3661)), "1h 1m");
+    }
+
+    // -- format_duration_whole_seconds unit tests --
+
+    #[test]
+    fn whole_seconds_zero() {
+        assert_eq!(
+            format_duration_whole_seconds(Duration::from_millis(0)),
+            "0s"
+        );
+    }
+
+    #[test]
+    fn whole_seconds_floors_fractional() {
+        // 1.9s should display as "1s", matching how the spinner ticks over
+        // integer-second boundaries rather than showing "1.9s".
+        assert_eq!(
+            format_duration_whole_seconds(Duration::from_millis(1_900)),
+            "1s"
+        );
+    }
+
+    #[test]
+    fn whole_seconds_sub_minute() {
+        assert_eq!(format_duration_whole_seconds(Duration::from_secs(1)), "1s");
+        assert_eq!(
+            format_duration_whole_seconds(Duration::from_secs(59)),
+            "59s"
+        );
+    }
+
+    #[test]
+    fn whole_seconds_minute_boundary() {
+        assert_eq!(
+            format_duration_whole_seconds(Duration::from_secs(60)),
+            "1m 0s"
+        );
+    }
+
+    #[test]
+    fn whole_seconds_minutes() {
+        assert_eq!(
+            format_duration_whole_seconds(Duration::from_secs(125)),
+            "2m 5s"
+        );
+    }
+
+    #[test]
+    fn whole_seconds_hour() {
+        assert_eq!(
+            format_duration_whole_seconds(Duration::from_secs(3661)),
+            "1h 1m"
+        );
     }
 
     // -- BashRenderer::render_complete tests --

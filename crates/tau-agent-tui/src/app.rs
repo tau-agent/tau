@@ -173,6 +173,12 @@ pub struct App {
     pub messages: Vec<MessageItem>,
     /// Current mode.
     pub mode: AppMode,
+    /// When the current streaming phase began. `Some` while
+    /// `mode == Streaming`, `None` otherwise. Used by the UI for the
+    /// delayed spinner reveal (1s) and the elapsed-time counter on the
+    /// "Working..." line. Kept in sync by
+    /// `sync_streaming_timer()` which the main loop calls each iteration.
+    pub streaming_started_at: Option<std::time::Instant>,
     /// Current agent phase — updated explicitly by Phase events and
     /// implicitly by stream events (see `update_phase_from_event`).
     pub phase: AgentPhase,
@@ -324,6 +330,7 @@ impl App {
             provider,
             messages: Vec::new(),
             mode: AppMode::Input,
+            streaming_started_at: None,
             phase: AgentPhase::default(),
             scroll_pos: std::cell::Cell::new(None),
             max_scroll: std::cell::Cell::new(0),
@@ -1903,6 +1910,24 @@ impl App {
             self.task_picker_previous_mode = target;
         } else {
             self.mode = target;
+        }
+        self.sync_streaming_timer();
+    }
+
+    /// Keep `streaming_started_at` in sync with the current mode. Start the
+    /// timer on the transition `!Streaming -> Streaming`; clear it on the
+    /// reverse transition. Call this whenever `mode` may have changed — the
+    /// main loop calls it every iteration as a safety net for the many
+    /// direct `self.mode = ...` assignments scattered across the code.
+    pub fn sync_streaming_timer(&mut self) {
+        match (self.mode, self.streaming_started_at.is_some()) {
+            (AppMode::Streaming, false) => {
+                self.streaming_started_at = Some(std::time::Instant::now());
+            }
+            (m, true) if m != AppMode::Streaming => {
+                self.streaming_started_at = None;
+            }
+            _ => {}
         }
     }
 
