@@ -115,7 +115,7 @@ impl ApiUsage {
         if let Some(n) = self.cache_creation_input_tokens {
             usage.cache_write = n;
         }
-        usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
+        usage.recompute_total();
     }
 }
 

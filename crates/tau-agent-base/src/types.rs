@@ -140,6 +140,13 @@ pub struct Usage {
     pub cost: Cost,
 }
 
+impl Usage {
+    /// Recompute `total_tokens` as the sum of `input + output + cache_read + cache_write`.
+    pub fn recompute_total(&mut self) {
+        self.total_tokens = self.input + self.output + self.cache_read + self.cache_write;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stop reason
 // ---------------------------------------------------------------------------
@@ -658,6 +665,29 @@ pub fn timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_recompute_total_sums_fields() {
+        let mut u = Usage {
+            input: 10,
+            output: 20,
+            cache_read: 3,
+            cache_write: 4,
+            total_tokens: 0,
+            cost: Cost::default(),
+        };
+        u.recompute_total();
+        assert_eq!(u.total_tokens, 37);
+
+        // Idempotent when fields unchanged.
+        u.recompute_total();
+        assert_eq!(u.total_tokens, 37);
+
+        // Overwrites stale values.
+        u.total_tokens = 999;
+        u.recompute_total();
+        assert_eq!(u.total_tokens, 37);
+    }
 
     #[test]
     fn info_message_serde_roundtrip() {

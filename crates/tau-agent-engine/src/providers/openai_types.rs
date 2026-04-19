@@ -198,7 +198,7 @@ impl ChunkUsage {
         usage.output = output;
         usage.cache_read = cache_read;
         usage.cache_write = cache_write;
-        usage.total_tokens = input + output + cache_read + cache_write;
+        usage.recompute_total();
     }
 }
 
