@@ -625,11 +625,16 @@ async fn run_inner(
                     }
                 }
                 Action::ForkSession => {
-                    // Create a new session inheriting model/cwd from the current session
+                    // Create a new session inheriting model/cwd/budget from the current session
                     let info = fetch_session_info(&sid).await.ok();
                     let model = info.as_ref().map(|i| i.model.clone());
                     let cwd = info.as_ref().and_then(|i| i.cwd.clone());
-                    match create_session(model, cwd, Some(sid.clone())).await {
+                    // Inherit child_budget from the current session so the forked
+                    // child can itself dispatch task sessions (see task 559).
+                    // Fall back to the CLI/DB default of 16 if we couldn't fetch
+                    // session info for some reason.
+                    let child_budget = info.as_ref().map(|i| i.child_budget).unwrap_or(16);
+                    match create_session(model, cwd, Some(sid.clone()), child_budget).await {
                         Ok(new_id) => match fetch_session_info(&new_id).await {
                             Ok(new_info) => {
                                 app.save_nav_state();
@@ -656,12 +661,21 @@ async fn run_inner(
                     }
                 }
                 Action::NewSession => {
-                    // Create a fresh session with defaults
+                    // Create a fresh session with defaults.
+                    // Inherit child_budget from the TUI's current session so
+                    // that /new produces a sibling with the same auto-dispatch
+                    // capability as the launched session (task 559). Fall back
+                    // to the CLI/DB default of 16 if the lookup fails.
                     let model = crate::settings::default_model();
                     let cwd = std::env::current_dir()
                         .ok()
                         .and_then(|p| p.to_str().map(String::from));
-                    match create_session(Some(model), cwd, None).await {
+                    let child_budget = fetch_session_info(&sid)
+                        .await
+                        .ok()
+                        .map(|i| i.child_budget)
+                        .unwrap_or(16);
+                    match create_session(Some(model), cwd, None, child_budget).await {
                         Ok(new_id) => match fetch_session_info(&new_id).await {
                             Ok(new_info) => {
                                 app.save_nav_state();
@@ -925,6 +939,7 @@ async fn create_session(
     model: Option<String>,
     cwd: Option<String>,
     parent_id: Option<String>,
+    child_budget: u32,
 ) -> tau_agent_lib::Result<String> {
     let mut client = Client::connect().await?;
     client
@@ -934,7 +949,7 @@ async fn create_session(
             system_prompt: None,
             cwd,
             parent_id,
-            child_budget: 0,
+            child_budget,
             tagline: None,
             auto_archive: false,
             notify_parent: true,
