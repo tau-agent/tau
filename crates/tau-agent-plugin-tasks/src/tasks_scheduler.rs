@@ -2001,13 +2001,6 @@ impl WaitTracker {
             }
         }
     }
-
-    /// Remove a task from the tracker. Called when a task reaches a
-    /// terminal state, so a future task reusing the same id (shouldn't
-    /// happen in practice but safe) starts fresh.
-    pub fn forget(&mut self, task_id: i64) {
-        self.last.remove(&task_id);
-    }
 }
 
 /// Process-global [`WaitTracker`] for the plugin. The plugin runs as a
@@ -2054,8 +2047,7 @@ pub fn post_wait_updates_for_project(
 
 /// Helper for the main scheduler loop: for every waiting / queued /
 /// blocked / held task in `status`, feed its current wait reasons into
-/// `tracker` and post any resulting placeholder messages./// Also forgets terminal tasks from the tracker so their map entries
-/// don't linger for the lifetime of the server.
+/// `tracker` and post any resulting placeholder messages.
 ///
 /// Tasks that are actively dispatched (`active`, `review`, `merging`,
 /// `refining`) count as "no wait reason" for placeholder purposes even

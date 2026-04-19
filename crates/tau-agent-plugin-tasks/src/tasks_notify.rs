@@ -358,18 +358,26 @@ pub fn notify_state_change_split(
 
     // Terminal-state summary (task #574). When a task reaches a
     // terminal state, post a closing summary to the placeholder so the
-    // timeline has a clean final line.
+    // timeline has a clean final line. Skip if the placeholder has
+    // been archived externally (consistent with `collect_recipients`).
     if is_terminal_state(&task.state) {
         if let Some(ref placeholder_sid) = task.placeholder_session_id {
-            let summary = format_terminal_summary(db, task);
-            let _ = server_request(
-                writer,
-                reader,
-                tau_agent_plugin::Request::QueueInfo {
-                    target_session_id: placeholder_sid.clone(),
-                    text: summary,
-                },
-            );
+            if !is_session_archived(placeholder_sid, writer, reader) {
+                let summary = format_terminal_summary(db, task);
+                if let Err(e) = server_request(
+                    writer,
+                    reader,
+                    tau_agent_plugin::Request::QueueInfo {
+                        target_session_id: placeholder_sid.clone(),
+                        text: summary,
+                    },
+                ) {
+                    eprintln!(
+                        "tasks placeholder: failed to post terminal summary to {}: {}",
+                        placeholder_sid, e
+                    );
+                }
+            }
         }
     }
 }
@@ -445,14 +453,19 @@ pub fn notify_task_created(task: &Task, writer: &mut impl Write, reader: &mut im
         None => return,
     };
     let text = format_task_created(task);
-    let _ = server_request(
+    if let Err(e) = server_request(
         writer,
         reader,
         tau_agent_plugin::Request::QueueInfo {
             target_session_id: placeholder_sid.to_string(),
             text,
         },
-    );
+    ) {
+        eprintln!(
+            "tasks placeholder: failed to post task-created message to {}: {}",
+            placeholder_sid, e
+        );
+    }
 }
 
 /// Format a task's `tags` field (stored as JSON) as a comma-separated
@@ -517,14 +530,19 @@ pub fn notify_placeholder_wait(
         Some(sid) => sid,
         None => return,
     };
-    let _ = server_request(
+    if let Err(e) = server_request(
         writer,
         reader,
         tau_agent_plugin::Request::QueueInfo {
             target_session_id: placeholder_sid.to_string(),
             text: text.to_string(),
         },
-    );
+    ) {
+        eprintln!(
+            "tasks placeholder: failed to post wait message to {}: {}",
+            placeholder_sid, e
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,6 +1621,42 @@ mod tests {
             .map(|(_, t)| t.as_str())
             .collect();
         assert_eq!(ph_msgs.len(), 1, "{:?}", ph_msgs);
+    }
+
+    /// When the placeholder session has been archived externally, the
+    /// terminal-state summary is suppressed — consistent with
+    /// `collect_recipients` which also filters archived targets.
+    #[test]
+    fn placeholder_archived_skips_terminal_summary() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "ArcTerm", None, "ready");
+        db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
+        task.placeholder_session_id = Some("s-ph".into());
+        task.state = "merged".into();
+
+        let (shared, mut w, mut r) = make_io();
+        shared
+            .lock()
+            .expect("mock shared lock")
+            .archived_sessions
+            .insert("s-ph".into());
+
+        notify_state_change(&db, &task, "merging", None, &mut w, &mut r);
+
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        let ph_msgs: Vec<&str> = calls
+            .iter()
+            .filter(|(sid, _)| sid == "s-ph")
+            .map(|(_, t)| t.as_str())
+            .collect();
+        // collect_recipients filters the archived placeholder out of the
+        // fan-out, and the terminal-summary branch honours the same
+        // check — so zero messages land on s-ph.
+        assert!(
+            ph_msgs.is_empty(),
+            "no messages should reach archived placeholder: {:?}",
+            ph_msgs
+        );
     }
 
     /// `notify_task_created` posts exactly one message to the
