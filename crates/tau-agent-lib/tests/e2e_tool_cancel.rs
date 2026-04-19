@@ -23,7 +23,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use common::TestServer;
+use common::{CreateSessionBuilder, TestServer};
 use tau_agent_lib::plugin::{PluginEntry, PluginsConfig};
 use tau_agent_lib::protocol::{Request, Response};
 use tau_agent_lib::providers::mock::MockResponse;
@@ -124,19 +124,10 @@ fn cancel_chat_kills_bash_subprocess_through_worker_plugin() {
     let sid = {
         send(
             &admin,
-            &Request::CreateSession {
-                model: None,
-                provider: None,
-                system_prompt: Some("You are helpful.".into()),
-                cwd: Some("/tmp".into()),
-                parent_id: None,
-                child_budget: 0,
-                tagline: None,
-                auto_archive: false,
-                notify_parent: true,
-                project_name: None,
-                sandbox_profile: None,
-            },
+            &CreateSessionBuilder::standalone()
+                .system_prompt("You are helpful.")
+                .cwd("/tmp")
+                .build(),
         );
         let mut reader = BufReader::new(admin.try_clone().expect("clone"));
         match recv_line(&mut reader) {

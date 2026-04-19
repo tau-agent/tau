@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use common::{TestServer, send_recv};
+use common::{CreateSessionBuilder, TestServer, send_recv};
 use tau_agent_lib::plugin::{PluginEntry, PluginsConfig};
 use tau_agent_lib::protocol::{Request, Response};
 use tau_agent_lib::providers::mock::{MockProvider, MockResponse};
@@ -169,26 +169,14 @@ fn exec_tool_err(
 
 /// Create a session on the server and return its ID.
 fn create_session(server: &TestServer, cwd: Option<&str>, project_name: Option<&str>) -> String {
-    let conn = server.connect();
-    match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("test controller".into()),
-            cwd: cwd.map(String::from),
-            parent_id: None,
-            child_budget: 16,
-            tagline: Some("test-controller".into()),
-            auto_archive: false,
-            notify_parent: false,
-            project_name: project_name.map(String::from),
-            sandbox_profile: None,
-        },
-    ) {
-        Response::SessionCreated { session_id } => session_id,
-        other => panic!("expected SessionCreated, got: {:?}", other),
-    }
+    CreateSessionBuilder::new(server)
+        .system_prompt("test controller")
+        .cwd_opt(cwd)
+        .child_budget(16)
+        .tagline("test-controller")
+        .notify_parent(false)
+        .project_opt(project_name)
+        .send()
 }
 
 /// Wait for a task to reach a given state, polling via task_get.

@@ -287,6 +287,329 @@ where
     }
 }
 
+// ---------------------------------------------------------------------------
+// CreateSessionBuilder — ergonomic helper for building `Request::CreateSession`
+// in tests, collapsing ~12-line literals down to a fluent one-liner.
+//
+// Defaults mirror the dominant pattern observed across the e2e suite:
+//   model / provider / system_prompt / cwd / parent_id / tagline /
+//   project_name / sandbox_profile = None
+//   child_budget = 0
+//   auto_archive = false
+//   notify_parent = true
+// ---------------------------------------------------------------------------
+
+pub struct CreateSessionBuilder<'a> {
+    server: Option<&'a TestServer>,
+    model: Option<String>,
+    provider: Option<String>,
+    system_prompt: Option<String>,
+    cwd: Option<String>,
+    parent_id: Option<String>,
+    child_budget: u32,
+    tagline: Option<String>,
+    auto_archive: bool,
+    notify_parent: bool,
+    project_name: Option<String>,
+    sandbox_profile: Option<String>,
+}
+
+impl<'a> CreateSessionBuilder<'a> {
+    pub fn new(server: &'a TestServer) -> Self {
+        Self {
+            server: Some(server),
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: None,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        }
+    }
+
+    /// Construct a builder without an attached `TestServer`. The caller
+    /// is responsible for sending the resulting `Request` over their own
+    /// connection — useful for tests that drive raw `UnixStream`s directly.
+    pub fn standalone() -> Self {
+        Self {
+            server: None,
+            model: None,
+            provider: None,
+            system_prompt: None,
+            cwd: None,
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        }
+    }
+
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn model_opt(mut self, model: Option<impl Into<String>>) -> Self {
+        self.model = model.map(Into::into);
+        self
+    }
+
+    pub fn provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    pub fn provider_opt(mut self, provider: Option<impl Into<String>>) -> Self {
+        self.provider = provider.map(Into::into);
+        self
+    }
+
+    pub fn system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    pub fn system_prompt_opt(mut self, prompt: Option<impl Into<String>>) -> Self {
+        self.system_prompt = prompt.map(Into::into);
+        self
+    }
+
+    pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn cwd_opt(mut self, cwd: Option<impl Into<String>>) -> Self {
+        self.cwd = cwd.map(Into::into);
+        self
+    }
+
+    pub fn parent(mut self, parent_id: impl Into<String>) -> Self {
+        self.parent_id = Some(parent_id.into());
+        self
+    }
+
+    pub fn parent_opt(mut self, parent_id: Option<impl Into<String>>) -> Self {
+        self.parent_id = parent_id.map(Into::into);
+        self
+    }
+
+    pub fn child_budget(mut self, n: u32) -> Self {
+        self.child_budget = n;
+        self
+    }
+
+    pub fn tagline(mut self, tagline: impl Into<String>) -> Self {
+        self.tagline = Some(tagline.into());
+        self
+    }
+
+    pub fn tagline_opt(mut self, tagline: Option<impl Into<String>>) -> Self {
+        self.tagline = tagline.map(Into::into);
+        self
+    }
+
+    pub fn notify_parent(mut self, notify: bool) -> Self {
+        self.notify_parent = notify;
+        self
+    }
+
+    pub fn project(mut self, project: impl Into<String>) -> Self {
+        self.project_name = Some(project.into());
+        self
+    }
+
+    pub fn project_opt(mut self, project: Option<impl Into<String>>) -> Self {
+        self.project_name = project.map(Into::into);
+        self
+    }
+
+    /// Build the `Request::CreateSession` value without sending it.
+    /// Useful for unit-testing the builder itself.
+    pub fn build(&self) -> Request {
+        Request::CreateSession {
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            system_prompt: self.system_prompt.clone(),
+            cwd: self.cwd.clone(),
+            parent_id: self.parent_id.clone(),
+            child_budget: self.child_budget,
+            tagline: self.tagline.clone(),
+            auto_archive: self.auto_archive,
+            notify_parent: self.notify_parent,
+            project_name: self.project_name.clone(),
+            sandbox_profile: self.sandbox_profile.clone(),
+        }
+    }
+
+    /// Send the `CreateSession` request and return the new session id.
+    /// Panics on any non-`SessionCreated` response.
+    pub fn send(self) -> String {
+        let req = self.build();
+        let server = self.server.expect(
+            "CreateSessionBuilder::send requires a TestServer; use build() for raw connections",
+        );
+        let conn = server.connect();
+        match send_recv(&conn, &req) {
+            Response::SessionCreated { session_id } => session_id,
+            other => panic!("expected SessionCreated, got {:?}", other),
+        }
+    }
+
+    /// Send the `CreateSession` request and return the raw response,
+    /// for tests that want to assert an error was returned.
+    pub fn send_raw(self) -> Response {
+        let req = self.build();
+        let server = self.server.expect(
+            "CreateSessionBuilder::send_raw requires a TestServer; use build() for raw connections",
+        );
+        let conn = server.connect();
+        send_recv(&conn, &req)
+    }
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    fn dummy_server() -> TestServer {
+        let dir = tempfile::tempdir().expect("tempdir");
+        TestServer {
+            sock_path: dir.path().join("unused.sock"),
+            _dir: dir,
+        }
+    }
+
+    #[test]
+    fn builder_build_defaults() {
+        let server = dummy_server();
+        let req = CreateSessionBuilder::new(&server).build();
+        match req {
+            Request::CreateSession {
+                model,
+                provider,
+                system_prompt,
+                cwd,
+                parent_id,
+                child_budget,
+                tagline,
+                auto_archive,
+                notify_parent,
+                project_name,
+                sandbox_profile,
+            } => {
+                assert!(model.is_none());
+                assert!(provider.is_none());
+                assert!(system_prompt.is_none());
+                assert!(cwd.is_none());
+                assert!(parent_id.is_none());
+                assert_eq!(child_budget, 0);
+                assert!(tagline.is_none());
+                assert!(!auto_archive);
+                assert!(notify_parent);
+                assert!(project_name.is_none());
+                assert!(sandbox_profile.is_none());
+            }
+            other => panic!("expected CreateSession, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn builder_build_with_fields_set() {
+        let server = dummy_server();
+        let req = CreateSessionBuilder::new(&server)
+            .model("m")
+            .provider("p")
+            .system_prompt("sp")
+            .cwd("/tmp")
+            .parent("s1")
+            .child_budget(7)
+            .tagline("tag")
+            .notify_parent(false)
+            .project("proj")
+            .build();
+        match req {
+            Request::CreateSession {
+                model,
+                provider,
+                system_prompt,
+                cwd,
+                parent_id,
+                child_budget,
+                tagline,
+                notify_parent,
+                project_name,
+                auto_archive,
+                sandbox_profile,
+            } => {
+                assert_eq!(model.as_deref(), Some("m"));
+                assert_eq!(provider.as_deref(), Some("p"));
+                assert_eq!(system_prompt.as_deref(), Some("sp"));
+                assert_eq!(cwd.as_deref(), Some("/tmp"));
+                assert_eq!(parent_id.as_deref(), Some("s1"));
+                assert_eq!(child_budget, 7);
+                assert_eq!(tagline.as_deref(), Some("tag"));
+                assert!(!notify_parent);
+                assert_eq!(project_name.as_deref(), Some("proj"));
+                assert!(!auto_archive);
+                assert!(sandbox_profile.is_none());
+            }
+            other => panic!("expected CreateSession, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn builder_opt_setters() {
+        let server = dummy_server();
+        let some_str: Option<&str> = Some("/home");
+        let none_str: Option<&str> = None;
+        let req_some = CreateSessionBuilder::new(&server)
+            .cwd_opt(some_str)
+            .model_opt(Some("m"))
+            .project_opt(Some("p"))
+            .build();
+        let req_none = CreateSessionBuilder::new(&server)
+            .cwd_opt(none_str)
+            .model_opt(None::<String>)
+            .project_opt(None::<&str>)
+            .build();
+        if let Request::CreateSession {
+            cwd,
+            model,
+            project_name,
+            ..
+        } = req_some
+        {
+            assert_eq!(cwd.as_deref(), Some("/home"));
+            assert_eq!(model.as_deref(), Some("m"));
+            assert_eq!(project_name.as_deref(), Some("p"));
+        } else {
+            panic!("expected CreateSession");
+        }
+        if let Request::CreateSession {
+            cwd,
+            model,
+            project_name,
+            ..
+        } = req_none
+        {
+            assert!(cwd.is_none());
+            assert!(model.is_none());
+            assert!(project_name.is_none());
+        } else {
+            panic!("expected CreateSession");
+        }
+    }
+}
+
 impl Drop for TestServer {
     fn drop(&mut self) {
         if let Ok(mut conn) = UnixStream::connect(&self.sock_path) {

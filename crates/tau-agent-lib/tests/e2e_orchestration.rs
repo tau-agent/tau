@@ -1,7 +1,7 @@
 //! End-to-end tests for session orchestration.
 
 mod common;
-use common::{TestServer, send_recv, send_recv_all};
+use common::{CreateSessionBuilder, TestServer, send_recv, send_recv_all};
 
 use std::io::Write;
 use std::time::Duration;
@@ -313,19 +313,10 @@ fn orchestration_tool_definitions() {
 #[test]
 fn protocol_create_session_with_parent() {
     // Verify serialization/deserialization of new fields
-    let req = Request::CreateSession {
-        model: None,
-        provider: None,
-        system_prompt: None,
-        cwd: None,
-        parent_id: Some("s1".into()),
-        child_budget: 5,
-        tagline: None,
-        auto_archive: false,
-        notify_parent: true,
-        project_name: None,
-        sandbox_profile: None,
-    };
+    let req = CreateSessionBuilder::standalone()
+        .parent("s1")
+        .child_budget(5)
+        .build();
     let json = serde_json::to_string(&req).unwrap();
     assert!(json.contains("parent_id"));
     assert!(json.contains("child_budget"));
@@ -424,45 +415,22 @@ fn spawn_child_chat_produces_messages() {
     let server = TestServer::start(vec![MockResponse::Text("Child response".into())]);
 
     // Create parent with budget
-    let conn = server.connect();
-    let parent_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("parent".into()),
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 5,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let parent_id = match CreateSessionBuilder::new(&server)
+        .system_prompt("parent")
+        .cwd("/tmp")
+        .child_budget(5)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("expected SessionCreated, got {:?}", other),
     };
 
     // Create child under parent
-    let conn2 = server.connect();
-    let child_id = match send_recv(
-        &conn2,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("child".into()),
-            cwd: None, // inherit
-            parent_id: Some(parent_id.clone()),
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let child_id = match CreateSessionBuilder::new(&server)
+        .parent(parent_id.clone())
+        .system_prompt("child")
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("expected SessionCreated, got {:?}", other),
     };
@@ -540,23 +508,12 @@ fn spawn_multiple_children_wait_all() {
     ]);
 
     // Create parent
-    let conn = server.connect();
-    let parent_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("parent".into()),
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 10,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let parent_id = match CreateSessionBuilder::new(&server)
+        .system_prompt("parent")
+        .cwd("/tmp")
+        .child_budget(10)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
@@ -564,23 +521,11 @@ fn spawn_multiple_children_wait_all() {
     // Spawn 3 children
     let mut child_ids = Vec::new();
     for i in 0..3 {
-        let c = server.connect();
-        let cid = match send_recv(
-            &c,
-            &Request::CreateSession {
-                model: None,
-                provider: None,
-                system_prompt: Some(format!("child-{}", i)),
-                cwd: None,
-                parent_id: Some(parent_id.clone()),
-                child_budget: 0,
-                tagline: None,
-                auto_archive: false,
-                notify_parent: true,
-                project_name: None,
-                sandbox_profile: None,
-            },
-        ) {
+        let cid = match CreateSessionBuilder::new(&server)
+            .parent(parent_id.clone())
+            .system_prompt(format!("child-{}", i))
+            .send_raw()
+        {
             Response::SessionCreated { session_id } => session_id,
             other => panic!("{:?}", other),
         };
@@ -679,45 +624,20 @@ fn spawn_child_inherits_parent_model_and_cwd() {
     let server = TestServer::start(vec![]);
 
     // Create parent with specific cwd
-    let conn = server.connect();
-    let parent_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: None,
-            cwd: Some("/home/test/project".into()),
-            parent_id: None,
-            child_budget: 5,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let parent_id = match CreateSessionBuilder::new(&server)
+        .cwd("/home/test/project")
+        .child_budget(5)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
 
     // Create child with no model or cwd specified
-    let conn2 = server.connect();
-    let child_id = match send_recv(
-        &conn2,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: None,
-            cwd: None,
-            parent_id: Some(parent_id.clone()),
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let child_id = match CreateSessionBuilder::new(&server)
+        .parent(parent_id.clone())
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
@@ -757,23 +677,7 @@ fn wait_sessions_idle_returns_done() {
     // Create two sessions, don't chat with either
     let mut sids = Vec::new();
     for _ in 0..2 {
-        let c = server.connect();
-        let sid = match send_recv(
-            &c,
-            &Request::CreateSession {
-                model: None,
-                provider: None,
-                system_prompt: None,
-                cwd: None,
-                parent_id: None,
-                child_budget: 0,
-                tagline: None,
-                auto_archive: false,
-                notify_parent: true,
-                project_name: None,
-                sandbox_profile: None,
-            },
-        ) {
+        let sid = match CreateSessionBuilder::new(&server).send_raw() {
             Response::SessionCreated { session_id } => session_id,
             other => panic!("{:?}", other),
         };
@@ -807,44 +711,21 @@ fn spawn_delete_parent_cascades() {
     let server = TestServer::start(vec![MockResponse::Text("child work".into())]);
 
     // Create parent -> child, chat with child
-    let conn = server.connect();
-    let parent_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("parent".into()),
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 5,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let parent_id = match CreateSessionBuilder::new(&server)
+        .system_prompt("parent")
+        .cwd("/tmp")
+        .child_budget(5)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
 
-    let conn2 = server.connect();
-    let child_id = match send_recv(
-        &conn2,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("child".into()),
-            cwd: None,
-            parent_id: Some(parent_id.clone()),
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let child_id = match CreateSessionBuilder::new(&server)
+        .parent(parent_id.clone())
+        .system_prompt("child")
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
@@ -893,44 +774,19 @@ fn spawn_cancel_child() {
     let server = TestServer::start(vec![]);
 
     // Create parent -> child
-    let conn = server.connect();
-    let parent_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: None,
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 5,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let parent_id = match CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
 
-    let conn2 = server.connect();
-    let child_id = match send_recv(
-        &conn2,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: None,
-            cwd: None,
-            parent_id: Some(parent_id),
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let child_id = match CreateSessionBuilder::new(&server)
+        .parent(parent_id)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
@@ -957,44 +813,21 @@ fn wait_sessions_returns_summary() {
     let server = TestServer::start(vec![MockResponse::Text("The answer is 42.".into())]);
 
     // Create parent -> child
-    let conn = server.connect();
-    let parent_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("parent".into()),
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 5,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let parent_id = match CreateSessionBuilder::new(&server)
+        .system_prompt("parent")
+        .cwd("/tmp")
+        .child_budget(5)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
 
-    let conn2 = server.connect();
-    let child_id = match send_recv(
-        &conn2,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("child".into()),
-            cwd: None,
-            parent_id: Some(parent_id),
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let child_id = match CreateSessionBuilder::new(&server)
+        .parent(parent_id)
+        .system_prompt("child")
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
@@ -1067,23 +900,7 @@ fn wait_any_sessions_idle_returns_all() {
 
     let mut sids = Vec::new();
     for _ in 0..3 {
-        let c = server.connect();
-        let sid = match send_recv(
-            &c,
-            &Request::CreateSession {
-                model: None,
-                provider: None,
-                system_prompt: None,
-                cwd: None,
-                parent_id: None,
-                child_budget: 0,
-                tagline: None,
-                auto_archive: false,
-                notify_parent: true,
-                project_name: None,
-                sandbox_profile: None,
-            },
-        ) {
+        let sid = match CreateSessionBuilder::new(&server).send_raw() {
             Response::SessionCreated { session_id } => session_id,
             other => panic!("{:?}", other),
         };
@@ -1120,45 +937,22 @@ fn wait_any_sessions_returns_only_completed() {
         MockResponse::Text("slow child done".into()),
     ]);
 
-    let conn = server.connect();
-    let parent_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("parent".into()),
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 10,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let parent_id = match CreateSessionBuilder::new(&server)
+        .system_prompt("parent")
+        .cwd("/tmp")
+        .child_budget(10)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
 
     // Create fast child and start its chat
-    let c = server.connect();
-    let fast_id = match send_recv(
-        &c,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("fast".into()),
-            cwd: None,
-            parent_id: Some(parent_id.clone()),
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let fast_id = match CreateSessionBuilder::new(&server)
+        .parent(parent_id.clone())
+        .system_prompt("fast")
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
@@ -1175,23 +969,11 @@ fn wait_any_sessions_returns_only_completed() {
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
 
     // Create slow child (idle, no messages)
-    let c = server.connect();
-    let slow_id = match send_recv(
-        &c,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("slow".into()),
-            cwd: None,
-            parent_id: Some(parent_id.clone()),
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let slow_id = match CreateSessionBuilder::new(&server)
+        .parent(parent_id.clone())
+        .system_prompt("slow")
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
@@ -1306,45 +1088,22 @@ fn second_child_completion_notifies_parent() {
     ]);
 
     // --- Step 1: Create parent session (idle) ---
-    let conn = server.connect();
-    let parent_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("parent orchestrator".into()),
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 5,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let parent_id = match CreateSessionBuilder::new(&server)
+        .system_prompt("parent orchestrator")
+        .cwd("/tmp")
+        .child_budget(5)
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("expected SessionCreated, got {:?}", other),
     };
 
     // --- Step 2: Create child under parent ---
-    let conn = server.connect();
-    let child_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("child worker".into()),
-            cwd: None,
-            parent_id: Some(parent_id.clone()),
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let child_id = match CreateSessionBuilder::new(&server)
+        .parent(parent_id.clone())
+        .system_prompt("child worker")
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("expected SessionCreated, got {:?}", other),
     };
@@ -1600,44 +1359,20 @@ fn await_reply_e2e() {
     let server = TestServer::start(vec![]);
 
     // Create sender and target sessions
-    let conn = server.connect();
-    let sender_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("sender".into()),
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let sender_id = match CreateSessionBuilder::new(&server)
+        .system_prompt("sender")
+        .cwd("/tmp")
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };
 
-    let conn = server.connect();
-    let target_id = match send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: Some("target".into()),
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 0,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    ) {
+    let target_id = match CreateSessionBuilder::new(&server)
+        .system_prompt("target")
+        .cwd("/tmp")
+        .send_raw()
+    {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("{:?}", other),
     };

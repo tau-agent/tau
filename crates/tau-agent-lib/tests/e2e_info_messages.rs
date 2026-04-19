@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{TestServer, send_recv};
+use common::{CreateSessionBuilder, TestServer, send_recv};
 use tau_agent_lib::protocol::{Request, Response};
 use tau_agent_lib::types::Message;
 
@@ -17,54 +17,6 @@ fn info_texts(messages: &[Message]) -> Vec<String> {
             _ => None,
         })
         .collect()
-}
-
-fn create_session(server: &TestServer) -> String {
-    let conn = server.connect();
-    let resp = send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: None,
-            cwd: Some("/tmp".into()),
-            parent_id: None,
-            child_budget: 5,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    );
-    match resp {
-        Response::SessionCreated { session_id } => session_id,
-        other => panic!("expected SessionCreated, got {:?}", other),
-    }
-}
-
-fn create_child(server: &TestServer, parent: &str) -> String {
-    let conn = server.connect();
-    let resp = send_recv(
-        &conn,
-        &Request::CreateSession {
-            model: None,
-            provider: None,
-            system_prompt: None,
-            cwd: Some("/tmp".into()),
-            parent_id: Some(parent.into()),
-            child_budget: 1,
-            tagline: None,
-            auto_archive: false,
-            notify_parent: true,
-            project_name: None,
-            sandbox_profile: None,
-        },
-    );
-    match resp {
-        Response::SessionCreated { session_id } => session_id,
-        other => panic!("expected SessionCreated, got {:?}", other),
-    }
 }
 
 fn get_messages(server: &TestServer, sid: &str) -> Vec<Message> {
@@ -88,7 +40,10 @@ fn get_messages(server: &TestServer, sid: &str) -> Vec<Message> {
 #[test]
 fn cancel_idle_session_without_caller_records_plain_info() {
     let server = TestServer::start(vec![]);
-    let sid = create_session(&server);
+    let sid = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
 
     let conn = server.connect();
     let resp = send_recv(
@@ -109,7 +64,10 @@ fn cancel_idle_session_without_caller_records_plain_info() {
 #[test]
 fn cancel_idle_session_with_caller_records_attributed_info() {
     let server = TestServer::start(vec![]);
-    let sid = create_session(&server);
+    let sid = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
 
     let conn = server.connect();
     let resp = send_recv(
@@ -137,7 +95,10 @@ fn cancel_idle_session_with_caller_records_attributed_info() {
 #[test]
 fn set_cwd_without_caller_records_plain_info() {
     let server = TestServer::start(vec![]);
-    let sid = create_session(&server);
+    let sid = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
 
     let conn = server.connect();
     let resp = send_recv(
@@ -159,7 +120,10 @@ fn set_cwd_without_caller_records_plain_info() {
 #[test]
 fn set_cwd_with_caller_records_attributed_info() {
     let server = TestServer::start(vec![]);
-    let sid = create_session(&server);
+    let sid = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
 
     let conn = server.connect();
     let resp = send_recv(
@@ -185,7 +149,10 @@ fn set_cwd_with_caller_records_attributed_info() {
 #[test]
 fn set_model_without_caller_records_plain_info() {
     let server = TestServer::start(vec![]);
-    let sid = create_session(&server);
+    let sid = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
 
     let conn = server.connect();
     // The test server registers a single mock model; use its id to change to
@@ -214,7 +181,10 @@ fn set_model_without_caller_records_plain_info() {
 #[test]
 fn set_model_with_caller_records_attributed_info() {
     let server = TestServer::start(vec![]);
-    let sid = create_session(&server);
+    let sid = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
 
     let conn = server.connect();
     let mock_id = tau_agent_lib::providers::mock::mock_model().id.clone();
@@ -248,11 +218,29 @@ fn set_model_with_caller_records_attributed_info() {
 #[test]
 fn reparent_children_annotates_each_child_only() {
     let server = TestServer::start(vec![]);
-    let old_parent = create_session(&server);
-    let new_parent = create_session(&server);
-    let c1 = create_child(&server, &old_parent);
-    let c2 = create_child(&server, &old_parent);
-    let c3 = create_child(&server, &old_parent);
+    let old_parent = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
+    let new_parent = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
+    let c1 = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .parent(&old_parent)
+        .child_budget(1)
+        .send();
+    let c2 = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .parent(&old_parent)
+        .child_budget(1)
+        .send();
+    let c3 = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .parent(&old_parent)
+        .child_budget(1)
+        .send();
 
     let conn = server.connect();
     let resp = send_recv(
@@ -296,7 +284,10 @@ fn reparent_children_annotates_each_child_only() {
 #[test]
 fn reload_plugins_emits_success_info() {
     let server = TestServer::start(vec![]);
-    let sid = create_session(&server);
+    let sid = CreateSessionBuilder::new(&server)
+        .cwd("/tmp")
+        .child_budget(5)
+        .send();
 
     let conn = server.connect();
     let resp = send_recv(
