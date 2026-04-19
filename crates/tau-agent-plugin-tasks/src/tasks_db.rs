@@ -38,13 +38,15 @@ pub struct Task {
     /// dispatch helpers fall back to the legacy parenting rule in that
     /// case. See `create_placeholder_session` in `tasks.rs`.
     pub placeholder_session_id: Option<String>,
-    /// True when the task was filed with `initial_state = ready` but
-    /// without a usable `affected_files` list and so was auto-routed
-    /// through the planning phase (task #596). The planner uses this
-    /// flag to deliver a focused "only populate affected_files, then
-    /// transition straight to ready" prompt instead of the standard
-    /// planning prompt. Defaults to `false` for tasks that took the
-    /// normal initial_state path.
+    /// Set when a `ready`-state task was filed without an
+    /// `affected_files` list and so was auto-routed through planning
+    /// (task #596). Used by [`build_planning_message`] to add a
+    /// gentle nudge: "the caller filed this as ready and thought the
+    /// spec was complete — treat their scope as authoritative, but
+    /// still do the full planning exploration." The task otherwise
+    /// walks the normal `planning → refining → ready` flow, identical
+    /// to any planning-originated task. Defaults to `false` for tasks
+    /// that took the normal initial_state path.
     pub auto_downgraded_from_ready: bool,
     pub created_at: i64,
     pub updated_at: i64,

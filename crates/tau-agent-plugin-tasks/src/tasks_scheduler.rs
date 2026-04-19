@@ -195,12 +195,30 @@ pub fn select_non_conflicting_with_reasons<'a>(
 }
 
 /// Extract file paths from the `affected_files` JSON value.
+///
+/// The wildcard marker `"*"` (task #596) signals "this task may touch
+/// anything" — a task that genuinely cannot predict its file set, e.g.
+/// a codebase-wide survey or a refactor whose scope is the whole tree.
+/// Such a task is treated as file-less here so the scheduler's
+/// "at-most-one file-less task per project" rule serialises it against
+/// every other task. Returning an empty `Vec` is the smallest change
+/// that reuses the existing file-less serialisation path verbatim:
+/// `select_non_conflicting` and the conflict-overlap checks all already
+/// treat empty-files tasks as the file-less slot.
+///
+/// We honour the marker if it appears anywhere in the array — a list
+/// like `["src/foo.rs", "*"]` is conservatively unbounded.
 pub(crate) fn extract_files(val: &Option<serde_json::Value>) -> Vec<String> {
     match val {
-        Some(serde_json::Value::Array(arr)) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect(),
+        Some(serde_json::Value::Array(arr)) => {
+            // `"*"` anywhere in the array → unbounded scope, treat as file-less.
+            if arr.iter().any(|v| v.as_str() == Some("*")) {
+                return Vec::new();
+            }
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -3177,6 +3195,81 @@ mod tests {
         let val = Some(serde_json::json!("not an array"));
         let files = extract_files(&val);
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_extract_files_star_marker_returns_empty() {
+        // Task #596: `["*"]` is the explicit "unbounded scope" marker.
+        // It must collapse to an empty vec so the scheduler treats the
+        // task as file-less (which serialises it via the at-most-one
+        // file-less rule).
+        let val = Some(serde_json::json!(["*"]));
+        let files = extract_files(&val);
+        assert!(
+            files.is_empty(),
+            "`[\"*\"]` must collapse to empty (file-less), got {:?}",
+            files
+        );
+    }
+
+    #[test]
+    fn test_extract_files_star_anywhere_in_array_returns_empty() {
+        // A `"*"` anywhere in the list is conservatively unbounded —
+        // the caller has signalled they don't fully know the scope, so
+        // we must serialise the task even if some concrete files are
+        // also listed.
+        let val = Some(serde_json::json!(["src/foo.rs", "*"]));
+        let files = extract_files(&val);
+        assert!(files.is_empty(), "got {:?}", files);
+    }
+
+    #[test]
+    fn test_select_non_conflicting_two_star_marker_tasks_serialise() {
+        // Two tasks both with `["*"]` must NOT run in parallel — the
+        // marker means "unbounded scope", and the file-less rule
+        // serialises file-less tasks against each other.
+        let tasks = vec![
+            make_task(1, 0, Some(vec!["*"])),
+            make_task(2, 0, Some(vec!["*"])),
+        ];
+        let batch = select_non_conflicting(&tasks, &[]);
+        assert_eq!(
+            batch.len(),
+            1,
+            "only one star-marker task may run per pass, got {}",
+            batch.len()
+        );
+    }
+
+    #[test]
+    fn test_select_non_conflicting_star_marker_blocks_concrete_files_task() {
+        // A `["*"]` task selected first claims everything; subsequent
+        // tasks with concrete files must be blocked.
+        let tasks = vec![
+            make_task(1, /*high prio*/ 10, Some(vec!["*"])),
+            make_task(2, 0, Some(vec!["src/foo.rs"])),
+        ];
+        let batch = select_non_conflicting(&tasks, &[]);
+        assert_eq!(batch.len(), 1, "got {:?}", batch);
+        assert_eq!(
+            batch[0].id, 1,
+            "higher-priority star task should win the batch"
+        );
+    }
+
+    #[test]
+    fn test_select_non_conflicting_star_marker_blocked_by_active_task() {
+        // An active task with concrete files holds those files;
+        // a `["*"]` task must be blocked by it (it cannot prove
+        // disjointness against an active task with any files).
+        let tasks = vec![make_task(1, 0, Some(vec!["*"]))];
+        let active = vec![(99, vec!["src/active.rs".to_string()])];
+        let batch = select_non_conflicting(&tasks, &active);
+        assert!(
+            batch.is_empty(),
+            "star-marker task must wait while any other task is active, got {:?}",
+            batch
+        );
     }
 
     #[test]

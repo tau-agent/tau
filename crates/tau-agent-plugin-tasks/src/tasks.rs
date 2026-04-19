@@ -4730,7 +4730,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ready_with_auto_skip_review_default_on_downgrade() {
+    fn test_ready_skip_review_unchanged_on_downgrade() {
         let db = TasksDb::open_memory().unwrap();
         let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
