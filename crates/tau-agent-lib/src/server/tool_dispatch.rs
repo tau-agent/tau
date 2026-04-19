@@ -6,7 +6,9 @@ use super::dispatch::{
     get_session_info_impl, list_sessions_impl, project_stats_impl,
 };
 use super::notifications::{
-    auto_archive_done_sessions, last_assistant_text, queue_and_maybe_resume, queue_info_to_session,
+    auto_archive_done_sessions, is_no_agent_loop_session, last_assistant_text,
+    placeholder_no_agent_note, queue_and_maybe_resume, queue_info_to_session,
+    record_message_to_log_session,
 };
 use super::state::{SessionLocks, SharedState, lock_state, session_lock};
 use super::{SharedTestOverrides, ShutdownHandle};
@@ -414,6 +416,20 @@ pub(super) async fn handle_server_request(
             await_reply,
             reply_to: _,
         } => {
+            // Short-circuit: placeholder (log-provider) sessions don't
+            // run the agent loop. Record the message and return a note
+            // via MessageReply (for await_reply) or OkWithNote (for
+            // fire-and-forget). See task 582.
+            if is_no_agent_loop_session(state, target_session_id) {
+                record_message_to_log_session(state, target_session_id, content);
+                let note = placeholder_no_agent_note(target_session_id);
+                return if *await_reply {
+                    Response::MessageReply { content: note }
+                } else {
+                    Response::OkWithNote { note }
+                };
+            }
+
             if *await_reply {
                 let (msg_id, rx) = {
                     let mut st = lock_state(state);

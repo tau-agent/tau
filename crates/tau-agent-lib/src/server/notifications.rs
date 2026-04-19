@@ -66,6 +66,55 @@ pub(super) fn queue_info_to_session(state: &SharedState, target: &str, text: &st
     }
 }
 
+/// Return true iff the target session exists and is a "no-agent-loop"
+/// placeholder session — i.e. its provider is registered and reports
+/// `needs_api_key() == false` (today: the built-in `log` provider).
+///
+/// Such sessions are append-only audit logs, not interlocutors.
+/// Callers use this to short-circuit `Chat` / `QueueMessage` requests
+/// targeting a placeholder: the message is recorded to history but no
+/// agent turn is run. See task 582.
+pub(super) fn is_no_agent_loop_session(state: &SharedState, target: &str) -> bool {
+    let st = lock_state(state);
+    let Ok(Some(session)) = st.db.get_session(target) else {
+        return false;
+    };
+    !st.registry.needs_api_key(&session.model.api)
+}
+
+/// Human-readable note emitted when a message is accepted by a placeholder
+/// (log-provider) session without triggering an agent turn. Surfaced to
+/// `QueueMessage`/`Chat` callers so they understand why no reply arrived.
+pub(super) fn placeholder_no_agent_note(target: &str) -> String {
+    format!(
+        "Message recorded on session {sid}. Note: {sid} is a log-only \
+         session (placeholder) \u{2014} it does not run an agent loop, so \
+         this message is appended to the session's history but no \
+         response will be generated.",
+        sid = target
+    )
+}
+
+/// Record a message onto a log-provider / placeholder session without
+/// running the agent loop. See `is_no_agent_loop_session` for context.
+///
+/// Behaviour:
+///   * Appends the message as a `Message::User` to the session's history.
+///   * Does NOT insert into `queued_messages` — there's no resume path.
+///   * Does NOT call the agent runner.
+///   * Does NOT emit phase transitions.
+///
+/// Intentionally mirrors `queue_info_to_session` but uses a `User` message
+/// so the content is preserved as the sender wrote it (not display-only),
+/// matching the "placeholder == append-only audit log" semantic.
+pub(super) fn record_message_to_log_session(state: &SharedState, target: &str, content: &str) {
+    let user_msg = Message::User(UserMessage::text(content));
+    let st = lock_state(state);
+    if let Err(e) = st.db.append_message(target, &user_msg) {
+        tracing::warn!(session_id = %target, %e, "failed to persist message to log session");
+    }
+}
+
 /// Queue a message and, if the target session is idle, spawn a resume task so
 /// the message is processed without waiting for the next user interaction.
 #[allow(clippy::too_many_arguments)]

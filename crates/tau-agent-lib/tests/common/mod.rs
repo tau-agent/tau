@@ -52,6 +52,7 @@ pub fn send_recv_all(stream: &UnixStream, req: &Request) -> Vec<Response> {
                 | Response::Cancelled
                 | Response::MessageReply { .. }
                 | Response::Ok
+                | Response::OkWithNote { .. }
                 | Response::Models { .. }
                 | Response::Messages { .. }
                 | Response::ToolExecuted { .. }

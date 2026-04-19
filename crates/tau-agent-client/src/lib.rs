@@ -78,6 +78,7 @@ impl Client {
                 | Response::Cancelled
                 | Response::Error { .. }
                 | Response::Ok
+                | Response::OkWithNote { .. }
                 | Response::SessionCreated { .. }
                 | Response::SessionInfo { .. }
                 | Response::SessionAncestors { .. }

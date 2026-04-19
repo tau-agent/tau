@@ -356,6 +356,18 @@ pub enum Response {
     MessageReply { content: String },
     /// Success (generic ack).
     Ok,
+    /// Success, with an advisory note from the server.
+    ///
+    /// Emitted in place of `Ok` when the server wants to tell the caller
+    /// something about how the request was handled without treating it as
+    /// an error. Today: `QueueMessage` (fire-and-forget) targeting a
+    /// placeholder (log-provider) session — the note explains that the
+    /// message was recorded but no agent loop ran. See task 582.
+    ///
+    /// Older clients that don't know this variant will fall through to
+    /// their default-error path; the request still succeeded on the
+    /// server side.
+    OkWithNote { note: String },
     /// Garbage-collection result.
     GcComplete { deleted: usize },
     /// Tool execution result (response to ExecuteTool).

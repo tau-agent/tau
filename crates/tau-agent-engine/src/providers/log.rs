@@ -21,6 +21,10 @@ impl Provider for LogProvider {
         API_ID
     }
 
+    fn needs_api_key(&self) -> bool {
+        false
+    }
+
     fn stream(
         &self,
         _model: &Model,

@@ -325,19 +325,31 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         }
     }
 
-    let api_key = {
+    // Preflight: resolve API key unless the provider is a no-key provider
+    // (e.g. the `log` provider). This is the P1 safety net from task 582 —
+    // even if an agent loop somehow kicks off on a log-provider session we
+    // do NOT want to emit "no API key for provider: log".
+    let needs_key = {
         let st = lock_state(state);
-        resolve_api_key(&st.auth, &st.config, &model.provider)?
+        st.registry.needs_api_key(&model.api)
     };
-    let api_key = match api_key {
-        Some(key) => key,
-        None => {
-            return Err(crate::Error::NoApiKey(model.provider.clone()));
+    let api_key = if needs_key {
+        let api_key = {
+            let st = lock_state(state);
+            resolve_api_key(&st.auth, &st.config, &model.provider)?
+        };
+        match api_key {
+            Some(key) => Some(key),
+            None => {
+                return Err(crate::Error::NoApiKey(model.provider.clone()));
+            }
         }
+    } else {
+        None
     };
 
     let options = StreamOptions {
-        api_key: Some(api_key),
+        api_key,
         ..Default::default()
     };
 

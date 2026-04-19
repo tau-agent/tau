@@ -2581,6 +2581,78 @@ fn server_execute_tool_nonexistent_session() {
 // Log provider tests
 // ---------------------------------------------------------------------------
 
+/// Spin up a test server registered with ONLY the `log` provider and model.
+/// Returns the temp dir (kept alive for socket lifetime) and socket path.
+fn start_log_only_test_server() -> (tempfile::TempDir, std::path::PathBuf) {
+    use tau_agent_lib::providers::log::{LogProvider, log_model};
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("tau-log-test.sock");
+    let db_path = dir.path().join("test.db");
+    let sock_clone = sock_path.clone();
+
+    let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
+    registry.register(LogProvider);
+
+    let config = tau_agent_lib::server::TestServerConfig {
+        registry,
+        models: vec![log_model()],
+        socket_path: sock_clone,
+        db_path,
+        tool_executor_factory: None,
+        mock_tools: vec![],
+        plugins_config: None,
+        aliases: std::collections::HashMap::new(),
+    };
+
+    std::thread::spawn(move || {
+        smol::block_on(async {
+            if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
+                eprintln!("test server error: {}", e);
+            }
+        });
+    });
+
+    for _ in 0..50 {
+        if sock_path.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sock_path.exists(), "server socket did not appear");
+    (dir, sock_path)
+}
+
+fn create_log_session(sock_path: &std::path::Path) -> String {
+    let conn = UnixStream::connect(sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    match send_recv(
+        &conn,
+        &Request::CreateSession {
+            model: Some("log".into()),
+            provider: Some("log".into()),
+            system_prompt: Some("test".into()),
+            cwd: Some("/tmp".into()),
+            parent_id: None,
+            child_budget: 0,
+            tagline: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+            sandbox_profile: None,
+        },
+    ) {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    }
+}
+
+fn shutdown_log_server(sock_path: &std::path::Path) {
+    let conn = UnixStream::connect(sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send_recv(&conn, &Request::Shutdown { restart: false });
+}
+
 #[test]
 fn server_log_provider_chat_returns_immediately() {
     use tau_agent_lib::providers::log::{LogProvider, log_model};
@@ -2688,6 +2760,221 @@ fn server_log_provider_chat_returns_immediately() {
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     send_recv(&conn3, &Request::Shutdown { restart: false });
+}
+
+/// Task 582 — P2: `QueueMessage` (fire-and-forget) targeting a log-provider
+/// session must record the message to history AND return `OkWithNote`
+/// (the courtesy note explaining no agent loop ran). No `queued_messages`
+/// row should survive (the message is handled synchronously, not queued),
+/// and no agent-turn events (`AgentDone`, `AssistantChunk`, etc.) are
+/// emitted.
+#[test]
+fn queue_message_to_log_session_records_without_agent_loop() {
+    let (_dir, sock_path) = start_log_only_test_server();
+    let sid = create_log_session(&sock_path);
+
+    // Fire-and-forget QueueMessage to the log session.
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(
+        &conn,
+        &Request::QueueMessage {
+            target_session_id: sid.clone(),
+            content: "hello placeholder".into(),
+            sender_info: "test".into(),
+            await_reply: false,
+            reply_to: None,
+        },
+    );
+    match &resp {
+        Response::OkWithNote { note } => {
+            assert!(
+                note.contains(&sid) && note.to_lowercase().contains("placeholder"),
+                "expected note mentioning session id and placeholder semantics, got: {}",
+                note
+            );
+        }
+        other => panic!("expected OkWithNote, got {:?}", other),
+    }
+
+    // Verify the message landed in the session's history as a user message.
+    let conn2 = UnixStream::connect(&sock_path).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let msgs_resp = send_recv(
+        &conn2,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
+    let messages = match msgs_resp {
+        Response::Messages { messages } => messages,
+        other => panic!("expected Messages, got {:?}", other),
+    };
+    let user_found = messages.iter().any(|m| {
+        matches!(
+            m,
+            tau_agent_lib::types::Message::User(u)
+                if u.content.iter().any(|c| matches!(
+                    c,
+                    tau_agent_lib::types::UserContent::Text(t) if t.text.contains("hello placeholder")
+                ))
+        )
+    });
+    assert!(
+        user_found,
+        "user message 'hello placeholder' should be in session history, got: {:?}",
+        messages
+    );
+
+    // And no AssistantMessage was appended — the agent loop did not run.
+    let has_assistant = messages
+        .iter()
+        .any(|m| matches!(m, tau_agent_lib::types::Message::Assistant(_)));
+    assert!(
+        !has_assistant,
+        "placeholder session must not produce an assistant message, got: {:?}",
+        messages
+    );
+
+    shutdown_log_server(&sock_path);
+}
+
+/// Task 582 — P2: `Chat` on a log-provider session records the message,
+/// emits an informational `Status` stream event with the courtesy note,
+/// and terminates with `AgentDone` without running the agent loop.
+#[test]
+fn chat_to_log_session_emits_note_and_no_agent_loop() {
+    let (_dir, sock_path) = start_log_only_test_server();
+    let sid = create_log_session(&sock_path);
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let responses = send_recv_all(
+        &conn,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hi there".into(),
+        },
+    );
+
+    // AgentDone is the terminal.
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::AgentDone)),
+        "expected AgentDone, got {:?}",
+        responses
+    );
+    // No Error response (the bug produced 'no API key for provider: log').
+    let error_count = responses
+        .iter()
+        .filter(|r| matches!(r, Response::Error { .. }))
+        .count();
+    assert_eq!(
+        error_count, 0,
+        "placeholder Chat should not produce Error, got: {:?}",
+        responses
+    );
+    // The Status note is present.
+    let note_present = responses.iter().any(|r| {
+        if let Response::Stream { event } = r {
+            matches!(
+                event.as_ref(),
+                tau_agent_lib::types::StreamEvent::Status { message } if message.to_lowercase().contains("placeholder")
+            )
+        } else {
+            false
+        }
+    });
+    assert!(
+        note_present,
+        "expected Status event with placeholder note, got: {:?}",
+        responses
+    );
+    // No text deltas — the log provider's stream() never ran.
+    let has_text = responses.iter().any(|r| {
+        if let Response::Stream { event } = r {
+            matches!(
+                event.as_ref(),
+                tau_agent_lib::types::StreamEvent::TextDelta { delta, .. } if !delta.is_empty()
+            )
+        } else {
+            false
+        }
+    });
+    assert!(
+        !has_text,
+        "placeholder Chat must not emit text deltas, got: {:?}",
+        responses
+    );
+
+    // The message is persisted.
+    let conn2 = UnixStream::connect(&sock_path).unwrap();
+    conn2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let msgs_resp = send_recv(
+        &conn2,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
+    let messages = match msgs_resp {
+        Response::Messages { messages } => messages,
+        other => panic!("expected Messages, got {:?}", other),
+    };
+    let user_found = messages.iter().any(|m| {
+        matches!(
+            m,
+            tau_agent_lib::types::Message::User(u)
+                if u.content.iter().any(|c| matches!(
+                    c,
+                    tau_agent_lib::types::UserContent::Text(t) if t.text.contains("hi there")
+                ))
+        )
+    });
+    assert!(
+        user_found,
+        "user message 'hi there' should be in session history, got: {:?}",
+        messages
+    );
+
+    shutdown_log_server(&sock_path);
+}
+
+/// Task 582 — P2: `QueueMessage` with `await_reply=true` against a log
+/// session returns `MessageReply` (with the courtesy note as content)
+/// immediately, instead of blocking and timing out.
+#[test]
+fn queue_message_await_reply_to_log_session_returns_note() {
+    let (_dir, sock_path) = start_log_only_test_server();
+    let sid = create_log_session(&sock_path);
+
+    let conn = UnixStream::connect(&sock_path).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let resp = send_recv(
+        &conn,
+        &Request::QueueMessage {
+            target_session_id: sid.clone(),
+            content: "need a reply".into(),
+            sender_info: "test".into(),
+            await_reply: true,
+            reply_to: None,
+        },
+    );
+    match &resp {
+        Response::MessageReply { content } => {
+            assert!(
+                content.to_lowercase().contains("placeholder"),
+                "expected placeholder note, got: {}",
+                content
+            );
+        }
+        other => panic!("expected MessageReply with note, got {:?}", other),
+    }
+
+    shutdown_log_server(&sock_path);
 }
 
 // ---------------------------------------------------------------------------

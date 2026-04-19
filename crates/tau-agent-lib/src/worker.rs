@@ -1231,6 +1231,14 @@ async fn handle_session_tool(
                     "",
                     &format!("Message sent to session {}", target),
                 ),
+                Ok(crate::protocol::Response::OkWithNote { note }) => {
+                    // The server accepted the message but wanted to tell
+                    // us something about how it was handled (e.g. target
+                    // is a placeholder/log-provider session — message
+                    // recorded but no agent loop ran). Surface the note
+                    // so the caller LLM can act on it.
+                    ToolResultMessage::success(tcid, "", &note)
+                }
                 Ok(crate::protocol::Response::Error { message }) => {
                     ToolResultMessage::error(tcid, "", &message)
                 }

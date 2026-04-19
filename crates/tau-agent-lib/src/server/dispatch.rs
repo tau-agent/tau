@@ -9,8 +9,9 @@ use std::os::unix::net::UnixStream;
 use super::agent_runner::{run_agent_turn, run_compaction, send};
 use super::notifications::{
     auto_archive_done_sessions, broadcast_to_subscribers, broadcast_to_subscribers_and_wait,
-    emit_phase, emit_phase_and_wait, last_assistant_text, notify_session_done_waiters,
-    queue_and_maybe_resume, queue_info_to_session, queue_message_to_session,
+    emit_phase, emit_phase_and_wait, is_no_agent_loop_session, last_assistant_text,
+    notify_session_done_waiters, placeholder_no_agent_note, queue_and_maybe_resume,
+    queue_info_to_session, queue_message_to_session, record_message_to_log_session,
 };
 use super::registry::{
     maybe_respawn_for_queued, model_info, session_info, session_info_from_db_stats,
@@ -539,6 +540,28 @@ pub(super) async fn handle_client(
                     send(&mut writer, &resp).await.ok();
                     continue;
                 }
+
+                // Short-circuit: Chat on a placeholder (log-provider)
+                // session records the message but does NOT spin up the
+                // agent loop. Emit an Info stream event with the note,
+                // then AgentDone so the streaming client terminates
+                // cleanly. See task 582.
+                if is_no_agent_loop_session(&state, &session_id) {
+                    record_message_to_log_session(&state, &session_id, &text);
+                    let note = placeholder_no_agent_note(&session_id);
+                    let info_resp = Response::Stream {
+                        event: Box::new(StreamEvent::Status {
+                            message: note.clone(),
+                        }),
+                    };
+                    broadcast_to_subscribers(&state, &session_id, &info_resp);
+                    send(&mut writer, &info_resp).await.ok();
+                    let done_resp = Response::AgentDone;
+                    broadcast_to_subscribers_and_wait(&state, &session_id, &done_resp).await;
+                    send(&mut writer, &done_resp).await.ok();
+                    continue;
+                }
+
                 // Acquire per-session lock — serializes concurrent Chat requests.
                 // If another agent turn is running, this awaits until it finishes.
                 // Try non-blocking lock first; if contended, notify and then block.
@@ -1695,6 +1718,23 @@ pub(super) async fn handle_client(
                     .ok();
                     continue;
                 }
+
+                // Short-circuit: messages to a placeholder (log-provider)
+                // session are recorded to history but do NOT trigger an
+                // agent loop. Return a courtesy note so the caller knows
+                // no reply will arrive. See task 582.
+                if is_no_agent_loop_session(&state, &target_session_id) {
+                    record_message_to_log_session(&state, &target_session_id, &content);
+                    let note = placeholder_no_agent_note(&target_session_id);
+                    let resp = if await_reply {
+                        Response::MessageReply { content: note }
+                    } else {
+                        Response::OkWithNote { note }
+                    };
+                    send(&mut writer, &resp).await?;
+                    continue;
+                }
+
                 if await_reply {
                     // Generate a unique msg_id, create a oneshot channel,
                     // prefix the message so the target knows to reply.
