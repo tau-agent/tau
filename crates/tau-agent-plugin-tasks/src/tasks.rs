@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::params;
 
+use crate::err::plugin_io_err;
 use crate::tasks_db::{TaskUpdate, TasksDb};
 use crate::tasks_merge;
 use crate::tasks_merge_worker::{MergeJob, MergeWorker};
@@ -56,7 +57,7 @@ impl ProjectResolver {
             &path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("open tau.db: {}", e)))?;
+        .map_err(plugin_io_err("open tau.db"))?;
         Ok(Self { conn })
     }
 

@@ -7,6 +7,8 @@
 //! The plugin communicates with the server via the plugin protocol over
 //! stdin/stdout — it does NOT depend on `tau-agent-lib`.
 
+pub(crate) mod err;
+
 pub mod tasks;
 pub mod tasks_config;
 pub mod tasks_db;

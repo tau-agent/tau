@@ -56,6 +56,7 @@
 use std::io::Write;
 use std::sync::mpsc;
 
+use crate::err::plugin_io_err;
 use crate::tasks::{ChannelLineReader, ProjectResolver};
 use crate::tasks_db::{TaskUpdate, TasksDb};
 
@@ -153,7 +154,7 @@ impl MergeWorker {
                 crate::tasks_scheduler::set_thread_rpc_prefix("merge-sr");
                 worker_loop(db, resolver, rx, writer, reader);
             })
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("spawn merge worker: {}", e)))?;
+            .map_err(plugin_io_err("spawn merge worker"))?;
 
         Ok(Self {
             tx: Some(tx),

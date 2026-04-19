@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::sync::{Mutex, OnceLock};
 
+use crate::err::plugin_io_err;
 use crate::tasks_config;
 use crate::tasks_db::{Task, TaskUpdate, TasksDb};
 use crate::tasks_git;
@@ -1516,7 +1517,7 @@ pub fn is_rebased_on_target(db: &TasksDb, task: &Task) -> tau_agent_plugin::Resu
         .args(["merge-base", "--is-ancestor", &merge_target, branch])
         .current_dir(worktree)
         .output()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("git merge-base: {}", e)))?;
+        .map_err(plugin_io_err("git merge-base"))?;
 
     Ok(output.status.success())
 }

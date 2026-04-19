@@ -6,6 +6,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::err::plugin_io_err;
+
 /// Create a new git branch from a base branch.
 pub fn create_branch(
     repo_path: &str,
@@ -16,7 +18,7 @@ pub fn create_branch(
         .args(["branch", branch_name, base_branch])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("git branch: {}", e)))?;
+        .map_err(plugin_io_err("git branch"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -40,7 +42,7 @@ pub fn create_worktree(
         .args(["worktree", "add", worktree_path, branch_name])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("git worktree add: {}", e)))?;
+        .map_err(plugin_io_err("git worktree add"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -73,7 +75,7 @@ pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> tau_agent_plugin
         .args(["worktree", "remove", "--force", worktree_path])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("git worktree remove: {}", e)))?;
+        .map_err(plugin_io_err("git worktree remove"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -92,7 +94,7 @@ pub fn delete_branch(repo_path: &str, branch_name: &str) -> tau_agent_plugin::Re
         .args(["branch", "-D", branch_name])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("git branch -D: {}", e)))?;
+        .map_err(plugin_io_err("git branch -D"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -111,9 +113,7 @@ pub fn get_repo_root(cwd: &str) -> tau_agent_plugin::Result<String> {
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(cwd)
         .output()
-        .map_err(|e| {
-            tau_agent_plugin::Error::Io(format!("git rev-parse --show-toplevel: {}", e))
-        })?;
+        .map_err(plugin_io_err("git rev-parse --show-toplevel"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -138,7 +138,7 @@ pub fn branch_exists(repo_path: &str, branch_name: &str) -> tau_agent_plugin::Re
         ])
         .current_dir(repo_path)
         .output()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("git rev-parse --verify: {}", e)))?;
+        .map_err(plugin_io_err("git rev-parse --verify"))?;
 
     Ok(output.status.success())
 }
@@ -181,7 +181,7 @@ pub fn ensure_worktrees_dir(project_root: &str) -> tau_agent_plugin::Result<()> 
     let worktrees_line = "/worktrees/";
     if gitignore_path.exists() {
         let existing = std::fs::read_to_string(&gitignore_path)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("read .tau/.gitignore: {}", e)))?;
+            .map_err(plugin_io_err("read .tau/.gitignore"))?;
         if !existing.lines().any(|line| line.trim() == worktrees_line) {
             let mut content = existing;
             if !content.ends_with('\n') && !content.is_empty() {
@@ -189,13 +189,12 @@ pub fn ensure_worktrees_dir(project_root: &str) -> tau_agent_plugin::Result<()> 
             }
             content.push_str(worktrees_line);
             content.push('\n');
-            std::fs::write(&gitignore_path, content).map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("write .tau/.gitignore: {}", e))
-            })?;
+            std::fs::write(&gitignore_path, content)
+                .map_err(plugin_io_err("write .tau/.gitignore"))?;
         }
     } else {
         std::fs::write(&gitignore_path, format!("{}\n", worktrees_line))
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("write .tau/.gitignore: {}", e)))?;
+            .map_err(plugin_io_err("write .tau/.gitignore"))?;
     }
 
     Ok(())
@@ -212,7 +211,7 @@ pub fn abort_partial_rebase(worktree_path: &str) -> tau_agent_plugin::Result<()>
         .args(["rev-parse", "--git-dir"])
         .current_dir(worktree_path)
         .output()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("git rev-parse --git-dir: {}", e)))?;
+        .map_err(plugin_io_err("git rev-parse --git-dir"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -237,7 +236,7 @@ pub fn abort_partial_rebase(worktree_path: &str) -> tau_agent_plugin::Result<()>
             .args(["rebase", "--abort"])
             .current_dir(worktree_path)
             .output()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("git rebase --abort: {}", e)))?;
+            .map_err(plugin_io_err("git rebase --abort"))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

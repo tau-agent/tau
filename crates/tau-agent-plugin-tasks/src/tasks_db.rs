@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::err::plugin_io_err;
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -425,10 +427,10 @@ impl TasksDb {
         })?;
 
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("pragma: {}", e)))?;
+            .map_err(plugin_io_err("pragma"))?;
 
         conn.execute_batch(SCHEMA)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("create tables: {}", e)))?;
+            .map_err(plugin_io_err("create tables"))?;
 
         Self::migrate(&conn)?;
 
@@ -438,14 +440,14 @@ impl TasksDb {
     /// Open an in-memory database (for tests).
     #[cfg(test)]
     pub fn open_memory() -> tau_agent_plugin::Result<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("open in-memory tasks db: {}", e)))?;
+        let conn =
+            Connection::open_in_memory().map_err(plugin_io_err("open in-memory tasks db"))?;
 
         conn.execute_batch("PRAGMA foreign_keys=ON;")
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("pragma: {}", e)))?;
+            .map_err(plugin_io_err("pragma"))?;
 
         conn.execute_batch(SCHEMA)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("create tables: {}", e)))?;
+            .map_err(plugin_io_err("create tables"))?;
 
         Self::migrate(&conn)?;
 
@@ -470,9 +472,7 @@ impl TasksDb {
                  DROP INDEX IF EXISTS idx_tasks_project_state; \
                  CREATE INDEX IF NOT EXISTS idx_tasks_project_state ON tasks(project_name, state);",
             )
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("migrate project -> project_name: {}", e))
-            })?;
+            .map_err(plugin_io_err("migrate project -> project_name"))?;
         }
 
         // Check if assigned_session column still exists.
@@ -492,7 +492,7 @@ impl TasksDb {
                  WHERE assigned_session IS NOT NULL AND (session_id IS NULL OR session_id != assigned_session); \
                  ALTER TABLE tasks DROP COLUMN assigned_session;"
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate assigned_session: {}", e)))?;
+            .map_err(plugin_io_err("migrate assigned_session"))?;
         }
 
         // Drop the legacy `skip_planning` column if an older schema still
@@ -508,9 +508,7 @@ impl TasksDb {
 
         if has_skip_planning {
             conn.execute_batch("ALTER TABLE tasks DROP COLUMN skip_planning;")
-                .map_err(|e| {
-                    tau_agent_plugin::Error::Io(format!("migrate drop skip_planning: {}", e))
-                })?;
+                .map_err(plugin_io_err("migrate drop skip_planning"))?;
         }
 
         // Add require_approval column if it doesn't exist.
@@ -526,7 +524,7 @@ impl TasksDb {
             conn.execute_batch(
                 "ALTER TABLE tasks ADD COLUMN require_approval INTEGER NOT NULL DEFAULT 0;",
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate require_approval: {}", e)))?;
+            .map_err(plugin_io_err("migrate require_approval"))?;
         }
 
         // Add merge_target column if it doesn't exist.
@@ -538,7 +536,7 @@ impl TasksDb {
 
         if !has_merge_target {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN merge_target TEXT;")
-                .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate merge_target: {}", e)))?;
+                .map_err(plugin_io_err("migrate merge_target"))?;
         }
 
         // Add sandbox_profile column if it doesn't exist.
@@ -552,9 +550,7 @@ impl TasksDb {
 
         if !has_sandbox_profile {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN sandbox_profile TEXT;")
-                .map_err(|e| {
-                    tau_agent_plugin::Error::Io(format!("migrate sandbox_profile: {}", e))
-                })?;
+                .map_err(plugin_io_err("migrate sandbox_profile"))?;
         }
 
         // Add held column if it doesn't exist. Introduced by task #527 to
@@ -567,7 +563,7 @@ impl TasksDb {
 
         if !has_held {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN held INTEGER NOT NULL DEFAULT 0;")
-                .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate held: {}", e)))?;
+                .map_err(plugin_io_err("migrate held"))?;
         }
 
         // Add placeholder_session_id column if it doesn't exist.
@@ -585,9 +581,7 @@ impl TasksDb {
 
         if !has_placeholder_session_id {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN placeholder_session_id TEXT;")
-                .map_err(|e| {
-                    tau_agent_plugin::Error::Io(format!("migrate placeholder_session_id: {}", e))
-                })?;
+                .map_err(plugin_io_err("migrate placeholder_session_id"))?;
         }
 
         // Add auto_downgraded_from_ready column if it doesn't exist.
@@ -632,7 +626,7 @@ impl TasksDb {
                 );
                 UPDATE tasks SET state = 'closed' WHERE state = 'done';",
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate done to merged/closed: {}", e)))?;
+            .map_err(plugin_io_err("migrate done to merged/closed"))?;
         }
 
         Ok(())
@@ -707,7 +701,7 @@ impl TasksDb {
                     now,
                 ],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert task: {}", e)))?;
+            .map_err(plugin_io_err("insert task"))?;
 
         let id = self.conn.last_insert_rowid();
         self.get_task(id)?
@@ -723,7 +717,7 @@ impl TasksDb {
                 row_to_task,
             )
             .optional()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get task: {}", e)))
+            .map_err(plugin_io_err("get task"))
     }
 
     /// List tasks with optional filters.
@@ -779,17 +773,15 @@ impl TasksDb {
         let mut stmt = self
             .conn
             .prepare(&sql)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare list tasks: {}", e)))?;
+            .map_err(plugin_io_err("prepare list tasks"))?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("list tasks: {}", e)))?;
+            .map_err(plugin_io_err("list tasks"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(
-                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read task row: {}", e)))?,
-            );
+            tasks.push(row.map_err(plugin_io_err("read task row"))?);
         }
         Ok(tasks)
     }
@@ -813,18 +805,17 @@ impl TasksDb {
             TASK_COLUMNS
         );
 
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
-            tau_agent_plugin::Error::Io(format!("prepare list_recent_by_state: {}", e))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(plugin_io_err("prepare list_recent_by_state"))?;
         let rows = stmt
             .query_map(params![project_name, state, limit as i64], row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("list_recent_by_state: {}", e)))?;
+            .map_err(plugin_io_err("list_recent_by_state"))?;
 
         let mut tasks = Vec::with_capacity(limit);
         for row in rows {
-            tasks.push(
-                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read task row: {}", e)))?,
-            );
+            tasks.push(row.map_err(plugin_io_err("read task row"))?);
         }
         Ok(tasks)
     }
@@ -889,7 +880,7 @@ impl TasksDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("update_task begin: {}", e)))?;
+            .map_err(plugin_io_err("update_task begin"))?;
 
         // Build SET clauses and record history
         let mut sets = vec!["updated_at = ?".to_string()];
@@ -907,7 +898,7 @@ impl TasksDb {
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                         params![id, $col, old_str, new_str, session_id, now],
                     )
-                    .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+                    .map_err(plugin_io_err("insert history"))?;
                 }
             };
         }
@@ -933,7 +924,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "session_id", old_sid, Option::<String>::None, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(plugin_io_err("insert history"))?;
         }
 
         if let Some(ref val) = update.tags {
@@ -948,7 +939,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "tags", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(plugin_io_err("insert history"))?;
         }
 
         if let Some(ref val) = update.affected_files {
@@ -963,7 +954,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "affected_files", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(plugin_io_err("insert history"))?;
         }
 
         if let Some(val) = update.skip_review {
@@ -976,7 +967,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "skip_review", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(plugin_io_err("insert history"))?;
         }
 
         if let Some(val) = update.require_approval {
@@ -989,7 +980,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "require_approval", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(plugin_io_err("insert history"))?;
         }
 
         if let Some(val) = update.held {
@@ -1002,7 +993,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "held", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(plugin_io_err("insert history"))?;
         }
 
         if let Some(ref val) = update.merge_target {
@@ -1015,7 +1006,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "merge_target", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(plugin_io_err("insert history"))?;
         }
 
         if let Some(ref val) = update.sandbox_profile {
@@ -1028,13 +1019,12 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "sandbox_profile", old_str, new_str, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert history: {}", e)))?;
+            .map_err(plugin_io_err("insert history"))?;
         }
 
         if sets.len() == 1 {
             // Only updated_at, nothing else to update
-            tx.commit()
-                .map_err(|e| tau_agent_plugin::Error::Io(format!("update_task commit: {}", e)))?;
+            tx.commit().map_err(plugin_io_err("update_task commit"))?;
             return self
                 .get_task(id)?
                 .ok_or_else(|| tau_agent_plugin::Error::Io("task not found after update".into()));
@@ -1057,10 +1047,9 @@ impl TasksDb {
             params_vec.iter().map(|p| p.as_ref()).collect();
 
         tx.execute(&sql, params_refs.as_slice())
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("update task: {}", e)))?;
+            .map_err(plugin_io_err("update task"))?;
 
-        tx.commit()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("update_task commit: {}", e)))?;
+        tx.commit().map_err(plugin_io_err("update_task commit"))?;
 
         self.get_task(id)?
             .ok_or_else(|| tau_agent_plugin::Error::Io("task not found after update".into()))
@@ -1086,7 +1075,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![task_id, content, author, now, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("insert message: {}", e)))?;
+            .map_err(plugin_io_err("insert message"))?;
 
         let id = self.conn.last_insert_rowid();
         Ok(TaskMessage {
@@ -1113,7 +1102,7 @@ impl TasksDb {
                 "UPDATE task_messages SET content = ?1, updated_at = ?2 WHERE id = ?3",
                 params![content, now, message_id],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("edit message: {}", e)))?;
+            .map_err(plugin_io_err("edit message"))?;
 
         if updated == 0 {
             return Err(tau_agent_plugin::Error::Io(format!(
@@ -1129,7 +1118,7 @@ impl TasksDb {
                 params![message_id],
                 row_to_message,
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get edited message: {}", e)))
+            .map_err(plugin_io_err("get edited message"))
     }
 
     /// Get all messages for a task.
@@ -1140,17 +1129,15 @@ impl TasksDb {
                 "SELECT id, task_id, content, author, created_at, updated_at
                  FROM task_messages WHERE task_id = ?1 ORDER BY id",
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get messages: {}", e)))?;
+            .map_err(plugin_io_err("prepare get messages"))?;
 
         let rows = stmt
             .query_map(params![task_id], row_to_message)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get messages: {}", e)))?;
+            .map_err(plugin_io_err("get messages"))?;
 
         let mut messages = Vec::new();
         for row in rows {
-            messages.push(
-                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read message row: {}", e)))?,
-            );
+            messages.push(row.map_err(plugin_io_err("read message row"))?);
         }
         Ok(messages)
     }
@@ -1187,7 +1174,7 @@ impl TasksDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("add_relation begin: {}", e)))?;
+            .map_err(plugin_io_err("add_relation begin"))?;
 
         // Validate both tasks exist (cross-project relations are allowed)
         tx.query_row(
@@ -1196,7 +1183,7 @@ impl TasksDb {
             |_row| Ok(()),
         )
         .optional()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("check from_task: {}", e)))?
+        .map_err(plugin_io_err("check from_task"))?
         .ok_or_else(|| tau_agent_plugin::Error::Io(format!("from_task {} not found", from_task)))?;
 
         tx.query_row(
@@ -1205,7 +1192,7 @@ impl TasksDb {
             |_row| Ok(()),
         )
         .optional()
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("check to_task: {}", e)))?
+        .map_err(plugin_io_err("check to_task"))?
         .ok_or_else(|| tau_agent_plugin::Error::Io(format!("to_task {} not found", to_task)))?;
 
         // Prevent circular dependencies for depends_on.
@@ -1225,17 +1212,13 @@ impl TasksDb {
                         "SELECT to_task FROM task_relations
                          WHERE from_task = ?1 AND relation = 'depends_on'",
                     )
-                    .map_err(|e| {
-                        tau_agent_plugin::Error::Io(format!("prepare cycle check: {}", e))
-                    })?;
+                    .map_err(plugin_io_err("prepare cycle check"))?;
 
                 let deps: Vec<i64> = stmt
                     .query_map(params![current], |row| row.get(0))
-                    .map_err(|e| tau_agent_plugin::Error::Io(format!("cycle check: {}", e)))?
+                    .map_err(plugin_io_err("cycle check"))?
                     .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| {
-                        tau_agent_plugin::Error::Io(format!("read cycle check row: {}", e))
-                    })?;
+                    .map_err(plugin_io_err("read cycle check row"))?;
 
                 for dep in deps {
                     if dep == from_task {
@@ -1256,10 +1239,9 @@ impl TasksDb {
              VALUES (?1, ?2, ?3)",
             params![from_task, to_task, relation],
         )
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("insert relation: {}", e)))?;
+        .map_err(plugin_io_err("insert relation"))?;
 
-        tx.commit()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("add_relation commit: {}", e)))?;
+        tx.commit().map_err(plugin_io_err("add_relation commit"))?;
 
         Ok(())
     }
@@ -1272,7 +1254,7 @@ impl TasksDb {
                 "SELECT from_task, to_task, relation FROM task_relations
                  WHERE from_task = ?1 OR to_task = ?1",
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get relations: {}", e)))?;
+            .map_err(plugin_io_err("prepare get relations"))?;
 
         let rows = stmt
             .query_map(params![task_id], |row| {
@@ -1282,13 +1264,11 @@ impl TasksDb {
                     relation: row.get(2)?,
                 })
             })
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get relations: {}", e)))?;
+            .map_err(plugin_io_err("get relations"))?;
 
         let mut relations = Vec::new();
         for row in rows {
-            relations.push(
-                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read relation row: {}", e)))?,
-            );
+            relations.push(row.map_err(plugin_io_err("read relation row"))?);
         }
         Ok(relations)
     }
@@ -1307,17 +1287,15 @@ impl TasksDb {
                  JOIN tasks t ON t.id = r.to_task
                  WHERE r.from_task = ?1 AND r.relation = 'depends_on' AND t.state NOT IN ('merged', 'closed')",
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get_blocking_dependencies: {}", e)))?;
+            .map_err(plugin_io_err("prepare get_blocking_dependencies"))?;
 
-        let rows = stmt.query_map(params![task_id], row_to_task).map_err(|e| {
-            tau_agent_plugin::Error::Io(format!("get_blocking_dependencies: {}", e))
-        })?;
+        let rows = stmt
+            .query_map(params![task_id], row_to_task)
+            .map_err(plugin_io_err("get_blocking_dependencies"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(row.map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("read blocking dependency row: {}", e))
-            })?);
+            tasks.push(row.map_err(plugin_io_err("read blocking dependency row"))?);
         }
         Ok(tasks)
     }
@@ -1347,17 +1325,15 @@ impl TasksDb {
                    )
                  ORDER BY t.priority DESC, t.created_at ASC",
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get_schedulable_tasks: {}", e)))?;
+            .map_err(plugin_io_err("prepare get_schedulable_tasks"))?;
 
         let rows = stmt
             .query_map(params![project_name], row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get_schedulable_tasks: {}", e)))?;
+            .map_err(plugin_io_err("get_schedulable_tasks"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(row.map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("read schedulable task row: {}", e))
-            })?);
+            tasks.push(row.map_err(plugin_io_err("read schedulable task row"))?);
         }
         Ok(tasks)
     }
@@ -1391,19 +1367,18 @@ impl TasksDb {
 
         let params_refs: Vec<&dyn rusqlite::types::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
-            tau_agent_plugin::Error::Io(format!("prepare get_approved_tasks: {}", e))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(plugin_io_err("prepare get_approved_tasks"))?;
 
         let rows = stmt
             .query_map(params_refs.as_slice(), row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get_approved_tasks: {}", e)))?;
+            .map_err(plugin_io_err("get_approved_tasks"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(row.map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("read approved task row: {}", e))
-            })?);
+            tasks.push(row.map_err(plugin_io_err("read approved task row"))?);
         }
         Ok(tasks)
     }
@@ -1424,7 +1399,7 @@ impl TasksDb {
                 params![project_name],
                 |row| row.get(0),
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("count_inflight_tasks: {}", e)))?;
+            .map_err(plugin_io_err("count_inflight_tasks"))?;
         Ok(count as usize)
     }
 
@@ -1441,19 +1416,15 @@ impl TasksDb {
                  ORDER BY priority DESC, created_at ASC",
                 TASK_COLUMNS
             ))
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("prepare get_inflight_tasks: {}", e))
-            })?;
+            .map_err(plugin_io_err("prepare get_inflight_tasks"))?;
 
         let rows = stmt
             .query_map(params![project_name], row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get_inflight_tasks: {}", e)))?;
+            .map_err(plugin_io_err("get_inflight_tasks"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(row.map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("read inflight task row: {}", e))
-            })?);
+            tasks.push(row.map_err(plugin_io_err("read inflight task row"))?);
         }
         Ok(tasks)
     }
@@ -1476,19 +1447,13 @@ impl TasksDb {
                     "SELECT to_task FROM task_relations
                      WHERE from_task = ?1 AND relation = 'depends_on'",
                 )
-                .map_err(|e| {
-                    tau_agent_plugin::Error::Io(format!("prepare has_transitive_dependency: {}", e))
-                })?;
+                .map_err(plugin_io_err("prepare has_transitive_dependency"))?;
 
             let deps: Vec<i64> = stmt
                 .query_map(params![current], |row| row.get(0))
-                .map_err(|e| {
-                    tau_agent_plugin::Error::Io(format!("has_transitive_dependency: {}", e))
-                })?
+                .map_err(plugin_io_err("has_transitive_dependency"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| {
-                    tau_agent_plugin::Error::Io(format!("read transitive dependency row: {}", e))
-                })?;
+                .map_err(plugin_io_err("read transitive dependency row"))?;
 
             for dep in deps {
                 if dep == to {
@@ -1513,17 +1478,15 @@ impl TasksDb {
                 "SELECT {} FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
                 TASK_COLUMNS
             ))
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get subtasks: {}", e)))?;
+            .map_err(plugin_io_err("prepare get subtasks"))?;
 
         let rows = stmt
             .query_map(params![parent_id], row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get subtasks: {}", e)))?;
+            .map_err(plugin_io_err("get subtasks"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(
-                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read subtask row: {}", e)))?,
-            );
+            tasks.push(row.map_err(plugin_io_err("read subtask row"))?);
         }
         Ok(tasks)
     }
@@ -1588,14 +1551,14 @@ impl TasksDb {
         let tx = self
             .conn
             .unchecked_transaction()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("assign_task begin: {}", e)))?;
+            .map_err(plugin_io_err("assign_task begin"))?;
 
         tx.execute(
             "UPDATE tasks SET state = ?1, session_id = ?2, updated_at = ?3 \
              WHERE id = ?4",
             params![new_state, session_id, now, task_id],
         )
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("assign task update: {}", e)))?;
+        .map_err(plugin_io_err("assign task update"))?;
 
         // Record state change in history (only if state actually changed)
         if new_state != task.state {
@@ -1604,7 +1567,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![task_id, "state", task.state, new_state, session_id, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("assign task history (state): {}", e)))?;
+            .map_err(plugin_io_err("assign task history (state)"))?;
         }
 
         // Record session_id change in history
@@ -1620,7 +1583,7 @@ impl TasksDb {
                 now
             ],
         )
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("assign task history (assigned): {}", e)))?;
+        .map_err(plugin_io_err("assign task history (assigned)"))?;
 
         // Record in task_sessions
         tx.execute(
@@ -1628,7 +1591,7 @@ impl TasksDb {
              VALUES (?1, ?2, 'worker', ?3)",
             params![task_id, session_id, now],
         )
-        .map_err(|e| tau_agent_plugin::Error::Io(format!("assign task session: {}", e)))?;
+        .map_err(plugin_io_err("assign task session"))?;
 
         // For interactive tasks with a changed session, update all descendant
         // tasks' session_id within this same transaction (atomic).
@@ -1646,18 +1609,12 @@ impl TasksDb {
                 while let Some(pid) = queue.pop_front() {
                     let mut stmt = tx
                         .prepare("SELECT id, session_id FROM tasks WHERE parent_id = ?1")
-                        .map_err(|e| {
-                            tau_agent_plugin::Error::Io(format!("prepare descendant query: {}", e))
-                        })?;
+                        .map_err(plugin_io_err("prepare descendant query"))?;
                     let rows: Vec<(i64, Option<String>)> = stmt
                         .query_map(params![pid], |row| Ok((row.get(0)?, row.get(1)?)))
-                        .map_err(|e| {
-                            tau_agent_plugin::Error::Io(format!("query descendants: {}", e))
-                        })?
+                        .map_err(plugin_io_err("query descendants"))?
                         .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| {
-                            tau_agent_plugin::Error::Io(format!("read descendant row: {}", e))
-                        })?;
+                        .map_err(plugin_io_err("read descendant row"))?;
                     for (child_id, child_session) in rows {
                         // Track old sessions that were parented under
                         // the old owner (for reparenting RPCs later).
@@ -1709,8 +1666,7 @@ impl TasksDb {
             }
         }
 
-        tx.commit()
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("assign_task commit: {}", e)))?;
+        tx.commit().map_err(plugin_io_err("assign_task commit"))?;
 
         let updated_task = self
             .get_task(task_id)?
@@ -1739,7 +1695,7 @@ impl TasksDb {
                  VALUES (?1, ?2, ?3, ?4)",
                 params![task_id, session_id, role, now],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("record session: {}", e)))?;
+            .map_err(plugin_io_err("record session"))?;
         Ok(())
     }
 
@@ -1759,23 +1715,17 @@ impl TasksDb {
                  INNER JOIN tasks t ON t.id = ts.task_id \
                  WHERE t.project_name = ?1",
             )
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("prepare list_project_task_sessions: {}", e))
-            })?;
+            .map_err(plugin_io_err("prepare list_project_task_sessions"))?;
 
         let rows = stmt
             .query_map(params![project_name], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("list_project_task_sessions: {}", e))
-            })?;
+            .map_err(plugin_io_err("list_project_task_sessions"))?;
 
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("read project task session row: {}", e))
-            })?);
+            out.push(row.map_err(plugin_io_err("read project task session row"))?);
         }
         Ok(out)
     }
@@ -1788,7 +1738,7 @@ impl TasksDb {
                 "SELECT task_id, session_id, role, created_at \
                  FROM task_sessions WHERE task_id = ?1 ORDER BY created_at",
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get sessions: {}", e)))?;
+            .map_err(plugin_io_err("prepare get sessions"))?;
 
         let rows = stmt
             .query_map(params![task_id], |row| {
@@ -1799,13 +1749,11 @@ impl TasksDb {
                     created_at: row.get(3)?,
                 })
             })
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get sessions: {}", e)))?;
+            .map_err(plugin_io_err("get sessions"))?;
 
         let mut sessions = Vec::new();
         for row in rows {
-            sessions.push(
-                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read session row: {}", e)))?,
-            );
+            sessions.push(row.map_err(plugin_io_err("read session row"))?);
         }
         Ok(sessions)
     }
@@ -1824,7 +1772,7 @@ impl TasksDb {
                  FROM task_history WHERE task_id = ?1 \
                  ORDER BY id DESC LIMIT 200",
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get history: {}", e)))?;
+            .map_err(plugin_io_err("prepare get history"))?;
 
         let rows = stmt
             .query_map(params![task_id], |row| {
@@ -1836,13 +1784,11 @@ impl TasksDb {
                     created_at: row.get(4)?,
                 })
             })
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("get history: {}", e)))?;
+            .map_err(plugin_io_err("get history"))?;
 
         let mut entries = Vec::new();
         for row in rows {
-            entries.push(
-                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read history row: {}", e)))?,
-            );
+            entries.push(row.map_err(plugin_io_err("read history row"))?);
         }
         entries.reverse();
         Ok(entries)
@@ -1867,9 +1813,7 @@ impl TasksDb {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("find latest session by role: {}", e))
-            })?;
+            .map_err(plugin_io_err("find latest session by role"))?;
         Ok(result)
     }
 
@@ -1897,16 +1841,12 @@ impl TasksDb {
             let mut stmt = self
                 .conn
                 .prepare(sql)
-                .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare search: {}", e)))?;
+                .map_err(plugin_io_err("prepare search"))?;
             let rows = stmt
                 .query_map(params![project_name, state, like_query], row_to_task)
-                .map_err(|e| tau_agent_plugin::Error::Io(format!("search tasks: {}", e)))?;
+                .map_err(plugin_io_err("search tasks"))?;
             for row in rows {
-                tasks.push(
-                    row.map_err(|e| {
-                        tau_agent_plugin::Error::Io(format!("read search row: {}", e))
-                    })?,
-                );
+                tasks.push(row.map_err(plugin_io_err("read search row"))?);
             }
         } else {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
@@ -1920,16 +1860,12 @@ impl TasksDb {
             let mut stmt = self
                 .conn
                 .prepare(sql)
-                .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare search: {}", e)))?;
+                .map_err(plugin_io_err("prepare search"))?;
             let rows = stmt
                 .query_map(params![project_name, like_query], row_to_task)
-                .map_err(|e| tau_agent_plugin::Error::Io(format!("search tasks: {}", e)))?;
+                .map_err(plugin_io_err("search tasks"))?;
             for row in rows {
-                tasks.push(
-                    row.map_err(|e| {
-                        tau_agent_plugin::Error::Io(format!("read search row: {}", e))
-                    })?,
-                );
+                tasks.push(row.map_err(plugin_io_err("read search row"))?);
             }
         }
 
@@ -1947,7 +1883,7 @@ impl TasksDb {
                 "UPDATE tasks SET branch = ?1, updated_at = ?2 WHERE id = ?3",
                 params![branch, now, task_id],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("set_branch: {}", e)))?;
+            .map_err(plugin_io_err("set_branch"))?;
 
         if updated == 0 {
             return Err(tau_agent_plugin::Error::Io(format!(
@@ -1967,7 +1903,7 @@ impl TasksDb {
                 "UPDATE tasks SET worktree_path = ?1, updated_at = ?2 WHERE id = ?3",
                 params![path, now, task_id],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("set_worktree_path: {}", e)))?;
+            .map_err(plugin_io_err("set_worktree_path"))?;
 
         if updated == 0 {
             return Err(tau_agent_plugin::Error::Io(format!(
@@ -2014,7 +1950,7 @@ impl TasksDb {
                 "UPDATE tasks SET session_id = ?1, updated_at = ?2 WHERE id = ?3",
                 params![session_id, now, task_id],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("set_session_id: {}", e)))?;
+            .map_err(plugin_io_err("set_session_id"))?;
 
         if updated == 0 {
             return Err(tau_agent_plugin::Error::Io(format!(
@@ -2034,7 +1970,7 @@ impl TasksDb {
                 "UPDATE tasks SET session_id = NULL, updated_at = ?1 WHERE id = ?2",
                 params![now, task_id],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("clear_session_id: {}", e)))?;
+            .map_err(plugin_io_err("clear_session_id"))?;
 
         if updated == 0 {
             return Err(tau_agent_plugin::Error::Io(format!(
@@ -2061,9 +1997,7 @@ impl TasksDb {
                 "UPDATE tasks SET placeholder_session_id = ?1, updated_at = ?2 WHERE id = ?3",
                 params![session_id, now, task_id],
             )
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("set_placeholder_session_id: {}", e))
-            })?;
+            .map_err(plugin_io_err("set_placeholder_session_id"))?;
 
         if updated == 0 {
             return Err(tau_agent_plugin::Error::Io(format!(
@@ -2103,19 +2037,15 @@ impl TasksDb {
                  WHERE state = 'active' AND session_id IS NULL AND updated_at <= ?1",
                 TASK_COLUMNS
             ))
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("prepare stuck active query: {}", e))
-            })?;
+            .map_err(plugin_io_err("prepare stuck active query"))?;
 
         let rows = stmt
             .query_map(params![cutoff], row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("query stuck active: {}", e)))?;
+            .map_err(plugin_io_err("query stuck active"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(row.map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("read stuck active task: {}", e))
-            })?);
+            tasks.push(row.map_err(plugin_io_err("read stuck active task"))?);
         }
         Ok(tasks)
     }
@@ -2146,19 +2076,15 @@ impl TasksDb {
                    AND NOT held AND updated_at <= ?1",
                 TASK_COLUMNS
             ))
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("prepare stuck ready query: {}", e))
-            })?;
+            .map_err(plugin_io_err("prepare stuck ready query"))?;
 
         let rows = stmt
             .query_map(params![cutoff], row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("query stuck ready: {}", e)))?;
+            .map_err(plugin_io_err("query stuck ready"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(row.map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("read stuck ready task: {}", e))
-            })?);
+            tasks.push(row.map_err(plugin_io_err("read stuck ready task"))?);
         }
         Ok(tasks)
     }
@@ -2173,19 +2099,15 @@ impl TasksDb {
                  WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
                 TASK_COLUMNS
             ))
-            .map_err(|e| {
-                tau_agent_plugin::Error::Io(format!("prepare stale worktree query: {}", e))
-            })?;
+            .map_err(plugin_io_err("prepare stale worktree query"))?;
 
         let rows = stmt
             .query_map([], row_to_task)
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("query stale worktrees: {}", e)))?;
+            .map_err(plugin_io_err("query stale worktrees"))?;
 
         let mut tasks = Vec::new();
         for row in rows {
-            tasks.push(
-                row.map_err(|e| tau_agent_plugin::Error::Io(format!("read stale task: {}", e)))?,
-            );
+            tasks.push(row.map_err(plugin_io_err("read stale task"))?);
         }
         Ok(tasks)
     }
@@ -2199,7 +2121,7 @@ impl TasksDb {
                 "UPDATE tasks SET worktree_path = NULL, updated_at = ?1 WHERE id = ?2",
                 params![now, task_id],
             )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("clear_worktree: {}", e)))?;
+            .map_err(plugin_io_err("clear_worktree"))?;
 
         if updated == 0 {
             return Err(tau_agent_plugin::Error::Io(format!(
