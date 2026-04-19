@@ -171,6 +171,19 @@ fn execute_bash(
 // Merge execution
 // ---------------------------------------------------------------------------
 
+/// Build the shell command used in step 7b to delete a task's branch
+/// after a successful merge.
+///
+/// The command uses `git -C <project_dir>` so it is cwd-agnostic: the
+/// log-session that runs it was created with `cwd = worktree_path`,
+/// and step 7a deletes that worktree before we reach 7b. Without
+/// `-C`, bash fails to `chdir` into the missing cwd and returns
+/// ENOENT before git is even exec'd — the silent post-merge
+/// branch-leak reported in task #581.
+fn build_branch_delete_command(project_dir: &str, branch: &str) -> String {
+    format!("git -C '{}' branch -D {}", project_dir, branch)
+}
+
 /// Execute the merge sequence for a task.
 ///
 /// The task must already be in `merging` state with a worktree.
@@ -443,6 +456,23 @@ pub fn merge_task_for_caller(
     // 7a'. Update session cwds: any session still pointing at the removed
     // worktree should be moved back to the project root so that plugin
     // respawns don't fail with "No such file or directory".
+    //
+    // The `log_session` we created in step 3 was given `cwd =
+    // worktree_path` and is NOT recorded in `task_sessions` (it is
+    // purely local to this merge), so the DB-driven loop below would
+    // miss it. Move its cwd explicitly first — otherwise subsequent
+    // `execute_bash` calls on the log session spawn bash with a
+    // deleted cwd and fail with `ENOENT` before the command runs
+    // (see task #581).
+    let _ = server_request(
+        writer,
+        reader,
+        Request::SetCwd {
+            session_id: log_session.clone(),
+            cwd: project_dir.to_string(),
+            caller_session_id: None,
+        },
+    );
     if let Ok(sessions) = db.get_sessions(task_id) {
         for ts in &sessions {
             let _ = server_request(
@@ -457,13 +487,19 @@ pub fn merge_task_for_caller(
         }
     }
 
-    // 7b. Delete the task branch (no longer needed after merge)
-    let (output, br_err) = execute_bash(
-        writer,
-        reader,
-        &log_session,
-        &format!("git branch -D {}", branch),
-    )?;
+    // 7b. Delete the task branch (no longer needed after merge).
+    //
+    // Use `git -C <project_dir>` so the command is cwd-agnostic: the
+    // log_session was created with `cwd = worktree_path`, which step
+    // 7a just deleted. Before task #581 this was plain `git branch
+    // -D <branch>`, and bash's `chdir` into the missing worktree
+    // failed with ENOENT before git ever ran — leaving dead
+    // `task-NNN` branches after every merge. Step 7a' also moves the
+    // log_session's cwd to `project_dir` as a belt-and-braces fix,
+    // but the explicit `-C` here is what makes this step robust
+    // against any future cwd weirdness.
+    let br_cmd = build_branch_delete_command(project_dir, branch);
+    let (output, br_err) = execute_bash(writer, reader, &log_session, &br_cmd)?;
     log.push_str(&output);
     if br_err {
         eprintln!(
@@ -1091,6 +1127,181 @@ command = "cargo test"
     }
 
     // ----- merge state validation -----
+
+    // ----- branch-delete command construction (task #581) -----
+
+    #[test]
+    fn test_build_branch_delete_command_uses_c_flag() {
+        // The -C flag is what makes the command cwd-agnostic so it
+        // still works after step 7a deletes the worktree that is the
+        // log-session's cwd. Before task #581, the command was plain
+        // `git branch -D <branch>` and bash silently failed to chdir
+        // into the missing worktree.
+        let cmd = build_branch_delete_command("/home/user/project", "task-42");
+        assert!(
+            cmd.contains("git -C '/home/user/project'"),
+            "expected -C <project_dir>, got: {}",
+            cmd
+        );
+        assert!(
+            cmd.contains("branch -D task-42"),
+            "expected branch -D <branch>, got: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_branch_delete_command_project_dir_comes_before_branch() {
+        // Guard against someone accidentally swapping the argument
+        // order — `git branch -C` means something entirely different
+        // (copy branch).
+        let cmd = build_branch_delete_command("/repo", "task-7");
+        let c_idx = cmd.find("-C").expect("-C present");
+        let d_idx = cmd.find("-D").expect("-D present");
+        assert!(
+            c_idx < d_idx,
+            "expected -C before -D so it binds to the git top-level flag, got: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_build_branch_delete_command_does_not_depend_on_cwd() {
+        // Property we care about: regardless of where the shell is
+        // invoked from, the command carries enough info to find the
+        // repo. Exercise this by actually running it from /tmp
+        // against a throwaway git repo.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir");
+
+        // Init a repo, make one commit on main, branch off a
+        // `task-test` branch, then switch back to main so the
+        // task-test branch is deletable.
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("run git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["commit", "--allow-empty", "-qm", "init"]);
+        run(&repo, &["branch", "task-test"]);
+
+        // Run the delete command from /tmp (NOT inside the repo) —
+        // the regression was exactly this case: cwd had nothing to
+        // do with the repo and without `-C` the command failed.
+        let project_dir = repo.to_str().expect("utf8 path");
+        let cmd = build_branch_delete_command(project_dir, "task-test");
+        let tmp_cwd = std::env::temp_dir();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&cmd)
+            .current_dir(&tmp_cwd)
+            .output()
+            .expect("run bash");
+        assert!(
+            out.status.success(),
+            "branch-delete command failed when run from {}: stdout={} stderr={}",
+            tmp_cwd.display(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Confirm the branch is actually gone.
+        let check = std::process::Command::new("git")
+            .args(["show-ref", "--verify", "refs/heads/task-test"])
+            .current_dir(&repo)
+            .output()
+            .expect("run git show-ref");
+        assert!(
+            !check.status.success(),
+            "task-test branch still exists after build_branch_delete_command ran"
+        );
+    }
+
+    #[test]
+    fn test_build_branch_delete_command_survives_missing_cwd() {
+        // Regression for task #581: the log-session's cwd is the
+        // task worktree, which step 7a deletes before step 7b runs.
+        // Simulate that exact sequence: create a dir, cd bash into
+        // it, delete the dir, then run the command. The command
+        // MUST succeed because `-C` pins git to project_dir.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).expect("mkdir repo");
+
+        let run = |cwd: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("run git");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+        run(&repo, &["init", "-q", "-b", "main"]);
+        run(&repo, &["config", "user.email", "t@t"]);
+        run(&repo, &["config", "user.name", "t"]);
+        run(&repo, &["commit", "--allow-empty", "-qm", "init"]);
+        run(&repo, &["branch", "task-581"]);
+
+        // Create a sibling directory that we will delete before
+        // invoking bash — this is the "deleted worktree" scenario.
+        let doomed_cwd = tmp.path().join("doomed-worktree");
+        std::fs::create_dir(&doomed_cwd).expect("mkdir doomed");
+
+        let project_dir = repo.to_str().expect("utf8 path");
+        let cmd = build_branch_delete_command(project_dir, "task-581");
+
+        // Spawn bash with cwd = doomed_cwd, but delete doomed_cwd
+        // *before* we actually invoke it. std::process::Command
+        // delegates chdir to posix_spawn/execvp; if doomed_cwd is
+        // gone, spawn itself fails with ENOENT — exactly the
+        // failure mode described in the bug report.
+        //
+        // So the realistic simulation is: use a parent shell that
+        // deletes the dir itself, then runs the command. If the
+        // command depends on cwd, the parent shell will itself
+        // exit with failure; if the command has `-C`, it doesn't
+        // care about cwd and succeeds.
+        let wrapper = format!(
+            "cd '{}' && cd .. && rm -rf '{}' && {}",
+            doomed_cwd.display(),
+            doomed_cwd.display(),
+            cmd
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&wrapper)
+            .output()
+            .expect("run bash");
+        assert!(
+            out.status.success(),
+            "command failed when cwd was deleted mid-run: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Confirm the branch was actually deleted.
+        let check = std::process::Command::new("git")
+            .args(["show-ref", "--verify", "refs/heads/task-581"])
+            .current_dir(&repo)
+            .output()
+            .expect("run git show-ref");
+        assert!(
+            !check.status.success(),
+            "task-581 branch still exists after the cwd-deleted branch-delete command ran"
+        );
+    }
 
     #[test]
     fn test_merge_result_serialization() {
