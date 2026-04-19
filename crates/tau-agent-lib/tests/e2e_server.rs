@@ -2291,9 +2291,6 @@ fn server_execute_tool_nonexistent_session() {
 // Log provider tests
 // ---------------------------------------------------------------------------
 
-/// Spin up a test server registered with ONLY the `log` provider and model.
-/// Thin wrapper retained for readability — see
-/// [`TestServer::start_log_only`] in `common/mod.rs`.
 fn create_log_session(sock_path: &std::path::Path) -> String {
     let conn = UnixStream::connect(sock_path).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(10)))
@@ -3835,6 +3832,12 @@ fn get_session_ancestors_missing_mid_parent() {
 
 /// Helper: start a server bound to the given socket+db with the given
 /// queued mock responses. Returns the join handle of the server task.
+///
+/// Deliberately **not** routed through `TestServer::start_with_config`
+/// (catalog #10, task #609): the seamless-restart tests need to reuse
+/// the same socket+db across multiple server lifetimes, so the caller
+/// owns the tempdir and paths. `start_with_config`'s "create tempdir +
+/// return owning `TestServer`" contract is incompatible with that.
 fn start_restart_server(
     sock_path: &std::path::Path,
     db_path: &std::path::Path,
@@ -4226,12 +4229,6 @@ fn seamless_restart_rejects_new_chat_during_drain() {
 // subscribers never get stuck waiting for a terminal event.
 // ---------------------------------------------------------------------------
 
-/// Start a test server configured with a mock-API model whose `provider`
-/// slug is a bogus/unregistered string so `resolve_api_key` returns
-/// `None` and the agent-runner early-returns `Err(NoApiKey)` at
-/// `agent_runner.rs:344`. See [`TestServer::start_without_api_key`] in
-/// `common/mod.rs` for the actual implementation.
-///
 /// A `Chat` request on a session whose provider has no API key must emit
 /// **both** `Response::Error` and `Response::AgentDone` (in that order),
 /// and the Error must precede AgentDone on the subscription stream. This
@@ -4413,12 +4410,6 @@ fn subscriber_sees_error_then_agent_done_on_no_api_key() {
 // no-agent-loop (log) model from its parent.
 // ---------------------------------------------------------------------------
 
-/// Spin up a test server registered with BOTH the mock provider (as the
-/// default model) and the log provider. Needed for task #590: we want to
-/// create a `log`-model placeholder session and then verify that a child
-/// created with `model = None` does NOT inherit `log` from the parent.
-/// See [`TestServer::start_mock_plus_log`] in `common/mod.rs`.
-///
 /// Regression for task #590.
 ///
 /// Before the fix, creating a session with `model = None` and a `log`-
