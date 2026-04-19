@@ -31,6 +31,13 @@ pub struct Task {
     /// scheduler's eligibility predicate skips it. Released via
     /// `update_task` with `held: Some(false)`.
     pub held: bool,
+    /// The task's *placeholder session* — a non-LLM (`model = "log"`)
+    /// session that owns every other session spawned for this task
+    /// (planner, refiner, worker, reviewer, merge, future automation).
+    /// `None` for tasks created before task #561 introduced placeholders;
+    /// dispatch helpers fall back to the legacy parenting rule in that
+    /// case. See `create_placeholder_session` in `tasks.rs`.
+    pub placeholder_session_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -276,6 +283,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id TEXT,
     skip_review INTEGER NOT NULL DEFAULT 0,
     held INTEGER NOT NULL DEFAULT 0,
+    placeholder_session_id TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -488,6 +496,26 @@ impl TasksDb {
                 .map_err(|e| tau_agent_plugin::Error::Io(format!("migrate held: {}", e)))?;
         }
 
+        // Add placeholder_session_id column if it doesn't exist.
+        // Introduced by task #561: every new task gets a non-LLM parent
+        // session that hosts all task-related sub-sessions (planner,
+        // worker, reviewer, merge, …). Existing (in-flight) tasks get
+        // NULL and fall back to the legacy parenting rule.
+        let has_placeholder_session_id: bool = conn
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'placeholder_session_id'",
+            )
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_placeholder_session_id {
+            conn.execute_batch("ALTER TABLE tasks ADD COLUMN placeholder_session_id TEXT;")
+                .map_err(|e| {
+                    tau_agent_plugin::Error::Io(format!("migrate placeholder_session_id: {}", e))
+                })?;
+        }
+
         // Migrate done -> merged/closed terminal states.
         let has_done: bool = conn
             .prepare("SELECT COUNT(*) FROM tasks WHERE state = 'done'")
@@ -581,7 +609,7 @@ impl TasksDb {
         self.conn
             .query_row(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
                         created_at, updated_at
                  FROM tasks WHERE id = ?1",
                 params![id],
@@ -602,7 +630,7 @@ impl TasksDb {
     ) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut sql = String::from(
             "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                    branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                    branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
                     created_at, updated_at
              FROM tasks WHERE project_name = ?1",
         );
@@ -676,7 +704,7 @@ impl TasksDb {
         limit: usize,
     ) -> tau_agent_plugin::Result<Vec<Task>> {
         let sql = "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                          branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                          branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
                           created_at, updated_at
                    FROM tasks
                    WHERE project_name = ?1 AND state = ?2
@@ -1151,7 +1179,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.created_at,
                         t.updated_at
                  FROM task_relations r
                  JOIN tasks t ON t.id = r.to_task
@@ -1183,7 +1211,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.created_at,
                         t.updated_at
                  FROM tasks t
                  WHERE t.project_name = ?1 AND t.state IN ('ready', 'planning')
@@ -1221,7 +1249,7 @@ impl TasksDb {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project_name {
             Some(p) => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved' AND project_name = ?1
@@ -1231,7 +1259,7 @@ impl TasksDb {
             ),
             None => (
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
                         created_at, updated_at
                  FROM tasks
                  WHERE state = 'approved'
@@ -1288,7 +1316,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
                         created_at, updated_at
                  FROM tasks
                  WHERE project_name = ?1
@@ -1363,7 +1391,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
                         created_at, updated_at
                  FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
             )
@@ -1742,7 +1770,7 @@ impl TasksDb {
         if let Some(state) = state_filter {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1 AND t.state = ?2
@@ -1765,7 +1793,7 @@ impl TasksDb {
         } else {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1
@@ -1899,6 +1927,35 @@ impl TasksDb {
         Ok(())
     }
 
+    /// Set the placeholder_session_id for a task — the sid of the task's
+    /// non-LLM (`model = "log"`) placeholder session that parents every
+    /// task-spawned session (planner, worker, reviewer, refiner, merge,
+    /// …). See task #561.
+    pub fn set_placeholder_session_id(
+        &self,
+        task_id: i64,
+        session_id: &str,
+    ) -> tau_agent_plugin::Result<()> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE tasks SET placeholder_session_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![session_id, now, task_id],
+            )
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("set_placeholder_session_id: {}", e))
+            })?;
+
+        if updated == 0 {
+            return Err(tau_agent_plugin::Error::Io(format!(
+                "task {} not found",
+                task_id
+            )));
+        }
+        Ok(())
+    }
+
     /// Find tasks in terminal states (merged/closed/failed) that still have a worktree_path set.
     /// Used for startup cleanup of stale worktrees.
     pub fn get_stale_worktree_tasks(&self) -> tau_agent_plugin::Result<Vec<Task>> {
@@ -1906,7 +1963,7 @@ impl TasksDb {
             .conn
             .prepare(
                 "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held,
+                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id,
                         created_at, updated_at
                  FROM tasks
                  WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
@@ -1975,8 +2032,9 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         require_approval: row.get::<_, i32>(13)? != 0,
         sandbox_profile: row.get(14)?,
         held: row.get::<_, i32>(15)? != 0,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
+        placeholder_session_id: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -5638,6 +5696,7 @@ mod tests {
             require_approval: false,
             sandbox_profile: None,
             held: false,
+            placeholder_session_id: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -6806,6 +6865,105 @@ mod tests {
             .map(|c| c > 0)
             .unwrap();
         assert!(has_held, "migrate() should add the held column");
+    }
+
+    #[test]
+    fn test_placeholder_session_id_migration_adds_column_to_legacy_db() {
+        // Build a legacy schema that predates the placeholder_session_id
+        // column (task #561).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY,
+                project_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'interactive',
+                priority INTEGER DEFAULT 0,
+                parent_id INTEGER REFERENCES tasks(id),
+                tags TEXT,
+                affected_files TEXT,
+                branch TEXT,
+                worktree_path TEXT,
+                session_id TEXT,
+                skip_review INTEGER NOT NULL DEFAULT 0,
+                require_approval INTEGER NOT NULL DEFAULT 0,
+                merge_target TEXT,
+                sandbox_profile TEXT,
+                held INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE task_history (
+                id INTEGER PRIMARY KEY,
+                task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                field TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                session_id TEXT,
+                created_at INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+
+        // Insert a row so we can confirm the migration leaves existing
+        // data intact (with placeholder_session_id = NULL).
+        conn.execute(
+            "INSERT INTO tasks (project_name, title, state, created_at, updated_at) \
+             VALUES ('proj', 'legacy task', 'ready', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let has_col_before: bool = conn
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') \
+                 WHERE name = 'placeholder_session_id'",
+            )
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(!has_col_before);
+
+        TasksDb::migrate(&conn).unwrap();
+
+        let has_col_after: bool = conn
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') \
+                 WHERE name = 'placeholder_session_id'",
+            )
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|c| c > 0)
+            .unwrap();
+        assert!(
+            has_col_after,
+            "migrate() should add the placeholder_session_id column"
+        );
+
+        // Legacy row preserved with NULL placeholder_session_id.
+        let placeholder: Option<String> = conn
+            .prepare("SELECT placeholder_session_id FROM tasks WHERE title = 'legacy task'")
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)))
+            .unwrap();
+        assert!(placeholder.is_none());
+    }
+
+    #[test]
+    fn test_set_placeholder_session_id_roundtrip() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "proj", "p", None, None, None, false, "ready", false, None, None, false,
+            )
+            .unwrap();
+        assert!(task.placeholder_session_id.is_none());
+
+        db.set_placeholder_session_id(task.id, "placeholder-sid")
+            .unwrap();
+        let got = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            got.placeholder_session_id.as_deref(),
+            Some("placeholder-sid")
+        );
     }
 
     #[test]

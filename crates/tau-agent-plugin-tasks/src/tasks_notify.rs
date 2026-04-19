@@ -83,6 +83,21 @@ pub fn task_session_tagline(task: &Task, role: &str) -> String {
     format!("[task {}] {}: {}", task.id, role, title)
 }
 
+/// Tagline for a task's *placeholder* session — the non-LLM session that
+/// groups every other session spawned for this task (planner, worker,
+/// reviewer, refiner, merge, …). No role suffix because the placeholder
+/// spans all roles.
+///
+/// ```text
+/// [task {id}] {title}
+/// ```
+///
+/// The title is truncated the same way as [`task_session_tagline`].
+pub fn task_placeholder_tagline(task: &Task) -> String {
+    let title = truncate_title(&task.title, TAGLINE_TITLE_MAX);
+    format!("[task {}] {}", task.id, title)
+}
+
 /// Best-effort update of a session's tagline via [`Request::SetTagline`].
 ///
 /// Call this when an existing session is reused across a role change
@@ -1198,6 +1213,32 @@ mod tests {
         // All snowmen except the last char.
         let snow_count = title_part.chars().filter(|c| *c == '☃').count();
         assert_eq!(snow_count, TAGLINE_TITLE_MAX - 1);
+    }
+
+    // -----------------------------------------------------------------
+    // task_placeholder_tagline
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn task_placeholder_tagline_basic() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Short title", None, "ready");
+        assert_eq!(
+            task_placeholder_tagline(&task),
+            format!("[task {}] Short title", task.id),
+        );
+    }
+
+    #[test]
+    fn task_placeholder_tagline_truncates_long_titles() {
+        let db = TasksDb::open_memory().expect("db");
+        let t = "x".repeat(100);
+        let task = create_task(&db, &t, None, "ready");
+        let line = task_placeholder_tagline(&task);
+        let prefix = format!("[task {}] ", task.id);
+        let title_part = &line[prefix.len()..];
+        assert_eq!(title_part.chars().count(), TAGLINE_TITLE_MAX);
+        assert!(title_part.ends_with('…'));
     }
 
     #[test]

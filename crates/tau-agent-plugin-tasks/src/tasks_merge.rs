@@ -230,6 +230,10 @@ pub fn merge_task_for_caller(
     let mut log = String::new();
 
     // 3. Create a log-provider session
+    // Task #561: parent the merge session on the task's placeholder so
+    // it nests with the rest of the task's sessions and is cascade-
+    // archived with the placeholder subtree. Pre-561 tasks (no
+    // placeholder) get the legacy `None` parenting.
     let log_session = match server_request(
         writer,
         reader,
@@ -238,7 +242,7 @@ pub fn merge_task_for_caller(
             provider: None,
             system_prompt: None,
             cwd: Some(worktree_path.clone()),
-            parent_id: None,
+            parent_id: task.placeholder_session_id.clone(),
             child_budget: 0,
             tagline: Some(crate::tasks_notify::task_session_tagline(&task, "merge")),
             auto_archive: false,
@@ -463,7 +467,50 @@ pub fn merge_task_for_caller(
     // records `interactive`, etc.), so a `task.session_id` missing from
     // `task_sessions` means we have no role information and cannot safely
     // decide to archive.
-    if let Ok(sessions) = db.get_sessions(task_id) {
+    // Task #561: if the task has a placeholder session, archive it —
+    // `archive_session_tree` cascades to every child (planner, worker,
+    // reviewer, refiner, merge log session, …) in one hop, replacing
+    // the per-role loop below. The loop is retained as a fallback for
+    // tasks that predate task #561 and have no placeholder.
+    //
+    // We deliberately do NOT fall back to archiving `task.session_id` when
+    // it isn't present in `task_sessions`: every codepath that sets
+    // `task.session_id` also records an entry in `task_sessions` with an
+    // explicit role (`assign_task` records `worker`, interactive creation
+    // records `interactive`, etc.), so a `task.session_id` missing from
+    // `task_sessions` means we have no role information and cannot safely
+    // decide to archive.
+    if let Some(ref placeholder_sid) = task.placeholder_session_id {
+        // Tier-3 check: if the caller is inside the placeholder's
+        // subtree, archiving it inline would race with the caller's
+        // own agent loop. Defer to post-idle. The post-idle path still
+        // archives via the role-filter (legacy) — but with the
+        // placeholder present, the subtree cascade covers it
+        // regardless.
+        let caller_inside =
+            caller_in_placeholder_subtree(writer, reader, caller_session_id, placeholder_sid);
+        if caller_inside {
+            if let Some(cid) = caller_session_id {
+                let _ = server_request(
+                    writer,
+                    reader,
+                    Request::EnqueuePostIdleAction {
+                        session_id: cid.to_string(),
+                        action: tau_agent_plugin::PostIdleAction::ArchiveTaskSessions { task_id },
+                    },
+                );
+                log.push_str(
+                    "Deferred task-subtree archival to post-idle (caller is in subtree)\n",
+                );
+            }
+        } else {
+            archive_session(writer, reader, placeholder_sid);
+            log.push_str(&format!(
+                "Archived placeholder session {} (cascades to subtree)\n",
+                placeholder_sid
+            ));
+        }
+    } else if let Ok(sessions) = db.get_sessions(task_id) {
         let (to_archive, to_skip) = sessions_to_archive(&sessions);
 
         // Tier-3 check: if the caller's session is in the to-archive set,
@@ -503,7 +550,10 @@ pub fn merge_task_for_caller(
         }
     }
 
-    // 8. Archive the log session
+    // 8. Archive the log session. When the task has a placeholder, the
+    // log session is its descendant and was already cascade-archived
+    // above — archiving again is idempotent (already-archived sessions
+    // return success), so this line is safe either way.
     archive_session(writer, reader, &log_session);
 
     log.push_str("=== Merge complete ===\n");
@@ -521,6 +571,39 @@ fn archive_session(writer: &mut impl Write, reader: &mut impl BufRead, session_i
             require_ancestor: None,
         },
     );
+}
+
+/// Return `true` when `caller_session_id` is `placeholder_sid` itself or
+/// one of its descendants — i.e. archiving the placeholder would rip the
+/// caller's own session out from under it.
+///
+/// Walks up the caller's ancestor chain via `GetSessionAncestors`
+/// (leaf-first, depth-guarded server-side at 64). Best-effort: returns
+/// `false` on any RPC error, which causes the caller to archive inline
+/// — the retry logic in `post_idle` handles the resulting race.
+fn caller_in_placeholder_subtree(
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+    caller_session_id: Option<&str>,
+    placeholder_sid: &str,
+) -> bool {
+    let Some(caller) = caller_session_id else {
+        return false;
+    };
+    if caller == placeholder_sid {
+        return true;
+    }
+    let sessions = match server_request(
+        writer,
+        reader,
+        Request::GetSessionAncestors {
+            session_id: caller.to_string(),
+        },
+    ) {
+        Ok(Response::SessionAncestors { sessions }) => sessions,
+        _ => return false,
+    };
+    sessions.iter().any(|info| info.id == placeholder_sid)
 }
 
 // ---------------------------------------------------------------------------

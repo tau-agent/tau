@@ -93,20 +93,38 @@ async fn drain_with_policy(state: &SharedState, session_id: &str, policy: Archiv
 async fn execute_action(state: &SharedState, action: &PostIdleAction, policy: ArchiveRetryPolicy) {
     match action {
         PostIdleAction::ArchiveTaskSessions { task_id } => {
-            let sessions = match crate::tasks_db::TasksDb::open_default() {
-                Ok(db) => match db.get_sessions(*task_id) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(task_id = *task_id, %e, "post-idle: get_sessions failed");
-                        return;
-                    }
-                },
+            // Task #561: prefer the placeholder-subtree cascade when the
+            // task has a placeholder session. The server-side
+            // `archive_session_tree` archives the placeholder and every
+            // descendant in one hop, so we never need the per-role loop
+            // for tasks created post-561. Pre-561 tasks (no placeholder)
+            // fall back to the legacy role-filter archival.
+            let (placeholder_sid, sessions) = match crate::tasks_db::TasksDb::open_default() {
+                Ok(db) => {
+                    let placeholder = db
+                        .get_task(*task_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| t.placeholder_session_id);
+                    let sessions = match db.get_sessions(*task_id) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(task_id = *task_id, %e, "post-idle: get_sessions failed");
+                            return;
+                        }
+                    };
+                    (placeholder, sessions)
+                }
                 Err(e) => {
                     tracing::warn!(task_id = *task_id, %e, "post-idle: open tasks db failed");
                     return;
                 }
             };
-            execute_archive_task_sessions(state, &sessions, policy).await;
+            if let Some(sid) = placeholder_sid {
+                archive_with_retries(state, &sid, policy).await;
+            } else {
+                execute_archive_task_sessions(state, &sessions, policy).await;
+            }
         }
     }
 }

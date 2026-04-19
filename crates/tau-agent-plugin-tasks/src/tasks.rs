@@ -658,6 +658,25 @@ fn handle_task_create(
         hold,
     ) {
         Ok(task) => {
+            // Task #561: every new task gets a non-LLM placeholder
+            // session that owns every task-related session spawned
+            // subsequently (planner, worker, reviewer, merge, ...).
+            // Placeholder creation is best-effort — if it fails, the
+            // task still exists and dispatch paths fall back to the
+            // legacy parenting rule.
+            let placeholder_sid =
+                create_placeholder_session(db, &task, resolver, session_id, writer, reader);
+
+            // Re-fetch so the task carries the newly-set
+            // `placeholder_session_id`; subsequent dispatch paths (the
+            // interactive block below + the scheduler event dispatched
+            // for ready/planning) will read it from the fresh copy.
+            let task = match db.get_task(task.id) {
+                Ok(Some(t)) => t,
+                _ => task,
+            };
+            let _ = &placeholder_sid; // suppress unused warning on fallback paths
+
             // Subtasks start in ready or planning state — trigger a schedule pass.
             // Held tasks stay parked: the scheduler skips them until released
             // via task_update(hold=false).
@@ -730,6 +749,123 @@ fn handle_task_create(
     }
 }
 
+/// Create a task-placeholder session for `task` — a non-LLM
+/// (`model = "log"`) session that owns every task-related session spawned
+/// subsequently (planner, refiner, worker, reviewer, merge, …). See
+/// task #561.
+///
+/// Parenting rule:
+/// * Top-level task: the placeholder is parented on the root of the session
+///   that created the task, so new work surfaces in the user's primary
+///   session tree regardless of where in the tree `task_create` was invoked
+///   from.
+/// * Subtask: the placeholder is parented on the **parent task's**
+///   placeholder (not on the parent task's worker or planner). If the
+///   parent task predates this change and has no placeholder, falls back
+///   to the parent task's `session_id`.
+///
+/// The resulting sid is persisted on the task row via
+/// [`TasksDb::set_placeholder_session_id`]. Placeholder creation is
+/// best-effort: on failure, the task itself still exists and dispatch
+/// helpers fall back to the legacy parenting rule via the `None`
+/// `placeholder_session_id`.
+fn create_placeholder_session(
+    db: &TasksDb,
+    task: &crate::tasks_db::Task,
+    resolver: &ProjectResolver,
+    creator_session_id: Option<&str>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<String> {
+    use tau_agent_plugin::{Request, Response};
+
+    // Placeholder `cwd` must be valid for CreateSession. The placeholder
+    // never runs tools, but the server validates the directory exists.
+    let project_path = match resolver.resolve(&task.project_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "tasks: failed to resolve project '{}' for placeholder session: {}",
+                task.project_name, e
+            );
+            return None;
+        }
+    };
+
+    // Parenting.
+    let parent_id = if let Some(pid) = task.parent_id {
+        // Subtask: nest the placeholder under the parent task's placeholder.
+        // Fall back to the parent task's current session_id if the parent
+        // predates task #561 and has no placeholder.
+        match db.get_task(pid) {
+            Ok(Some(parent)) => parent
+                .placeholder_session_id
+                .clone()
+                .or_else(|| parent.session_id.clone()),
+            _ => None,
+        }
+    } else {
+        // Top-level: anchor on the creator's session root.
+        creator_session_id.and_then(|sid| tasks_scheduler::find_root_session(sid, writer, reader))
+    };
+
+    let create_req = Request::CreateSession {
+        model: Some("log".to_string()),
+        provider: None,
+        system_prompt: None,
+        cwd: Some(project_path),
+        parent_id,
+        // Placeholder owns the whole task subtree (planner + refiner +
+        // worker + reviewer + merge + a few extras). 16 matches the CLI
+        // default and leaves room for retries / sub-spawns.
+        child_budget: 16,
+        tagline: Some(crate::tasks_notify::task_placeholder_tagline(task)),
+        // Placeholder outlives every individual phase session; we archive
+        // it explicitly when the task reaches a terminal state.
+        auto_archive: false,
+        // `notify_parent: false` prevents completion-notify amplification:
+        // the placeholder's parent (orchestrator / user root) already
+        // receives task-terminal notifications via the explicit recipients
+        // list in `tasks_notify::collect_recipients`.
+        notify_parent: false,
+        project_name: Some(task.project_name.clone()),
+        sandbox_profile: task.sandbox_profile.clone(),
+    };
+
+    match crate::tasks_scheduler::server_request(writer, reader, create_req) {
+        Ok(Response::SessionCreated { session_id }) => {
+            if let Err(e) = db.set_placeholder_session_id(task.id, &session_id) {
+                eprintln!(
+                    "tasks: placeholder session {} created for task {} but DB update failed: {}",
+                    session_id, task.id, e
+                );
+            }
+            Some(session_id)
+        }
+        Ok(Response::Error { message }) => {
+            eprintln!(
+                "tasks: failed to create placeholder session for task {}: {}",
+                task.id, message
+            );
+            None
+        }
+        Ok(_) => {
+            eprintln!(
+                "tasks: unexpected response creating placeholder session for task {}",
+                task.id
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "tasks: error creating placeholder session for task {}: {}",
+                task.id, e
+            );
+            None
+        }
+    }
+}
+
 /// Create a fresh session for an interactive task.
 ///
 /// Returns the new session ID on success, or None if session creation fails
@@ -761,14 +897,20 @@ fn create_interactive_session(
     let model =
         parent_session_id.and_then(|sid| tasks_scheduler::get_session_model(sid, writer, reader));
 
-    // Session-tree parent: top-level tasks re-parent onto the triggering
+    // Session-tree parent: Task #561 — if the task has a placeholder
+    // session, parent on it; otherwise fall back to the legacy rule.
+    //
+    // Legacy rule: top-level tasks re-parent onto the triggering
     // session's root so new work surfaces in the user's primary tree
     // (task #512). Subtasks keep the current session as parent.
-    let session_parent = if task.parent_id.is_none() {
-        parent_session_id.and_then(|sid| tasks_scheduler::find_root_session(sid, writer, reader))
-    } else {
-        parent_session_id.map(String::from)
-    };
+    let session_parent = task.placeholder_session_id.clone().or_else(|| {
+        if task.parent_id.is_none() {
+            parent_session_id
+                .and_then(|sid| tasks_scheduler::find_root_session(sid, writer, reader))
+        } else {
+            parent_session_id.map(String::from)
+        }
+    });
 
     let create_req = Request::CreateSession {
         model,
@@ -1639,9 +1781,25 @@ fn auto_archive_task_session(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) {
-    // Archive all task sessions: worker, reviewer, refiner, etc.
+    // Task #561: if the task has a placeholder session, archive that —
+    // the server-side `archive_session_tree` cascades to every child
+    // (planner/worker/reviewer/refiner/merge), replacing the per-role
+    // loop below in the common case. The role loop is kept as a
+    // fallback for tasks that predate task #561 and have no
+    // placeholder.
     let mut archived: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Ok(sessions) = db.get_sessions(task.id) {
+    if let Some(ref placeholder_sid) = task.placeholder_session_id {
+        let _ = crate::tasks_scheduler::server_request(
+            writer,
+            reader,
+            tau_agent_plugin::Request::ArchiveSession {
+                session_id: placeholder_sid.clone(),
+                require_ancestor: None,
+            },
+        );
+        archived.insert(placeholder_sid.clone());
+    } else if let Ok(sessions) = db.get_sessions(task.id) {
+        // Legacy fallback: archive every recorded session individually.
         for ts in &sessions {
             let _ = crate::tasks_scheduler::server_request(
                 writer,
@@ -3234,8 +3392,9 @@ mod tests {
         assert_eq!(task["title"], "Test task");
         assert_eq!(task["priority"], 3);
         assert_eq!(task["state"], "interactive");
-        // Interactive task gets a fresh session via ServerRequest
-        assert_eq!(task["session_id"], "mock-s1");
+        // Interactive task gets a fresh session via ServerRequest.
+        // Task #561: mock-s1 is the placeholder, mock-s2 is the interactive session.
+        assert_eq!(task["session_id"], "mock-s2");
 
         // Check message was created
         let messages = db.get_messages(task_id).unwrap();
@@ -5094,8 +5253,10 @@ mod tests {
         let task: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(task["state"], "interactive");
-        // session_id should be the NEW session, not the creating session
-        assert_eq!(task["session_id"], "mock-s1");
+        // mock-s1 is the task's placeholder session (task #561), mock-s2 is the
+        // fresh interactive session the user will drive.
+        assert_eq!(task["session_id"], "mock-s2");
+        assert_eq!(task["placeholder_session_id"], "mock-s1");
 
         // Check task_sessions table has both creator and interactive records
         let task_id = task["id"].as_i64().unwrap();
@@ -5105,7 +5266,7 @@ mod tests {
             .iter()
             .map(|s| (s.session_id.as_str(), s.role.as_str()))
             .collect();
-        assert!(roles.contains(&("mock-s1", "interactive")));
+        assert!(roles.contains(&("mock-s2", "interactive")));
         assert!(roles.contains(&("creating-session", "creator")));
     }
 
@@ -5134,14 +5295,16 @@ mod tests {
         let task: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(task["state"], "interactive");
-        // Session still created even without a parent session
-        assert_eq!(task["session_id"], "mock-s1");
+        // Session still created even without a parent session.
+        // mock-s1 is the task's placeholder (task #561), mock-s2 the interactive session.
+        assert_eq!(task["session_id"], "mock-s2");
+        assert_eq!(task["placeholder_session_id"], "mock-s1");
 
         // Only the interactive session recorded (no creator since no parent session)
         let task_id = task["id"].as_i64().unwrap();
         let sessions = db.get_sessions(task_id).unwrap();
         assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].session_id, "mock-s1");
+        assert_eq!(sessions[0].session_id, "mock-s2");
         assert_eq!(sessions[0].role, "interactive");
     }
 
@@ -5249,12 +5412,13 @@ mod tests {
         );
     }
 
-    /// Subtask session must keep its hierarchy parent (the calling
-    /// session), NOT re-parent onto the root — grouping subtasks under
-    /// their orchestrator is how task boards stay organised.
+    /// Subtask session's placeholder must parent on the **parent task's
+    /// placeholder** (task #561), not on the orchestrator that called
+    /// `task_create`. Subtask's phase sessions parent on the subtask's
+    /// own placeholder.
     ///
-    /// Regression test for task #512 — verifies the top-level-only scope
-    /// of root-parenting.
+    /// Regression test for the parenting rules from task #512 (top-level
+    /// vs. subtask) and task #561 (placeholder nesting).
     #[test]
     fn test_subtask_session_keeps_hierarchy_parent() {
         let db = TasksDb::open_memory().unwrap();
@@ -5316,20 +5480,52 @@ mod tests {
         let mut shared = writer.shared.lock().unwrap();
         shared.process_pending();
         let all_written = shared.written_lines.join("\n");
-        let create_line = all_written
+        let create_lines: Vec<&str> = all_written
             .lines()
-            .find(|l| l.contains("\"create_session\""))
-            .expect("expected a CreateSession request line");
-        let parsed: serde_json::Value = serde_json::from_str(create_line).unwrap();
-        let parent_id_sent = parsed
-            .pointer("/request/parent_id")
-            .and_then(|v| v.as_str());
+            .filter(|l| l.contains("\"create_session\""))
+            .collect();
         assert_eq!(
-            parent_id_sent,
-            Some("orchestrator"),
-            "subtask session should keep its hierarchy parent (the calling session); \
+            create_lines.len(),
+            2,
+            "expected two create_session requests for subtask: placeholder + interactive; got: {}",
+            all_written
+        );
+
+        // Task #561: the subtask's placeholder is parented on the parent
+        // task's placeholder (mock-s1). Parent task was created first in
+        // this test, so its placeholder is mock-s1 and its interactive
+        // session is mock-s2. The subtask's placeholder is the FIRST
+        // create_session we see after the drain.
+        let placeholder_req: serde_json::Value = serde_json::from_str(create_lines[0]).unwrap();
+        assert_eq!(
+            placeholder_req
+                .pointer("/request/model")
+                .and_then(|v| v.as_str()),
+            Some("log"),
+            "first create_session should be the placeholder",
+        );
+        assert_eq!(
+            placeholder_req
+                .pointer("/request/parent_id")
+                .and_then(|v| v.as_str()),
+            Some("mock-s1"),
+            "subtask placeholder should be parented on the parent task's placeholder; \
              full request: {}",
-            create_line
+            create_lines[0]
+        );
+
+        // The subtask's interactive session (second create_session) is
+        // parented on the subtask's placeholder (mock-s3 — counter was
+        // at 2 before this task's placeholder was created).
+        let interactive_req: serde_json::Value = serde_json::from_str(create_lines[1]).unwrap();
+        assert_eq!(
+            interactive_req
+                .pointer("/request/parent_id")
+                .and_then(|v| v.as_str()),
+            Some("mock-s3"),
+            "subtask interactive session should be parented on the subtask's placeholder; \
+             full request: {}",
+            create_lines[1]
         );
     }
 
@@ -5375,8 +5571,291 @@ mod tests {
         let subtask: serde_json::Value = serde_json::from_str(&text).unwrap();
 
         assert_eq!(subtask["state"], "planning");
-        // Subtask should NOT have session auto-linked (it's not interactive)
+        // Subtask should NOT have a phase session auto-linked (it's not interactive).
         assert!(subtask["session_id"].is_null());
+        // But task #561 does create a placeholder session for every new
+        // task, including planning-state subtasks.
+        assert_eq!(
+            subtask["placeholder_session_id"].as_str(),
+            Some("mock-s3"),
+            "subtask should get a placeholder (task #561); full: {}",
+            subtask
+        );
+    }
+
+    // ----- placeholder session (task #561) tests -----
+
+    /// Creating any task spawns a non-LLM placeholder session via
+    /// CreateSession(model="log") and records its sid on the task row.
+    #[test]
+    fn test_task_create_spawns_placeholder_with_log_model() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Placeholder test",
+                "initial_state": "planning",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("creator"),
+                tool_call_id: "tc1",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let created: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = created["id"].as_i64().unwrap();
+
+        // The task row carries the placeholder sid.
+        assert_eq!(
+            created["placeholder_session_id"].as_str(),
+            Some("mock-s1"),
+            "task row should have placeholder_session_id set; full: {}",
+            created
+        );
+
+        // Exactly one CreateSession went out (planning tasks do not create
+        // a phase session at task_create time — the scheduler dispatches
+        // the planner session later). That CreateSession is the
+        // placeholder with model="log" and the placeholder tagline.
+        let shared = writer.shared.lock().unwrap();
+        let create_lines: Vec<&String> = shared
+            .written_lines
+            .iter()
+            .filter(|l| l.contains("\"create_session\""))
+            .collect();
+        assert_eq!(
+            create_lines.len(),
+            1,
+            "expected exactly one create_session (the placeholder) for a planning task; got: {:?}",
+            create_lines
+        );
+        let req: serde_json::Value = serde_json::from_str(create_lines[0]).unwrap();
+        assert_eq!(
+            req.pointer("/request/model").and_then(|v| v.as_str()),
+            Some("log"),
+            "placeholder must use model=log",
+        );
+        assert_eq!(
+            req.pointer("/request/notify_parent")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "placeholder must not notify its parent",
+        );
+        assert_eq!(
+            req.pointer("/request/child_budget")
+                .and_then(|v| v.as_i64()),
+            Some(16),
+            "placeholder must have child_budget=16",
+        );
+        assert_eq!(
+            req.pointer("/request/auto_archive")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "placeholder must not auto-archive (outlives its phase sessions)",
+        );
+        let expected_tag = format!("[task {}] Placeholder test", task_id);
+        assert_eq!(
+            req.pointer("/request/tagline").and_then(|v| v.as_str()),
+            Some(expected_tag.as_str()),
+            "placeholder tagline must be the no-role form",
+        );
+    }
+
+    /// A subtask's placeholder is parented on the *parent task's
+    /// placeholder*, not on the parent task's phase session or on the
+    /// caller.
+    #[test]
+    fn test_subtask_placeholder_parents_on_parent_task_placeholder() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Parent task — planning-state so only its placeholder is created.
+        let parent_result = handle_task_create(
+            &db,
+            &serde_json::json!({"title": "Parent", "initial_state": "planning"}),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("creator"),
+                tool_call_id: "tc-parent",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let parent: serde_json::Value =
+            serde_json::from_str(&extract_text(&parent_result)).unwrap();
+        let parent_id = parent["id"].as_i64().unwrap();
+        assert_eq!(parent["placeholder_session_id"].as_str(), Some("mock-s1"));
+
+        // Drain written_lines so we only inspect the subtask's CreateSession.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.process_pending();
+            shared.written_lines.clear();
+        }
+
+        // Subtask — also planning-state; again, only its placeholder is created.
+        let subtask_result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Child",
+                "parent_id": parent_id,
+                "initial_state": "planning",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("creator"),
+                tool_call_id: "tc-child",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!subtask_result.is_error);
+
+        let shared = writer.shared.lock().unwrap();
+        let create_lines: Vec<&String> = shared
+            .written_lines
+            .iter()
+            .filter(|l| l.contains("\"create_session\""))
+            .collect();
+        assert_eq!(
+            create_lines.len(),
+            1,
+            "expected exactly one create_session (the subtask's placeholder)"
+        );
+        let req: serde_json::Value = serde_json::from_str(create_lines[0]).unwrap();
+        assert_eq!(
+            req.pointer("/request/parent_id").and_then(|v| v.as_str()),
+            Some("mock-s1"),
+            "subtask placeholder parent_id should be the parent task's placeholder \
+             (mock-s1), not the caller (creator). full: {}",
+            create_lines[0]
+        );
+    }
+
+    /// Tasks without a placeholder (pre-561 / placeholder creation
+    /// failure) fall back to legacy parenting so in-flight tasks still
+    /// work and `auto_archive_task_session` still archives their role
+    /// sessions individually.
+    #[test]
+    fn test_auto_archive_falls_back_to_role_loop_without_placeholder() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Seed a task with no placeholder but two recorded phase sessions.
+        let task = db
+            .create_task(
+                "test-project",
+                "legacy",
+                None,
+                None,
+                None,
+                true,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.record_session(task.id, "legacy-planner", "planner")
+            .unwrap();
+        db.record_session(task.id, "legacy-worker", "worker")
+            .unwrap();
+        assert!(task.placeholder_session_id.is_none());
+
+        auto_archive_task_session(&db, &task, &resolver, &mut writer, &mut reader);
+
+        let shared = writer.shared.lock().unwrap();
+        let archive_targets: Vec<Option<&str>> = shared
+            .written_lines
+            .iter()
+            .filter(|l| l.contains("\"archive_session\""))
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v.pointer("/request/session_id")
+                    .and_then(|x| x.as_str())
+                    .map(|s| match s {
+                        "legacy-planner" => "legacy-planner",
+                        "legacy-worker" => "legacy-worker",
+                        _ => "other",
+                    })
+            })
+            .collect();
+        assert!(
+            archive_targets.contains(&Some("legacy-planner"))
+                && archive_targets.contains(&Some("legacy-worker")),
+            "role loop should archive both recorded phase sessions; got: {:?}",
+            archive_targets
+        );
+    }
+
+    /// When the task has a placeholder, `auto_archive_task_session`
+    /// archives the placeholder only (which the server cascades to
+    /// every descendant). The per-role loop is skipped.
+    #[test]
+    fn test_auto_archive_cascades_via_placeholder() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "p561",
+                None,
+                None,
+                None,
+                true,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.set_placeholder_session_id(task.id, "placeholder-sid")
+            .unwrap();
+        db.record_session(task.id, "planner-sid", "planner")
+            .unwrap();
+        db.record_session(task.id, "worker-sid", "worker").unwrap();
+        let task = db.get_task(task.id).unwrap().unwrap();
+
+        auto_archive_task_session(&db, &task, &resolver, &mut writer, &mut reader);
+
+        let shared = writer.shared.lock().unwrap();
+        let archive_requests: Vec<String> = shared
+            .written_lines
+            .iter()
+            .filter(|l| l.contains("\"archive_session\""))
+            .filter_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                v.pointer("/request/session_id")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        // Exactly one ArchiveSession request — for the placeholder.
+        // (task.session_id is None, so the follow-up session_id archive
+        // does not fire.)
+        assert_eq!(
+            archive_requests,
+            vec!["placeholder-sid".to_string()],
+            "auto_archive should archive only the placeholder when set",
+        );
     }
 
     // ----- auto-archive on terminal state tests -----
