@@ -460,13 +460,6 @@ pub fn merge_task_for_caller(
     // out from under the user. See `ARCHIVABLE_ROLES` and
     // `sessions_to_archive` at the top of this module.
     //
-    // We deliberately do NOT fall back to archiving `task.session_id` when
-    // it isn't present in `task_sessions`: every codepath that sets
-    // `task.session_id` also records an entry in `task_sessions` with an
-    // explicit role (`assign_task` records `worker`, interactive creation
-    // records `interactive`, etc.), so a `task.session_id` missing from
-    // `task_sessions` means we have no role information and cannot safely
-    // decide to archive.
     // Task #561: if the task has a placeholder session, archive it —
     // `archive_session_tree` cascades to every child (planner, worker,
     // reviewer, refiner, merge log session, …) in one hop, replacing

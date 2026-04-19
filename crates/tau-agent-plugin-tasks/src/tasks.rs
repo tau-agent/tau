@@ -664,8 +664,7 @@ fn handle_task_create(
             // Placeholder creation is best-effort — if it fails, the
             // task still exists and dispatch paths fall back to the
             // legacy parenting rule.
-            let placeholder_sid =
-                create_placeholder_session(db, &task, resolver, session_id, writer, reader);
+            let _ = create_placeholder_session(db, &task, resolver, session_id, writer, reader);
 
             // Re-fetch so the task carries the newly-set
             // `placeholder_session_id`; subsequent dispatch paths (the
@@ -675,7 +674,6 @@ fn handle_task_create(
                 Ok(Some(t)) => t,
                 _ => task,
             };
-            let _ = &placeholder_sid; // suppress unused warning on fallback paths
 
             // Subtasks start in ready or planning state — trigger a schedule pass.
             // Held tasks stay parked: the scheduler skips them until released
@@ -1645,15 +1643,16 @@ fn handle_task_update(
             // participates in the recipient set and sees the transition
             // that spawned it in its own history.
             //
-            // Terminal transitions (merged / closed) are handled inside
-            // their dedicated block below: they must fire BEFORE
-            // `auto_archive_task_session`, otherwise the soon-to-be
-            // archived worker/reviewer sessions would be filtered out of
-            // the recipient set.
+            // Terminal transitions (merged / closed / failed) are
+            // handled inside their dedicated block below: they must
+            // fire BEFORE `auto_archive_task_session`, otherwise the
+            // soon-to-be archived worker/reviewer sessions would be
+            // filtered out of the recipient set.
             if let Some(ref old) = old_state
                 && &task.state != old
                 && task.state != "merged"
                 && task.state != "closed"
+                && task.state != "failed"
             {
                 let context = match (old.as_str(), task.state.as_str()) {
                     ("review", "active") => Some("rework requested"),
@@ -1675,9 +1674,17 @@ fn handle_task_update(
                 );
             }
 
-            // When a task transitions to a terminal state, auto-archive its session
-            // and notify the parent task's session.
-            if task.state == "merged" || task.state == "closed" {
+            // When a task transitions to a terminal state, auto-archive its
+            // session and notify the parent task's session. Task #561 adds
+            // `failed` to the terminal set: the placeholder-and-cascade
+            // model relies on placeholders being archived at every
+            // terminal state, otherwise a failed task's placeholder
+            // lingers in the tree indefinitely. If the user later
+            // transitions `failed` back to `active`, a fresh worker
+            // session is dispatched (since `find_reusable_session`
+            // filters out archived sessions); it will parent onto the
+            // now-archived placeholder, which the server tolerates.
+            if task.state == "merged" || task.state == "closed" || task.state == "failed" {
                 // Emit observational state-change broadcast BEFORE archiving
                 // so the still-live worker/reviewer/... sessions receive the
                 // terminal info-message in their own history.  (Archived
@@ -5855,6 +5862,77 @@ mod tests {
             archive_requests,
             vec!["placeholder-sid".to_string()],
             "auto_archive should archive only the placeholder when set",
+        );
+    }
+
+    /// Task #561 extends the auto-archive terminal-state gating to
+    /// include `failed` so failed tasks' placeholders don't linger in
+    /// the tree. Transitioning a task to `failed` via `handle_task_update`
+    /// must archive the placeholder via the same cascade path.
+    #[test]
+    fn test_failed_state_archives_placeholder() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Failed archive",
+                None,
+                None,
+                None,
+                true,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        db.set_placeholder_session_id(task.id, "failed-placeholder")
+            .unwrap();
+        // Advance to a state from which `failed` is reachable.
+        db.assign_task(task.id, "worker-session").unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "failed"}),
+            Some("worker-session"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "handler error: {:?}",
+            extract_text(&result)
+        );
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "failed");
+
+        // The placeholder-cascade archive request must have been sent.
+        let shared = writer.shared.lock().unwrap();
+        let archive_requests: Vec<String> = shared
+            .written_lines
+            .iter()
+            .filter(|l| l.contains("\"archive_session\""))
+            .filter_map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                v.pointer("/request/session_id")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(
+            archive_requests
+                .iter()
+                .any(|sid| sid == "failed-placeholder"),
+            "failed transition should archive the placeholder; archive_requests: {:?}",
+            archive_requests,
         );
     }
 
