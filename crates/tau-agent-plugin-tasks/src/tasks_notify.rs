@@ -198,7 +198,14 @@ fn collect_recipients(
         }
     }
 
-    // 5. Filter archived sessions.
+    // 5. Placeholder session (task #574). The placeholder owns the
+    //    task's session subtree and accumulates a timeline of the task's
+    //    life; it receives every legitimate state transition.
+    if let Some(ref sid) = task.placeholder_session_id {
+        set.insert(sid.clone());
+    }
+
+    // 6. Filter archived sessions.
     set.into_iter()
         .filter(|sid| !is_session_archived(sid, writer, reader))
         .collect()
@@ -348,6 +355,176 @@ pub fn notify_state_change_split(
             },
         );
     }
+
+    // Terminal-state summary (task #574). When a task reaches a
+    // terminal state, post a closing summary to the placeholder so the
+    // timeline has a clean final line.
+    if is_terminal_state(&task.state) {
+        if let Some(ref placeholder_sid) = task.placeholder_session_id {
+            let summary = format_terminal_summary(db, task);
+            let _ = server_request(
+                writer,
+                reader,
+                tau_agent_plugin::Request::QueueInfo {
+                    target_session_id: placeholder_sid.clone(),
+                    text: summary,
+                },
+            );
+        }
+    }
+}
+
+/// True when `state` is one of the task state-machine's terminal states.
+fn is_terminal_state(state: &str) -> bool {
+    matches!(state, "merged" | "closed" | "failed")
+}
+
+/// Format the human-readable terminal summary posted to the placeholder
+/// on transitions into `merged` / `closed` / `failed`.
+///
+/// ```text
+/// Task #{id} {merged|closed|failed}. {count} sessions, {duration} elapsed.
+/// ```
+fn format_terminal_summary(db: &TasksDb, task: &Task) -> String {
+    let session_count = db.get_sessions(task.id).map(|v| v.len()).unwrap_or(0);
+    let elapsed_ms = task.updated_at.saturating_sub(task.created_at);
+    let elapsed = format_duration_ms(elapsed_ms);
+    format!(
+        "Task #{} {}. {} session{}, {} elapsed.",
+        task.id,
+        task.state,
+        session_count,
+        if session_count == 1 { "" } else { "s" },
+        elapsed,
+    )
+}
+
+/// Format a duration in milliseconds as a short human string.
+/// Examples: `42ms`, `3.4s`, `1m23s`, `2h05m`, `1d03h`.
+fn format_duration_ms(ms: i64) -> String {
+    if ms < 0 {
+        return "0ms".to_string();
+    }
+    let ms = ms as u64;
+    if ms < 1_000 {
+        return format!("{}ms", ms);
+    }
+    let secs = ms / 1_000;
+    if secs < 60 {
+        let tenths = (ms % 1_000) / 100;
+        return format!("{}.{}s", secs, tenths);
+    }
+    let mins = secs / 60;
+    let rem_secs = secs % 60;
+    if mins < 60 {
+        return format!("{}m{:02}s", mins, rem_secs);
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    if hours < 24 {
+        return format!("{}h{:02}m", hours, rem_mins);
+    }
+    let days = hours / 24;
+    let rem_hours = hours % 24;
+    format!("{}d{:02}h", days, rem_hours)
+}
+
+/// Post the one-time "task created" info message to the task's
+/// placeholder session, summarising the task at creation time.
+///
+/// Fires exactly once per task, right after
+/// [`create_placeholder_session`](crate::tasks::create_placeholder_session)
+/// records the placeholder sid on the task row. If the task has no
+/// placeholder (placeholder creation failed) this is a no-op.
+///
+/// Delivery is best-effort: errors are swallowed so a failed RPC can't
+/// prevent the surrounding task creation from succeeding.
+pub fn notify_task_created(task: &Task, writer: &mut impl Write, reader: &mut impl BufRead) {
+    let placeholder_sid = match task.placeholder_session_id.as_deref() {
+        Some(sid) => sid,
+        None => return,
+    };
+    let text = format_task_created(task);
+    let _ = server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::QueueInfo {
+            target_session_id: placeholder_sid.to_string(),
+            text,
+        },
+    );
+}
+
+/// Format a task's `tags` field (stored as JSON) as a comma-separated
+/// list. Returns `"—"` when empty/missing.
+fn format_tags(tags: &Option<serde_json::Value>) -> String {
+    let arr = match tags.as_ref().and_then(|v| v.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return "—".to_string(),
+    };
+    let parts: Vec<String> = arr
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect();
+    if parts.is_empty() {
+        "—".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Build the multi-line "Task #N created" info-message body.
+fn format_task_created(task: &Task) -> String {
+    let title = capped_title(&task.title);
+    let mut out = format!("Task #{} created: {}\n\n", task.id, title);
+    out.push_str(&format!("Priority: {}\n", task.priority));
+    let tags_str = format_tags(&task.tags);
+    out.push_str(&format!("Tags: {}\n", tags_str));
+    let parent_str = match task.parent_id {
+        Some(pid) => format!("#{}", pid),
+        None => "(top-level)".to_string(),
+    };
+    out.push_str(&format!("Parent task: {}\n", parent_str));
+    out.push_str(&format!(
+        "Require approval: {}\n",
+        if task.require_approval { "yes" } else { "no" },
+    ));
+    out.push_str(&format!(
+        "Skip review: {}\n",
+        if task.skip_review { "yes" } else { "no" },
+    ));
+    let merge_target = task.merge_target.as_deref().unwrap_or("(default)");
+    out.push_str(&format!("Merge target: {}\n", merge_target));
+    out.push_str(&format!("Initial state: {}", task.state));
+    out
+}
+
+/// Post a scheduler-wait info message to the task's placeholder.
+///
+/// Called by the scheduler tracker (see [`WaitTracker`]) when a task's
+/// wait reason changes. Fires only on transitions (newly-present,
+/// changed, or newly-cleared) — the tracker handles deduplication.
+///
+/// `text` is the rendered wait line (e.g. `"Waiting: file conflict with
+/// task #42"` or `"Wait cleared after 2m31s. Dispatching."`).
+pub fn notify_placeholder_wait(
+    task: &Task,
+    text: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let placeholder_sid = match task.placeholder_session_id.as_deref() {
+        Some(sid) => sid,
+        None => return,
+    };
+    let _ = server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::QueueInfo {
+            target_session_id: placeholder_sid.to_string(),
+            text: text.to_string(),
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,5 +1488,245 @@ mod tests {
         assert_eq!(calls[0].1, format!("[task {}] refining: Example", task.id));
         // Sanity check: it is not the old planning tagline.
         assert!(!calls[0].1.contains("planning:"));
+    }
+
+    // -----------------------------------------------------------------
+    // Placeholder session messages (task #574)
+    // -----------------------------------------------------------------
+
+    /// `collect_recipients` / `notify_state_change` must include the
+    /// task's placeholder session in every broadcast.
+    #[test]
+    fn placeholder_receives_state_transition_message() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "PH", None, "ready");
+        db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec worker");
+        task.placeholder_session_id = Some("s-ph".into());
+        task.state = "active".into();
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+
+        let calls = captured_sorted(&shared);
+        let sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(
+            sids.contains(&"s-ph"),
+            "placeholder missing from recipients: {:?}",
+            sids
+        );
+        // Text is the normal transition line.
+        let expected = format!("[task #{}] PH: ready → active", task.id);
+        for (sid, text) in &calls {
+            if sid == "s-ph" {
+                assert_eq!(text, &expected);
+            }
+        }
+    }
+
+    /// Identical-state "transitions" remain a no-op even with the
+    /// placeholder in the recipient set.
+    #[test]
+    fn placeholder_no_message_on_identical_state() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Same", None, "ready");
+        db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
+        task.placeholder_session_id = Some("s-ph".into());
+        task.state = "ready".into();
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+
+        assert!(captured_sorted(&shared).is_empty());
+    }
+
+    /// Terminal-state transitions post both the normal transition line
+    /// AND a summary line to the placeholder.
+    #[test]
+    fn placeholder_terminal_transition_posts_summary() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Term", None, "ready");
+        db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec");
+        task.placeholder_session_id = Some("s-ph".into());
+        task.state = "merged".into();
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, "merging", None, &mut w, &mut r);
+
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        let ph_msgs: Vec<&str> = calls
+            .iter()
+            .filter(|(sid, _)| sid == "s-ph")
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(
+            ph_msgs.len(),
+            2,
+            "expected transition + summary on placeholder: {:?}",
+            ph_msgs
+        );
+        assert!(
+            ph_msgs
+                .iter()
+                .any(|m| m.contains("merged") && m.contains(&format!("[task #{}]", task.id))),
+            "transition line missing: {:?}",
+            ph_msgs
+        );
+        assert!(
+            ph_msgs
+                .iter()
+                .any(|m| m.starts_with(&format!("Task #{} merged.", task.id))),
+            "summary line missing: {:?}",
+            ph_msgs
+        );
+    }
+
+    /// Non-terminal transitions do NOT post a summary line.
+    #[test]
+    fn placeholder_non_terminal_transition_no_summary() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "NT", None, "ready");
+        db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
+        task.placeholder_session_id = Some("s-ph".into());
+        task.state = "active".into();
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, "ready", None, &mut w, &mut r);
+
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        let ph_msgs: Vec<&str> = calls
+            .iter()
+            .filter(|(sid, _)| sid == "s-ph")
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(ph_msgs.len(), 1, "{:?}", ph_msgs);
+    }
+
+    /// `notify_task_created` posts exactly one message to the
+    /// placeholder, formatted with the task metadata.
+    #[test]
+    fn task_created_posts_initial_message_to_placeholder() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Created", None, "planning");
+        db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
+        task.placeholder_session_id = Some("s-ph".into());
+
+        let (shared, mut w, mut r) = make_io();
+        notify_task_created(&task, &mut w, &mut r);
+
+        let calls = captured_sorted(&shared);
+        assert_eq!(calls.len(), 1, "{:?}", calls);
+        assert_eq!(calls[0].0, "s-ph");
+        let text = &calls[0].1;
+        assert!(
+            text.starts_with(&format!("Task #{} created: Created", task.id)),
+            "text: {:?}",
+            text
+        );
+        // Metadata lines are present.
+        assert!(text.contains("\nPriority: "), "text: {:?}", text);
+        assert!(text.contains("\nTags: "), "text: {:?}", text);
+        assert!(
+            text.contains("\nParent task: (top-level)"),
+            "text: {:?}",
+            text
+        );
+        assert!(text.contains("\nRequire approval: no"), "text: {:?}", text);
+        assert!(text.contains("\nSkip review: no"), "text: {:?}", text);
+        assert!(
+            text.contains("\nMerge target: (default)"),
+            "text: {:?}",
+            text
+        );
+        assert!(
+            text.contains("\nInitial state: planning"),
+            "text: {:?}",
+            text
+        );
+    }
+
+    /// `notify_task_created` is a no-op when the placeholder id is
+    /// missing (creation failed upstream). No QueueInfo is sent.
+    #[test]
+    fn task_created_no_placeholder_is_noop() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "NoPH", None, "ready");
+        assert!(task.placeholder_session_id.is_none());
+
+        let (shared, mut w, mut r) = make_io();
+        notify_task_created(&task, &mut w, &mut r);
+
+        assert!(shared.lock().expect("lock").queue_info_calls.is_empty());
+    }
+
+    /// `format_task_created` renders subtasks with a `#<parent>` marker
+    /// and surfaces tags / non-default settings.
+    #[test]
+    fn format_task_created_subtask_with_tags_and_flags() {
+        let db = TasksDb::open_memory().expect("db");
+        let parent = create_task(&db, "Parent", None, "planning");
+        let mut task = create_task(&db, "Child", Some(parent.id), "ready");
+        // Adjust fields the create_task helper doesn't set directly.
+        task.tags = Some(serde_json::json!(["backend", "urgent"]));
+        task.require_approval = true;
+        task.skip_review = true;
+        task.merge_target = Some("release".into());
+        task.placeholder_session_id = Some("s-ph".into());
+
+        let text = format_task_created(&task);
+        assert!(text.starts_with(&format!("Task #{} created: Child", task.id)));
+        assert!(text.contains(&format!("\nParent task: #{}\n", parent.id)));
+        assert!(text.contains("\nTags: backend, urgent\n"));
+        assert!(text.contains("\nRequire approval: yes\n"));
+        assert!(text.contains("\nSkip review: yes\n"));
+        assert!(text.contains("\nMerge target: release\n"));
+        assert!(text.ends_with("\nInitial state: ready"));
+    }
+
+    /// `notify_placeholder_wait` fires a single QueueInfo to the task's
+    /// placeholder with the given text; no-op if no placeholder.
+    #[test]
+    fn notify_placeholder_wait_posts_single_message() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Wait", None, "ready");
+        task.placeholder_session_id = Some("s-ph".into());
+
+        let (shared, mut w, mut r) = make_io();
+        notify_placeholder_wait(&task, "Waiting: test reason", &mut w, &mut r);
+
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        assert_eq!(calls.len(), 1, "{:?}", calls);
+        assert_eq!(calls[0].0, "s-ph");
+        assert_eq!(calls[0].1, "Waiting: test reason");
+
+        // Missing placeholder → no-op.
+        let task2 = create_task(&db, "Wait2", None, "ready");
+        let (shared2, mut w2, mut r2) = make_io();
+        notify_placeholder_wait(&task2, "Waiting: x", &mut w2, &mut r2);
+        assert!(shared2.lock().expect("lock").queue_info_calls.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // format_duration_ms
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn format_duration_ms_ranges() {
+        assert_eq!(format_duration_ms(0), "0ms");
+        assert_eq!(format_duration_ms(42), "42ms");
+        assert_eq!(format_duration_ms(1_500), "1.5s");
+        assert_eq!(format_duration_ms(45 * 1_000), "45.0s");
+        assert_eq!(format_duration_ms(90 * 1_000), "1m30s");
+        assert_eq!(format_duration_ms(3_600_000 + 5_000), "1h00m");
+        assert_eq!(format_duration_ms(86_400_000 * 2), "2d00h");
+    }
+
+    /// Negative values coming from clock skew map to "0ms" (defensive).
+    #[test]
+    fn format_duration_ms_negative_clamps_to_zero() {
+        assert_eq!(format_duration_ms(-5), "0ms");
     }
 }

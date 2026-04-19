@@ -675,6 +675,12 @@ fn handle_task_create(
                 _ => task,
             };
 
+            // Task #574: post the one-time "task created" info message
+            // to the placeholder so the placeholder's timeline starts
+            // with a clear summary of the task at creation time. No-op
+            // if placeholder creation failed above.
+            crate::tasks_notify::notify_task_created(&task, writer, reader);
+
             // Subtasks start in ready or planning state — trigger a schedule pass.
             // Held tasks stay parked: the scheduler skips them until released
             // via task_update(hold=false).
@@ -3200,6 +3206,19 @@ fn run_schedule_pass(
             eprintln!("tasks scheduler: schedule pass error: {}", e);
         }
     }
+
+    // Task #574: after each schedule + dispatch pass, refresh the
+    // per-task placeholder wait-reason timeline so queued tasks
+    // surface why they are stalled (and so newly-dispatched tasks
+    // emit a matching "wait cleared" line).
+    tasks_scheduler::post_wait_updates_for_project(
+        db,
+        project_name,
+        Some(&project_path),
+        writer,
+        reader,
+    );
+
     warnings
 }
 
@@ -6320,6 +6339,68 @@ mod tests {
             "subtask placeholder parent_id should be the parent task's placeholder \
              (mock-s1), not the caller (creator). full: {}",
             create_lines[0]
+        );
+    }
+
+    /// Task #574: creating a task posts exactly one "Task #N created"
+    /// info message to the placeholder, right after placeholder
+    /// creation.
+    #[test]
+    fn test_task_create_posts_initial_message_to_placeholder() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Hello world",
+                "initial_state": "planning",
+                "priority": 3,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("creator"),
+                tool_call_id: "tc-init",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error);
+        let created: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = created["id"].as_i64().unwrap();
+        assert_eq!(created["placeholder_session_id"].as_str(), Some("mock-s1"),);
+
+        // Drain any pending writes to the mock.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.process_pending();
+        }
+
+        let calls = captured_queue_info(&writer.shared);
+        // One QueueInfo, targeted at the placeholder, with the
+        // expected summary header.
+        let ph_calls: Vec<&(String, String)> =
+            calls.iter().filter(|(sid, _)| sid == "mock-s1").collect();
+        assert_eq!(
+            ph_calls.len(),
+            1,
+            "expected exactly one QueueInfo to placeholder; all calls: {:?}",
+            calls
+        );
+        let (_, text) = ph_calls[0];
+        assert!(
+            text.starts_with(&format!("Task #{} created: Hello world", task_id)),
+            "initial message header mismatch: {:?}",
+            text
+        );
+        assert!(text.contains("\nPriority: 3\n"), "text: {:?}", text);
+        assert!(
+            text.contains("\nInitial state: planning"),
+            "text: {:?}",
+            text
         );
     }
 

@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
+use std::sync::{Mutex, OnceLock};
 
 use crate::tasks_config;
 use crate::tasks_db::{Task, TaskUpdate, TasksDb};
@@ -1838,6 +1839,325 @@ impl From<WaitReason> for tau_agent_base::protocol::TaskWaitReason {
             WaitReason::NotScheduled => P::NotScheduled,
         }
     }
+}
+
+impl WaitReason {
+    /// Render this wait reason as a short human-readable phrase suitable
+    /// for embedding in a placeholder timeline message (task #574).
+    /// Stable, language-invariant output — the tracker dedupes on this
+    /// string, so changes to the text would replay spurious messages on
+    /// the next scheduler pass after an upgrade.
+    pub fn describe(&self) -> String {
+        match self {
+            WaitReason::Dependency {
+                task_id,
+                state,
+                project_name,
+                ..
+            } => format!(
+                "dependency task #{} not yet complete (state {}, project {})",
+                task_id, state, project_name
+            ),
+            WaitReason::FileConflict {
+                files,
+                with_task_id,
+            } => format!(
+                "file conflict with task #{} on {}",
+                with_task_id,
+                files.join(", ")
+            ),
+            WaitReason::BudgetExhausted { used, max } => {
+                format!("concurrent-task budget exhausted ({}/{})", used, max)
+            }
+            WaitReason::MergeTargetNotFound { branch } => {
+                format!("merge target branch '{}' not found", branch)
+            }
+            WaitReason::NotScheduled => "not yet scheduled".to_string(),
+        }
+    }
+}
+
+/// Combine multiple wait reasons into a single short summary string
+/// suitable for posting to a placeholder. Returns `None` when the list
+/// is empty.
+pub fn summarize_wait_reasons(reasons: &[WaitReason]) -> Option<String> {
+    if reasons.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = reasons.iter().map(|r| r.describe()).collect();
+    Some(parts.join("; "))
+}
+
+/// In-memory tracker mapping `task_id -> last-posted wait-reason digest`.
+/// Used by the scheduler loop to post a placeholder info message only
+/// when the wait reason changes (newly-present, changed, or cleared).
+///
+/// The map is intentionally not persisted across restarts — a fresh
+/// server replays the current wait reasons once, which is acceptable.
+#[derive(Debug, Default)]
+pub struct WaitTracker {
+    /// `None` value means "last-seen state was ‘no wait reason’". Only
+    /// tasks that have ever been observed appear in the map; freshly
+    /// seen ones post an initial "Waiting:" line.
+    last: std::collections::HashMap<i64, WaitTrackerEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct WaitTrackerEntry {
+    /// Last-posted digest (None = last state was ‘cleared’). Always
+    /// present once a task is seen.
+    digest: Option<String>,
+    /// Unix-ms timestamp when the current `digest` was first observed.
+    since_ms: i64,
+}
+
+/// One tracker diff: what the scheduler should post to a task's
+/// placeholder right now. `None` means no action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitEvent {
+    /// Task has a (new or changed) wait reason. Post `"Waiting: {text}"`.
+    Waiting(String),
+    /// Task's wait cleared (previously had a reason, now has none).
+    /// Post `"Wait cleared after {duration}. Dispatching."`.
+    Cleared { elapsed_ms: i64 },
+}
+
+impl WaitTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update the tracker with the current wait-reason summary for
+    /// `task_id`, returning the event to post (if any).
+    ///
+    /// * `digest = Some(..)`: the task is currently waiting with that
+    ///   summary text.
+    /// * `digest = None`: the task has no wait reason (dispatched,
+    ///   terminal, or otherwise off the queue).
+    /// * `now_ms`: the current wall-clock for "since" bookkeeping.
+    pub fn observe(
+        &mut self,
+        task_id: i64,
+        digest: Option<String>,
+        now_ms: i64,
+    ) -> Option<WaitEvent> {
+        match (self.last.get(&task_id).cloned(), digest) {
+            (None, Some(new)) => {
+                // First time we see this task and it has a wait reason.
+                self.last.insert(
+                    task_id,
+                    WaitTrackerEntry {
+                        digest: Some(new.clone()),
+                        since_ms: now_ms,
+                    },
+                );
+                Some(WaitEvent::Waiting(new))
+            }
+            (None, None) => {
+                // First time we see this task and it's not waiting — no
+                // message needed. Record it so a subsequent wait posts.
+                self.last.insert(
+                    task_id,
+                    WaitTrackerEntry {
+                        digest: None,
+                        since_ms: now_ms,
+                    },
+                );
+                None
+            }
+            (Some(entry), Some(new)) => {
+                if entry.digest.as_deref() == Some(new.as_str()) {
+                    // Same reason — no-op.
+                    None
+                } else {
+                    // Reason changed (including going from None -> Some).
+                    self.last.insert(
+                        task_id,
+                        WaitTrackerEntry {
+                            digest: Some(new.clone()),
+                            since_ms: now_ms,
+                        },
+                    );
+                    Some(WaitEvent::Waiting(new))
+                }
+            }
+            (Some(entry), None) => {
+                if entry.digest.is_none() {
+                    // Was already cleared — no-op.
+                    None
+                } else {
+                    let elapsed = now_ms.saturating_sub(entry.since_ms);
+                    self.last.insert(
+                        task_id,
+                        WaitTrackerEntry {
+                            digest: None,
+                            since_ms: now_ms,
+                        },
+                    );
+                    Some(WaitEvent::Cleared {
+                        elapsed_ms: elapsed,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Remove a task from the tracker. Called when a task reaches a
+    /// terminal state, so a future task reusing the same id (shouldn't
+    /// happen in practice but safe) starts fresh.
+    pub fn forget(&mut self, task_id: i64) {
+        self.last.remove(&task_id);
+    }
+}
+
+/// Process-global [`WaitTracker`] for the plugin. The plugin runs as a
+/// single process with one scheduler loop, so a single tracker suffices
+/// for all projects.
+fn global_wait_tracker() -> &'static Mutex<WaitTracker> {
+    static TRACKER: OnceLock<Mutex<WaitTracker>> = OnceLock::new();
+    TRACKER.get_or_init(|| Mutex::new(WaitTracker::new()))
+}
+
+/// Run a wait-reason pass for `project_name`: compute the current
+/// scheduler status, feed each waiting task's digest into the global
+/// [`WaitTracker`], and post any resulting placeholder info messages.
+///
+/// Called by the plugin's schedule-pass driver after every `schedule()`
+/// + dispatch attempt so wait lines on the placeholder timeline stay in
+/// sync with the scheduler's view.
+///
+/// Best-effort: failures to compute status or send RPCs are logged and
+/// swallowed — placeholder messaging must not break the scheduler.
+pub fn post_wait_updates_for_project(
+    db: &TasksDb,
+    project_name: &str,
+    project_path: Option<&str>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let status = match get_status(db, project_name, project_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "tasks placeholder wait: failed to compute status for '{}': {}",
+                project_name, e
+            );
+            return;
+        }
+    };
+    let mut tracker = match global_wait_tracker().lock() {
+        Ok(t) => t,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    post_wait_updates(&status, &mut tracker, writer, reader);
+}
+
+/// Helper for the main scheduler loop: for every waiting / queued /
+/// blocked / held task in `status`, feed its current wait reasons into
+/// `tracker` and post any resulting placeholder messages./// Also forgets terminal tasks from the tracker so their map entries
+/// don't linger for the lifetime of the server.
+///
+/// Tasks that are actively dispatched (`active`, `review`, `merging`,
+/// `refining`) count as "no wait reason" for placeholder purposes even
+/// if `status.active[].wait_reasons` lists downstream dependencies —
+/// the placeholder already receives state-change messages for those.
+pub fn post_wait_updates(
+    status: &SchedulerStatus,
+    tracker: &mut WaitTracker,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let now_ms = now_unix_ms();
+
+    // Tasks that are in-flight: wait tracker should observe "no reason"
+    // so any pending "Waiting:" message clears into a "Wait cleared" line.
+    for ts in &status.active {
+        handle_wait(tracker, ts, None, now_ms, writer, reader);
+    }
+
+    // Queued/blocked/held: report current wait summary.
+    for bucket in [
+        &status.queued_planning,
+        &status.queued_ready,
+        &status.blocked,
+        &status.held,
+    ] {
+        for ts in bucket {
+            let digest = summarize_wait_reasons(&ts.wait_reasons);
+            let digest = if ts.task.held {
+                // Held tasks always surface a fixed reason even if the
+                // underlying wait_reasons vector is NotScheduled.
+                Some(match digest {
+                    Some(r) => format!("held — awaiting manual release ({})", r),
+                    None => "held — awaiting manual release".to_string(),
+                })
+            } else {
+                digest
+            };
+            handle_wait(tracker, ts, digest, now_ms, writer, reader);
+        }
+    }
+}
+
+fn handle_wait(
+    tracker: &mut WaitTracker,
+    ts: &TaskStatus,
+    digest: Option<String>,
+    now_ms: i64,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    // Only post if the task has a placeholder to post to.
+    if ts.task.placeholder_session_id.is_none() {
+        // Still observe so future wait transitions for this task start
+        // from a coherent baseline if placeholder is populated later.
+        let _ = tracker.observe(ts.task.id, digest, now_ms);
+        return;
+    }
+    let Some(event) = tracker.observe(ts.task.id, digest, now_ms) else {
+        return;
+    };
+    let text = match event {
+        WaitEvent::Waiting(r) => format!("Waiting: {}", r),
+        WaitEvent::Cleared { elapsed_ms } => {
+            format!(
+                "Wait cleared after {}. Dispatching.",
+                format_duration_ms_short(elapsed_ms)
+            )
+        }
+    };
+    crate::tasks_notify::notify_placeholder_wait(&ts.task, &text, writer, reader);
+}
+
+fn now_unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Short duration formatter used in wait-cleared messages.
+fn format_duration_ms_short(ms: i64) -> String {
+    if ms < 0 {
+        return "0ms".to_string();
+    }
+    let ms = ms as u64;
+    if ms < 1_000 {
+        return format!("{}ms", ms);
+    }
+    let secs = ms / 1_000;
+    if secs < 60 {
+        return format!("{}s", secs);
+    }
+    let mins = secs / 60;
+    let rem_secs = secs % 60;
+    if mins < 60 {
+        return format!("{}m{:02}s", mins, rem_secs);
+    }
+    let hours = mins / 60;
+    let rem_mins = mins % 60;
+    format!("{}h{:02}m", hours, rem_mins)
 }
 
 /// Status of a single task in the scheduler view.
@@ -4596,5 +4916,336 @@ mod tests {
             let got: P = src.into();
             assert_eq!(got, want);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // WaitTracker (task #574)
+    // -----------------------------------------------------------------
+
+    /// First observation of a waiting task emits a `Waiting` event.
+    /// Repeating the same digest is a no-op.
+    #[test]
+    fn wait_tracker_first_observe_emits_then_dedups() {
+        let mut t = WaitTracker::new();
+        let e1 = t.observe(1, Some("file conflict".into()), 1_000);
+        assert_eq!(e1, Some(WaitEvent::Waiting("file conflict".into())));
+        let e2 = t.observe(1, Some("file conflict".into()), 2_000);
+        assert_eq!(e2, None);
+        let e3 = t.observe(1, Some("file conflict".into()), 3_000);
+        assert_eq!(e3, None);
+    }
+
+    /// A changed digest emits a new `Waiting` event with the new text.
+    #[test]
+    fn wait_tracker_changed_reason_emits() {
+        let mut t = WaitTracker::new();
+        assert!(matches!(
+            t.observe(1, Some("A".into()), 1_000),
+            Some(WaitEvent::Waiting(_))
+        ));
+        let e = t.observe(1, Some("B".into()), 2_000);
+        assert_eq!(e, Some(WaitEvent::Waiting("B".into())));
+    }
+
+    /// Clearing a wait (Some → None) emits a `Cleared` event with
+    /// elapsed-since-first-observed-digest.
+    #[test]
+    fn wait_tracker_clear_emits_cleared_with_elapsed() {
+        let mut t = WaitTracker::new();
+        t.observe(1, Some("A".into()), 1_000);
+        t.observe(1, Some("A".into()), 1_500); // dedup, doesn't reset clock
+        let e = t.observe(1, None, 4_000);
+        assert_eq!(e, Some(WaitEvent::Cleared { elapsed_ms: 3_000 }));
+        // Second clear is a no-op.
+        assert_eq!(t.observe(1, None, 5_000), None);
+    }
+
+    /// First observation with `None` digest records the baseline but
+    /// does NOT emit an event (nothing to tell the user yet).
+    #[test]
+    fn wait_tracker_first_observe_none_is_silent() {
+        let mut t = WaitTracker::new();
+        assert_eq!(t.observe(42, None, 1_000), None);
+        // Then a new waiting reason DOES emit.
+        assert_eq!(
+            t.observe(42, Some("dep".into()), 2_000),
+            Some(WaitEvent::Waiting("dep".into()))
+        );
+    }
+
+    /// `summarize_wait_reasons` is stable: same reasons → same string.
+    #[test]
+    fn summarize_wait_reasons_joins_with_semicolons() {
+        let reasons = vec![
+            WaitReason::NotScheduled,
+            WaitReason::BudgetExhausted { used: 3, max: 8 },
+        ];
+        let s = summarize_wait_reasons(&reasons).expect("non-empty");
+        assert_eq!(
+            s,
+            "not yet scheduled; concurrent-task budget exhausted (3/8)"
+        );
+    }
+
+    #[test]
+    fn summarize_wait_reasons_empty_returns_none() {
+        assert!(summarize_wait_reasons(&[]).is_none());
+    }
+
+    /// End-to-end scheduler wait-message posting: two passes with the
+    /// same wait reason post only one message; a cleared wait posts the
+    /// "Wait cleared" message.
+    #[test]
+    fn post_wait_updates_dedups_and_clears() {
+        use crate::tasks_db::TasksDb;
+
+        let db = TasksDb::open_memory().expect("db");
+        let task = db
+            .create_task(
+                "p", "t", None, None, None, false, "ready", false, None, None, false,
+            )
+            .expect("create");
+        db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
+        let task = db.get_task(task.id).expect("get").expect("task");
+
+        // Build a synthetic SchedulerStatus that has this task queued
+        // with a file-conflict wait reason.
+        let ts = TaskStatus {
+            task: task.clone(),
+            session_id: None,
+            wait_reasons: vec![WaitReason::FileConflict {
+                files: vec!["x.rs".into()],
+                with_task_id: 99,
+            }],
+        };
+        let status_waiting = SchedulerStatus {
+            active: vec![],
+            queued_planning: vec![],
+            queued_ready: vec![ts.clone()],
+            held: vec![],
+            blocked: vec![],
+            inflight_count: 0,
+            max_concurrent: 8,
+        };
+
+        // Two passes with same reason → one message.
+        let mut tracker = WaitTracker::new();
+        let (shared, mut w, mut r) = make_io_nop();
+        post_wait_updates(&status_waiting, &mut tracker, &mut w, &mut r);
+        post_wait_updates(&status_waiting, &mut tracker, &mut w, &mut r);
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        assert_eq!(calls.len(), 1, "first-pass calls: {:?}", calls);
+        assert_eq!(calls[0].0, "s-ph");
+        assert!(calls[0].1.starts_with("Waiting: "), "msg: {:?}", calls[0].1);
+        assert!(
+            calls[0].1.contains("task #99"),
+            "msg should mention conflicting task: {:?}",
+            calls[0].1
+        );
+
+        // Task moves to active → wait cleared.
+        let mut task_active = task.clone();
+        task_active.state = "active".into();
+        let status_active = SchedulerStatus {
+            active: vec![TaskStatus {
+                task: task_active,
+                session_id: Some("s-worker".into()),
+                wait_reasons: vec![],
+            }],
+            queued_planning: vec![],
+            queued_ready: vec![],
+            held: vec![],
+            blocked: vec![],
+            inflight_count: 1,
+            max_concurrent: 8,
+        };
+        post_wait_updates(&status_active, &mut tracker, &mut w, &mut r);
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        assert_eq!(calls.len(), 2, "after-clear calls: {:?}", calls);
+        assert!(
+            calls[1].1.starts_with("Wait cleared after "),
+            "cleared msg: {:?}",
+            calls[1].1
+        );
+
+        // Another pass while active → no-op.
+        post_wait_updates(&status_active, &mut tracker, &mut w, &mut r);
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        assert_eq!(calls.len(), 2, "no extra message expected: {:?}", calls);
+    }
+
+    /// A *changed* wait reason (e.g. file-conflict → budget-exhausted)
+    /// posts a new message.
+    #[test]
+    fn post_wait_updates_changed_reason_posts_new_message() {
+        use crate::tasks_db::TasksDb;
+
+        let db = TasksDb::open_memory().expect("db");
+        let task = db
+            .create_task(
+                "p", "t", None, None, None, false, "ready", false, None, None, false,
+            )
+            .expect("create");
+        db.set_placeholder_session_id(task.id, "s-ph").expect("ph");
+        let task = db.get_task(task.id).expect("get").expect("task");
+
+        let make_status = |reason: WaitReason| SchedulerStatus {
+            active: vec![],
+            queued_planning: vec![],
+            queued_ready: vec![TaskStatus {
+                task: task.clone(),
+                session_id: None,
+                wait_reasons: vec![reason],
+            }],
+            held: vec![],
+            blocked: vec![],
+            inflight_count: 0,
+            max_concurrent: 8,
+        };
+
+        let mut tracker = WaitTracker::new();
+        let (shared, mut w, mut r) = make_io_nop();
+        post_wait_updates(
+            &make_status(WaitReason::FileConflict {
+                files: vec!["x.rs".into()],
+                with_task_id: 1,
+            }),
+            &mut tracker,
+            &mut w,
+            &mut r,
+        );
+        post_wait_updates(
+            &make_status(WaitReason::BudgetExhausted { used: 8, max: 8 }),
+            &mut tracker,
+            &mut w,
+            &mut r,
+        );
+        let calls = shared.lock().expect("lock").queue_info_calls.clone();
+        assert_eq!(calls.len(), 2, "{:?}", calls);
+        assert!(calls[0].1.contains("file conflict"), "{:?}", calls[0].1);
+        assert!(calls[1].1.contains("budget"), "{:?}", calls[1].1);
+    }
+
+    // Minimal mock IO that records QueueInfo requests and responds Ok
+    // to everything. Reused by the post_wait_updates tests so they
+    // don't need the full tasks_notify mock harness.
+    //
+    // The main difference from the tasks_notify MockShared is that
+    // this one only needs to handle QueueInfo — placeholder lookups
+    // skip GetSessionInfo because the placeholder is already in the
+    // task row and collect_recipients is bypassed.
+    mod mock_io {
+        use std::io::{BufReader, Read, Write};
+        use std::sync::{Arc, Mutex};
+        use tau_agent_plugin::{PluginMessage, PluginRequest, Request, Response};
+
+        pub struct MockShared {
+            write_buf: Vec<u8>,
+            read_buf: Vec<u8>,
+            pub queue_info_calls: Vec<(String, String)>,
+        }
+
+        impl MockShared {
+            pub fn new() -> Self {
+                Self {
+                    write_buf: Vec::new(),
+                    read_buf: Vec::new(),
+                    queue_info_calls: Vec::new(),
+                }
+            }
+
+            fn process_pending(&mut self) {
+                let buf = std::mem::take(&mut self.write_buf);
+                let text = String::from_utf8_lossy(&buf);
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let msg: PluginMessage = match serde_json::from_str(line) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let (request_id, request) = match msg {
+                        PluginMessage::ServerRequest {
+                            request_id,
+                            request,
+                        } => (request_id, request),
+                        _ => continue,
+                    };
+                    if let Request::QueueInfo {
+                        target_session_id,
+                        text,
+                    } = &request
+                    {
+                        self.queue_info_calls
+                            .push((target_session_id.clone(), text.clone()));
+                    }
+                    let reply = PluginRequest::ServerResponse {
+                        request_id,
+                        response: Response::Ok,
+                    };
+                    if let Ok(mut json) = serde_json::to_string(&reply) {
+                        json.push('\n');
+                        self.read_buf.extend_from_slice(json.as_bytes());
+                    }
+                }
+            }
+        }
+
+        pub struct MockWriter {
+            pub shared: Arc<Mutex<MockShared>>,
+        }
+        impl Write for MockWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.shared
+                    .lock()
+                    .expect("mock writer lock")
+                    .write_buf
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        pub struct MockReader {
+            pub shared: Arc<Mutex<MockShared>>,
+        }
+        impl Read for MockReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let mut shared = self.shared.lock().expect("mock reader lock");
+                shared.process_pending();
+                if shared.read_buf.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "no mock responses left",
+                    ));
+                }
+                let n = std::cmp::min(buf.len(), shared.read_buf.len());
+                buf[..n].copy_from_slice(&shared.read_buf[..n]);
+                shared.read_buf.drain(..n);
+                Ok(n)
+            }
+        }
+
+        pub fn make_io() -> (Arc<Mutex<MockShared>>, MockWriter, BufReader<MockReader>) {
+            let shared = Arc::new(Mutex::new(MockShared::new()));
+            let writer = MockWriter {
+                shared: shared.clone(),
+            };
+            let reader = BufReader::new(MockReader {
+                shared: shared.clone(),
+            });
+            (shared, writer, reader)
+        }
+    }
+
+    fn make_io_nop() -> (
+        std::sync::Arc<std::sync::Mutex<mock_io::MockShared>>,
+        mock_io::MockWriter,
+        std::io::BufReader<mock_io::MockReader>,
+    ) {
+        mock_io::make_io()
     }
 }
