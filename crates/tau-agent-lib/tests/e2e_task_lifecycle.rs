@@ -234,13 +234,18 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// Start a test server with the tasks plugin loaded as a global plugin.
-/// Returns (TestServer, session_id for the controller session).
+/// Internal helper: start a test server with the tasks plugin loaded as
+/// a global plugin, optionally also registering the `log` provider.
 ///
 /// The `mock_responses` are consumed by dispatched sessions' LLM calls.
-fn start_server_with_tasks(
-    _repo_path: &std::path::Path,
+/// With `with_log_provider = true`, `LogProvider` is registered and
+/// `log_model()` is appended to the model list so a session can genuinely
+/// use `model = "log"` — see the model-inheritance regressions
+/// (#582, #590) for why that matters.
+fn start_server_with_tasks_impl(
+    repo_path: &std::path::Path,
     mock_responses: Vec<MockResponse>,
+    with_log_provider: bool,
 ) -> TestServer {
     let tau_bin = tau_binary();
     let tau_bin_str = tau_bin.to_string_lossy().to_string();
@@ -248,7 +253,7 @@ fn start_server_with_tasks(
     // Create an isolated XDG_DATA_HOME so the tasks plugin doesn't hit the
     // production tasks database.  We place it as a sibling of the repo inside
     // the same tmpdir so it shares the tmpdir lifetime.
-    let data_home = _repo_path.parent().unwrap().join("xdg_data");
+    let data_home = repo_path.parent().unwrap().join("xdg_data");
     std::fs::create_dir_all(&data_home).unwrap();
     let data_home_str = data_home.to_string_lossy().to_string();
 
@@ -270,7 +275,7 @@ fn start_server_with_tasks(
         .unwrap();
         conn.execute(
             "INSERT INTO projects (name, path) VALUES (?1, ?2)",
-            rusqlite::params!["e2e-test", _repo_path.to_string_lossy().to_string()],
+            rusqlite::params!["e2e-test", repo_path.to_string_lossy().to_string()],
         )
         .unwrap();
     }
@@ -309,11 +314,32 @@ fn start_server_with_tasks(
         config.registry = {
             let mut r = tau_agent_lib::provider::ProviderRegistry::new();
             r.register(provider);
+            if with_log_provider {
+                r.register(tau_agent_lib::providers::log::LogProvider);
+            }
             r
         };
+        if with_log_provider {
+            // Append the log model so resolve_model("log") finds it.  Mock
+            // model stays first → server-wide default remains the mock model.
+            config
+                .models
+                .push(tau_agent_lib::providers::log::log_model());
+        }
         config.plugins_config = Some(plugins_config);
         config
     })
+}
+
+/// Start a test server with the tasks plugin loaded as a global plugin.
+/// Returns (TestServer, session_id for the controller session).
+///
+/// The `mock_responses` are consumed by dispatched sessions' LLM calls.
+fn start_server_with_tasks(
+    repo_path: &std::path::Path,
+    mock_responses: Vec<MockResponse>,
+) -> TestServer {
+    start_server_with_tasks_impl(repo_path, mock_responses, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1436,77 +1462,7 @@ fn start_server_with_tasks_and_log_provider(
     repo_path: &std::path::Path,
     mock_responses: Vec<MockResponse>,
 ) -> TestServer {
-    let tau_bin = tau_binary();
-    let tau_bin_str = tau_bin.to_string_lossy().to_string();
-
-    let data_home = repo_path.parent().unwrap().join("xdg_data");
-    std::fs::create_dir_all(&data_home).unwrap();
-    let data_home_str = data_home.to_string_lossy().to_string();
-
-    let tau_data_dir = data_home.join("tau");
-    std::fs::create_dir_all(&tau_data_dir).unwrap();
-    {
-        let tau_db_path = tau_data_dir.join("tau.db");
-        let conn = rusqlite::Connection::open(&tau_db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS projects (
-                name TEXT PRIMARY KEY,
-                path TEXT NOT NULL,
-                created_at INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL DEFAULT 0
-            )",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO projects (name, path) VALUES (?1, ?2)",
-            rusqlite::params!["e2e-test", repo_path.to_string_lossy().to_string()],
-        )
-        .unwrap();
-    }
-
-    let plugins_config = PluginsConfig {
-        no_default_worker: true,
-        global: [(
-            "tasks".to_string(),
-            PluginEntry {
-                command: vec![tau_bin_str.clone(), "plugin-tasks".into()],
-                env: [("XDG_DATA_HOME".to_string(), data_home_str)]
-                    .into_iter()
-                    .collect(),
-            },
-        )]
-        .into_iter()
-        .collect::<HashMap<_, _>>(),
-        session: [(
-            "worker".to_string(),
-            PluginEntry {
-                command: vec![tau_bin_str, "worker".into()],
-                env: HashMap::new(),
-            },
-        )]
-        .into_iter()
-        .collect::<HashMap<_, _>>(),
-        idle_timeout_secs: 300,
-        ..Default::default()
-    };
-
-    let provider = MockProvider::new(mock_responses);
-
-    TestServer::start_with_config(vec![], move |mut config| {
-        config.registry = {
-            let mut r = tau_agent_lib::provider::ProviderRegistry::new();
-            r.register(provider);
-            r.register(tau_agent_lib::providers::log::LogProvider);
-            r
-        };
-        // Append the log model so resolve_model("log") finds it.  Mock
-        // model stays first → server-wide default remains the mock model.
-        config
-            .models
-            .push(tau_agent_lib::providers::log::log_model());
-        config.plugins_config = Some(plugins_config);
-        config
-    })
+    start_server_with_tasks_impl(repo_path, mock_responses, true)
 }
 
 /// Open the tasks plugin's sqlite DB at `xdg_data/tau/tasks.db` and apply

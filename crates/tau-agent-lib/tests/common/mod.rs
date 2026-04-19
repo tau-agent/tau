@@ -176,6 +176,57 @@ impl TestServer {
         }
     }
 
+    /// Start a test server registered with ONLY the `log` provider and
+    /// `log_model()`. Used by placeholder / no-agent-loop tests.
+    pub fn start_log_only() -> Self {
+        Self::start_with_config(vec![], |mut config| {
+            use tau_agent_lib::providers::log::{LogProvider, log_model};
+            let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
+            registry.register(LogProvider);
+            config.registry = registry;
+            config.models = vec![log_model()];
+            config
+        })
+    }
+
+    /// Start a test server whose default model advertises a bogus provider
+    /// slug, so `resolve_api_key` returns `None` and the agent runner
+    /// early-returns `Err(NoApiKey)`. Used by the "no api key" error-path
+    /// tests.
+    pub fn start_without_api_key() -> Self {
+        Self::start_with_config(vec![], |mut config| {
+            // Register MockProvider under the "mock" api id so
+            // `needs_api_key` returns true.  The model below uses a bogus
+            // provider slug that is guaranteed not to match any auth
+            // entry or env var — so the preflight `resolve_api_key`
+            // returns None and we hit NoApiKey.
+            let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
+            registry.register(MockProvider::new(vec![]));
+            config.registry = registry;
+            let mut model = mock_model();
+            model.id = "needs-key-model-583".into();
+            model.provider = "bogus-provider-583-no-such-key".into();
+            config.models = vec![model];
+            config
+        })
+    }
+
+    /// Start a test server registered with BOTH the mock provider (as the
+    /// default model) and the log provider.  `mock_model()` is listed
+    /// first so it becomes the server's default_model; `log_model()` is
+    /// registered so explicit `model: "log"` requests resolve correctly.
+    pub fn start_mock_plus_log() -> Self {
+        Self::start_with_config(vec![], |mut config| {
+            use tau_agent_lib::providers::log::{LogProvider, log_model};
+            let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
+            registry.register(MockProvider::new(vec![]));
+            registry.register(LogProvider);
+            config.registry = registry;
+            config.models = vec![mock_model(), log_model()];
+            config
+        })
+    }
+
     pub fn connect(&self) -> UnixStream {
         let conn = UnixStream::connect(&self.sock_path).unwrap();
         conn.set_read_timeout(Some(Duration::from_secs(30)))

@@ -2292,46 +2292,8 @@ fn server_execute_tool_nonexistent_session() {
 // ---------------------------------------------------------------------------
 
 /// Spin up a test server registered with ONLY the `log` provider and model.
-/// Returns the temp dir (kept alive for socket lifetime) and socket path.
-fn start_log_only_test_server() -> (tempfile::TempDir, std::path::PathBuf) {
-    use tau_agent_lib::providers::log::{LogProvider, log_model};
-    let dir = tempfile::tempdir().unwrap();
-    let sock_path = dir.path().join("tau-log-test.sock");
-    let db_path = dir.path().join("test.db");
-    let sock_clone = sock_path.clone();
-
-    let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
-    registry.register(LogProvider);
-
-    let config = tau_agent_lib::server::TestServerConfig {
-        registry,
-        models: vec![log_model()],
-        socket_path: sock_clone,
-        db_path,
-        tool_executor_factory: None,
-        mock_tools: vec![],
-        plugins_config: None,
-        aliases: std::collections::HashMap::new(),
-    };
-
-    std::thread::spawn(move || {
-        smol::block_on(async {
-            if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
-                eprintln!("test server error: {}", e);
-            }
-        });
-    });
-
-    for _ in 0..50 {
-        if sock_path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(sock_path.exists(), "server socket did not appear");
-    (dir, sock_path)
-}
-
+/// Thin wrapper retained for readability — see
+/// [`TestServer::start_log_only`] in `common/mod.rs`.
 fn create_log_session(sock_path: &std::path::Path) -> String {
     let conn = UnixStream::connect(sock_path).unwrap();
     conn.set_read_timeout(Some(Duration::from_secs(10)))
@@ -2466,7 +2428,8 @@ fn server_log_provider_chat_returns_immediately() {
 /// emitted.
 #[test]
 fn queue_message_to_log_session_records_without_agent_loop() {
-    let (_dir, sock_path) = start_log_only_test_server();
+    let server = TestServer::start_log_only();
+    let sock_path = &server.sock_path;
     let sid = create_log_session(&sock_path);
 
     // Fire-and-forget QueueMessage to the log session.
@@ -2542,7 +2505,8 @@ fn queue_message_to_log_session_records_without_agent_loop() {
 /// and terminates with `AgentDone` without running the agent loop.
 #[test]
 fn chat_to_log_session_emits_note_and_no_agent_loop() {
-    let (_dir, sock_path) = start_log_only_test_server();
+    let server = TestServer::start_log_only();
+    let sock_path = &server.sock_path;
     let sid = create_log_session(&sock_path);
 
     let conn = UnixStream::connect(&sock_path).unwrap();
@@ -2644,7 +2608,8 @@ fn chat_to_log_session_emits_note_and_no_agent_loop() {
 /// immediately, instead of blocking and timing out.
 #[test]
 fn queue_message_await_reply_to_log_session_returns_note() {
-    let (_dir, sock_path) = start_log_only_test_server();
+    let server = TestServer::start_log_only();
+    let sock_path = &server.sock_path;
     let sid = create_log_session(&sock_path);
 
     let conn = UnixStream::connect(&sock_path).unwrap();
@@ -4264,54 +4229,9 @@ fn seamless_restart_rejects_new_chat_during_drain() {
 /// Start a test server configured with a mock-API model whose `provider`
 /// slug is a bogus/unregistered string so `resolve_api_key` returns
 /// `None` and the agent-runner early-returns `Err(NoApiKey)` at
-/// `agent_runner.rs:344`. This exercises the most common "error before
-/// streaming started" code path.
-fn start_server_without_api_key() -> (tempfile::TempDir, std::path::PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let sock_path = dir.path().join("tau-noapikey-test.sock");
-    let db_path = dir.path().join("test.db");
-    let sock_clone = sock_path.clone();
-
-    // Register MockProvider under the "mock" api id so `needs_api_key`
-    // returns true. The model below uses a bogus provider slug that is
-    // guaranteed not to match any auth entry or env var — so the
-    // preflight `resolve_api_key` returns None and we hit NoApiKey.
-    let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
-    registry.register(MockProvider::new(vec![]));
-
-    let mut model = mock_model();
-    model.id = "needs-key-model-583".into();
-    model.provider = "bogus-provider-583-no-such-key".into();
-
-    let config = tau_agent_lib::server::TestServerConfig {
-        registry,
-        models: vec![model],
-        socket_path: sock_clone,
-        db_path,
-        tool_executor_factory: None,
-        mock_tools: vec![],
-        plugins_config: None,
-        aliases: std::collections::HashMap::new(),
-    };
-
-    std::thread::spawn(move || {
-        smol::block_on(async {
-            if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
-                eprintln!("test server error: {}", e);
-            }
-        });
-    });
-
-    for _ in 0..50 {
-        if sock_path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(sock_path.exists(), "server socket did not appear");
-    (dir, sock_path)
-}
-
+/// `agent_runner.rs:344`. See [`TestServer::start_without_api_key`] in
+/// `common/mod.rs` for the actual implementation.
+///
 /// A `Chat` request on a session whose provider has no API key must emit
 /// **both** `Response::Error` and `Response::AgentDone` (in that order),
 /// and the Error must precede AgentDone on the subscription stream. This
@@ -4319,7 +4239,8 @@ fn start_server_without_api_key() -> (tempfile::TempDir, std::path::PathBuf) {
 /// mode.
 #[test]
 fn chat_no_api_key_emits_error_and_agent_done_in_order() {
-    let (_dir, sock_path) = start_server_without_api_key();
+    let server = TestServer::start_without_api_key();
+    let sock_path = &server.sock_path;
 
     // Create a session using the key-less model.
     let conn = UnixStream::connect(&sock_path).unwrap();
@@ -4395,7 +4316,8 @@ fn chat_no_api_key_emits_error_and_agent_done_in_order() {
 /// Chat on a separate connection).
 #[test]
 fn subscriber_sees_error_then_agent_done_on_no_api_key() {
-    let (_dir, sock_path) = start_server_without_api_key();
+    let server = TestServer::start_without_api_key();
+    let sock_path = &server.sock_path;
 
     let conn_create = UnixStream::connect(&sock_path).unwrap();
     conn_create
@@ -4495,49 +4417,8 @@ fn subscriber_sees_error_then_agent_done_on_no_api_key() {
 /// default model) and the log provider. Needed for task #590: we want to
 /// create a `log`-model placeholder session and then verify that a child
 /// created with `model = None` does NOT inherit `log` from the parent.
-fn start_mock_plus_log_test_server() -> (tempfile::TempDir, std::path::PathBuf) {
-    use tau_agent_lib::providers::log::{LogProvider, log_model};
-    let dir = tempfile::tempdir().unwrap();
-    let sock_path = dir.path().join("tau-test.sock");
-    let db_path = dir.path().join("test.db");
-    let sock_clone = sock_path.clone();
-
-    let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
-    registry.register(MockProvider::new(vec![]));
-    registry.register(LogProvider);
-
-    // mock_model() is listed first so it becomes the server's default_model;
-    // log_model() is registered so that explicit `model: "log"` requests
-    // resolve correctly.
-    let config = tau_agent_lib::server::TestServerConfig {
-        registry,
-        models: vec![mock_model(), log_model()],
-        socket_path: sock_clone,
-        db_path,
-        tool_executor_factory: None,
-        mock_tools: vec![],
-        plugins_config: None,
-        aliases: std::collections::HashMap::new(),
-    };
-
-    std::thread::spawn(move || {
-        smol::block_on(async {
-            if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
-                eprintln!("test server error: {}", e);
-            }
-        });
-    });
-
-    for _ in 0..50 {
-        if sock_path.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(sock_path.exists(), "server socket did not appear");
-    (dir, sock_path)
-}
-
+/// See [`TestServer::start_mock_plus_log`] in `common/mod.rs`.
+///
 /// Regression for task #590.
 ///
 /// Before the fix, creating a session with `model = None` and a `log`-
@@ -4553,7 +4434,8 @@ fn start_mock_plus_log_test_server() -> (tempfile::TempDir, std::path::PathBuf) 
 fn create_session_with_none_model_and_log_parent_uses_default() {
     use tau_agent_lib::providers::log::log_model;
 
-    let (_dir, sock_path) = start_mock_plus_log_test_server();
+    let server = TestServer::start_mock_plus_log();
+    let sock_path = &server.sock_path;
 
     // Create a log-provider parent session (simulates the task placeholder).
     let parent_conn = UnixStream::connect(&sock_path).unwrap();
