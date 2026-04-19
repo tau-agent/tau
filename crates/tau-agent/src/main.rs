@@ -766,32 +766,15 @@ fn maybe_auto_init() {
 // Cumulative usage tracking
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct UsageTotals {
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-    cost: f64,
-    /// Context window size from model.
-    context_window: u64,
-    /// Context tokens from last successful response.
-    context_tokens: Option<u64>,
-    /// Whether using OAuth subscription.
-    is_subscription: bool,
+// Struct and `add` live in `tau_agent_base::usage_totals`; the `display`
+// formatter is specific to the CLI and stays local via an extension trait.
+use tau_agent_lib::usage_totals::UsageTotals;
+
+trait UsageTotalsDisplay {
+    fn display(&self);
 }
 
-impl UsageTotals {
-    fn add(&mut self, usage: &tau_agent_lib::Usage) {
-        self.input += usage.input;
-        self.output += usage.output;
-        self.cache_read += usage.cache_read;
-        self.cache_write += usage.cache_write;
-        self.cost += usage.cost.total;
-        // Context estimate: last response's total input (fresh + cached)
-        self.context_tokens = Some(usage.input + usage.cache_read + usage.cache_write);
-    }
-
+impl UsageTotalsDisplay for UsageTotals {
     fn display(&self) {
         use tau_agent_lib::protocol::format_tokens;
         let mut parts = Vec::new();

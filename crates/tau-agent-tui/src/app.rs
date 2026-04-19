@@ -17,29 +17,9 @@ use crate::message::MessageItem;
 use crate::render::RendererRegistry;
 use crate::theme::Theme;
 
-/// Cumulative usage tracking (mirrored from tau-agent).
-#[derive(Default)]
-pub struct UsageTotals {
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub cost: f64,
-    pub context_window: u64,
-    pub context_tokens: Option<u64>,
-    pub is_subscription: bool,
-}
-
-impl UsageTotals {
-    pub fn add(&mut self, usage: &tau_agent_lib::Usage) {
-        self.input += usage.input;
-        self.output += usage.output;
-        self.cache_read += usage.cache_read;
-        self.cache_write += usage.cache_write;
-        self.cost += usage.cost.total;
-        self.context_tokens = Some(usage.input + usage.cache_read + usage.cache_write);
-    }
-}
+/// Cumulative usage tracking, shared with the `tau-agent` CLI via
+/// `tau_agent_base::usage_totals`.
+pub use tau_agent_lib::usage_totals::UsageTotals;
 
 /// What the app is currently doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -126,6 +126,16 @@ pub struct AssignResult {
 // State transition validation
 // ---------------------------------------------------------------------------
 
+/// Column list for all `SELECT ... FROM tasks` queries that feed into
+/// [`row_to_task`]. The order here must match `row_to_task`'s column-index
+/// accesses — tests exercise `row_to_task` via column ordinals, so any drift
+/// will surface there.
+const TASK_COLUMNS: &str = "id, project_name, title, state, priority, \
+    parent_id, tags, affected_files, branch, merge_target, worktree_path, \
+    session_id, skip_review, require_approval, sandbox_profile, held, \
+    placeholder_session_id, auto_downgraded_from_ready, created_at, \
+    updated_at";
+
 const VALID_STATES: &[&str] = &[
     "interactive",
     "planning",
@@ -708,10 +718,7 @@ impl TasksDb {
     pub fn get_task(&self, id: i64) -> tau_agent_plugin::Result<Option<Task>> {
         self.conn
             .query_row(
-                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                        created_at, updated_at
-                 FROM tasks WHERE id = ?1",
+                &format!("SELECT {} FROM tasks WHERE id = ?1", TASK_COLUMNS),
                 params![id],
                 row_to_task,
             )
@@ -728,12 +735,7 @@ impl TasksDb {
         tag_filter: Option<&str>,
         limit: Option<i64>,
     ) -> tau_agent_plugin::Result<Vec<Task>> {
-        let mut sql = String::from(
-            "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                    branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                    created_at, updated_at
-             FROM tasks WHERE project_name = ?1",
-        );
+        let mut sql = format!("SELECT {} FROM tasks WHERE project_name = ?1", TASK_COLUMNS);
         let mut param_idx = 2;
         let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(project_name.to_string())];
@@ -803,15 +805,15 @@ impl TasksDb {
         state: &str,
         limit: usize,
     ) -> tau_agent_plugin::Result<Vec<Task>> {
-        let sql = "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                          branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                          created_at, updated_at
-                   FROM tasks
+        let sql = format!(
+            "SELECT {} FROM tasks
                    WHERE project_name = ?1 AND state = ?2
                    ORDER BY updated_at DESC, id DESC
-                   LIMIT ?3";
+                   LIMIT ?3",
+            TASK_COLUMNS
+        );
 
-        let mut stmt = self.conn.prepare(sql).map_err(|e| {
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| {
             tau_agent_plugin::Error::Io(format!("prepare list_recent_by_state: {}", e))
         })?;
         let rows = stmt
@@ -1368,23 +1370,21 @@ impl TasksDb {
     ) -> tau_agent_plugin::Result<Vec<Task>> {
         let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match project_name {
             Some(p) => (
-                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                        created_at, updated_at
-                 FROM tasks
+                format!(
+                    "SELECT {} FROM tasks
                  WHERE state = 'approved' AND project_name = ?1
-                 ORDER BY priority DESC, created_at ASC"
-                    .to_string(),
+                 ORDER BY priority DESC, created_at ASC",
+                    TASK_COLUMNS
+                ),
                 vec![Box::new(p.to_string())],
             ),
             None => (
-                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                        created_at, updated_at
-                 FROM tasks
+                format!(
+                    "SELECT {} FROM tasks
                  WHERE state = 'approved'
-                 ORDER BY priority DESC, created_at ASC"
-                    .to_string(),
+                 ORDER BY priority DESC, created_at ASC",
+                    TASK_COLUMNS
+                ),
                 vec![],
             ),
         };
@@ -1434,16 +1434,16 @@ impl TasksDb {
     pub fn get_inflight_tasks(&self, project_name: &str) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                        created_at, updated_at
-                 FROM tasks
+            .prepare(&format!(
+                "SELECT {} FROM tasks
                  WHERE project_name = ?1
                    AND state IN ('active', 'review', 'merging', 'refining')
                  ORDER BY priority DESC, created_at ASC",
-            )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get_inflight_tasks: {}", e)))?;
+                TASK_COLUMNS
+            ))
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("prepare get_inflight_tasks: {}", e))
+            })?;
 
         let rows = stmt
             .query_map(params![project_name], row_to_task)
@@ -1509,12 +1509,10 @@ impl TasksDb {
     pub fn get_subtasks(&self, parent_id: i64) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                        created_at, updated_at
-                 FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
-            )
+            .prepare(&format!(
+                "SELECT {} FROM tasks WHERE parent_id = ?1 ORDER BY priority DESC, created_at ASC",
+                TASK_COLUMNS
+            ))
             .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare get subtasks: {}", e)))?;
 
         let rows = stmt
@@ -2100,14 +2098,14 @@ impl TasksDb {
         let cutoff = now_ms.saturating_sub(max_age_ms);
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                        created_at, updated_at
-                 FROM tasks
+            .prepare(&format!(
+                "SELECT {} FROM tasks
                  WHERE state = 'active' AND session_id IS NULL AND updated_at <= ?1",
-            )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare stuck active query: {}", e)))?;
+                TASK_COLUMNS
+            ))
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("prepare stuck active query: {}", e))
+            })?;
 
         let rows = stmt
             .query_map(params![cutoff], row_to_task)
@@ -2142,15 +2140,15 @@ impl TasksDb {
         let cutoff = now_ms.saturating_sub(max_age_ms);
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                        created_at, updated_at
-                 FROM tasks
+            .prepare(&format!(
+                "SELECT {} FROM tasks
                  WHERE state = 'ready' AND session_id IS NOT NULL
                    AND NOT held AND updated_at <= ?1",
-            )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare stuck ready query: {}", e)))?;
+                TASK_COLUMNS
+            ))
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("prepare stuck ready query: {}", e))
+            })?;
 
         let rows = stmt
             .query_map(params![cutoff], row_to_task)
@@ -2170,14 +2168,14 @@ impl TasksDb {
     pub fn get_stale_worktree_tasks(&self) -> tau_agent_plugin::Result<Vec<Task>> {
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT id, project_name, title, state, priority, parent_id, tags, affected_files,
-                        branch, merge_target, worktree_path, session_id, skip_review, require_approval, sandbox_profile, held, placeholder_session_id, auto_downgraded_from_ready,
-                        created_at, updated_at
-                 FROM tasks
+            .prepare(&format!(
+                "SELECT {} FROM tasks
                  WHERE state IN ('merged', 'closed', 'failed') AND worktree_path IS NOT NULL",
-            )
-            .map_err(|e| tau_agent_plugin::Error::Io(format!("prepare stale worktree query: {}", e)))?;
+                TASK_COLUMNS
+            ))
+            .map_err(|e| {
+                tau_agent_plugin::Error::Io(format!("prepare stale worktree query: {}", e))
+            })?;
 
         let rows = stmt
             .query_map([], row_to_task)

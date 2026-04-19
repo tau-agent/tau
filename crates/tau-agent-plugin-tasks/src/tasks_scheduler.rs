@@ -588,6 +588,26 @@ fn resolve_model_source(
         .or_else(|| resolve_hierarchy_parent(db, task))
 }
 
+/// Look up a session's full [`SessionInfo`] via the `GetSessionInfo` RPC.
+///
+/// Returns `None` if the request fails or the session is not found. Callers
+/// typically map this to a single field (see [`get_session_model`],
+/// [`get_session_parent`]). Prefer this helper over open-coding the
+/// request/response match at each call site.
+pub fn get_session_info(
+    session_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<tau_agent_plugin::SessionInfo> {
+    let req = tau_agent_plugin::Request::GetSessionInfo {
+        session_id: session_id.to_string(),
+    };
+    match server_request(writer, reader, req) {
+        Ok(tau_agent_plugin::Response::SessionInfo { info }) => Some(info),
+        _ => None,
+    }
+}
+
 /// Look up a session's model via GetSessionInfo. Returns `None` if the
 /// request fails or the session is not found.
 pub fn get_session_model(
@@ -595,13 +615,7 @@ pub fn get_session_model(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> Option<String> {
-    let req = tau_agent_plugin::Request::GetSessionInfo {
-        session_id: session_id.to_string(),
-    };
-    match server_request(writer, reader, req) {
-        Ok(tau_agent_plugin::Response::SessionInfo { info }) => Some(info.model),
-        _ => None,
-    }
+    get_session_info(session_id, writer, reader).map(|info| info.model)
 }
 
 /// Look up a session's parent session id via GetSessionInfo.
@@ -613,13 +627,7 @@ pub fn get_session_parent(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
 ) -> Option<String> {
-    let req = tau_agent_plugin::Request::GetSessionInfo {
-        session_id: session_id.to_string(),
-    };
-    match server_request(writer, reader, req) {
-        Ok(tau_agent_plugin::Response::SessionInfo { info }) => info.parent_id,
-        _ => None,
-    }
+    get_session_info(session_id, writer, reader).and_then(|info| info.parent_id)
 }
 
 /// Last-resort fallback for `resolve_model_source`: when no planner,
@@ -1147,18 +1155,11 @@ fn find_reusable_session(
     let session_id = db.find_latest_session_by_role(task_id, role).ok()??;
 
     // Ask the server whether the session is still alive.
-    let req = tau_agent_plugin::Request::GetSessionInfo {
-        session_id: session_id.clone(),
-    };
-    match server_request(writer, reader, req) {
-        Ok(tau_agent_plugin::Response::SessionInfo { info }) => {
-            if info.archived {
-                return None;
-            }
-            Some(session_id)
-        }
-        _ => None,
+    let info = get_session_info(&session_id, writer, reader)?;
+    if info.archived {
+        return None;
     }
+    Some(session_id)
 }
 
 /// Resume an existing session by sending it a QueueMessage.
@@ -4465,6 +4466,51 @@ mod tests {
             None,
             "root placeholder has no parent to inherit from"
         );
+    }
+
+    /// `get_session_info` returns a full `SessionInfo` on success and `None`
+    /// on server error. Both `get_session_model` and `get_session_parent` are
+    /// thin wrappers on top, so covering the base helper is enough.
+    #[test]
+    fn test_get_session_info_ok_and_error() {
+        use std::io::BufReader;
+
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(SessionInfoMock {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            responses: std::collections::HashMap::from([(
+                "s1".to_string(),
+                session_info("s1", Some("s-parent"), false),
+            )]),
+        }));
+        let mut writer = MockSessionInfoWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockSessionInfoReader {
+            shared: shared.clone(),
+        };
+        let mut reader_buf = BufReader::new(reader);
+
+        // Known session: full SessionInfo comes back.
+        let info = get_session_info("s1", &mut writer, &mut reader_buf)
+            .expect("known session id should resolve");
+        assert_eq!(info.id, "s1");
+        assert_eq!(info.parent_id.as_deref(), Some("s-parent"));
+
+        // Thin wrappers derive their result from the same RPC.
+        assert_eq!(
+            get_session_model("s1", &mut writer, &mut reader_buf).as_deref(),
+            Some("m"),
+        );
+        assert_eq!(
+            get_session_parent("s1", &mut writer, &mut reader_buf).as_deref(),
+            Some("s-parent"),
+        );
+
+        // Unknown session id → server returns Error, helper yields None.
+        assert!(get_session_info("s-missing", &mut writer, &mut reader_buf).is_none());
+        assert!(get_session_model("s-missing", &mut writer, &mut reader_buf).is_none());
+        assert!(get_session_parent("s-missing", &mut writer, &mut reader_buf).is_none());
     }
 
     /// Verify that `server_request` handles a concurrent `ToolCall` arriving

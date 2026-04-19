@@ -21,6 +21,7 @@ pub use tau_agent_base::protocol;
 pub use tau_agent_base::subscription_usage;
 pub use tau_agent_base::tool_prompt;
 pub use tau_agent_base::types;
+pub use tau_agent_base::usage_totals;
 
 pub use tau_agent_base::{
     Error, Result, read_json_line, read_json_line_async, truncate_str, truncate_str_end,

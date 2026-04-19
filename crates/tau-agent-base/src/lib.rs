@@ -13,8 +13,10 @@ pub mod protocol;
 pub mod subscription_usage;
 pub mod tool_prompt;
 pub mod types;
+pub mod usage_totals;
 
 pub use types::*;
+pub use usage_totals::UsageTotals;
 
 // ---------------------------------------------------------------------------
 // JSON-line I/O helpers (sync only — async helpers live in dependent crates)
