@@ -156,7 +156,7 @@ Standard [`tracing-subscriber` filter syntax][filter-syntax] is supported
 TAU_LOG=info                                       # default
 TAU_LOG=warn                                       # quieter
 TAU_LOG=debug                                      # very chatty
-TAU_LOG=tau_agent::plugin=debug,tau_agent=info     # per-module
+TAU_LOG=tau_agent_lib::plugin=debug,tau_agent_lib=info     # per-module
 ```
 
 `TAU_LOG` takes precedence. If it's unset, tau falls back to `RUST_LOG`,
@@ -174,6 +174,6 @@ tail -f ~/.local/state/tau/logs/server.log
 ```
 
 Look for the last `plugin.hook` span with no matching completion — that
-plugin is the culprit. `TAU_LOG=tau_agent::plugin=debug` enables the
+plugin is the culprit. `TAU_LOG=tau_agent_lib::plugin=debug` enables the
 `sending` / `returned` traces inside each hook span, making it obvious
 where in the round-trip the plugin got stuck.

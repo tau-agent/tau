@@ -382,7 +382,7 @@ fn current_active_chat_session() -> Option<String> {
 /// chat.  Used from signal handlers — must be quick and infallible.
 fn fire_and_forget_cancel(session_id: &str) {
     use std::io::Write;
-    let req = tau_agent::protocol::Request::CancelChat {
+    let req = tau_agent_lib::protocol::Request::CancelChat {
         session_id: session_id.to_string(),
         caller_session_id: None,
     };
@@ -391,7 +391,9 @@ fn fire_and_forget_cancel(session_id: &str) {
         Err(_) => return,
     };
     line.push('\n');
-    if let Ok(stream) = std::os::unix::net::UnixStream::connect(tau_agent::server::socket_path()) {
+    if let Ok(stream) =
+        std::os::unix::net::UnixStream::connect(tau_agent_lib::server::socket_path())
+    {
         let mut w = std::io::BufWriter::new(stream);
         let _ = w.write_all(line.as_bytes());
         let _ = w.flush();
@@ -401,7 +403,7 @@ fn fire_and_forget_cancel(session_id: &str) {
 /// Default signal handler for non-chat CLI modes (sessions list, server
 /// status, etc.): print and exit with the appropriate status code.
 fn install_default_signal_handler() {
-    if let Err(e) = tau_agent::shutdown::install(|sig| {
+    if let Err(e) = tau_agent_lib::shutdown::install(|sig| {
         let code = match sig {
             nix::sys::signal::Signal::SIGHUP => 129,
             nix::sys::signal::Signal::SIGINT => 130,
@@ -410,7 +412,7 @@ fn install_default_signal_handler() {
         };
         eprintln!(
             "tau: received {}, exiting",
-            tau_agent::shutdown::signal_name(sig),
+            tau_agent_lib::shutdown::signal_name(sig),
         );
         std::process::exit(code);
     }) {
@@ -428,13 +430,13 @@ fn install_chat_signal_handler() {
         if let Some(sid) = current_active_chat_session() {
             eprintln!(
                 "\ntau: received {}, cancelling chat and exiting",
-                tau_agent::shutdown::signal_name(sig),
+                tau_agent_lib::shutdown::signal_name(sig),
             );
             fire_and_forget_cancel(&sid);
         } else {
             eprintln!(
                 "\ntau: received {}, exiting",
-                tau_agent::shutdown::signal_name(sig),
+                tau_agent_lib::shutdown::signal_name(sig),
             );
         }
         let code = match sig {
@@ -450,12 +452,12 @@ fn install_chat_signal_handler() {
         nix::sys::signal::Signal::SIGHUP,
         nix::sys::signal::Signal::SIGINT,
     ];
-    if let Err(e) = tau_agent::shutdown::install_for(signals, cancel) {
+    if let Err(e) = tau_agent_lib::shutdown::install_for(signals, cancel) {
         eprintln!("tau: failed to install chat signal handlers: {}", e);
     }
 }
 
-async fn run(cli: Cli) -> tau_agent::Result<()> {
+async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
@@ -477,11 +479,11 @@ async fn run(cli: Cli) -> tau_agent::Result<()> {
             cmd_chat(message, session, &model, no_tui, child_budget).await?;
         }
         Commands::Worker => {
-            tau_agent::worker::run();
+            tau_agent_lib::worker::run();
             return Ok(());
         }
         Commands::PluginTasks => {
-            tau_agent::tasks::run_tasks_plugin();
+            tau_agent_lib::tasks::run_tasks_plugin();
             return Ok(());
         }
         Commands::Login { provider } => {
@@ -555,7 +557,7 @@ async fn run(cli: Cli) -> tau_agent::Result<()> {
                 cmd_auth_status().await?;
             }
             AuthAction::Logout { provider } => {
-                let auth = tau_agent::auth::AuthStorage::open_default();
+                let auth = tau_agent_lib::auth::AuthStorage::open_default();
                 auth.remove(&provider)?;
                 eprintln!("logged out from {}", provider);
             }
@@ -574,7 +576,7 @@ async fn run(cli: Cli) -> tau_agent::Result<()> {
 // Default command: open TUI with session picker
 // ---------------------------------------------------------------------------
 
-async fn cmd_default() -> tau_agent::Result<()> {
+async fn cmd_default() -> tau_agent_lib::Result<()> {
     // Auto-init check
     maybe_auto_init();
 
@@ -585,7 +587,7 @@ async fn cmd_default() -> tau_agent::Result<()> {
     let model = tau_agent_tui::settings::default_model();
 
     // Connect to server, create an initial session for the TUI
-    let mut client = tau_agent::client::Client::connect_or_start().await?;
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from));
@@ -599,7 +601,7 @@ async fn cmd_default() -> tau_agent::Result<()> {
 
     // Create session (needed for TUI initialization)
     client
-        .send(&tau_agent::protocol::Request::CreateSession {
+        .send(&tau_agent_lib::protocol::Request::CreateSession {
             model: Some(model_id),
             provider,
             system_prompt: None,
@@ -617,13 +619,13 @@ async fn cmd_default() -> tau_agent::Result<()> {
     let mut created_id = None;
     client
         .recv_streaming(|resp| {
-            if let tau_agent::protocol::Response::SessionCreated { session_id } = resp {
+            if let tau_agent_lib::protocol::Response::SessionCreated { session_id } = resp {
                 created_id = Some(session_id.clone());
             }
         })
         .await?;
     let session_id =
-        created_id.ok_or_else(|| tau_agent::Error::Io("failed to create session".into()))?;
+        created_id.ok_or_else(|| tau_agent_lib::Error::Io("failed to create session".into()))?;
 
     // Track the active session so the SIGTERM/SIGHUP handler can cancel it.
     set_active_chat_session(Some(session_id.clone()));
@@ -664,7 +666,7 @@ fn maybe_auto_init() {
     };
 
     // Already a project? Nothing to do.
-    if tau_agent::project::discover_project(&cwd).is_some() {
+    if tau_agent_lib::project::discover_project(&cwd).is_some() {
         return;
     }
 
@@ -696,14 +698,14 @@ fn maybe_auto_init() {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "project".to_string());
-        let name = tau_agent::project::slugify(&name);
+        let name = tau_agent_lib::project::slugify(&name);
 
-        if tau_agent::project::validate_project_name(&name).is_err() {
+        if tau_agent_lib::project::validate_project_name(&name).is_err() {
             eprintln!("Invalid project name '{}', skipping auto-init.", name);
             return;
         }
 
-        let db = match tau_agent::db::Db::open_default() {
+        let db = match tau_agent_lib::db::Db::open_default() {
             Ok(db) => db,
             Err(e) => {
                 eprintln!("Failed to open database: {}", e);
@@ -729,7 +731,7 @@ fn maybe_auto_init() {
             return;
         }
 
-        match tau_agent::project::init_project(&cwd, &name) {
+        match tau_agent_lib::project::init_project(&cwd, &name) {
             Ok(canonical_path) => {
                 let canonical_str = canonical_path.to_string_lossy().to_string();
                 if let Err(e) = db.create_project(&name, &canonical_str) {
@@ -780,7 +782,7 @@ struct UsageTotals {
 }
 
 impl UsageTotals {
-    fn add(&mut self, usage: &tau_agent::Usage) {
+    fn add(&mut self, usage: &tau_agent_lib::Usage) {
         self.input += usage.input;
         self.output += usage.output;
         self.cache_read += usage.cache_read;
@@ -791,7 +793,7 @@ impl UsageTotals {
     }
 
     fn display(&self) {
-        use tau_agent::protocol::format_tokens;
+        use tau_agent_lib::protocol::format_tokens;
         let mut parts = Vec::new();
         if self.input > 0 {
             parts.push(format!("↑{}", format_tokens(self.input)));
@@ -832,13 +834,16 @@ impl UsageTotals {
 // Commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_login(provider: &str) -> tau_agent::Result<()> {
+async fn cmd_login(provider: &str) -> tau_agent_lib::Result<()> {
     match provider {
         "anthropic" => {
             eprintln!("Logging in to Anthropic (OAuth)...");
-            let creds = smol::unblock(tau_agent::auth::login_anthropic).await?;
-            let auth = tau_agent::auth::AuthStorage::open_default();
-            auth.set("anthropic", tau_agent::auth::AuthCredential::Oauth(creds))?;
+            let creds = smol::unblock(tau_agent_lib::auth::login_anthropic).await?;
+            let auth = tau_agent_lib::auth::AuthStorage::open_default();
+            auth.set(
+                "anthropic",
+                tau_agent_lib::auth::AuthCredential::Oauth(creds),
+            )?;
             eprintln!("Login successful! Credentials saved.");
         }
         _ => {
@@ -849,13 +854,16 @@ async fn cmd_login(provider: &str) -> tau_agent::Result<()> {
             let mut key = String::new();
             std::io::stdin()
                 .read_line(&mut key)
-                .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+                .map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
             let key = key.trim().to_string();
             if key.is_empty() {
-                return Err(tau_agent::Error::Io("empty API key".into()));
+                return Err(tau_agent_lib::Error::Io("empty API key".into()));
             }
-            let auth = tau_agent::auth::AuthStorage::open_default();
-            auth.set(provider, tau_agent::auth::AuthCredential::ApiKey { key })?;
+            let auth = tau_agent_lib::auth::AuthStorage::open_default();
+            auth.set(
+                provider,
+                tau_agent_lib::auth::AuthCredential::ApiKey { key },
+            )?;
             eprintln!("API key saved for {}.", provider);
         }
     }
@@ -868,14 +876,14 @@ async fn cmd_chat(
     model: &str,
     no_tui: bool,
     child_budget: u32,
-) -> tau_agent::Result<()> {
+) -> tau_agent_lib::Result<()> {
     // Install chat-mode signal handler for the non-TUI variants.  The
     // TUI installs its own (different) handler from inside its run loop
     // so the terminal is restored on signal-driven exit.
     if no_tui || message.is_some() {
         install_chat_signal_handler();
     }
-    let mut client = tau_agent::client::Client::connect_or_start().await?;
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
 
     // Parse "provider/model" syntax
     let (provider, model_id) = if let Some(idx) = model.find('/') {
@@ -891,7 +899,7 @@ async fn cmd_chat(
             .ok()
             .and_then(|p| p.to_str().map(String::from));
         client
-            .send(&tau_agent::protocol::Request::CreateSession {
+            .send(&tau_agent_lib::protocol::Request::CreateSession {
                 model: Some(model_id),
                 provider,
                 system_prompt: None,
@@ -909,13 +917,13 @@ async fn cmd_chat(
         let mut created_id = None;
         client
             .recv_streaming(|resp| {
-                if let tau_agent::protocol::Response::SessionCreated { session_id } = resp {
+                if let tau_agent_lib::protocol::Response::SessionCreated { session_id } = resp {
                     created_id = Some(session_id.clone());
                 }
             })
             .await?;
-        let id =
-            created_id.ok_or_else(|| tau_agent::Error::Io("failed to create session".into()))?;
+        let id = created_id
+            .ok_or_else(|| tau_agent_lib::Error::Io("failed to create session".into()))?;
         (id, false)
     };
 
@@ -981,11 +989,11 @@ async fn cmd_chat(
 }
 
 async fn get_session_info(
-    client: &mut tau_agent::client::Client,
+    client: &mut tau_agent_lib::client::Client,
     session_id: &str,
-) -> tau_agent::Result<tau_agent::protocol::SessionInfo> {
+) -> tau_agent_lib::Result<tau_agent_lib::protocol::SessionInfo> {
     client
-        .send(&tau_agent::protocol::Request::GetSessionInfo {
+        .send(&tau_agent_lib::protocol::Request::GetSessionInfo {
             session_id: session_id.to_string(),
         })
         .await?;
@@ -994,10 +1002,10 @@ async fn get_session_info(
     let mut error = None;
     client
         .recv_streaming(|resp| match resp {
-            tau_agent::protocol::Response::SessionInfo { info: i } => {
+            tau_agent_lib::protocol::Response::SessionInfo { info: i } => {
                 info = Some(i.clone());
             }
-            tau_agent::protocol::Response::Error { message } => {
+            tau_agent_lib::protocol::Response::Error { message } => {
                 error = Some(message.clone());
             }
             _ => {}
@@ -1006,21 +1014,21 @@ async fn get_session_info(
 
     match (info, error) {
         (Some(i), _) => Ok(i),
-        (_, Some(e)) => Err(tau_agent::Error::Io(e)),
-        _ => Err(tau_agent::Error::Io("no response".into())),
+        (_, Some(e)) => Err(tau_agent_lib::Error::Io(e)),
+        _ => Err(tau_agent_lib::Error::Io("no response".into())),
     }
 }
 
 /// Create a new session and return its ID.
 async fn cli_create_session(
-    client: &mut tau_agent::client::Client,
+    client: &mut tau_agent_lib::client::Client,
     model: Option<String>,
     cwd: Option<String>,
     parent_id: Option<String>,
     child_budget: u32,
-) -> tau_agent::Result<String> {
+) -> tau_agent_lib::Result<String> {
     client
-        .send(&tau_agent::protocol::Request::CreateSession {
+        .send(&tau_agent_lib::protocol::Request::CreateSession {
             model,
             provider: None,
             system_prompt: None,
@@ -1038,23 +1046,23 @@ async fn cli_create_session(
     let mut created_id = None;
     client
         .recv_streaming(|resp| {
-            if let tau_agent::protocol::Response::SessionCreated { session_id } = resp {
+            if let tau_agent_lib::protocol::Response::SessionCreated { session_id } = resp {
                 created_id = Some(session_id.clone());
             }
         })
         .await?;
 
-    created_id.ok_or_else(|| tau_agent::Error::Io("failed to create session".into()))
+    created_id.ok_or_else(|| tau_agent_lib::Error::Io("failed to create session".into()))
 }
 
 async fn send_and_print(
-    client: &mut tau_agent::client::Client,
+    client: &mut tau_agent_lib::client::Client,
     session_id: &str,
     text: &str,
     totals: &mut UsageTotals,
-) -> tau_agent::Result<()> {
+) -> tau_agent_lib::Result<()> {
     client
-        .send(&tau_agent::protocol::Request::Chat {
+        .send(&tau_agent_lib::protocol::Request::Chat {
             session_id: session_id.to_string(),
             text: text.to_string(),
         })
@@ -1125,12 +1133,12 @@ async fn send_and_print(
                             if last_was_esc {
                                 // Double Escape — send cancel.
                                 eprintln!("\n[cancelling...]");
-                                let cancel_req = tau_agent::protocol::Request::CancelChat {
+                                let cancel_req = tau_agent_lib::protocol::Request::CancelChat {
                                     session_id: session_id_clone.clone(),
                                     caller_session_id: None,
                                 };
                                 if let Ok(stream) = std::os::unix::net::UnixStream::connect(
-                                    tau_agent::server::socket_path(),
+                                    tau_agent_lib::server::socket_path(),
                                 ) {
                                     use std::io::Write;
                                     let mut line =
@@ -1167,14 +1175,14 @@ async fn send_and_print(
     let mut was_cancelled = false;
     client
         .recv_streaming(|resp| match resp {
-            tau_agent::protocol::Response::Stream { event } => {
+            tau_agent_lib::protocol::Response::Stream { event } => {
                 match event.as_ref() {
-                    tau_agent::StreamEvent::TextDelta { delta, .. } => {
+                    tau_agent_lib::StreamEvent::TextDelta { delta, .. } => {
                         print!("{}", delta);
                         use std::io::Write;
                         std::io::stdout().flush().ok();
                     }
-                    tau_agent::StreamEvent::ToolcallEnd { tool_call, .. } => {
+                    tau_agent_lib::StreamEvent::ToolcallEnd { tool_call, .. } => {
                         let args_str = tool_call.arguments.to_string();
                         let preview = if args_str.len() > 100 {
                             format!("{}...", &args_str[..100])
@@ -1183,10 +1191,10 @@ async fn send_and_print(
                         };
                         eprintln!("[tool: {} {}]", tool_call.name, preview);
                     }
-                    tau_agent::StreamEvent::ToolOutputDelta { .. } => {
+                    tau_agent_lib::StreamEvent::ToolOutputDelta { .. } => {
                         eprint!("."); // progress dot for streaming output
                     }
-                    tau_agent::StreamEvent::ToolResult {
+                    tau_agent_lib::StreamEvent::ToolResult {
                         tool_name,
                         is_error,
                         content,
@@ -1210,42 +1218,42 @@ async fn send_and_print(
                             eprintln!("[tool ok: {} {}]", tool_name, preview);
                         }
                     }
-                    tau_agent::StreamEvent::Done { message, .. } => {
+                    tau_agent_lib::StreamEvent::Done { message, .. } => {
                         // Only print newline if there was text content
                         if message.content.iter().any(
-                            |c| matches!(c, tau_agent::AssistantContent::Text(t) if !t.text.is_empty()),
+                            |c| matches!(c, tau_agent_lib::AssistantContent::Text(t) if !t.text.is_empty()),
                         ) {
                             println!();
                         }
                         totals.add(&message.usage);
                     }
-                    tau_agent::StreamEvent::Error { error, .. } => {
+                    tau_agent_lib::StreamEvent::Error { error, .. } => {
                         if let Some(ref msg) = error.error_message {
                             eprintln!("\nerror: {}", msg);
                         }
                     }
-                    tau_agent::StreamEvent::Status { message } => {
+                    tau_agent_lib::StreamEvent::Status { message } => {
                         eprintln!("[{}]", message);
                     }
                     _ => {}
                 }
             }
-            tau_agent::protocol::Response::AgentDone => {
+            tau_agent_lib::protocol::Response::AgentDone => {
                 totals.display();
             }
-            tau_agent::protocol::Response::Cancelled => {
+            tau_agent_lib::protocol::Response::Cancelled => {
                 was_cancelled = true;
                 eprintln!("[cancelled]");
                 totals.display();
             }
-            tau_agent::protocol::Response::ServerShutdown { restart } => {
+            tau_agent_lib::protocol::Response::ServerShutdown { restart } => {
                 if *restart {
                     eprintln!("[server restarting...]");
                 } else {
                     eprintln!("[server shutting down]");
                 }
             }
-            tau_agent::protocol::Response::Error { message } => {
+            tau_agent_lib::protocol::Response::Error { message } => {
                 eprintln!("error: {}", message);
             }
             _ => {}
@@ -1278,18 +1286,18 @@ fn history_path() -> std::path::PathBuf {
 }
 
 async fn interactive_loop(
-    client: &mut tau_agent::client::Client,
+    client: &mut tau_agent_lib::client::Client,
     mut session_id: String,
     totals: &mut UsageTotals,
     child_budget: u32,
-) -> tau_agent::Result<()> {
+) -> tau_agent_lib::Result<()> {
     let hist = history_path();
     if let Some(parent) = hist.parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
     let mut rl = rustyline::DefaultEditor::new()
-        .map_err(|e| tau_agent::Error::Io(format!("readline init: {}", e)))?;
+        .map_err(|e| tau_agent_lib::Error::Io(format!("readline init: {}", e)))?;
     let _ = rl.load_history(&hist);
 
     loop {
@@ -1297,7 +1305,7 @@ async fn interactive_loop(
             Ok(line) => line,
             Err(rustyline::error::ReadlineError::Interrupted) => continue,
             Err(rustyline::error::ReadlineError::Eof) => break,
-            Err(e) => return Err(tau_agent::Error::Io(format!("readline: {}", e))),
+            Err(e) => return Err(tau_agent_lib::Error::Io(format!("readline: {}", e))),
         };
         let line = line.trim();
         if line.is_empty() {
@@ -1305,7 +1313,7 @@ async fn interactive_loop(
         }
 
         rl.add_history_entry(line)
-            .map_err(|e| tau_agent::Error::Io(format!("history: {}", e)))?;
+            .map_err(|e| tau_agent_lib::Error::Io(format!("history: {}", e)))?;
         let _ = rl.save_history(&hist);
 
         // Handle slash commands
@@ -1343,7 +1351,10 @@ async fn interactive_loop(
 
 /// Try to reconnect to the server after a connection error.
 /// Returns true if reconnection succeeded.
-async fn try_reconnect(client: &mut tau_agent::client::Client, err: &tau_agent::Error) -> bool {
+async fn try_reconnect(
+    client: &mut tau_agent_lib::client::Client,
+    err: &tau_agent_lib::Error,
+) -> bool {
     let msg = err.to_string();
     if !msg.contains("Broken pipe")
         && !msg.contains("Connection refused")
@@ -1355,7 +1366,7 @@ async fn try_reconnect(client: &mut tau_agent::client::Client, err: &tau_agent::
     // Wait a moment for the server to restart
     for _ in 0..30 {
         smol::Timer::after(std::time::Duration::from_millis(200)).await;
-        if let Ok(new_client) = tau_agent::client::Client::connect_or_start().await {
+        if let Ok(new_client) = tau_agent_lib::client::Client::connect_or_start().await {
             *client = new_client;
             eprintln!("[reconnected]");
             return true;
@@ -1365,8 +1376,8 @@ async fn try_reconnect(client: &mut tau_agent::client::Client, err: &tau_agent::
     false
 }
 
-fn pct(b: Option<&tau_agent::auth::UsageBucket>) -> String {
-    tau_agent::protocol::format_utilization(b.and_then(|b| b.utilization))
+fn pct(b: Option<&tau_agent_lib::auth::UsageBucket>) -> String {
+    tau_agent_lib::protocol::format_utilization(b.and_then(|b| b.utilization))
 }
 
 /// Parse ISO 8601 reset timestamp → "Thu 04:00 (3d 14h 15m)".
@@ -1391,19 +1402,19 @@ fn format_resets(resets_at: &str) -> String {
     format!("{} ({})", local.format("%a %H:%M"), relative)
 }
 
-async fn print_subscription_usage(client: &mut tau_agent::client::Client) {
+async fn print_subscription_usage(client: &mut tau_agent_lib::client::Client) {
     client
-        .send(&tau_agent::protocol::Request::GetSubscriptionUsage)
+        .send(&tau_agent_lib::protocol::Request::GetSubscriptionUsage)
         .await
         .ok();
 
     client
         .recv_streaming(|resp| {
-            if let tau_agent::protocol::Response::SubscriptionUsage { usage } = resp {
+            if let tau_agent_lib::protocol::Response::SubscriptionUsage { usage } = resp {
                 fn bucket_line(
                     label: &str,
                     indent: bool,
-                    b: Option<&tau_agent::auth::UsageBucket>,
+                    b: Option<&tau_agent_lib::auth::UsageBucket>,
                 ) {
                     let prefix = if indent { "          " } else { "usage:    " };
                     let resets = b
@@ -1430,7 +1441,7 @@ async fn print_subscription_usage(client: &mut tau_agent::client::Client) {
                 {
                     println!("          extra ${:.2}/${:.2}", used, limit);
                 }
-            } else if let tau_agent::protocol::Response::Error { message } = resp {
+            } else if let tau_agent_lib::protocol::Response::Error { message } = resp {
                 eprintln!("usage:    unavailable ({})", message);
             }
         })
@@ -1440,12 +1451,12 @@ async fn print_subscription_usage(client: &mut tau_agent::client::Client) {
 
 /// Handle a slash command. Returns Ok(true) if the loop should exit.
 async fn handle_slash_command(
-    client: &mut tau_agent::client::Client,
+    client: &mut tau_agent_lib::client::Client,
     session_id: &mut String,
     line: &str,
     totals: &mut UsageTotals,
     child_budget: u32,
-) -> tau_agent::Result<bool> {
+) -> tau_agent_lib::Result<bool> {
     let (cmd, args) = line.split_once(' ').unwrap_or((line, ""));
     let args = args.trim();
 
@@ -1464,7 +1475,7 @@ async fn handle_slash_command(
             );
             println!(
                 "tokens:   {}",
-                tau_agent::protocol::format_stats(&info.stats)
+                tau_agent_lib::protocol::format_stats(&info.stats)
             );
 
             if info.stats.is_subscription {
@@ -1480,11 +1491,11 @@ async fn handle_slash_command(
                 let session_cwd = current_info.and_then(|i| i.cwd);
 
                 client
-                    .send(&tau_agent::protocol::Request::ListModels)
+                    .send(&tau_agent_lib::protocol::Request::ListModels)
                     .await?;
                 client
                     .recv_streaming(|resp| {
-                        if let tau_agent::protocol::Response::Models { models } = resp {
+                        if let tau_agent_lib::protocol::Response::Models { models } = resp {
                             for m in models {
                                 let marker = if current_model_id.as_deref() == Some(m.id.as_str()) {
                                     " *"
@@ -1505,14 +1516,15 @@ async fn handle_slash_command(
 
                 // Best-effort: ask the server for configured aliases. Older
                 // servers will return an Error response which we silently
-                // skip — the protocol comment in tau_agent::protocol::Request
+                // skip — the protocol comment in tau_agent_lib::protocol::Request
                 // documents this fallback contract.
                 client
-                    .send(&tau_agent::protocol::Request::ListAliases { cwd: session_cwd })
+                    .send(&tau_agent_lib::protocol::Request::ListAliases { cwd: session_cwd })
                     .await?;
                 client
                     .recv_streaming(|resp| {
-                        if let tau_agent::protocol::Response::Aliases { global, project } = resp {
+                        if let tau_agent_lib::protocol::Response::Aliases { global, project } = resp
+                        {
                             if !global.is_empty() {
                                 println!();
                                 println!("aliases (global):");
@@ -1533,7 +1545,7 @@ async fn handle_slash_command(
             } else {
                 // Set model
                 client
-                    .send(&tau_agent::protocol::Request::SetModel {
+                    .send(&tau_agent_lib::protocol::Request::SetModel {
                         session_id: session_id.to_string(),
                         model_id: args.to_string(),
                         caller_session_id: None,
@@ -1541,10 +1553,10 @@ async fn handle_slash_command(
                     .await?;
                 client
                     .recv_streaming(|resp| match resp {
-                        tau_agent::protocol::Response::ModelChanged { model } => {
+                        tau_agent_lib::protocol::Response::ModelChanged { model } => {
                             eprintln!("model changed to {}", model.id);
                         }
-                        tau_agent::protocol::Response::Error { message } => {
+                        tau_agent_lib::protocol::Response::Error { message } => {
                             eprintln!("error: {}", message);
                         }
                         _ => {}
@@ -1578,7 +1590,7 @@ async fn handle_slash_command(
                     eprintln!("error: {} is not a directory", new_cwd);
                 } else {
                     client
-                        .send(&tau_agent::protocol::Request::SetCwd {
+                        .send(&tau_agent_lib::protocol::Request::SetCwd {
                             session_id: session_id.to_string(),
                             cwd: new_cwd.clone(),
                             caller_session_id: None,
@@ -1609,7 +1621,7 @@ async fn handle_slash_command(
 
         "/reload" => {
             client
-                .send(&tau_agent::protocol::Request::ReloadPlugins {
+                .send(&tau_agent_lib::protocol::Request::ReloadPlugins {
                     session_id: session_id.to_string(),
                 })
                 .await?;
@@ -1659,36 +1671,36 @@ async fn handle_slash_command(
 // Server commands
 // ---------------------------------------------------------------------------
 
-async fn cmd_server_start(foreground: bool) -> tau_agent::Result<()> {
-    if tau_agent::server::is_running() {
+async fn cmd_server_start(foreground: bool) -> tau_agent_lib::Result<()> {
+    if tau_agent_lib::server::is_running() {
         eprintln!("server already running");
         return Ok(());
     }
 
     if foreground {
-        tau_agent::server::run().await?;
+        tau_agent_lib::server::run().await?;
     } else {
         spawn_server_daemon()?;
     }
     Ok(())
 }
 
-fn spawn_server_daemon() -> tau_agent::Result<()> {
-    let exe = std::env::current_exe().map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+fn spawn_server_daemon() -> tau_agent_lib::Result<()> {
+    let exe = std::env::current_exe().map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
 
     // Route the daemon's stderr to a catch-all file: tracing handles normal
     // diagnostic output, but panics and any un-migrated `eprintln!`s should
     // still be captured for post-mortem debugging. The file is opened in
     // append mode so daemon restarts don't truncate history.
-    let logs_dir = tau_agent::paths::logs_dir();
+    let logs_dir = tau_agent_lib::paths::logs_dir();
     std::fs::create_dir_all(&logs_dir)
-        .map_err(|e| tau_agent::Error::Io(format!("create logs dir: {}", e)))?;
+        .map_err(|e| tau_agent_lib::Error::Io(format!("create logs dir: {}", e)))?;
     let stderr_path = logs_dir.join("daemon.stderr.log");
     let stderr_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&stderr_path)
-        .map_err(|e| tau_agent::Error::Io(format!("open {}: {}", stderr_path.display(), e)))?;
+        .map_err(|e| tau_agent_lib::Error::Io(format!("open {}: {}", stderr_path.display(), e)))?;
 
     let child = std::process::Command::new(exe)
         .args(["server", "start", "--foreground"])
@@ -1696,17 +1708,17 @@ fn spawn_server_daemon() -> tau_agent::Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
-        .map_err(|e| tau_agent::Error::Io(format!("spawn: {}", e)))?;
+        .map_err(|e| tau_agent_lib::Error::Io(format!("spawn: {}", e)))?;
     eprintln!("server started (pid {})", child.id());
 
     // Wait for ready
     smol::block_on(async {
         for _ in 0..50 {
             smol::Timer::after(std::time::Duration::from_millis(100)).await;
-            if tau_agent::server::is_running() {
+            if tau_agent_lib::server::is_running() {
                 eprintln!(
                     "server ready at {}",
-                    tau_agent::server::socket_path().display()
+                    tau_agent_lib::server::socket_path().display()
                 );
                 return;
             }
@@ -1716,40 +1728,40 @@ fn spawn_server_daemon() -> tau_agent::Result<()> {
     Ok(())
 }
 
-async fn cmd_server_stop() -> tau_agent::Result<()> {
-    if !tau_agent::server::is_running() {
+async fn cmd_server_stop() -> tau_agent_lib::Result<()> {
+    if !tau_agent_lib::server::is_running() {
         eprintln!("server not running");
         return Ok(());
     }
-    let mut client = tau_agent::client::Client::connect().await?;
+    let mut client = tau_agent_lib::client::Client::connect().await?;
     client
-        .send(&tau_agent::protocol::Request::Shutdown { restart: false })
+        .send(&tau_agent_lib::protocol::Request::Shutdown { restart: false })
         .await?;
     client.recv_streaming(|_| {}).await?;
     eprintln!("server stopped");
     Ok(())
 }
 
-async fn cmd_server_restart() -> tau_agent::Result<()> {
-    if tau_agent::server::is_running() {
-        let mut client = tau_agent::client::Client::connect().await?;
+async fn cmd_server_restart() -> tau_agent_lib::Result<()> {
+    if tau_agent_lib::server::is_running() {
+        let mut client = tau_agent_lib::client::Client::connect().await?;
         client
-            .send(&tau_agent::protocol::Request::Shutdown { restart: true })
+            .send(&tau_agent_lib::protocol::Request::Shutdown { restart: true })
             .await?;
         client.recv_streaming(|_| {}).await?;
         eprintln!("shutdown requested, waiting for server to exit...");
         // Wait up to 65s (server drains for up to 60s)
         for i in 0..650 {
             smol::Timer::after(std::time::Duration::from_millis(100)).await;
-            if !tau_agent::server::is_running() {
+            if !tau_agent_lib::server::is_running() {
                 break;
             }
             if i > 0 && i % 50 == 0 {
                 eprintln!("still waiting... ({}s)", i / 10);
             }
         }
-        if tau_agent::server::is_running() {
-            return Err(tau_agent::Error::Io(
+        if tau_agent_lib::server::is_running() {
+            return Err(tau_agent_lib::Error::Io(
                 "old server didn't exit within 65s".into(),
             ));
         }
@@ -1759,18 +1771,18 @@ async fn cmd_server_restart() -> tau_agent::Result<()> {
 }
 
 fn cmd_server_status() {
-    if tau_agent::server::is_running() {
+    if tau_agent_lib::server::is_running() {
         eprintln!(
             "server running at {}",
-            tau_agent::server::socket_path().display()
+            tau_agent_lib::server::socket_path().display()
         );
     } else {
         eprintln!("server not running");
     }
 }
 
-async fn cmd_auth_status() -> tau_agent::Result<()> {
-    let auth = tau_agent::auth::AuthStorage::open_default();
+async fn cmd_auth_status() -> tau_agent_lib::Result<()> {
+    let auth = tau_agent_lib::auth::AuthStorage::open_default();
     let providers = auth.list()?;
     if providers.is_empty() {
         println!("not logged in to any providers");
@@ -1778,14 +1790,14 @@ async fn cmd_auth_status() -> tau_agent::Result<()> {
     } else {
         for p in &providers {
             let status = match auth.get(p)? {
-                Some(tau_agent::auth::AuthCredential::Oauth(creds)) => {
+                Some(tau_agent_lib::auth::AuthCredential::Oauth(creds)) => {
                     if creds.is_expired() {
                         "oauth (expired, will auto-refresh)"
                     } else {
                         "oauth (valid)"
                     }
                 }
-                Some(tau_agent::auth::AuthCredential::ApiKey { .. }) => "api key",
+                Some(tau_agent_lib::auth::AuthCredential::ApiKey { .. }) => "api key",
                 None => "none",
             };
             println!("{}\t{}", p, status);
@@ -1794,10 +1806,10 @@ async fn cmd_auth_status() -> tau_agent::Result<()> {
     Ok(())
 }
 
-async fn cmd_sessions_list(include_archived: bool) -> tau_agent::Result<()> {
-    let mut client = tau_agent::client::Client::connect_or_start().await?;
+async fn cmd_sessions_list(include_archived: bool) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
     client
-        .send(&tau_agent::protocol::Request::ListSessions {
+        .send(&tau_agent_lib::protocol::Request::ListSessions {
             include_archived,
             project_name: None,
         })
@@ -1805,7 +1817,7 @@ async fn cmd_sessions_list(include_archived: bool) -> tau_agent::Result<()> {
 
     client
         .recv_streaming(|resp| {
-            if let tau_agent::protocol::Response::Sessions { sessions } = resp {
+            if let tau_agent_lib::protocol::Response::Sessions { sessions } = resp {
                 if sessions.is_empty() {
                     println!("no sessions");
                 } else {
@@ -1833,12 +1845,12 @@ async fn cmd_sessions_list(include_archived: bool) -> tau_agent::Result<()> {
 }
 
 fn print_session_tree(
-    session: &tau_agent::protocol::SessionInfo,
-    all: &[tau_agent::protocol::SessionInfo],
+    session: &tau_agent_lib::protocol::SessionInfo,
+    all: &[tau_agent_lib::protocol::SessionInfo],
     depth: usize,
 ) {
     let indent = "  ".repeat(depth);
-    let stats = tau_agent::protocol::format_stats(&session.stats);
+    let stats = tau_agent_lib::protocol::format_stats(&session.stats);
     let cwd = session.cwd.as_deref().unwrap_or("");
     let ago = format_time_ago(session.last_activity);
     let budget = if session.child_budget > 0 {
@@ -1882,10 +1894,10 @@ fn print_session_tree(
     }
 }
 
-async fn cmd_sessions_archive(id: &str) -> tau_agent::Result<()> {
-    let mut client = tau_agent::client::Client::connect_or_start().await?;
+async fn cmd_sessions_archive(id: &str) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
     client
-        .send(&tau_agent::protocol::Request::ArchiveSession {
+        .send(&tau_agent_lib::protocol::Request::ArchiveSession {
             session_id: id.to_string(),
             require_ancestor: None,
         })
@@ -1895,10 +1907,10 @@ async fn cmd_sessions_archive(id: &str) -> tau_agent::Result<()> {
     Ok(())
 }
 
-async fn cmd_sessions_restore(id: &str) -> tau_agent::Result<()> {
-    let mut client = tau_agent::client::Client::connect_or_start().await?;
+async fn cmd_sessions_restore(id: &str) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
     client
-        .send(&tau_agent::protocol::Request::RestoreSession {
+        .send(&tau_agent_lib::protocol::Request::RestoreSession {
             session_id: id.to_string(),
         })
         .await?;
@@ -1907,10 +1919,10 @@ async fn cmd_sessions_restore(id: &str) -> tau_agent::Result<()> {
     Ok(())
 }
 
-async fn cmd_sessions_delete(id: &str) -> tau_agent::Result<()> {
-    let mut client = tau_agent::client::Client::connect_or_start().await?;
+async fn cmd_sessions_delete(id: &str) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
     client
-        .send(&tau_agent::protocol::Request::DeleteSession {
+        .send(&tau_agent_lib::protocol::Request::DeleteSession {
             session_id: id.to_string(),
         })
         .await?;
@@ -1919,15 +1931,15 @@ async fn cmd_sessions_delete(id: &str) -> tau_agent::Result<()> {
     Ok(())
 }
 
-fn cmd_sessions_dump(id: &str, output: Option<&str>) -> tau_agent::Result<()> {
-    let db = tau_agent::db::Db::open_default()?;
-    let recording = tau_agent::replay::dump_session(&db, id)?;
+fn cmd_sessions_dump(id: &str, output: Option<&str>) -> tau_agent_lib::Result<()> {
+    let db = tau_agent_lib::db::Db::open_default()?;
+    let recording = tau_agent_lib::replay::dump_session(&db, id)?;
     let json = serde_json::to_string_pretty(&recording)
-        .map_err(|e| tau_agent::Error::Io(format!("serialize recording: {}", e)))?;
+        .map_err(|e| tau_agent_lib::Error::Io(format!("serialize recording: {}", e)))?;
 
     if let Some(path) = output {
         std::fs::write(path, &json)
-            .map_err(|e| tau_agent::Error::Io(format!("write {}: {}", path, e)))?;
+            .map_err(|e| tau_agent_lib::Error::Io(format!("write {}: {}", path, e)))?;
         eprintln!("dumped session {} to {}", id, path);
     } else {
         println!("{}", json);
@@ -1935,20 +1947,20 @@ fn cmd_sessions_dump(id: &str, output: Option<&str>) -> tau_agent::Result<()> {
     Ok(())
 }
 
-async fn cmd_sessions_gc(older_than: u64) -> tau_agent::Result<()> {
-    let mut client = tau_agent::client::Client::connect_or_start().await?;
+async fn cmd_sessions_gc(older_than: u64) -> tau_agent_lib::Result<()> {
+    let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
     client
-        .send(&tau_agent::protocol::Request::GcSessions {
+        .send(&tau_agent_lib::protocol::Request::GcSessions {
             older_than_days: older_than,
         })
         .await?;
 
     client
         .recv_streaming(|resp| match resp {
-            tau_agent::protocol::Response::GcComplete { deleted } => {
+            tau_agent_lib::protocol::Response::GcComplete { deleted } => {
                 eprintln!("gc: deleted {} archived session(s)", deleted);
             }
-            tau_agent::protocol::Response::Error { message } => {
+            tau_agent_lib::protocol::Response::Error { message } => {
                 eprintln!("error: {}", message);
             }
             _ => {}
@@ -1961,8 +1973,8 @@ async fn cmd_sessions_gc(older_than: u64) -> tau_agent::Result<()> {
 // Provider / model management (edits providers.toml directly)
 // ---------------------------------------------------------------------------
 
-fn cmd_providers_list() -> tau_agent::Result<()> {
-    let cfg = tau_agent::config::load_config()?;
+fn cmd_providers_list() -> tau_agent_lib::Result<()> {
+    let cfg = tau_agent_lib::config::load_config()?;
     // Show built-in providers
     println!("built-in:");
     println!("  anthropic  api=anthropic  https://api.anthropic.com");
@@ -1990,55 +2002,55 @@ fn cmd_providers_add(
     api: &str,
     base_url: &str,
     api_key: Option<&str>,
-) -> tau_agent::Result<()> {
-    let mut cfg = tau_agent::config::load_config()?;
+) -> tau_agent_lib::Result<()> {
+    let mut cfg = tau_agent_lib::config::load_config()?;
     cfg.providers.insert(
         name.to_string(),
-        tau_agent::config::ProviderConfig {
+        tau_agent_lib::config::ProviderConfig {
             api: api.to_string(),
             base_url: base_url.to_string(),
             api_key: api_key.map(String::from),
             models: Vec::new(),
         },
     );
-    tau_agent::config::save_config(&cfg)?;
+    tau_agent_lib::config::save_config(&cfg)?;
     eprintln!("provider '{}' added. Restart server to apply.", name);
     Ok(())
 }
 
-fn cmd_providers_remove(name: &str) -> tau_agent::Result<()> {
-    let mut cfg = tau_agent::config::load_config()?;
+fn cmd_providers_remove(name: &str) -> tau_agent_lib::Result<()> {
+    let mut cfg = tau_agent_lib::config::load_config()?;
     if cfg.providers.remove(name).is_none() {
         eprintln!("provider '{}' not found in config", name);
         return Ok(());
     }
-    tau_agent::config::save_config(&cfg)?;
+    tau_agent_lib::config::save_config(&cfg)?;
     eprintln!("provider '{}' removed. Restart server to apply.", name);
     Ok(())
 }
 
-fn parse_thinking_style(s: &str) -> tau_agent::Result<tau_agent::ThinkingStyle> {
+fn parse_thinking_style(s: &str) -> tau_agent_lib::Result<tau_agent_lib::ThinkingStyle> {
     match s {
-        "none" => Ok(tau_agent::ThinkingStyle::None),
-        "anthropic" => Ok(tau_agent::ThinkingStyle::Anthropic),
-        "openai" => Ok(tau_agent::ThinkingStyle::OpenAi),
-        "qwen" => Ok(tau_agent::ThinkingStyle::Qwen),
-        _ => Err(tau_agent::Error::Parse(format!(
+        "none" => Ok(tau_agent_lib::ThinkingStyle::None),
+        "anthropic" => Ok(tau_agent_lib::ThinkingStyle::Anthropic),
+        "openai" => Ok(tau_agent_lib::ThinkingStyle::OpenAi),
+        "qwen" => Ok(tau_agent_lib::ThinkingStyle::Qwen),
+        _ => Err(tau_agent_lib::Error::Parse(format!(
             "unknown thinking style: '{}'. Use: none, anthropic, openai, qwen",
             s
         ))),
     }
 }
 
-fn cmd_models_list() -> tau_agent::Result<()> {
-    let cfg = tau_agent::config::load_config()?;
-    let models = tau_agent::config::resolve_models(&cfg);
+fn cmd_models_list() -> tau_agent_lib::Result<()> {
+    let cfg = tau_agent_lib::config::load_config()?;
+    let models = tau_agent_lib::config::resolve_models(&cfg);
     for m in &models {
         let thinking = match m.thinking {
-            tau_agent::ThinkingStyle::None => "",
-            tau_agent::ThinkingStyle::Anthropic => " [anthropic]",
-            tau_agent::ThinkingStyle::OpenAi => " [openai]",
-            tau_agent::ThinkingStyle::Qwen => " [qwen]",
+            tau_agent_lib::ThinkingStyle::None => "",
+            tau_agent_lib::ThinkingStyle::Anthropic => " [anthropic]",
+            tau_agent_lib::ThinkingStyle::OpenAi => " [openai]",
+            tau_agent_lib::ThinkingStyle::Qwen => " [qwen]",
         };
         println!(
             "  {:<32} {:<12} {}K ctx{}",
@@ -2053,7 +2065,7 @@ fn cmd_models_list() -> tau_agent::Result<()> {
     // from ./.tau/models.toml.  Project lookup is non-recursive: it only
     // checks the current working directory, not parent directories.  Run
     // from the project root to see project aliases.
-    let global_aliases = tau_agent::models_config::load_global_aliases();
+    let global_aliases = tau_agent_lib::models_config::load_global_aliases();
     if !global_aliases.is_empty() {
         println!();
         println!("aliases (global):");
@@ -2064,7 +2076,7 @@ fn cmd_models_list() -> tau_agent::Result<()> {
         }
     }
 
-    let project_aliases = tau_agent::models_config::load_project_aliases(".");
+    let project_aliases = tau_agent_lib::models_config::load_project_aliases(".");
     if !project_aliases.is_empty() {
         println!();
         println!("aliases (project):");
@@ -2085,26 +2097,26 @@ fn cmd_models_add(
     context: u64,
     max_tokens: u64,
     thinking: &str,
-) -> tau_agent::Result<()> {
+) -> tau_agent_lib::Result<()> {
     let thinking = parse_thinking_style(thinking)?;
-    let mut cfg = tau_agent::config::load_config()?;
+    let mut cfg = tau_agent_lib::config::load_config()?;
     let pc = cfg.providers.get_mut(provider).ok_or_else(|| {
-        tau_agent::Error::Io(format!(
+        tau_agent_lib::Error::Io(format!(
             "provider '{}' not found. Add it first with `tau providers add`.",
             provider
         ))
     })?;
     // Remove existing model with same id
     pc.models.retain(|m| m.id != id);
-    pc.models.push(tau_agent::config::ModelConfig {
+    pc.models.push(tau_agent_lib::config::ModelConfig {
         id: id.to_string(),
         name: name.map(String::from),
         context_window: context,
         max_tokens,
         thinking,
-        cost: tau_agent::ModelCost::default(),
+        cost: tau_agent_lib::ModelCost::default(),
     });
-    tau_agent::config::save_config(&cfg)?;
+    tau_agent_lib::config::save_config(&cfg)?;
     eprintln!(
         "model '{}' added to provider '{}'. Restart server to apply.",
         id, provider
@@ -2112,19 +2124,19 @@ fn cmd_models_add(
     Ok(())
 }
 
-fn cmd_models_remove(id: &str, provider: &str) -> tau_agent::Result<()> {
-    let mut cfg = tau_agent::config::load_config()?;
+fn cmd_models_remove(id: &str, provider: &str) -> tau_agent_lib::Result<()> {
+    let mut cfg = tau_agent_lib::config::load_config()?;
     let pc = cfg
         .providers
         .get_mut(provider)
-        .ok_or_else(|| tau_agent::Error::Io(format!("provider '{}' not found", provider)))?;
+        .ok_or_else(|| tau_agent_lib::Error::Io(format!("provider '{}' not found", provider)))?;
     let before = pc.models.len();
     pc.models.retain(|m| m.id != id);
     if pc.models.len() == before {
         eprintln!("model '{}' not found in provider '{}'", id, provider);
         return Ok(());
     }
-    tau_agent::config::save_config(&cfg)?;
+    tau_agent_lib::config::save_config(&cfg)?;
     eprintln!(
         "model '{}' removed from provider '{}'. Restart server to apply.",
         id, provider
@@ -2167,12 +2179,12 @@ fn format_time_ago(unix_secs: i64) -> String {
 // Task commands (direct DB access, no server round-trip)
 // ---------------------------------------------------------------------------
 
-fn project_key() -> tau_agent::Result<String> {
-    let cwd =
-        std::env::current_dir().map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
-    match tau_agent::project::discover_project(&cwd) {
+fn project_key() -> tau_agent_lib::Result<String> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| tau_agent_lib::Error::Io(format!("current_dir: {}", e)))?;
+    match tau_agent_lib::project::discover_project(&cwd) {
         Some((name, _root)) => Ok(name),
-        None => Err(tau_agent::Error::Io(
+        None => Err(tau_agent_lib::Error::Io(
             "not in a tau project — run `tau project init` first".into(),
         )),
     }
@@ -2189,7 +2201,7 @@ fn format_task_timestamp(ms: i64) -> String {
 // Project commands
 // ---------------------------------------------------------------------------
 
-fn cmd_project(action: ProjectAction) -> tau_agent::Result<()> {
+fn cmd_project(action: ProjectAction) -> tau_agent_lib::Result<()> {
     match action {
         ProjectAction::Init { name } => cmd_project_init(name),
         ProjectAction::List => cmd_project_list(),
@@ -2200,9 +2212,9 @@ fn cmd_project(action: ProjectAction) -> tau_agent::Result<()> {
     }
 }
 
-fn cmd_project_init(name: Option<String>) -> tau_agent::Result<()> {
-    let cwd =
-        std::env::current_dir().map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
+fn cmd_project_init(name: Option<String>) -> tau_agent_lib::Result<()> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| tau_agent_lib::Error::Io(format!("current_dir: {}", e)))?;
 
     let name = match name {
         Some(n) => n,
@@ -2211,16 +2223,16 @@ fn cmd_project_init(name: Option<String>) -> tau_agent::Result<()> {
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "project".to_string());
-            tau_agent::project::slugify(&dir_name)
+            tau_agent_lib::project::slugify(&dir_name)
         }
     };
 
-    tau_agent::project::validate_project_name(&name)?;
+    tau_agent_lib::project::validate_project_name(&name)?;
 
     // Check DB for name/path collisions before touching the filesystem.
-    let db = tau_agent::db::Db::open_default()?;
+    let db = tau_agent_lib::db::Db::open_default()?;
     if db.get_project(&name)?.is_some() {
-        return Err(tau_agent::Error::Io(format!(
+        return Err(tau_agent_lib::Error::Io(format!(
             "project name '{}' already exists in the registry",
             name
         )));
@@ -2228,18 +2240,18 @@ fn cmd_project_init(name: Option<String>) -> tau_agent::Result<()> {
 
     // Canonicalize cwd for path collision check (best effort — it exists).
     let canonical_path = std::fs::canonicalize(&cwd)
-        .map_err(|e| tau_agent::Error::Io(format!("canonicalize: {}", e)))?;
+        .map_err(|e| tau_agent_lib::Error::Io(format!("canonicalize: {}", e)))?;
     let path_str = canonical_path.to_string_lossy().to_string();
 
     if db.get_project_by_path(&path_str)?.is_some() {
-        return Err(tau_agent::Error::Io(format!(
+        return Err(tau_agent_lib::Error::Io(format!(
             "a project already exists at {}",
             path_str
         )));
     }
 
     // Create filesystem artifacts.
-    let canonical = tau_agent::project::init_project(&cwd, &name)?;
+    let canonical = tau_agent_lib::project::init_project(&cwd, &name)?;
     let canonical_str = canonical.to_string_lossy().to_string();
 
     // Register in global DB.
@@ -2249,8 +2261,8 @@ fn cmd_project_init(name: Option<String>) -> tau_agent::Result<()> {
     Ok(())
 }
 
-fn cmd_project_list() -> tau_agent::Result<()> {
-    let db = tau_agent::db::Db::open_default()?;
+fn cmd_project_list() -> tau_agent_lib::Result<()> {
+    let db = tau_agent_lib::db::Db::open_default()?;
     let projects = db.list_projects()?;
 
     if projects.is_empty() {
@@ -2273,15 +2285,15 @@ fn cmd_project_list() -> tau_agent::Result<()> {
     Ok(())
 }
 
-fn cmd_project_info() -> tau_agent::Result<()> {
-    let cwd =
-        std::env::current_dir().map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
+fn cmd_project_info() -> tau_agent_lib::Result<()> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| tau_agent_lib::Error::Io(format!("current_dir: {}", e)))?;
 
-    let (name, root) = tau_agent::project::discover_project(&cwd).ok_or_else(|| {
-        tau_agent::Error::Io("not in a tau project (no .tau/project.toml found)".into())
+    let (name, root) = tau_agent_lib::project::discover_project(&cwd).ok_or_else(|| {
+        tau_agent_lib::Error::Io("not in a tau project (no .tau/project.toml found)".into())
     })?;
 
-    let operator_dir = tau_agent::paths::project_config_dir(&name);
+    let operator_dir = tau_agent_lib::paths::project_config_dir(&name);
 
     println!("name:       {}", name);
     println!("path:       {}", root.display());
@@ -2308,7 +2320,7 @@ fn cmd_project_info() -> tau_agent::Result<()> {
     }
 
     // Show DB registration status.
-    let db = tau_agent::db::Db::open_default()?;
+    let db = tau_agent_lib::db::Db::open_default()?;
     if let Some(proj) = db.get_project(&name)? {
         println!(
             "registered: yes (last seen {})",
@@ -2321,11 +2333,11 @@ fn cmd_project_info() -> tau_agent::Result<()> {
     Ok(())
 }
 
-fn cmd_project_migrate() -> tau_agent::Result<()> {
-    let tau_db_path = tau_agent::paths::data_dir().join("tau.db");
-    let tasks_db_path = tau_agent::paths::data_dir().join("tasks.db");
-    let db = tau_agent::db::Db::open(&tau_db_path)?;
-    tau_agent::migration::run_project_migration(&db, &tasks_db_path)?;
+fn cmd_project_migrate() -> tau_agent_lib::Result<()> {
+    let tau_db_path = tau_agent_lib::paths::data_dir().join("tau.db");
+    let tasks_db_path = tau_agent_lib::paths::data_dir().join("tasks.db");
+    let db = tau_agent_lib::db::Db::open(&tau_db_path)?;
+    tau_agent_lib::migration::run_project_migration(&db, &tasks_db_path)?;
     eprintln!("Migration complete.");
     Ok(())
 }
@@ -2333,14 +2345,14 @@ fn cmd_project_migrate() -> tau_agent::Result<()> {
 /// Render `tau project stats` output: one project-total block, formatted
 /// like a condensed session status. Defaults to the current project
 /// (discovered from cwd) when `project` is None.
-fn cmd_project_stats(project: Option<String>) -> tau_agent::Result<()> {
+fn cmd_project_stats(project: Option<String>) -> tau_agent_lib::Result<()> {
     let name = match project {
         Some(n) => n,
         None => {
             let cwd = std::env::current_dir()
-                .map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
-            let (n, _) = tau_agent::project::discover_project(&cwd).ok_or_else(|| {
-                tau_agent::Error::Io(
+                .map_err(|e| tau_agent_lib::Error::Io(format!("current_dir: {}", e)))?;
+            let (n, _) = tau_agent_lib::project::discover_project(&cwd).ok_or_else(|| {
+                tau_agent_lib::Error::Io(
                     "not in a tau project (no .tau/project.toml found). Pass --project NAME to inspect a specific project."
                         .into(),
                 )
@@ -2349,7 +2361,7 @@ fn cmd_project_stats(project: Option<String>) -> tau_agent::Result<()> {
         }
     };
 
-    let db = tau_agent::db::Db::open_default()?;
+    let db = tau_agent_lib::db::Db::open_default()?;
     let stats = db.project_stats(&name)?;
     print_project_stats_block(&name, &stats);
     Ok(())
@@ -2357,7 +2369,7 @@ fn cmd_project_stats(project: Option<String>) -> tau_agent::Result<()> {
 
 /// Shared renderer used by `tau project stats`.  Kept in one place so the
 /// TUI `/project stats` slash command can produce the same layout.
-fn print_project_stats_block(project_name: &str, stats: &tau_agent::db::DbProjectStats) {
+fn print_project_stats_block(project_name: &str, stats: &tau_agent_lib::db::DbProjectStats) {
     println!("Project: {}", project_name);
     println!(
         "  Sessions:     {}",
@@ -2400,15 +2412,15 @@ fn format_u64_commas(n: u64) -> String {
     out
 }
 
-fn cmd_project_rename(new_name: &str) -> tau_agent::Result<()> {
-    let cwd =
-        std::env::current_dir().map_err(|e| tau_agent::Error::Io(format!("current_dir: {}", e)))?;
+fn cmd_project_rename(new_name: &str) -> tau_agent_lib::Result<()> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| tau_agent_lib::Error::Io(format!("current_dir: {}", e)))?;
 
-    let (old_name, root) = tau_agent::project::discover_project(&cwd).ok_or_else(|| {
-        tau_agent::Error::Io("not in a tau project (no .tau/project.toml found)".into())
+    let (old_name, root) = tau_agent_lib::project::discover_project(&cwd).ok_or_else(|| {
+        tau_agent_lib::Error::Io("not in a tau project (no .tau/project.toml found)".into())
     })?;
 
-    tau_agent::project::validate_project_name(new_name)?;
+    tau_agent_lib::project::validate_project_name(new_name)?;
 
     if old_name == new_name {
         eprintln!("project is already named '{}'", new_name);
@@ -2416,31 +2428,31 @@ fn cmd_project_rename(new_name: &str) -> tau_agent::Result<()> {
     }
 
     // Rename operator config directory first (easiest to revert).
-    let old_operator_dir = tau_agent::paths::project_config_dir(&old_name);
-    let new_operator_dir = tau_agent::paths::project_config_dir(new_name);
+    let old_operator_dir = tau_agent_lib::paths::project_config_dir(&old_name);
+    let new_operator_dir = tau_agent_lib::paths::project_config_dir(new_name);
     if new_operator_dir.exists() {
-        return Err(tau_agent::Error::Io(format!(
+        return Err(tau_agent_lib::Error::Io(format!(
             "operator config directory already exists: {}",
             new_operator_dir.display()
         )));
     }
     if old_operator_dir.exists() {
         std::fs::rename(&old_operator_dir, &new_operator_dir)
-            .map_err(|e| tau_agent::Error::Io(format!("rename operator dir: {}", e)))?;
+            .map_err(|e| tau_agent_lib::Error::Io(format!("rename operator dir: {}", e)))?;
     }
 
     // Update .tau/project.toml.
-    let config = tau_agent::project::ProjectConfig {
+    let config = tau_agent_lib::project::ProjectConfig {
         name: new_name.to_string(),
     };
     let toml_str = toml::to_string_pretty(&config)
-        .map_err(|e| tau_agent::Error::Io(format!("serialize project.toml: {}", e)))?;
+        .map_err(|e| tau_agent_lib::Error::Io(format!("serialize project.toml: {}", e)))?;
     let project_toml = root.join(".tau").join("project.toml");
     std::fs::write(&project_toml, toml_str)
-        .map_err(|e| tau_agent::Error::Io(format!("write project.toml: {}", e)))?;
+        .map_err(|e| tau_agent_lib::Error::Io(format!("write project.toml: {}", e)))?;
 
     // Update DB.
-    let db = tau_agent::db::Db::open_default()?;
+    let db = tau_agent_lib::db::Db::open_default()?;
     db.rename_project(&old_name, new_name)?;
 
     eprintln!("renamed project '{}' → '{}'", old_name, new_name);
@@ -2452,8 +2464,8 @@ fn format_time_ago_ms(ms: i64) -> String {
     format_time_ago(ms / 1000)
 }
 
-fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
-    let db = tau_agent::tasks_db::TasksDb::open_default()?;
+fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
+    let db = tau_agent_lib::tasks_db::TasksDb::open_default()?;
 
     match action {
         TaskAction::List { state, parent } => {
@@ -2463,7 +2475,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
                 println!("no tasks");
                 return Ok(());
             }
-            let tree = tau_agent::tasks_db::tree_order(tasks);
+            let tree = tau_agent_lib::tasks_db::tree_order(tasks);
             println!("  {:>4}  {:<12}  {:>8}  TITLE", "ID", "STATE", "PRIORITY");
             for (depth, t) in &tree {
                 let indent = "  ".repeat(*depth);
@@ -2476,7 +2488,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
         TaskAction::Get { id } => {
             let task = db
                 .get_task(id)?
-                .ok_or_else(|| tau_agent::Error::Io(format!("task {} not found", id)))?;
+                .ok_or_else(|| tau_agent_lib::Error::Io(format!("task {} not found", id)))?;
 
             let skip = if task.skip_review { "yes" } else { "no" };
             let require_approval = if task.require_approval { "yes" } else { "no" };
@@ -2600,7 +2612,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
             title,
             priority,
         } => {
-            let update = tau_agent::tasks_db::TaskUpdate {
+            let update = tau_agent_lib::tasks_db::TaskUpdate {
                 state,
                 title,
                 priority,
@@ -2614,7 +2626,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
             println!("added message #{} to task #{}", msg.id, id);
         }
         TaskAction::Approve { id } => {
-            let update = tau_agent::tasks_db::TaskUpdate {
+            let update = tau_agent_lib::tasks_db::TaskUpdate {
                 state: Some("approved".to_string()),
                 ..Default::default()
             };
@@ -2626,7 +2638,7 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
             println!("Claimed task #{}: {}", result.task.id, result.task.title);
         }
         TaskAction::Ready { id } => {
-            let update = tau_agent::tasks_db::TaskUpdate {
+            let update = tau_agent_lib::tasks_db::TaskUpdate {
                 state: Some("ready".to_string()),
                 ..Default::default()
             };
@@ -2653,8 +2665,8 @@ fn cmd_task(action: TaskAction) -> tau_agent::Result<()> {
         }
         TaskAction::Status => {
             let project = project_key()?;
-            let status = tau_agent::tasks_scheduler::get_status(&db, &project, None)?;
-            print!("{}", tau_agent::tasks_scheduler::format_status(&status));
+            let status = tau_agent_lib::tasks_scheduler::get_status(&db, &project, None)?;
+            print!("{}", tau_agent_lib::tasks_scheduler::format_status(&status));
         }
     }
     Ok(())
@@ -2680,7 +2692,7 @@ mod tests {
         // instead exercise the format_u64_commas path which backs the
         // block's numeric columns — the integration-style assertion
         // would otherwise require running the binary end-to-end.
-        let stats = tau_agent::db::DbProjectStats {
+        let stats = tau_agent_lib::db::DbProjectStats {
             session_count: 42,
             message_count: 8124,
             tokens_input: 12_340_156,

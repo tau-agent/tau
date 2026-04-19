@@ -3,12 +3,12 @@
 use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui_textarea::TextArea;
 
-use tau_agent::auth::SubscriptionUsage;
-use tau_agent::protocol::{
+use tau_agent_lib::auth::SubscriptionUsage;
+use tau_agent_lib::protocol::{
     ProjectStatsInfo, Response, SessionInfo, TaskHistoryInfo, TaskInfo, TaskMessageInfo,
     TaskRelationInfo, TaskSessionInfo,
 };
-use tau_agent::types::{
+use tau_agent_lib::types::{
     AgentPhase, AssistantContent, Message, StopReason, StreamEvent, ToolResultMessage, UserContent,
 };
 
@@ -17,7 +17,7 @@ use crate::message::MessageItem;
 use crate::render::RendererRegistry;
 use crate::theme::Theme;
 
-/// Cumulative usage tracking (mirrored from tau-agent-cli).
+/// Cumulative usage tracking (mirrored from tau-agent).
 #[derive(Default)]
 pub struct UsageTotals {
     pub input: u64,
@@ -31,7 +31,7 @@ pub struct UsageTotals {
 }
 
 impl UsageTotals {
-    pub fn add(&mut self, usage: &tau_agent::Usage) {
+    pub fn add(&mut self, usage: &tau_agent_lib::Usage) {
         self.input += usage.input;
         self.output += usage.output;
         self.cache_read += usage.cache_read;
@@ -104,7 +104,7 @@ pub struct PickerGroups {
     /// reasons keeping it from dispatch. Dependency reasons drive the
     /// inline `⏳ #N` row suffix; the detail overlay renders every
     /// reason verbatim.
-    pub wait_reasons: std::collections::HashMap<i64, Vec<tau_agent::protocol::TaskWaitReason>>,
+    pub wait_reasons: std::collections::HashMap<i64, Vec<tau_agent_lib::protocol::TaskWaitReason>>,
 }
 
 /// One row in the scheduler-grouped task picker.
@@ -153,7 +153,7 @@ pub struct TaskPickerDetail {
     /// Scheduler wait reasons for this task (empty for tasks that are
     /// active/merged/etc.). Populated from the picker's last TaskOverview
     /// snapshot so the detail overlay can render the full list.
-    pub wait_reasons: Vec<tau_agent::protocol::TaskWaitReason>,
+    pub wait_reasons: Vec<tau_agent_lib::protocol::TaskWaitReason>,
     pub scroll: usize,
 }
 
@@ -443,7 +443,9 @@ impl App {
                     let output = content
                         .iter()
                         .filter_map(|c| match c {
-                            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                            tau_agent_lib::types::ToolResultContent::Text(t) => {
+                                Some(t.text.as_str())
+                            }
                             _ => None,
                         })
                         .collect::<Vec<_>>()
@@ -1925,7 +1927,7 @@ impl App {
     /// Call `save_nav_state()` first if you want to preserve the current session.
     pub fn switch_to_session(
         &mut self,
-        info: &tau_agent::protocol::SessionInfo,
+        info: &tau_agent_lib::protocol::SessionInfo,
         messages: Vec<Message>,
     ) {
         self.session_id = info.id.clone();
@@ -2296,7 +2298,7 @@ impl App {
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_dir().ok());
         if let Some(cwd) = cwd {
-            if let Some((name, _root)) = tau_agent::project::discover_project(cwd.as_path()) {
+            if let Some((name, _root)) = tau_agent_lib::project::discover_project(cwd.as_path()) {
                 return name;
             }
         }
@@ -2677,7 +2679,7 @@ impl App {
                 }
             }
             Response::Error { message } => {
-                if tau_agent::protocol::is_shutting_down_error(&message) {
+                if tau_agent_lib::protocol::is_shutting_down_error(&message) {
                     // Treat as a transient server-restart signal rather
                     // than a fatal error. The Subscribe task auto-reconnects
                     // and re-fetches messages; no user-visible red line.
@@ -2723,7 +2725,7 @@ impl App {
                 });
             }
             Response::SessionInfo { info } => {
-                let stats_str = tau_agent::protocol::format_stats(&info.stats);
+                let stats_str = tau_agent_lib::protocol::format_stats(&info.stats);
                 self.messages.push(MessageItem::Status {
                     text: format!(
                         "session: {} | {}/{} | {} msgs | {}",
@@ -2779,7 +2781,7 @@ impl App {
                         text: format!("{} child session(s):", children.len()),
                     });
                     for s in &children {
-                        let stats = tau_agent::protocol::format_stats(&s.stats);
+                        let stats = tau_agent_lib::protocol::format_stats(&s.stats);
                         self.messages.push(MessageItem::Status {
                             text: format!(
                                 "  {}  {}/{}  {} msgs  {}",
@@ -2828,7 +2830,7 @@ impl App {
                 if self.mode == AppMode::TaskPicker {
                     let mut wr_map: std::collections::HashMap<
                         i64,
-                        Vec<tau_agent::protocol::TaskWaitReason>,
+                        Vec<tau_agent_lib::protocol::TaskWaitReason>,
                     > = std::collections::HashMap::new();
                     for entry in wait_reasons {
                         wr_map.insert(entry.task_id, entry.reasons);
@@ -3525,7 +3527,9 @@ pub(crate) fn push_group_rows(
     group: &[(usize, TaskInfo)],
     needle: Option<&str>,
     suppress_state_label: bool,
-    wait_reasons: Option<&std::collections::HashMap<i64, Vec<tau_agent::protocol::TaskWaitReason>>>,
+    wait_reasons: Option<
+        &std::collections::HashMap<i64, Vec<tau_agent_lib::protocol::TaskWaitReason>>,
+    >,
     age_hint: Option<String>,
 ) {
     // Tasks in this bucket, keyed by id, so we can detect cross-bucket parents.
@@ -3550,7 +3554,7 @@ pub(crate) fn push_group_rows(
                 reasons
                     .iter()
                     .filter_map(|r| match r {
-                        tau_agent::protocol::TaskWaitReason::Dependency { task_id, .. } => {
+                        tau_agent_lib::protocol::TaskWaitReason::Dependency { task_id, .. } => {
                             Some(*task_id)
                         }
                         _ => None,
@@ -3760,7 +3764,7 @@ fn tree_sort_sessions(sessions: Vec<SessionInfo>) -> Vec<SessionInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tau_agent::types::{AssistantMessage, TextContent, Usage};
+    use tau_agent_lib::types::{AssistantMessage, TextContent, Usage};
 
     fn make_app() -> App {
         App::new(
@@ -5060,7 +5064,7 @@ mod tests {
     fn restore_messages_populates_input_history() {
         let mut app = make_app();
 
-        use tau_agent::types::{TextContent, UserContent, UserMessage};
+        use tau_agent_lib::types::{TextContent, UserContent, UserMessage};
         let messages = vec![
             Message::User(UserMessage {
                 content: vec![UserContent::Text(TextContent {

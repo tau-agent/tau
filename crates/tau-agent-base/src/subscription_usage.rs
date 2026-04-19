@@ -1,7 +1,7 @@
 //! Subscription usage types and OAuth token detection.
 //!
 //! These are pure data types used by the wire protocol. The actual
-//! OAuth flow and credential storage lives in `tau-agent-server::auth`.
+//! OAuth flow and credential storage lives in `tau-agent-lib::auth`.
 
 use serde::{Deserialize, Serialize};
 

@@ -24,8 +24,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use smol::channel::{self, Sender};
 
-use tau_agent::client::Client;
-use tau_agent::protocol::{Request, Response};
+use tau_agent_lib::client::Client;
+use tau_agent_lib::protocol::{Request, Response};
 
 use crate::app::{Action, App, AppMode};
 use crate::events::EventLoop;
@@ -40,7 +40,7 @@ pub async fn run(
     provider: String,
     context_window: u64,
     is_subscription: bool,
-) -> tau_agent::Result<()> {
+) -> tau_agent_lib::Result<()> {
     run_tui(
         session_id,
         model,
@@ -62,7 +62,7 @@ pub async fn run_with_picker(
     provider: String,
     context_window: u64,
     is_subscription: bool,
-) -> tau_agent::Result<()> {
+) -> tau_agent_lib::Result<()> {
     run_tui(
         session_id,
         model,
@@ -82,9 +82,9 @@ async fn run_tui(
     context_window: u64,
     is_subscription: bool,
     start_in_picker: bool,
-) -> tau_agent::Result<()> {
+) -> tau_agent_lib::Result<()> {
     // Set up terminal
-    enable_raw_mode().map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+    enable_raw_mode().map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
     let mut stdout = io::stdout();
     // Enable keyboard enhancement for Shift+Enter etc.
     // Send both Kitty protocol AND xterm modifyOtherKeys:
@@ -112,9 +112,10 @@ async fn run_tui(
         Clear(ClearType::All),
         MoveTo(0, 0),
     )
-    .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+    .map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+    let mut terminal =
+        Terminal::new(backend).map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
 
     // Install TUI-aware shutdown handler.  On SIGTERM/SIGHUP (parent
     // shell closed, systemd stop) we restore the terminal so the user's
@@ -177,11 +178,11 @@ fn install_tui_signal_handler() {
         nix::sys::signal::Signal::SIGTERM,
         nix::sys::signal::Signal::SIGHUP,
     ];
-    if let Err(e) = tau_agent::shutdown::install_for(signals, |sig| {
+    if let Err(e) = tau_agent_lib::shutdown::install_for(signals, |sig| {
         restore_terminal();
         eprintln!(
             "tau: received {}, exiting",
-            tau_agent::shutdown::signal_name(sig),
+            tau_agent_lib::shutdown::signal_name(sig),
         );
         let code = match sig {
             nix::sys::signal::Signal::SIGHUP => 129,
@@ -203,7 +204,7 @@ async fn run_inner(
     context_window: u64,
     is_subscription: bool,
     start_in_picker: bool,
-) -> tau_agent::Result<Option<String>> {
+) -> tau_agent_lib::Result<Option<String>> {
     let saved_settings = settings::load();
     let theme = match saved_settings.tui.theme.as_deref() {
         Some(name) => theme::load_by_name(name).unwrap_or_else(|_| theme::dark()),
@@ -289,7 +290,7 @@ async fn run_inner(
                     match either {
                         futures::future::Either::Left((Some(Ok(resp)), _)) => {
                             if sub_tx.send(resp).await.is_err() {
-                                return Err(tau_agent::Error::Io("app closed".into()));
+                                return Err(tau_agent_lib::Error::Io("app closed".into()));
                             }
                         }
                         futures::future::Either::Left((_, _)) => {
@@ -303,16 +304,16 @@ async fn run_inner(
                         }
                         futures::future::Either::Right((Err(_), _)) => {
                             // Switch channel closed — TUI shutting down
-                            return Err(tau_agent::Error::Io("app closed".into()));
+                            return Err(tau_agent_lib::Error::Io("app closed".into()));
                         }
                     }
                 }
-                Ok::<(), tau_agent::Error>(())
+                Ok::<(), tau_agent_lib::Error>(())
             }
             .await;
 
             match connected {
-                Err(tau_agent::Error::Io(ref msg)) if msg == "app closed" => break,
+                Err(tau_agent_lib::Error::Io(ref msg)) if msg == "app closed" => break,
                 _ => {}
             }
 
@@ -353,7 +354,7 @@ async fn run_inner(
     // Initial draw
     terminal
         .draw(|f| ui::draw(f, &app, &app.theme))
-        .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+        .map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
 
     // Render throttling: under streaming load (one event per token) the
     // naive "draw on every event" approach redraws hundreds of times per
@@ -883,7 +884,7 @@ async fn run_inner(
         if dirty && (force_draw || !throttle_active || interval_ok) {
             terminal
                 .draw(|f| ui::draw(f, &app, &app.theme))
-                .map_err(|e| tau_agent::Error::Io(e.to_string()))?;
+                .map_err(|e| tau_agent_lib::Error::Io(e.to_string()))?;
             last_draw = std::time::Instant::now();
             #[allow(unused_assignments)]
             {
@@ -924,7 +925,7 @@ async fn create_session(
     model: Option<String>,
     cwd: Option<String>,
     parent_id: Option<String>,
-) -> tau_agent::Result<String> {
+) -> tau_agent_lib::Result<String> {
     let mut client = Client::connect().await?;
     client
         .send(&Request::CreateSession {
@@ -951,11 +952,13 @@ async fn create_session(
         })
         .await?;
 
-    created_id.ok_or_else(|| tau_agent::Error::Io("failed to create session".into()))
+    created_id.ok_or_else(|| tau_agent_lib::Error::Io("failed to create session".into()))
 }
 
 /// Fetch message history for a session (blocking request/response).
-async fn fetch_messages(session_id: &str) -> tau_agent::Result<Vec<tau_agent::types::Message>> {
+async fn fetch_messages(
+    session_id: &str,
+) -> tau_agent_lib::Result<Vec<tau_agent_lib::types::Message>> {
     let mut client = Client::connect().await?;
     client
         .send(&Request::GetMessages {
@@ -972,13 +975,13 @@ async fn fetch_messages(session_id: &str) -> tau_agent::Result<Vec<tau_agent::ty
         })
         .await?;
 
-    messages.ok_or_else(|| tau_agent::Error::Io("no messages response".into()))
+    messages.ok_or_else(|| tau_agent_lib::Error::Io("no messages response".into()))
 }
 
 /// Fetch session info.
 async fn fetch_session_info(
     session_id: &str,
-) -> tau_agent::Result<tau_agent::protocol::SessionInfo> {
+) -> tau_agent_lib::Result<tau_agent_lib::protocol::SessionInfo> {
     let mut client = Client::connect().await?;
     client
         .send(&Request::GetSessionInfo {
@@ -995,12 +998,12 @@ async fn fetch_session_info(
         })
         .await?;
 
-    info.ok_or_else(|| tau_agent::Error::Io("no session info response".into()))
+    info.ok_or_else(|| tau_agent_lib::Error::Io("no session info response".into()))
 }
 
 /// Send a request and forget — don't recv responses.
 /// Used for Chat and CancelChat where responses arrive via the Subscribe connection.
-async fn send_fire_and_forget(req: Request) -> tau_agent::Result<()> {
+async fn send_fire_and_forget(req: Request) -> tau_agent_lib::Result<()> {
     let mut client = Client::connect().await?;
     client.send(&req).await?;
     // Connection drops — server will still process the request and broadcast events.
@@ -1010,7 +1013,7 @@ async fn send_fire_and_forget(req: Request) -> tau_agent::Result<()> {
 /// Open a fresh connection, send a request, and spawn a background task
 /// that receives all streaming responses and forwards them to `tx`.
 /// Used for point-to-point requests (ListModels, SetModel, etc.) that aren't broadcast.
-async fn send_request_and_recv(req: Request, tx: Sender<Response>) -> tau_agent::Result<()> {
+async fn send_request_and_recv(req: Request, tx: Sender<Response>) -> tau_agent_lib::Result<()> {
     let mut client = Client::connect().await?;
     client.send(&req).await?;
 

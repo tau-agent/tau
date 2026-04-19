@@ -2429,31 +2429,17 @@ dependencies = [
 name = "tau-agent"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "base64",
  "chrono",
- "fs2",
- "futures",
+ "clap",
+ "clap_complete",
+ "libc",
  "nix 0.30.1",
- "rand 0.10.0",
- "rusqlite",
- "serde",
+ "rustyline",
  "serde_json",
- "sha2 0.11.0",
  "smol",
- "tau-agent-base",
- "tau-agent-client",
- "tau-agent-engine",
- "tau-agent-plugin",
- "tau-agent-plugin-tasks",
- "tau-agent-plugin-worker",
- "tempfile",
- "thiserror 2.0.18",
+ "tau-agent-lib",
+ "tau-agent-tui",
  "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]
@@ -2465,23 +2451,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "toml",
-]
-
-[[package]]
-name = "tau-agent-cli"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "clap_complete",
- "libc",
- "nix 0.30.1",
- "rustyline",
- "serde_json",
- "smol",
- "tau-agent",
- "tau-agent-tui",
  "toml",
 ]
 
@@ -2512,6 +2481,37 @@ dependencies = [
  "tau-agent-plugin-worker",
  "tempfile",
  "tracing",
+ "ureq",
+]
+
+[[package]]
+name = "tau-agent-lib"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "fs2",
+ "futures",
+ "nix 0.30.1",
+ "rand 0.10.0",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "smol",
+ "tau-agent-base",
+ "tau-agent-client",
+ "tau-agent-engine",
+ "tau-agent-plugin",
+ "tau-agent-plugin-tasks",
+ "tau-agent-plugin-worker",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "ureq",
 ]
 
@@ -2556,10 +2556,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tau-agent-server"
-version = "0.1.0"
-
-[[package]]
 name = "tau-agent-tui"
 version = "0.1.0"
 dependencies = [
@@ -2572,7 +2568,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smol",
- "tau-agent",
+ "tau-agent-lib",
  "toml",
  "unicode-width",
 ]

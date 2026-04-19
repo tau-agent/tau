@@ -654,12 +654,12 @@ tau server start --foreground
 
 - `crates/tau-agent-base/src/plugin_protocol.rs` — wire types
   (`PluginRequest`, `PluginMessage`, `PluginRegistration`, etc.).
-- `crates/tau-agent/src/plugin.rs` — server-side plugin management.
+- `crates/tau-agent-lib/src/plugin.rs` — server-side plugin management.
 - `crates/tau-agent-base/src/protocol.rs` — `Request` / `Response` enums
   used inside `ServerRequest`.
 - `crates/tau-agent-engine/src/system_prompt.rs` — `ToolPrompt`,
   `prompt_snippet`, `prompt_guidelines` weaving.
-- `crates/tau-agent/src/server/` — global plugin background tasks,
+- `crates/tau-agent-lib/src/server/` — global plugin background tasks,
   hook firing, tool dispatch.
 - `crates/tau-agent-plugin-tasks/src/tasks_scheduler.rs` — reference
   implementation of a Rust plugin that uses the `ServerRequest` tunnel

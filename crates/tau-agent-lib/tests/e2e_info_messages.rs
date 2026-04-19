@@ -5,8 +5,8 @@
 mod common;
 
 use common::{TestServer, send_recv};
-use tau_agent::protocol::{Request, Response};
-use tau_agent::types::Message;
+use tau_agent_lib::protocol::{Request, Response};
+use tau_agent_lib::types::Message;
 
 /// Extract the info-message texts from a message list in order.
 fn info_texts(messages: &[Message]) -> Vec<String> {
@@ -190,7 +190,7 @@ fn set_model_without_caller_records_plain_info() {
     let conn = server.connect();
     // The test server registers a single mock model; use its id to change to
     // the same model. The info message reports the model name + provider.
-    let mock_id = tau_agent::providers::mock::mock_model().id.clone();
+    let mock_id = tau_agent_lib::providers::mock::mock_model().id.clone();
     let resp = send_recv(
         &conn,
         &Request::SetModel {
@@ -217,7 +217,7 @@ fn set_model_with_caller_records_attributed_info() {
     let sid = create_session(&server);
 
     let conn = server.connect();
-    let mock_id = tau_agent::providers::mock::mock_model().id.clone();
+    let mock_id = tau_agent_lib::providers::mock::mock_model().id.clone();
     let resp = send_recv(
         &conn,
         &Request::SetModel {

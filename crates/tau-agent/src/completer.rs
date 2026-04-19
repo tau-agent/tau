@@ -4,13 +4,13 @@
 //! Returns empty list if server is unreachable — completion degrades gracefully.
 
 use clap_complete::CompletionCandidate;
-use tau_agent::protocol::{Request, Response, format_tokens};
+use tau_agent_lib::protocol::{Request, Response, format_tokens};
 
 /// Send a request to the server and collect the response synchronously.
 /// Returns None if server is unreachable.
 fn query(req: &Request) -> Option<Response> {
     smol::block_on(async {
-        let mut client = tau_agent::client::Client::connect().await.ok()?;
+        let mut client = tau_agent_lib::client::Client::connect().await.ok()?;
         client.send(req).await.ok()?;
         let mut response = None;
         client

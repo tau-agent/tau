@@ -16,8 +16,8 @@ paths**, both of which can drop `ScheduleNeeded` without any retry:
    the `global_plugins` list and calls `plugin.call_hook()` on each plugin
    that registered for that hook. But while a plugin is executing a
    `ToolCall`, the server removes it from `global_plugins` via
-   `take_tool_plugin()` (see `crates/tau-agent/src/server/agent_runner.rs`
-   ~line 45 and `crates/tau-agent/src/plugin.rs::take_tool_plugin`). During
+   `take_tool_plugin()` (see `crates/tau-agent-lib/src/server/agent_runner.rs`
+   ~line 45 and `crates/tau-agent-lib/src/plugin.rs::take_tool_plugin`). During
    that window `call_hook_excluding()` simply does not see the plugin, so
    the `task_state_changed` hook is **never delivered** for that event.
    No error, no retry, no queued event on the plugin side.
@@ -74,7 +74,7 @@ pending event.
 
 The tasks plugin registers for the `task_state_changed` hook (`hooks:
 vec!["task_state_changed".to_string()]` at line 2147). The server's
-`FireHook` handler (`crates/tau-agent/src/server/tool_dispatch.rs` ~line
+`FireHook` handler (`crates/tau-agent-lib/src/server/tool_dispatch.rs` ~line
 608) calls `plugins.lock().call_hook_excluding(session_id, name, data,
 None)`. The tasks plugin's `PluginRequest::Hook` branch (~line 2376)
 pushes `ScheduleNeeded` / `MergeNeeded` and drains.
@@ -101,7 +101,7 @@ triggering session, and **reverts** the task back to `ready` for retry.
 ### Evidence trail
 
 ```rust
-// crates/tau-agent/src/server/agent_runner.rs::PluginExecutor::execute
+// crates/tau-agent-lib/src/server/agent_runner.rs::PluginExecutor::execute
 let taken = {
     let mut pm = self.plugins.lock().expect("plugins mutex poisoned");
     pm.take_tool_plugin(&self.session_id, &tool_call.name)
@@ -114,7 +114,7 @@ let taken = {
 ```
 
 ```rust
-// crates/tau-agent/src/plugin.rs::PluginManager::call_hook_excluding
+// crates/tau-agent-lib/src/plugin.rs::PluginManager::call_hook_excluding
 pub fn call_hook_excluding(
     &mut self,
     session_id: &str,

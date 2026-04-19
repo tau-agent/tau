@@ -21,9 +21,9 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use common::{TestServer, send_recv};
-use tau_agent::plugin::{PluginEntry, PluginsConfig};
-use tau_agent::protocol::{Request, Response};
-use tau_agent::providers::mock::{MockProvider, MockResponse};
+use tau_agent_lib::plugin::{PluginEntry, PluginsConfig};
+use tau_agent_lib::protocol::{Request, Response};
+use tau_agent_lib::providers::mock::{MockProvider, MockResponse};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -319,7 +319,7 @@ fn start_server_with_tasks(
 
     TestServer::start_with_config(vec![], move |mut config| {
         config.registry = {
-            let mut r = tau_agent::provider::ProviderRegistry::new();
+            let mut r = tau_agent_lib::provider::ProviderRegistry::new();
             r.register(provider);
             r
         };

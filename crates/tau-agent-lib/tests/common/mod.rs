@@ -6,8 +6,8 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tau_agent::protocol::{Request, Response};
-use tau_agent::providers::mock::{MockProvider, MockResponse, mock_model};
+use tau_agent_lib::protocol::{Request, Response};
+use tau_agent_lib::providers::mock::{MockProvider, MockResponse, mock_model};
 
 /// Send a request and read one response line.
 pub fn send_recv(stream: &UnixStream, req: &Request) -> Response {
@@ -83,10 +83,10 @@ impl TestServer {
         let sock_clone = sock_path.clone();
 
         let model = mock_model();
-        let mut registry = tau_agent::provider::ProviderRegistry::new();
+        let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
         registry.register(MockProvider::new(mock_responses));
 
-        let config = tau_agent::server::TestServerConfig {
+        let config = tau_agent_lib::server::TestServerConfig {
             registry,
             models: vec![model],
             socket_path: sock_clone,
@@ -99,7 +99,7 @@ impl TestServer {
 
         std::thread::spawn(move || {
             smol::block_on(async {
-                if let Err(e) = tau_agent::server::run_with_config(config).await {
+                if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
                     eprintln!("test server error: {}", e);
                 }
             });
@@ -123,7 +123,9 @@ impl TestServer {
     /// Start a test server with custom config modifications.
     pub fn start_with_config<F>(mock_responses: Vec<MockResponse>, configure: F) -> Self
     where
-        F: FnOnce(tau_agent::server::TestServerConfig) -> tau_agent::server::TestServerConfig,
+        F: FnOnce(
+            tau_agent_lib::server::TestServerConfig,
+        ) -> tau_agent_lib::server::TestServerConfig,
     {
         // Keep shutdown snappy in tests; production defaults to 180s.
         // SAFETY: integration tests each run in their own process.
@@ -136,10 +138,10 @@ impl TestServer {
         let sock_clone = sock_path.clone();
 
         let model = mock_model();
-        let mut registry = tau_agent::provider::ProviderRegistry::new();
+        let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
         registry.register(MockProvider::new(mock_responses));
 
-        let base_config = tau_agent::server::TestServerConfig {
+        let base_config = tau_agent_lib::server::TestServerConfig {
             registry,
             models: vec![model],
             socket_path: sock_clone,
@@ -153,7 +155,7 @@ impl TestServer {
 
         std::thread::spawn(move || {
             smol::block_on(async {
-                if let Err(e) = tau_agent::server::run_with_config(config).await {
+                if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
                     eprintln!("test server error: {}", e);
                 }
             });

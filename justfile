@@ -7,9 +7,9 @@ default: fmt build test
 fmt:
     cargo fmt -- --check
 
-# Build the tau-agent-cli crate (binary still named 'tau')
+# Build the tau-agent crate (binary still named 'tau')
 build:
-    cargo build -p tau-agent-cli
+    cargo build -p tau-agent
 
 # Run the full workspace test suite
 test:

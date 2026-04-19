@@ -8,10 +8,10 @@
 
 fn main() {
     // Install signal handlers — same pattern as `tau worker`.
-    if let Err(e) = tau_agent::shutdown::install(|sig| {
+    if let Err(e) = tau_agent_lib::shutdown::install(|sig| {
         eprintln!(
             "harness: received {}, killing tracked bash children",
-            tau_agent::shutdown::signal_name(sig),
+            tau_agent_lib::shutdown::signal_name(sig),
         );
         tau_agent_plugin_worker::tools::bash::kill_all_tracked();
         let code = match sig {

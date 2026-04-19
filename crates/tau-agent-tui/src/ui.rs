@@ -7,8 +7,8 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use tau_agent::protocol::format_tokens;
-use tau_agent::types::AgentPhase;
+use tau_agent_lib::protocol::format_tokens;
+use tau_agent_lib::types::AgentPhase;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{App, AppMode, PickerRow, PickerView};
@@ -358,7 +358,7 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     // Subscription usage limits: (5h 50% 16h | 7d 12% 2d | sonnet 6% 1d)
     if let Some(ref usage) = app.subscription_usage
-        && let Some(usage_str) = tau_agent::protocol::format_subscription_usage(usage)
+        && let Some(usage_str) = tau_agent_lib::protocol::format_subscription_usage(usage)
     {
         if !left_parts.is_empty() {
             left_parts.push(Span::styled(" ", dim));
@@ -452,7 +452,9 @@ fn draw_footer(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
 /// Build a flat display list from sessions, ordered as a tree.
 /// Returns (display_index, session_index, depth, is_last_sibling) tuples.
-fn build_session_tree(sessions: &[tau_agent::protocol::SessionInfo]) -> Vec<(usize, usize, bool)> {
+fn build_session_tree(
+    sessions: &[tau_agent_lib::protocol::SessionInfo],
+) -> Vec<(usize, usize, bool)> {
     // Map parent_id -> children indices
     let mut children_of: std::collections::HashMap<Option<&str>, Vec<usize>> =
         std::collections::HashMap::new();
@@ -467,7 +469,7 @@ fn build_session_tree(sessions: &[tau_agent::protocol::SessionInfo]) -> Vec<(usi
     fn walk_recursive(
         parent: Option<&str>,
         depth: usize,
-        sessions: &[tau_agent::protocol::SessionInfo],
+        sessions: &[tau_agent_lib::protocol::SessionInfo],
         children_of: &std::collections::HashMap<Option<&str>, Vec<usize>>,
         result: &mut Vec<(usize, usize, bool)>,
     ) {
@@ -503,7 +505,7 @@ fn build_session_tree(sessions: &[tau_agent::protocol::SessionInfo]) -> Vec<(usi
 
 /// Format a duration as a compact idle time string.
 /// Truncate `s` to at most `max_width` display columns, respecting char
-/// boundaries. Unlike `tau_agent::truncate_str` which counts bytes, this
+/// boundaries. Unlike `tau_agent_lib::truncate_str` which counts bytes, this
 /// accounts for wide characters (CJK, emoji, box-drawing glyphs).
 fn truncate_to_width(s: &str, max_width: usize) -> String {
     use unicode_width::UnicodeWidthChar;
@@ -971,7 +973,10 @@ fn task_state_style(state: &str, theme: &Theme) -> (&'static str, Style) {
 /// session.  Returns a two-column glyph (`"\u{25CF} "` for live, `"  "`
 /// otherwise) together with the style to paint it in.  The two-column shape
 /// keeps the task list columns aligned whether or not the indicator is on.
-fn live_indicator(task: &tau_agent::protocol::TaskInfo, theme: &Theme) -> (&'static str, Style) {
+fn live_indicator(
+    task: &tau_agent_lib::protocol::TaskInfo,
+    theme: &Theme,
+) -> (&'static str, Style) {
     if task.has_live_session {
         ("● ", theme.fg(theme.accent))
     } else {
@@ -1232,7 +1237,7 @@ fn render_group_header(text: &str, w: usize, theme: &Theme) -> Line<'static> {
 /// Render a single task row (shared between scheduler and ancestry views).
 #[allow(clippy::too_many_arguments)]
 fn render_task_row(
-    task: &tau_agent::protocol::TaskInfo,
+    task: &tau_agent_lib::protocol::TaskInfo,
     depth: usize,
     parent_out_of_group: bool,
     suppress_state_label: bool,
@@ -1389,7 +1394,7 @@ fn render_task_row(
 /// Returns an empty vec when `task.affected_files` is missing or empty.
 /// Otherwise each returned string is a pre-indented row (caller just wraps
 /// in a span). Long lists are truncated with a trailing `… (+N more)` row.
-pub(crate) fn affected_files_lines(task: &tau_agent::protocol::TaskInfo) -> Vec<String> {
+pub(crate) fn affected_files_lines(task: &tau_agent_lib::protocol::TaskInfo) -> Vec<String> {
     const MAX_FILES: usize = 8;
 
     let files: Vec<String> = match task.affected_files.as_ref().and_then(|v| v.as_array()) {
@@ -1422,10 +1427,10 @@ pub(crate) fn affected_files_lines(task: &tau_agent::protocol::TaskInfo) -> Vec<
 /// not held).  `🔒 held` is included as a final line whenever `task.held`
 /// is true, independent of `wait_reasons` (the two categories coexist).
 pub(crate) fn wait_reason_lines(
-    task: &tau_agent::protocol::TaskInfo,
-    wait_reasons: &[tau_agent::protocol::TaskWaitReason],
+    task: &tau_agent_lib::protocol::TaskInfo,
+    wait_reasons: &[tau_agent_lib::protocol::TaskWaitReason],
 ) -> Vec<String> {
-    use tau_agent::protocol::TaskWaitReason as R;
+    use tau_agent_lib::protocol::TaskWaitReason as R;
     const MAX_FILES_IN_CONFLICT: usize = 4;
 
     if wait_reasons.is_empty() && !task.held {
@@ -1812,7 +1817,7 @@ fn draw_task_detail(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 mod tests {
     use super::*;
     use crate::theme::dark;
-    use tau_agent::protocol::TaskInfo;
+    use tau_agent_lib::protocol::TaskInfo;
 
     #[test]
     fn truncate_to_width_ascii() {
@@ -1948,7 +1953,7 @@ mod tests {
 
     #[test]
     fn live_indicator_shows_dot_only_when_live() {
-        use tau_agent::protocol::TaskInfo;
+        use tau_agent_lib::protocol::TaskInfo;
         let theme = dark();
         let make = |live: bool| TaskInfo {
             id: 1,
@@ -2084,7 +2089,7 @@ mod tests {
 
     #[test]
     fn wait_reason_lines_formats_every_variant() {
-        use tau_agent::protocol::TaskWaitReason as R;
+        use tau_agent_lib::protocol::TaskWaitReason as R;
         let t = empty_task(1);
         let reasons = vec![
             R::Dependency {
@@ -2118,7 +2123,7 @@ mod tests {
 
     #[test]
     fn wait_reason_lines_cross_project_dep_shows_project() {
-        use tau_agent::protocol::TaskWaitReason as R;
+        use tau_agent_lib::protocol::TaskWaitReason as R;
         let t = empty_task(1);
         let reasons = vec![R::Dependency {
             task_id: 9,
@@ -2135,7 +2140,7 @@ mod tests {
 
     #[test]
     fn wait_reason_lines_truncates_long_file_conflict() {
-        use tau_agent::protocol::TaskWaitReason as R;
+        use tau_agent_lib::protocol::TaskWaitReason as R;
         let t = empty_task(1);
         let files: Vec<String> = (0..7).map(|i| format!("f{i}.rs")).collect();
         let reasons = vec![R::FileConflict {
@@ -2151,7 +2156,7 @@ mod tests {
 
     #[test]
     fn wait_reason_lines_appends_held_marker() {
-        use tau_agent::protocol::TaskWaitReason as R;
+        use tau_agent_lib::protocol::TaskWaitReason as R;
         let mut t = empty_task(1);
         t.held = true;
         // Held alone still yields a row.

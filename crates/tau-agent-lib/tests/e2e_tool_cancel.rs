@@ -24,9 +24,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use common::TestServer;
-use tau_agent::plugin::{PluginEntry, PluginsConfig};
-use tau_agent::protocol::{Request, Response};
-use tau_agent::providers::mock::MockResponse;
+use tau_agent_lib::plugin::{PluginEntry, PluginsConfig};
+use tau_agent_lib::protocol::{Request, Response};
+use tau_agent_lib::providers::mock::MockResponse;
 
 fn tau_binary() -> PathBuf {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -80,16 +80,18 @@ fn cancel_chat_kills_bash_subprocess_through_worker_plugin() {
     // Mock provider: a single assistant response that calls bash with a long
     // sleep. The bash tool will hold the agent loop inside execute_tool; we
     // cancel mid-flight and expect the subprocess to die within ~1s.
-    let mock = vec![MockResponse::ToolCalls(vec![tau_agent::types::ToolCall {
-        id: "tc-cancel".into(),
-        name: "bash".into(),
-        arguments: serde_json::json!({
-            // Long enough to clearly distinguish cancellation from natural
-            // exit, short of the default 120s tool watchdog.
-            "command": "sleep 90",
-            "timeout": 120,
-        }),
-    }])];
+    let mock = vec![MockResponse::ToolCalls(vec![
+        tau_agent_lib::types::ToolCall {
+            id: "tc-cancel".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({
+                // Long enough to clearly distinguish cancellation from natural
+                // exit, short of the default 120s tool watchdog.
+                "command": "sleep 90",
+                "timeout": 120,
+            }),
+        },
+    ])];
 
     // Spawn the real `tau worker` as a session plugin so bash is actually
     // available. This is the production configuration.
@@ -189,8 +191,8 @@ fn cancel_chat_kills_bash_subprocess_through_worker_plugin() {
         if let Response::Stream { event } = &resp
             && matches!(
                 event.as_ref(),
-                tau_agent::types::StreamEvent::ToolcallStart { .. }
-                    | tau_agent::types::StreamEvent::ToolcallEnd { .. }
+                tau_agent_lib::types::StreamEvent::ToolcallStart { .. }
+                    | tau_agent_lib::types::StreamEvent::ToolcallEnd { .. }
             )
         {
             saw_tool_start = true;
@@ -240,7 +242,7 @@ fn cancel_chat_kills_bash_subprocess_through_worker_plugin() {
         let resp = recv_line(&mut sub_reader);
         match &resp {
             Response::Stream { event } => {
-                if let tau_agent::types::StreamEvent::ToolResult {
+                if let tau_agent_lib::types::StreamEvent::ToolResult {
                     tool_call_id,
                     is_error,
                     content,

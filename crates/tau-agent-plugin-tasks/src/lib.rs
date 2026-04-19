@@ -5,7 +5,7 @@
 //! and git helpers.
 //!
 //! The plugin communicates with the server via the plugin protocol over
-//! stdin/stdout — it does NOT depend on `tau-agent-server`.
+//! stdin/stdout — it does NOT depend on `tau-agent-lib`.
 
 pub mod tasks;
 pub mod tasks_config;

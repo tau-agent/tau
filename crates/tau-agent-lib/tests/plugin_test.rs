@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tau_agent::plugin::*;
-use tau_agent::types::ToolCall;
+use tau_agent_lib::plugin::*;
+use tau_agent_lib::types::ToolCall;
 
 fn test_plugin_command() -> Vec<String> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -125,7 +125,7 @@ fn plugin_echo_tool() {
         .content
         .iter()
         .filter_map(|c| match c {
-            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            tau_agent_lib::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -158,7 +158,7 @@ fn plugin_slow_tool_streaming() {
         .content
         .iter()
         .filter_map(|c| match c {
-            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            tau_agent_lib::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -187,7 +187,7 @@ fn plugin_fail_tool() {
         .content
         .iter()
         .filter_map(|c| match c {
-            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            tau_agent_lib::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -248,7 +248,7 @@ fn plugin_multiple_tool_calls() {
             .content
             .iter()
             .filter_map(|c| match c {
-                tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+                tau_agent_lib::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -525,7 +525,7 @@ fn plugin_ensure_alive_respawns_when_dead() {
         .content
         .iter()
         .filter_map(|c| match c {
-            tau_agent::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
+            tau_agent_lib::types::ToolResultContent::Text(t) => Some(t.text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -656,7 +656,7 @@ no_default_worker = true
 /// still deliver the request and receive the response.
 #[test]
 fn global_plugin_hooks_work_through_background_io() {
-    use tau_agent::plugin::PluginMessage;
+    use tau_agent_lib::plugin::PluginMessage;
 
     let cmd = test_plugin_command();
     let config = PluginsConfig {

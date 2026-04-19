@@ -22,7 +22,7 @@ const LOG_RETENTION_DAYS: u64 = 14;
 ///
 /// Env filter: reads `TAU_LOG` if set, falling back to `RUST_LOG`, falling back
 /// to `"info"`. Standard `tracing-subscriber` env-filter syntax
-/// (e.g. `TAU_LOG=tau_agent::plugin=debug,tau_agent=info`).
+/// (e.g. `TAU_LOG=tau_agent_lib::plugin=debug,tau_agent_lib=info`).
 ///
 /// Returns a `WorkerGuard` that must be kept alive for the process lifetime
 /// so the non-blocking appender drains on shutdown.

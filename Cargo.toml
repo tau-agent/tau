@@ -14,14 +14,13 @@ keywords = ["llm", "agent", "ai", "claude", "chat"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-tau-agent = { path = "crates/tau-agent", version = "0.1.0" }
+tau-agent-lib = { path = "crates/tau-agent-lib", version = "0.1.0" }
 tau-agent-base = { path = "crates/tau-agent-base", version = "0.1.0" }
 tau-agent-client = { path = "crates/tau-agent-client", version = "0.1.0" }
 tau-agent-engine = { path = "crates/tau-agent-engine", version = "0.1.0" }
 tau-agent-plugin = { path = "crates/tau-agent-plugin", version = "0.1.0" }
 tau-agent-plugin-tasks = { path = "crates/tau-agent-plugin-tasks", version = "0.1.0" }
 tau-agent-plugin-worker = { path = "crates/tau-agent-plugin-worker", version = "0.1.0" }
-tau-agent-server = { path = "crates/tau-agent-server", version = "0.1.0" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smol = "2"

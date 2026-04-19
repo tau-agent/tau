@@ -12,7 +12,7 @@ categories.workspace = true
 description = "Ratatui-based terminal UI for the tau LLM agent"
 
 [dependencies]
-tau-agent.workspace = true
+tau-agent-lib.workspace = true
 smol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
