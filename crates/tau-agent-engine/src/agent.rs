@@ -211,9 +211,12 @@ async fn retry_countdown(
         let remaining_secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
         if last_seconds_shown != Some(remaining_secs) {
             let _ = event_tx.try_send(StreamEvent::Status {
-                message: format!(
-                    "Retrying (attempt {}/{}) in {}s... ({}: {})",
-                    attempt, max_attempts, remaining_secs, kind, err_msg
+                message: retry_countdown_message(
+                    attempt,
+                    max_attempts,
+                    remaining_secs,
+                    kind,
+                    err_msg,
                 ),
             });
             last_seconds_shown = Some(remaining_secs);
@@ -224,6 +227,29 @@ async fn retry_countdown(
         let chunk = remaining.min(std::time::Duration::from_millis(100));
         smol::Timer::after(chunk).await;
     }
+}
+
+/// Build the user-facing status line shown during retry countdowns.
+///
+/// The `remaining_secs` wait is humanised via [`format_duration_human`] so
+/// long backoffs (e.g. multi-hour 429 Retry-After values) display as
+/// `"8h28m"` rather than `"30524s"`. Sub-minute values are still rendered as
+/// bare seconds (`"8s"`), matching the previous format.
+fn retry_countdown_message(
+    attempt: usize,
+    max_attempts: usize,
+    remaining_secs: u64,
+    kind: &str,
+    err_msg: &str,
+) -> String {
+    format!(
+        "Retrying (attempt {}/{}) in {}... ({}: {})",
+        attempt,
+        max_attempts,
+        format_duration_human(remaining_secs.saturating_mul(1000)),
+        kind,
+        err_msg,
+    )
 }
 
 /// Emit a message via the on_message callback, if configured.
@@ -2582,6 +2608,45 @@ mod tests {
                 messages[0]
             );
         });
+    }
+
+    /// Task 636: multi-hour retry waits (e.g. weekly-quota 429s giving a
+    /// Retry-After of ~30000s) should render humanised, not as raw seconds.
+    #[test]
+    fn retry_countdown_message_humanizes_long_wait() {
+        let msg = retry_countdown_message(1, 5, 30524, "HTTP 429", "rate limited");
+        assert!(
+            msg.starts_with("Retrying "),
+            "message must start with 'Retrying ' so the TUI replaces it in place, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("attempt 1/5"),
+            "message should carry attempt info, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("HTTP 429: rate limited"),
+            "message should carry error context, got: {msg:?}"
+        );
+        assert!(
+            !msg.contains("30524s"),
+            "long wait must not render as raw seconds, got: {msg:?}"
+        );
+        // 30524s = 8h 28m 44s → humaniser truncates to "8h28m".
+        assert!(
+            msg.contains(" in 8h28m..."),
+            "long wait should be humanised to '8h28m', got: {msg:?}"
+        );
+    }
+
+    /// Sub-minute waits must still render as bare seconds so the existing
+    /// in-place status replacement (and short-countdown tests) keep working.
+    #[test]
+    fn retry_countdown_message_preserves_short_format() {
+        let msg = retry_countdown_message(2, 5, 8, "timeout", "stream stalled");
+        assert_eq!(
+            msg,
+            "Retrying (attempt 2/5) in 8s... (timeout: stream stalled)"
+        );
     }
 
     /// Integration test for task 535: Ctrl-C during a bash tool call must
