@@ -1399,25 +1399,25 @@ fn await_reply_e2e() {
         )
     });
 
-    // Give the server a moment to register the waiter
-    std::thread::sleep(Duration::from_millis(200));
+    // Poll for the msg_id message to appear in the target's history.
+    // The message is persisted by `drain_queued_messages` inside the
+    // spawned `resume_child_session` agent loop; under load that can
+    // take longer than a simple sleep, so retry up to ~5s.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let msg_text = loop {
+        let conn = server.connect();
+        let messages = match send_recv(
+            &conn,
+            &Request::GetMessages {
+                session_id: target_id.clone(),
+            },
+        ) {
+            Response::Messages { messages } => messages,
+            other => panic!("expected Messages, got {:?}", other),
+        };
 
-    // Find the msg_id by checking the target's messages
-    let conn = server.connect();
-    let messages = match send_recv(
-        &conn,
-        &Request::GetMessages {
-            session_id: target_id.clone(),
-        },
-    ) {
-        Response::Messages { messages } => messages,
-        other => panic!("expected Messages, got {:?}", other),
-    };
-
-    // Find the msg_id in the injected user message
-    let msg_text = messages
-        .iter()
-        .find_map(|m| {
+        // Find the msg_id in the injected user message
+        let found = messages.iter().find_map(|m| {
             if let tau_agent_lib::types::Message::User(u) = m {
                 let text: String = u
                     .content
@@ -1436,8 +1436,16 @@ fn await_reply_e2e() {
             } else {
                 None
             }
-        })
-        .expect("should find a message with msg_id");
+        });
+
+        if let Some(text) = found {
+            break text;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for msg_id message to appear in target history");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
 
     // Extract msg_id from "[Message from session:sN, msg_id=mN, awaits reply]"
     let msg_id = msg_text
