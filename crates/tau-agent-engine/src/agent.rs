@@ -45,8 +45,14 @@ pub struct AgentConfig {
     #[allow(clippy::type_complexity)]
     pub on_message: Option<std::sync::Mutex<Box<dyn FnMut(&Message) + Send>>>,
     /// Callback to refresh the API key after an auth error (e.g. expired OAuth token).
-    /// Called on 401/auth errors before retrying. Returns the new API key if refresh succeeded.
-    pub refresh_api_key: Option<Box<dyn Fn() -> Option<String> + Send + Sync>>,
+    /// Called on 401/auth errors before retrying. The argument is the API
+    /// key that just got rejected (`options.api_key`), so the callback can
+    /// distinguish "another session already refreshed, adopt their token"
+    /// from "I genuinely need to hit the OAuth endpoint" — see
+    /// `AuthStorage::get_api_key_excluding`.  Returns the new API key if
+    /// refresh succeeded.
+    #[allow(clippy::type_complexity)]
+    pub refresh_api_key: Option<Box<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>>,
     /// Model to use for loop-review checkpoints. If `None`, uses the session's own model.
     pub review_model: Option<Model>,
     /// Callback to drain Tier-2 post-persist actions attached to a tool
@@ -704,7 +710,8 @@ async fn stream_with_retry(
             if auth_retry_count < MAX_AUTH_RETRIES
                 && is_auth_error(err_msg)
                 && let Some(ref refresh_fn) = config.refresh_api_key
-                && let Some(new_key) = refresh_fn()
+                && let Some(new_key) = refresh_fn(options.api_key.as_deref())
+                && Some(new_key.as_str()) != options.api_key.as_deref()
             {
                 auth_retry_count += 1;
                 options.api_key = Some(new_key);

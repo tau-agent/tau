@@ -254,6 +254,25 @@ pub fn refresh_token(refresh_tok: &str) -> crate::Result<OAuthCredentials> {
 }
 
 // ---------------------------------------------------------------------------
+// Refresh indirection (test hookable)
+// ---------------------------------------------------------------------------
+
+/// Call the OAuth refresh endpoint.
+///
+/// This indirection exists so unit tests can swap in a counter-incrementing
+/// closure without needing an HTTP mock.  In production it just calls
+/// `refresh_token`.
+#[cfg(not(test))]
+fn do_refresh(refresh_tok: &str) -> crate::Result<OAuthCredentials> {
+    refresh_token(refresh_tok)
+}
+
+#[cfg(test)]
+fn do_refresh(refresh_tok: &str) -> crate::Result<OAuthCredentials> {
+    tests::test_refresh_hook(refresh_tok)
+}
+
+// ---------------------------------------------------------------------------
 // Credential storage (auth.json with file locking)
 // ---------------------------------------------------------------------------
 
@@ -355,6 +374,31 @@ impl AuthStorage {
     /// Get API key for a provider, auto-refreshing OAuth tokens if needed.
     /// Performs refresh under exclusive file lock to prevent races.
     pub fn get_api_key(&self, provider: &str) -> crate::Result<Option<String>> {
+        self.get_api_key_excluding(provider, None)
+    }
+
+    /// Resolve an API key for `provider`, preferring a value different from
+    /// `stale` ("the token that just got rejected").
+    ///
+    /// Semantics (OAuth credentials):
+    /// 1. Read the credential under a shared file lock.
+    /// 2. If the stored access token is **different** from `stale` and is
+    ///    not expired, return it without performing any HTTP refresh.  This
+    ///    is the hot path that breaks the 401-thrash cycle after a long
+    ///    429 sleep: a sibling session already refreshed and wrote the new
+    ///    token; we simply adopt it.
+    /// 3. Otherwise (stored access equals `stale`, or it is expired, or no
+    ///    credential exists yet) fall through to `refresh_locked`, which
+    ///    takes the exclusive lock, re-reads under that lock, and only
+    ///    calls the OAuth endpoint when the stored creds really are stale.
+    ///
+    /// For non-OAuth credentials the stored key is returned unchanged; for
+    /// missing credentials we fall back to `env_api_key`.
+    pub fn get_api_key_excluding(
+        &self,
+        provider: &str,
+        stale: Option<&str>,
+    ) -> crate::Result<Option<String>> {
         let cred = match self.get(provider)? {
             Some(c) => c,
             None => {
@@ -366,10 +410,21 @@ impl AuthStorage {
         match cred {
             AuthCredential::ApiKey { key } => Ok(Some(key)),
             AuthCredential::Oauth(oauth) => {
-                if !oauth.is_expired() {
+                // If the stored token differs from the caller's stale one
+                // and is still valid, adopt it without refreshing.  This is
+                // the fast path that breaks the thrash cycle.
+                if !oauth.is_expired() && stale != Some(oauth.access.as_str()) {
                     return Ok(Some(oauth.access));
                 }
-                // Need refresh — do it under exclusive lock
+                // Either the stored token is expired, or it equals the
+                // stale token the caller just tried — in both cases we go
+                // through the refresh path (which double-checks under the
+                // exclusive lock before actually hitting the network).
+                if !oauth.is_expired() {
+                    // Stored equals stale but not expired: the server has
+                    // already rejected this token, so force a refresh.
+                    return self.refresh_locked(provider, &oauth.refresh);
+                }
                 self.refresh_locked(provider, &oauth.refresh)
             }
         }
@@ -414,7 +469,7 @@ impl AuthStorage {
             stale_refresh.to_string()
         };
 
-        let new_creds = match refresh_token(&refresh_tok) {
+        let new_creds = match do_refresh(&refresh_tok) {
             Ok(c) => c,
             Err(e) => {
                 file.unlock().ok();
@@ -563,4 +618,283 @@ pub fn fetch_subscription_usage(token: &str) -> crate::Result<SubscriptionUsage>
         seven_day_opus: resp.seven_day_opus,
         extra_usage: resp.extra_usage,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex, OnceLock};
+
+    // ---------------------------------------------------------------------
+    // Test-only refresh hook
+    // ---------------------------------------------------------------------
+
+    type RefreshHook = Box<dyn Fn(&str) -> crate::Result<OAuthCredentials> + Send + Sync>;
+
+    fn hook_slot() -> &'static Mutex<Option<RefreshHook>> {
+        static SLOT: OnceLock<Mutex<Option<RefreshHook>>> = OnceLock::new();
+        SLOT.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Install a test-only refresh hook.  Returned guard restores the
+    /// previous hook on drop.
+    pub(super) struct HookGuard {
+        prev: Option<RefreshHook>,
+    }
+
+    impl Drop for HookGuard {
+        fn drop(&mut self) {
+            let mut slot = hook_slot().lock().expect("hook slot poisoned");
+            *slot = self.prev.take();
+        }
+    }
+
+    pub(super) fn install_refresh_hook<F>(f: F) -> HookGuard
+    where
+        F: Fn(&str) -> crate::Result<OAuthCredentials> + Send + Sync + 'static,
+    {
+        let mut slot = hook_slot().lock().expect("hook slot poisoned");
+        let prev = slot.take();
+        *slot = Some(Box::new(f));
+        HookGuard { prev }
+    }
+
+    /// Called by `do_refresh` under `#[cfg(test)]`.
+    pub(super) fn test_refresh_hook(refresh_tok: &str) -> crate::Result<OAuthCredentials> {
+        let slot = hook_slot().lock().expect("hook slot poisoned");
+        match slot.as_ref() {
+            Some(hook) => hook(refresh_tok),
+            None => Err(crate::Error::Http(
+                "test_refresh_hook invoked without an installed hook".into(),
+            )),
+        }
+    }
+
+    // Global mutex so concurrency tests that share the process-global hook
+    // slot don't stomp on each other when `cargo test` runs them in
+    // parallel.  Poison is ignored: a panicked test still releases the
+    // lock, we just don't want cascade failures.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LK: OnceLock<Mutex<()>> = OnceLock::new();
+        let m = LK.get_or_init(|| Mutex::new(()));
+        match m.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    fn tmp_storage() -> (AuthStorage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.json");
+        (AuthStorage::new(path), dir)
+    }
+
+    fn future_expiry() -> u64 {
+        crate::types::timestamp_ms() + 60 * 60 * 1000
+    }
+
+    fn past_expiry() -> u64 {
+        // Already past, well beyond the 5-minute EXPIRY_BUFFER_MS.
+        crate::types::timestamp_ms().saturating_sub(24 * 60 * 60 * 1000)
+    }
+
+    fn set_oauth(storage: &AuthStorage, provider: &str, access: &str, refresh: &str, expires: u64) {
+        storage
+            .set(
+                provider,
+                AuthCredential::Oauth(OAuthCredentials {
+                    refresh: refresh.to_string(),
+                    access: access.to_string(),
+                    expires,
+                }),
+            )
+            .expect("set oauth");
+    }
+
+    // ---------------------------------------------------------------------
+    // Unit tests: get_api_key_excluding without touching the refresh path.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn stale_differs_from_stored_returns_stored_without_refresh() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        set_oauth(&storage, "anthropic", "A1", "R1", future_expiry());
+
+        // If the hook were called, this would panic the test.
+        let _h = install_refresh_hook(|_| {
+            panic!("refresh must not be called on the fast path");
+        });
+
+        let got = storage
+            .get_api_key_excluding("anthropic", Some("A0"))
+            .expect("get key");
+        assert_eq!(got.as_deref(), Some("A1"));
+    }
+
+    #[test]
+    fn stale_equals_stored_and_not_expired_returns_same() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        set_oauth(&storage, "anthropic", "A1", "R1", future_expiry());
+
+        // When `stale == stored` but the stored token has not expired
+        // according to our clock, we fall into `refresh_locked`, which
+        // re-checks under the exclusive lock and returns the stored
+        // (non-expired) token without hitting the refresh endpoint.  The
+        // agent loop's "new_key == stale" guard then stops the retry
+        // loop, so we don't spin forever on a server that has invalidated
+        // a locally-fresh token.
+        let _h = install_refresh_hook(|_| {
+            panic!(
+                "refresh_locked must not hit the OAuth endpoint when the stored token is non-expired"
+            );
+        });
+
+        let got = storage
+            .get_api_key_excluding("anthropic", Some("A1"))
+            .expect("get key");
+        assert_eq!(got.as_deref(), Some("A1"));
+    }
+
+    #[test]
+    fn stale_none_and_not_expired_returns_stored() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        set_oauth(&storage, "anthropic", "A1", "R1", future_expiry());
+
+        let _h = install_refresh_hook(|_| {
+            panic!("refresh must not be called when token is fresh");
+        });
+
+        let got = storage.get_api_key("anthropic").expect("get key");
+        assert_eq!(got.as_deref(), Some("A1"));
+    }
+
+    #[test]
+    fn no_credential_falls_through_to_env() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        // Use a provider slug for which env_api_key consults a dedicated
+        // variable so this test is deterministic.
+        // SAFETY: tests run single-threaded w.r.t. this env var thanks to
+        // `test_lock()`.
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "env-key");
+        }
+        let got = storage
+            .get_api_key_excluding("anthropic", Some("whatever"))
+            .expect("get key");
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        assert_eq!(got.as_deref(), Some("env-key"));
+    }
+
+    #[test]
+    fn api_key_credential_ignores_stale() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        storage
+            .set(
+                "custom",
+                AuthCredential::ApiKey {
+                    key: "K".to_string(),
+                },
+            )
+            .expect("set api key");
+
+        // `stale == stored` still returns stored — ApiKey creds are not
+        // rotated, so there is nothing to refresh.
+        let got = storage
+            .get_api_key_excluding("custom", Some("K"))
+            .expect("get key");
+        assert_eq!(got.as_deref(), Some("K"));
+        let got = storage
+            .get_api_key_excluding("custom", Some("other"))
+            .expect("get key");
+        assert_eq!(got.as_deref(), Some("K"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Concurrency regression test: N sessions wake up with the same stale
+    // token, exactly one refresh HTTP call happens.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_wake_triggers_exactly_one_refresh() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        // Pre-populate an EXPIRED credential (like after a multi-day 429
+        // sleep).  Every session's local `options.api_key` is \"A0\".
+        set_oauth(&storage, "anthropic", "A0", "R0", past_expiry());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        // The hook simulates Anthropic's refresh endpoint: sleep briefly
+        // so racing threads have time to pile up against the exclusive
+        // lock, then hand back a fresh, non-expired credential.
+        let _h = install_refresh_hook(move |_| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(OAuthCredentials {
+                refresh: "R1".into(),
+                access: "A1".into(),
+                expires: future_expiry(),
+            })
+        });
+
+        let n = 10;
+        let storage = Arc::new(storage);
+        let barrier = Arc::new(Barrier::new(n));
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let s = storage.clone();
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                s.get_api_key_excluding("anthropic", Some("A0"))
+                    .expect("get key")
+            }));
+        }
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().expect("join"));
+        }
+
+        // All callers got the same new token.
+        for r in &results {
+            assert_eq!(r.as_deref(), Some("A1"));
+        }
+        // Exactly one refresh HTTP call.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "expected exactly one refresh call, got {}",
+            calls.load(Ordering::SeqCst),
+        );
+
+        // A lagging session wakes up later, still holding the ancient
+        // stale token.  The store now has a fresh non-expired credential,
+        // so it must be returned WITHOUT an additional refresh.
+        let late = storage
+            .get_api_key_excluding("anthropic", Some("A0"))
+            .expect("get key");
+        assert_eq!(late.as_deref(), Some("A1"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "lagging session must not trigger a second refresh",
+        );
+    }
 }

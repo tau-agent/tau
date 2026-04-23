@@ -6,7 +6,7 @@ use super::notifications::{
     notify_parent_of_child_completion, notify_session_done_waiters, queue_and_maybe_resume,
     queue_info_to_session,
 };
-use super::registry::{maybe_respawn_for_queued, resolve_api_key};
+use super::registry::{maybe_respawn_for_queued, resolve_api_key, resolve_api_key_excluding};
 use super::state::{SessionLocks, SharedState, lock_state, session_lock};
 use super::tool_dispatch::handle_server_request;
 use super::{SharedTestOverrides, ShutdownHandle};
@@ -420,9 +420,9 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         refresh_api_key: {
             let state_clone_refresh = state.clone();
             let provider_name = model.provider.clone();
-            Some(Box::new(move || {
+            Some(Box::new(move |stale: Option<&str>| {
                 let st = state_clone_refresh.lock().expect("state mutex poisoned");
-                resolve_api_key(&st.auth, &st.config, &provider_name)
+                resolve_api_key_excluding(&st.auth, &st.config, &provider_name, stale)
                     .ok()
                     .flatten()
             }))

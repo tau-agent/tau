@@ -190,8 +190,22 @@ pub(super) fn resolve_api_key(
     cfg: &crate::config::Config,
     provider: &str,
 ) -> crate::Result<Option<String>> {
+    resolve_api_key_excluding(auth, cfg, provider, None)
+}
+
+/// Like `resolve_api_key` but tells the auth store which token just got
+/// rejected by the server, so it can avoid re-issuing that same token and
+/// can skip the OAuth refresh HTTP call when a sibling session has
+/// already written a fresher one to `auth.json`.  See
+/// `AuthStorage::get_api_key_excluding` for full semantics.
+pub(super) fn resolve_api_key_excluding(
+    auth: &crate::auth::AuthStorage,
+    cfg: &crate::config::Config,
+    provider: &str,
+    stale: Option<&str>,
+) -> crate::Result<Option<String>> {
     // First try auth storage (handles OAuth refresh, env vars, etc.)
-    if let Ok(Some(key)) = auth.get_api_key(provider) {
+    if let Ok(Some(key)) = auth.get_api_key_excluding(provider, stale) {
         return Ok(Some(key));
     }
     // Then try config's inline api_key
