@@ -10,6 +10,7 @@ use tau_agent_lib::protocol::{
 };
 use tau_agent_lib::types::{
     AgentPhase, AssistantContent, Message, StopReason, StreamEvent, ToolResultMessage, UserContent,
+    timestamp_ms,
 };
 
 use crate::events::Event;
@@ -159,6 +160,15 @@ pub struct App {
     /// "Working..." line. Kept in sync by
     /// `sync_streaming_timer()` which the main loop calls each iteration.
     pub streaming_started_at: Option<std::time::Instant>,
+    /// Server-reported start of the current non-Idle agent turn for the
+    /// active session, converted to a local `Instant` on receipt. Unlike
+    /// `streaming_started_at` this is owned by the *turn* lifecycle and
+    /// is not reset by UI mode flicker (opening/closing the session
+    /// picker, task picker, etc.). `sync_streaming_timer` mirrors this
+    /// value into `streaming_started_at` while in Streaming mode so the
+    /// "Working... Xs" counter shows the elapsed agent time, not the
+    /// local mode-transition time. `None` when no turn is in flight.
+    pub turn_anchor: Option<std::time::Instant>,
     /// Current agent phase — updated explicitly by Phase events and
     /// implicitly by stream events (see `update_phase_from_event`).
     pub phase: AgentPhase,
@@ -302,6 +312,10 @@ pub struct NavEntry {
     pub session_cwd: Option<String>,
     /// Project name of the session at the time of navigation.
     pub session_project_name: Option<String>,
+    /// Server-reported start of the active turn for the saved session,
+    /// if any. Restored on `navigate_back` so the "Working..." counter
+    /// continues from the correct elapsed time.
+    pub turn_anchor: Option<std::time::Instant>,
 }
 
 impl App {
@@ -318,6 +332,7 @@ impl App {
             messages: Vec::new(),
             mode: AppMode::Input,
             streaming_started_at: None,
+            turn_anchor: None,
             phase: AgentPhase::default(),
             scroll_pos: std::cell::Cell::new(None),
             max_scroll: std::cell::Cell::new(0),
@@ -1926,20 +1941,62 @@ impl App {
         self.sync_streaming_timer();
     }
 
-    /// Keep `streaming_started_at` in sync with the current mode. Start the
-    /// timer on the transition `!Streaming -> Streaming`; clear it on the
-    /// reverse transition. Call this whenever `mode` may have changed — the
-    /// main loop calls it every iteration as a safety net for the many
-    /// direct `self.mode = ...` assignments scattered across the code.
+    /// Convert a server-reported Unix-ms timestamp to a local `Instant`
+    /// by comparing against our local clock. If the server clock is
+    /// skewed into the future we clamp to "now" so the elapsed counter
+    /// starts at 0s rather than going negative.
+    fn instant_from_server_ms(ms: u64) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        let now_ms = timestamp_ms();
+        if ms <= now_ms {
+            now.checked_sub(std::time::Duration::from_millis(now_ms - ms))
+                .unwrap_or(now)
+        } else {
+            now
+        }
+    }
+
+    /// Record a server-reported turn anchor (or clear it). Called from
+    /// the `StreamEvent::Phase` handler and from `switch_to_session`.
+    pub fn set_turn_anchor_from_ms(&mut self, ms: Option<u64>) {
+        self.turn_anchor = ms.map(Self::instant_from_server_ms);
+    }
+
+    /// "Working... Xs" counter and 1s spinner reveal both read from
+    /// `streaming_started_at`, so it must be `Some` while in Streaming
+    /// mode and `None` outside it.
+    ///
+    /// The anchor value is derived from `turn_anchor` when the server
+    /// has reported a turn start (`StreamEvent::Phase` or
+    /// `SessionInfo::turn_started_at_ms`). If no anchor is known yet
+    /// (typical right after the user sends a message locally, before
+    /// the first server event arrives) we fall back to stamping
+    /// `Instant::now()` so the counter starts at 0s. A later Phase
+    /// event will overwrite the fallback with the correct anchor.
+    ///
+    /// Crucially: while we're *already* in Streaming mode and
+    /// `streaming_started_at.is_some()`, we do **not** overwrite the
+    /// anchor on mode flicker (picker open/close loops) — only on the
+    /// true `!Streaming → Streaming` edge. This is what prevents the
+    /// counter from resetting to 0s every time the session picker opens.
     pub fn sync_streaming_timer(&mut self) {
-        match (self.mode, self.streaming_started_at.is_some()) {
-            (AppMode::Streaming, false) => {
-                self.streaming_started_at = Some(std::time::Instant::now());
+        match self.mode {
+            AppMode::Streaming => {
+                // Prefer the server-authoritative turn anchor; fall back to
+                // the existing `streaming_started_at` (preserves counter
+                // across mode flicker) and finally to `Instant::now()`
+                // (fresh turn with no server event yet).
+                let desired = self
+                    .turn_anchor
+                    .or(self.streaming_started_at)
+                    .unwrap_or_else(std::time::Instant::now);
+                self.streaming_started_at = Some(desired);
             }
-            (m, true) if m != AppMode::Streaming => {
-                self.streaming_started_at = None;
+            _ => {
+                if self.streaming_started_at.is_some() {
+                    self.streaming_started_at = None;
+                }
             }
-            _ => {}
         }
     }
 
@@ -1957,6 +2014,7 @@ impl App {
             last_usage_fetch: self.last_usage_fetch,
             session_cwd: self.session_cwd.clone(),
             session_project_name: self.session_project_name.clone(),
+            turn_anchor: self.turn_anchor.take(),
         });
     }
 
@@ -1983,6 +2041,13 @@ impl App {
         self.scroll_to_bottom();
         self.mode = AppMode::Input;
         self.pending_steer = None;
+        // Seed the turn anchor from the server so that if the agent is
+        // already mid-turn when we attach, the "Working... Xs" counter
+        // shows the real elapsed time from the start of the turn. Clear
+        // `streaming_started_at`; `sync_streaming_timer` will re-derive
+        // it from `turn_anchor` on the next mode transition.
+        self.set_turn_anchor_from_ms(info.turn_started_at_ms);
+        self.streaming_started_at = None;
     }
 
     /// Navigate back to the previous session from the nav stack.
@@ -1999,6 +2064,8 @@ impl App {
             self.last_usage_fetch = entry.last_usage_fetch;
             self.session_cwd = entry.session_cwd;
             self.session_project_name = entry.session_project_name;
+            self.turn_anchor = entry.turn_anchor;
+            self.streaming_started_at = None;
             self.current_task_id = None;
             self.scroll_to_bottom();
             self.mode = AppMode::Input;
@@ -2676,22 +2743,62 @@ impl App {
             // Thinking tokens → Thinking phase
             StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
                 self.phase = AgentPhase::Thinking;
+                self.ensure_turn_anchor();
             }
             // Text/toolcall tokens → Responding phase
             StreamEvent::TextStart { .. }
             | StreamEvent::TextDelta { .. }
             | StreamEvent::ToolcallStart { .. } => {
                 self.phase = AgentPhase::Responding;
+                self.ensure_turn_anchor();
             }
             // Tool call defined or result received → ToolExec phase
             StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
                 self.phase = AgentPhase::ToolExec;
+                self.ensure_turn_anchor();
             }
             // Explicit phase transition
-            StreamEvent::Phase { phase } => {
+            StreamEvent::Phase {
+                phase,
+                turn_started_at_ms,
+            } => {
                 self.phase = *phase;
+                match (*phase, *turn_started_at_ms) {
+                    (AgentPhase::Idle, _) => {
+                        self.turn_anchor = None;
+                    }
+                    (_, Some(ms)) => {
+                        let anchor = Self::instant_from_server_ms(ms);
+                        self.turn_anchor = Some(anchor);
+                        // If we're already in Streaming mode, overwrite the
+                        // counter anchor so the UI reflects the server's
+                        // authoritative timestamp immediately. Otherwise
+                        // the next `sync_streaming_timer` call will pick
+                        // it up when we enter Streaming mode.
+                        if self.mode == AppMode::Streaming {
+                            self.streaming_started_at = Some(anchor);
+                        }
+                    }
+                    (_, None) => {
+                        // Server didn't report an anchor (older server or
+                        // untracked transition). Keep any existing anchor;
+                        // otherwise stamp now so the counter at least starts.
+                        self.ensure_turn_anchor();
+                    }
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Stamp `turn_anchor` to now if it's currently `None`. Used when an
+    /// implicit phase-bearing stream event arrives without us having seen
+    /// a preceding server-stamped `StreamEvent::Phase` — e.g. if the
+    /// initial Phase(Connecting) was dropped or the user's own turn has
+    /// only just begun locally.
+    fn ensure_turn_anchor(&mut self) {
+        if self.turn_anchor.is_none() {
+            self.turn_anchor = Some(std::time::Instant::now());
         }
     }
 
@@ -2703,6 +2810,7 @@ impl App {
                 // transition back to Input.
                 if let StreamEvent::Phase {
                     phase: AgentPhase::Idle,
+                    ..
                 } = *event
                 {
                     let effective = if self.mode == AppMode::SessionPicker {
@@ -2717,6 +2825,7 @@ impl App {
                         self.set_mode(AppMode::Input);
                     }
                     self.phase = AgentPhase::Idle;
+                    self.turn_anchor = None;
                     return None;
                 }
                 // If we receive stream events while in Input mode,
@@ -2736,6 +2845,7 @@ impl App {
             Response::AgentDone => {
                 self.finalize_in_flight();
                 self.phase = AgentPhase::Idle;
+                self.turn_anchor = None;
                 self.set_mode(AppMode::Input);
                 self.pending_steer = None;
             }
@@ -2754,6 +2864,7 @@ impl App {
                     });
                 }
                 self.phase = AgentPhase::Idle;
+                self.turn_anchor = None;
                 self.set_mode(AppMode::Input);
                 self.pending_steer = None;
             }
@@ -4321,6 +4432,7 @@ mod tests {
         app.handle_server_response(Response::Stream {
             event: Box::new(StreamEvent::Phase {
                 phase: AgentPhase::Idle,
+                turn_started_at_ms: None,
             }),
         });
 
@@ -4330,6 +4442,165 @@ mod tests {
             AppMode::Input,
             "underlying mode should transition to Input"
         );
+    }
+
+    /// Task 637: opening the session picker mid-stream and closing it
+    /// again must NOT reset the "Working... Xs" elapsed-time counter.
+    /// The counter is anchored on `turn_anchor` (server-stamped turn
+    /// start), which is owned by the turn lifecycle, not the mode.
+    #[test]
+    fn working_timer_anchor_survives_picker_flicker() {
+        let mut app = make_app();
+
+        // Simulate server-reported turn start 5 seconds ago.
+        let server_start_ms = tau_agent_lib::types::timestamp_ms().saturating_sub(5_000);
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Responding,
+                turn_started_at_ms: Some(server_start_ms),
+            }),
+        });
+
+        // Should now be in Streaming mode with the anchor preserved.
+        assert_eq!(app.mode, AppMode::Streaming);
+        let original_anchor = app.turn_anchor.expect("anchor set from Phase event");
+        let original_started = app
+            .streaming_started_at
+            .expect("streaming_started_at mirrors anchor");
+        assert_eq!(original_started, original_anchor);
+        // Elapsed should already be ~5s, not 0s.
+        assert!(
+            original_started.elapsed() >= std::time::Duration::from_millis(4_500),
+            "elapsed should reflect server-reported 5s start, got {:?}",
+            original_started.elapsed()
+        );
+
+        // Open the session picker (mode flicker), then close it.
+        // Mimic what the TUI's keybindings do: save current mode, flip to
+        // SessionPicker. Then flip back by calling `set_mode(Streaming)`
+        // which writes to `picker_previous_mode` and, when the picker is
+        // closed elsewhere, `mode` is restored. We emulate that here by
+        // restoring `mode` directly and running `sync_streaming_timer`.
+        app.picker_previous_mode = app.mode;
+        app.mode = AppMode::SessionPicker;
+        app.sync_streaming_timer();
+        assert_eq!(app.mode, AppMode::SessionPicker);
+        assert_eq!(
+            app.streaming_started_at, None,
+            "streaming_started_at cleared while not in Streaming mode"
+        );
+        assert!(
+            app.turn_anchor.is_some(),
+            "turn_anchor preserved across mode flicker"
+        );
+
+        // Close picker, returning to Streaming.
+        app.mode = app.picker_previous_mode;
+        app.sync_streaming_timer();
+        assert_eq!(app.mode, AppMode::Streaming);
+        let new_started = app
+            .streaming_started_at
+            .expect("streaming_started_at re-derived from anchor");
+        assert_eq!(
+            new_started, original_anchor,
+            "streaming_started_at must match the original turn anchor, not Instant::now()"
+        );
+    }
+
+    /// Task 637: `switch_to_session` onto an already-live session seeds
+    /// `turn_anchor` from `SessionInfo::turn_started_at_ms` so that the
+    /// "Working... Xs" counter shows the real elapsed time.
+    #[test]
+    fn switch_to_session_seeds_turn_anchor_from_session_info() {
+        let mut app = make_app();
+        let started_30s_ago = tau_agent_lib::types::timestamp_ms().saturating_sub(30_000);
+
+        let info = SessionInfo {
+            id: "s-live".into(),
+            model: "test-model".into(),
+            provider: "test-provider".into(),
+            cwd: None,
+            message_count: 0,
+            stats: tau_agent_lib::protocol::SessionStats {
+                user_messages: 0,
+                assistant_messages: 0,
+                tool_calls: 0,
+                tool_results: 0,
+                tokens: tau_agent_lib::protocol::TokenStats::default(),
+                cost: 0.0,
+                is_subscription: false,
+                context_window: 0,
+                context_tokens: None,
+            },
+            last_activity: 0,
+            parent_id: None,
+            child_count: 0,
+            child_budget: 0,
+            tagline: None,
+            state: "responding".into(),
+            context_pct: None,
+            archived: false,
+            last_exit_status: None,
+            is_live: true,
+            project_name: None,
+            turn_started_at_ms: Some(started_30s_ago),
+        };
+
+        app.switch_to_session(&info, vec![]);
+        let anchor = app.turn_anchor.expect("anchor seeded from SessionInfo");
+        assert!(
+            anchor.elapsed() >= std::time::Duration::from_millis(29_500),
+            "elapsed must reflect the server's 30s-ago timestamp, got {:?}",
+            anchor.elapsed()
+        );
+
+        // Transitioning into Streaming must pick up the anchor, not stamp now.
+        app.mode = AppMode::Streaming;
+        app.sync_streaming_timer();
+        let started = app
+            .streaming_started_at
+            .expect("streaming_started_at derived from anchor");
+        assert_eq!(started, anchor);
+    }
+
+    /// Idle → Working still starts the counter at 0s when the server
+    /// hasn't reported an anchor yet (e.g. we're the one initiating the
+    /// turn locally and the first Phase event hasn't arrived).
+    #[test]
+    fn idle_to_working_starts_at_zero_without_server_anchor() {
+        let mut app = make_app();
+        assert!(app.turn_anchor.is_none());
+        app.mode = AppMode::Streaming;
+        app.sync_streaming_timer();
+        let started = app
+            .streaming_started_at
+            .expect("streaming_started_at stamped to now");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "without server anchor, counter starts at ~0s"
+        );
+    }
+
+    /// Phase(Idle) clears the turn anchor so the next turn's counter
+    /// starts fresh, not from the previous turn's start.
+    #[test]
+    fn phase_idle_clears_turn_anchor() {
+        let mut app = make_app();
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Responding,
+                turn_started_at_ms: Some(tau_agent_lib::types::timestamp_ms()),
+            }),
+        });
+        assert!(app.turn_anchor.is_some());
+
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Idle,
+                turn_started_at_ms: None,
+            }),
+        });
+        assert!(app.turn_anchor.is_none());
     }
 
     /// Cancelled response while picker is open should NOT close the picker.
@@ -4510,6 +4781,7 @@ mod tests {
         app.handle_server_response(Response::Stream {
             event: Box::new(StreamEvent::Phase {
                 phase: AgentPhase::Idle,
+                turn_started_at_ms: None,
             }),
         });
 

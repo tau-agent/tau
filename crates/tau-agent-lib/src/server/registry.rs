@@ -72,7 +72,7 @@ pub(super) fn session_info(
     messages: &[Message],
     last_message_time: Option<i64>,
     child_count: usize,
-    phase: Option<&crate::types::AgentPhase>,
+    phase: Option<&(crate::types::AgentPhase, Option<u64>)>,
     is_live: bool,
 ) -> SessionInfo {
     let stats = compute_stats(messages, &stored.model, stored.is_subscription);
@@ -83,6 +83,8 @@ pub(super) fn session_info(
     } else {
         None
     };
+    let phase_value = phase.map(|p| p.0);
+    let turn_started_at_ms = phase.and_then(|p| p.1);
     SessionInfo {
         id: stored.id.clone(),
         model: stored.model.id.clone(),
@@ -96,8 +98,7 @@ pub(super) fn session_info(
         child_count,
         child_budget: stored.child_budget,
         tagline: stored.tagline.clone(),
-        state: phase
-            .copied()
+        state: phase_value
             .unwrap_or_default()
             .label()
             .trim_end_matches("...")
@@ -107,6 +108,7 @@ pub(super) fn session_info(
         last_exit_status: stored.last_exit_status.clone(),
         is_live,
         project_name: stored.project_name.clone(),
+        turn_started_at_ms,
     }
 }
 
@@ -116,7 +118,7 @@ pub(super) fn session_info_from_db_stats(
     stored: &crate::db::StoredSession,
     db_stats: Option<&crate::db::DbSessionStats>,
     child_count: usize,
-    phase: Option<&crate::types::AgentPhase>,
+    phase: Option<&(crate::types::AgentPhase, Option<u64>)>,
     is_live: bool,
 ) -> SessionInfo {
     let empty = crate::db::DbSessionStats::default();
@@ -147,6 +149,8 @@ pub(super) fn session_info_from_db_stats(
         None
     };
 
+    let phase_value = phase.map(|p| p.0);
+    let turn_started_at_ms = phase.and_then(|p| p.1);
     SessionInfo {
         id: stored.id.clone(),
         model: stored.model.id.clone(),
@@ -159,8 +163,7 @@ pub(super) fn session_info_from_db_stats(
         child_count,
         child_budget: stored.child_budget,
         tagline: stored.tagline.clone(),
-        state: phase
-            .copied()
+        state: phase_value
             .unwrap_or_default()
             .label()
             .trim_end_matches("...")
@@ -170,6 +173,7 @@ pub(super) fn session_info_from_db_stats(
         last_exit_status: stored.last_exit_status.clone(),
         is_live,
         project_name: stored.project_name.clone(),
+        turn_started_at_ms,
     }
 }
 

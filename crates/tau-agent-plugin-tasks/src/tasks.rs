@@ -3922,6 +3922,7 @@ mod tests {
                                     archived: is_archived,
                                     last_exit_status: None,
                                     is_live: false,
+                                    turn_started_at_ms: None,
                                     project_name: None,
                                 },
                             }
@@ -3952,6 +3953,7 @@ mod tests {
                                             .contains(session_id.as_str()),
                                         last_exit_status: None,
                                         is_live: false,
+                                        turn_started_at_ms: None,
                                         project_name: None,
                                     }]
                                 });
@@ -6633,6 +6635,7 @@ mod tests {
             archived: false,
             last_exit_status: None,
             is_live: false,
+            turn_started_at_ms: None,
             project_name: None,
         }
     }

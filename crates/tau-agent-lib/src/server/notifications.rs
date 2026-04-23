@@ -281,18 +281,74 @@ fn persist_phase(
     session_id: &str,
     phase: crate::types::AgentPhase,
 ) -> Response {
-    {
+    let turn_started_at_ms = {
         let mut st = lock_state(state);
-        st.phases.insert(session_id.to_string(), phase);
+        let ts = set_phase_and_stamp_locked(&mut st, session_id, phase);
         // Persist meaningful phase transitions to DB.
         let label = phase.label().trim_end_matches("...");
         if let Err(e) = st.db.update_phase(session_id, label) {
             tracing::warn!(session_id = %session_id, %e, "failed to persist phase");
         }
-    }
+        ts
+    };
     Response::Stream {
-        event: Box::new(crate::types::StreamEvent::Phase { phase }),
+        event: Box::new(crate::types::StreamEvent::Phase {
+            phase,
+            turn_started_at_ms,
+        }),
     }
+}
+
+/// Update the in-memory phase map and return the turn-start anchor for the
+/// resulting phase.
+///
+/// Rules:
+/// * Transitioning to `Idle` clears any existing anchor and returns `None`.
+/// * Transitioning to a non-Idle phase stamps `Some(now_ms)` *only if* there
+///   is no existing anchor for this session (i.e. we are starting a fresh
+///   turn). Subsequent non-Idle transitions preserve the existing anchor so
+///   the counter is continuous for the whole turn.
+///
+/// Callers: `persist_phase` above, and the stream-event forward loop in
+/// `agent_runner.rs` that derives implicit phases from text/tool events.
+pub(super) fn set_phase_and_stamp_locked(
+    st: &mut super::state::State,
+    session_id: &str,
+    phase: crate::types::AgentPhase,
+) -> Option<u64> {
+    let now_ms = crate::types::timestamp_ms();
+    match phase {
+        crate::types::AgentPhase::Idle => {
+            st.phases.insert(session_id.to_string(), (phase, None));
+            None
+        }
+        _ => {
+            let entry = st
+                .phases
+                .entry(session_id.to_string())
+                .or_insert((phase, Some(now_ms)));
+            // Preserve existing anchor on phase→phase transitions; stamp only
+            // if there was no anchor (i.e. session was Idle / unknown).
+            if entry.1.is_none() {
+                entry.1 = Some(now_ms);
+            }
+            entry.0 = phase;
+            entry.1
+        }
+    }
+}
+
+/// Variant of [`set_phase_and_stamp_locked`] that takes a `SharedState` and
+/// manages the lock internally. Returns the turn-start anchor for the
+/// resulting phase. Used by the stream-forward loop that otherwise only
+/// holds the lock for the mutation.
+pub(super) fn set_phase_and_stamp(
+    state: &SharedState,
+    session_id: &str,
+    phase: crate::types::AgentPhase,
+) -> Option<u64> {
+    let mut st = lock_state(state);
+    set_phase_and_stamp_locked(&mut st, session_id, phase)
 }
 
 /// Wake all registered session-done waiters so they re-check completion.

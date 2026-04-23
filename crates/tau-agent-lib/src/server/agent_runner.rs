@@ -558,29 +558,51 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                 }
                 continue;
             }
-            // Update stored phase from implicit stream events.
-            match &event {
+            // Update stored phase from implicit stream events and, for
+            // explicit `Phase` events emitted by the engine, rebuild the
+            // event with a server-stamped `turn_started_at_ms` anchor.
+            let event = match event {
                 StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
-                    let mut st = state_clone.lock().expect("state mutex poisoned");
-                    st.phases
-                        .insert(session_id_owned.clone(), crate::types::AgentPhase::Thinking);
+                    super::notifications::set_phase_and_stamp(
+                        &state_clone,
+                        &session_id_owned,
+                        crate::types::AgentPhase::Thinking,
+                    );
+                    event
                 }
                 StreamEvent::TextStart { .. }
                 | StreamEvent::TextDelta { .. }
                 | StreamEvent::ToolcallStart { .. } => {
-                    let mut st = state_clone.lock().expect("state mutex poisoned");
-                    st.phases.insert(
-                        session_id_owned.clone(),
+                    super::notifications::set_phase_and_stamp(
+                        &state_clone,
+                        &session_id_owned,
                         crate::types::AgentPhase::Responding,
                     );
+                    event
                 }
                 StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
-                    let mut st = state_clone.lock().expect("state mutex poisoned");
-                    st.phases
-                        .insert(session_id_owned.clone(), crate::types::AgentPhase::ToolExec);
+                    super::notifications::set_phase_and_stamp(
+                        &state_clone,
+                        &session_id_owned,
+                        crate::types::AgentPhase::ToolExec,
+                    );
+                    event
                 }
-                _ => {}
-            }
+                StreamEvent::Phase { phase, .. } => {
+                    // Engine-emitted phase events don't carry a timestamp
+                    // (engine is wire-agnostic). Stamp on forward.
+                    let ts = super::notifications::set_phase_and_stamp(
+                        &state_clone,
+                        &session_id_owned,
+                        phase,
+                    );
+                    StreamEvent::Phase {
+                        phase,
+                        turn_started_at_ms: ts,
+                    }
+                }
+                other => other,
+            };
             let resp = Response::Stream {
                 event: Box::new(event),
             };

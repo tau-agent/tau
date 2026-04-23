@@ -297,6 +297,109 @@ fn server_chat_simple_text() {
     server.shutdown();
 }
 
+/// Task 637: the server stamps `turn_started_at_ms` on every non-Idle
+/// `StreamEvent::Phase` so the TUI can anchor its "Working... Xs"
+/// counter to the true turn start. After the turn completes, the
+/// anchor must be cleared (Phase(Idle) carries `None`).
+#[test]
+fn phase_events_carry_turn_started_at_ms() {
+    use tau_agent_lib::types::{AgentPhase, StreamEvent, timestamp_ms};
+
+    let server = TestServer::start(vec![MockResponse::Text("hello".into())]);
+    let sid = match CreateSessionBuilder::new(&server).cwd("/tmp").send_raw() {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let before_ms = timestamp_ms();
+
+    let conn = server.connect();
+    let responses = send_recv_all(
+        &conn,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hi".into(),
+        },
+    );
+    let after_ms = timestamp_ms();
+
+    let mut non_idle_anchors: Vec<u64> = Vec::new();
+    for r in &responses {
+        if let Response::Stream { event } = r
+            && let StreamEvent::Phase {
+                phase,
+                turn_started_at_ms,
+            } = event.as_ref()
+        {
+            match phase {
+                AgentPhase::Idle => {
+                    assert!(
+                        turn_started_at_ms.is_none(),
+                        "Phase(Idle) must carry turn_started_at_ms=None, got {:?}",
+                        turn_started_at_ms
+                    );
+                }
+                _ => {
+                    let ts = turn_started_at_ms.expect(
+                        "non-Idle Phase events must carry a server-stamped turn_started_at_ms",
+                    );
+                    non_idle_anchors.push(ts);
+                }
+            }
+        }
+    }
+
+    assert!(
+        !non_idle_anchors.is_empty(),
+        "expected at least one non-Idle Phase event carrying a turn anchor"
+    );
+    // All non-Idle events within a single turn share the same anchor,
+    // and that anchor falls within the wall-clock window of the chat.
+    let first = non_idle_anchors[0];
+    for ts in &non_idle_anchors {
+        assert_eq!(
+            *ts, first,
+            "all non-Idle Phase events in one turn must share the same anchor"
+        );
+    }
+    assert!(
+        first >= before_ms && first <= after_ms,
+        "turn_started_at_ms={} outside chat window [{}, {}]",
+        first,
+        before_ms,
+        after_ms
+    );
+
+    // After the turn completes, GetSessionInfo must report a None anchor.
+    // Poll briefly in case the server is still finalising post-AgentDone
+    // state (the terminal Phase(Idle) is emitted after AgentDone).
+    let mut info = None;
+    for _ in 0..40 {
+        let info_resp = send_recv(
+            &server.connect(),
+            &Request::GetSessionInfo {
+                session_id: sid.clone(),
+            },
+        );
+        let si = match info_resp {
+            Response::SessionInfo { info } => info,
+            other => panic!("expected SessionInfo, got {:?}", other),
+        };
+        if si.turn_started_at_ms.is_none() {
+            info = Some(si);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let info = info.expect("SessionInfo::turn_started_at_ms did not reach None post-turn");
+    assert!(
+        info.turn_started_at_ms.is_none(),
+        "SessionInfo::turn_started_at_ms must be None after AgentDone"
+    );
+
+    server.shutdown();
+}
+
 #[test]
 fn server_chat_tool_call_loop() {
     // Without a worker plugin, tool calls will error ("no plugin provides tool").
@@ -3275,7 +3378,7 @@ fn cancel_chat_without_active_loop_emits_cancelled() {
     let initial: Response = serde_json::from_str(line.trim()).unwrap();
     match &initial {
         Response::Stream { event } => match event.as_ref() {
-            StreamEvent::Phase { phase } => {
+            StreamEvent::Phase { phase, .. } => {
                 assert_eq!(*phase, tau_agent_lib::types::AgentPhase::Idle);
             }
             other => panic!("expected Phase event, got {:?}", other),
@@ -3310,7 +3413,7 @@ fn cancel_chat_without_active_loop_emits_cancelled() {
     let r3: Response = serde_json::from_str(line3.trim()).unwrap();
     match &r3 {
         Response::Stream { event } => match event.as_ref() {
-            StreamEvent::Phase { phase } => {
+            StreamEvent::Phase { phase, .. } => {
                 assert_eq!(
                     *phase,
                     tau_agent_lib::types::AgentPhase::Idle,
@@ -3454,7 +3557,7 @@ fn server_restart_clears_stale_phases() {
         let initial: Response = serde_json::from_str(line.trim()).unwrap();
         match &initial {
             Response::Stream { event } => match event.as_ref() {
-                StreamEvent::Phase { phase } => {
+                StreamEvent::Phase { phase, .. } => {
                     assert_eq!(
                         *phase,
                         tau_agent_lib::types::AgentPhase::Idle,

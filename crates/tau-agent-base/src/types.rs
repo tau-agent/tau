@@ -642,8 +642,16 @@ pub enum StreamEvent {
     /// - ToolResult → ToolExec
     /// - Start → transition from Connecting (but phase already set)
     /// - AgentDone/Cancelled/Error → Idle
+    ///
+    /// `turn_started_at_ms` is the server-stamped wall-clock (Unix ms)
+    /// when the current non-Idle turn began. It is preserved across
+    /// phase→phase transitions within a single turn and cleared on
+    /// transition to Idle. Used by clients to anchor the "Working... Xs"
+    /// counter so it survives UI mode flicker and late subscribe.
     Phase {
         phase: AgentPhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_started_at_ms: Option<u64>,
     },
     /// Informational status message (e.g. retry notices).
     Status {

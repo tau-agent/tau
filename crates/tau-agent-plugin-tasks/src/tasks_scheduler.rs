@@ -5304,6 +5304,7 @@ mod tests {
             archived,
             last_exit_status: None,
             is_live: false,
+            turn_started_at_ms: None,
             project_name: None,
         }
     }
@@ -6145,6 +6146,7 @@ mod tests {
                                     archived: is_archived,
                                     last_exit_status: None,
                                     is_live: false,
+                                    turn_started_at_ms: None,
                                     project_name: None,
                                 },
                             }
@@ -6167,6 +6169,7 @@ mod tests {
                                 archived: self.archived_sessions.contains(&session_id),
                                 last_exit_status: None,
                                 is_live: false,
+                                turn_started_at_ms: None,
                                 project_name: None,
                             }],
                         },

@@ -503,6 +503,13 @@ pub struct SessionInfo {
     /// from a previous turn or server restart.
     #[serde(default)]
     pub is_live: bool,
+    /// Unix-ms timestamp when the current non-Idle turn began on the
+    /// server. `Some(_)` while a turn is in flight, `None` when the
+    /// session is idle. Used by the TUI to anchor the "Working... Xs"
+    /// counter so it remains correct when attaching to an already-running
+    /// session from the picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started_at_ms: Option<u64>,
 }
 
 /// Result for a single session in WaitSessions response.
