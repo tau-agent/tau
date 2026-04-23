@@ -84,6 +84,12 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
+    /// Manage daemon configuration
+    #[command(alias = "cfg")]
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -254,6 +260,17 @@ enum ServerAction {
     Restart,
     /// Check server status
     Status,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Re-read providers.toml and the global models.toml without restarting
+    /// the daemon. Use this after editing either file to pick up changes
+    /// in running sessions (per-project `.tau/models.toml` and `auth.json`
+    /// are already re-read on every use and need no reload).
+    Reload,
+    /// Print the paths of the config files the daemon will reload.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -568,6 +585,10 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
         Commands::Project { action } => {
             cmd_project(action)?;
         }
+        Commands::Config { action } => match action {
+            ConfigAction::Reload => cmd_config_reload().await?,
+            ConfigAction::Show => cmd_config_show(),
+        },
     }
     Ok(())
 }
@@ -1711,6 +1732,56 @@ fn cmd_server_status() {
     } else {
         eprintln!("server not running");
     }
+}
+
+async fn cmd_config_reload() -> tau_agent_lib::Result<()> {
+    if !tau_agent_lib::server::is_running() {
+        return Err(tau_agent_lib::Error::Io(
+            "tau server not running; start it with `tau server start`".into(),
+        ));
+    }
+    let mut client = tau_agent_lib::client::Client::connect().await?;
+    client
+        .send(&tau_agent_lib::protocol::Request::ReloadConfig)
+        .await?;
+    let mut err: Option<String> = None;
+    client
+        .recv_streaming(|resp| {
+            if let tau_agent_lib::protocol::Response::Error { message } = resp {
+                err = Some(message.clone());
+            }
+        })
+        .await?;
+    if let Some(message) = err {
+        return Err(tau_agent_lib::Error::Io(message));
+    }
+    eprintln!("config reloaded");
+    Ok(())
+}
+
+fn cmd_config_show() {
+    let providers = tau_agent_lib::paths::config_dir().join("providers.toml");
+    let models = tau_agent_lib::paths::config_dir().join("models.toml");
+    println!(
+        "providers.toml: {} ({})",
+        providers.display(),
+        if providers.exists() {
+            "present"
+        } else {
+            "missing"
+        },
+    );
+    println!(
+        "models.toml:    {} ({})",
+        models.display(),
+        if models.exists() {
+            "present"
+        } else {
+            "missing"
+        },
+    );
+    println!();
+    println!("Edit the files, then run `tau config reload` to pick up the changes.");
 }
 
 async fn cmd_auth_status() -> tau_agent_lib::Result<()> {

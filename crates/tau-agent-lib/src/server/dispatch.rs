@@ -1946,6 +1946,47 @@ pub(super) async fn handle_client(
                     }
                 }
             }
+            crate::protocol::Request::ReloadConfig => {
+                // Do the disk I/O *outside* the state lock so we only
+                // hold the mutex for the swap. `load_runtime_config` can
+                // fail (providers.toml parse/IO error); on failure we
+                // leave the running state untouched so a broken edit
+                // can't brick a live server.
+                match super::load_runtime_config() {
+                    Ok(new_cfg) => {
+                        {
+                            let mut st = lock_state(&state);
+                            let old_default = (
+                                st.default_model.provider.clone(),
+                                st.default_model.id.clone(),
+                            );
+                            st.config = new_cfg.config;
+                            st.all_models = new_cfg.all_models;
+                            st.global_aliases = new_cfg.global_aliases;
+                            // Preserve the previously-selected default
+                            // model's identity when possible; fall back
+                            // to whatever `load_runtime_config` produced
+                            // (which is `all_models[0]`).
+                            st.default_model = st
+                                .all_models
+                                .iter()
+                                .find(|m| m.provider == old_default.0 && m.id == old_default.1)
+                                .cloned()
+                                .unwrap_or(new_cfg.default_model);
+                        }
+                        send(&mut writer, &Response::Ok).await?;
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("reload config: {}", e),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+            }
             crate::protocol::Request::GcSessions { older_than_days } => {
                 let older_than_ms = {
                     let now = crate::types::timestamp_ms();

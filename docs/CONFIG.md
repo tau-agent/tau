@@ -1,5 +1,36 @@
 # Configuration
 
+## Reloading configuration
+
+All config lives in plain TOML files on disk. After editing them, pick up
+the changes with one of:
+
+- TUI: `/config reload`
+- CLI: `tau config reload`
+
+The command re-reads:
+
+- `~/.config/tau/providers.toml` — the provider list and their custom models.
+- `~/.config/tau/models.toml` — global model aliases.
+
+And rebuilds the daemon's in-memory provider / model tables. If the file
+has a parse error the reload is rejected and the currently-loaded config
+stays in effect, so a broken edit can't brick a running server.
+
+Reloads do **not** change the model snapshot already stored on
+existing sessions — sessions hold on to the `Model` they were created
+with. New sessions (and model lookups after reload) pick up the updated
+config.
+
+The following sources are re-read on every use and need **no** reload:
+
+- Per-project `.tau/models.toml` (read on every session create / alias lookup).
+- Per-project operator aliases at `~/.config/tau/projects/{name}/models.toml`.
+- `auth.json` (read on every outgoing API request).
+
+`/config show` and `tau config show` print the file paths plus whether
+each currently exists — handy for answering "which file am I editing?".
+
 ## Provider configuration
 
 Tau loads its provider list from `~/.config/tau/providers.toml` (the path

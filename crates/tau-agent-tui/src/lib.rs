@@ -486,6 +486,12 @@ async fn run_inner(
                         text: "Plugins reloaded".into(),
                     });
                 }
+                Action::ReloadConfig => {
+                    send_request_and_recv(Request::ReloadConfig, server_tx.clone()).await?;
+                    app.messages.push(crate::message::MessageItem::Status {
+                        text: "Config reloaded".into(),
+                    });
+                }
                 Action::OpenSessionPicker => {
                     app.picker_previous_mode = app.mode;
                     app.mode = AppMode::SessionPicker;

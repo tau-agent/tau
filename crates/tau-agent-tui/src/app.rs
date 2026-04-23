@@ -2114,11 +2114,65 @@ impl App {
                 }
             }
             "/reload" => Some(Action::ReloadPlugins),
+            "/config" => {
+                // Subcommand-style, leaving room for `/config show`, `/config path`, etc.
+                match args {
+                    "" | "show" => {
+                        let providers = tau_agent_lib::paths::config_dir().join("providers.toml");
+                        let models = tau_agent_lib::paths::config_dir().join("models.toml");
+                        let mut lines = Vec::new();
+                        lines.push(format!(
+                            "providers.toml: {} ({})",
+                            providers.display(),
+                            if providers.exists() {
+                                "present"
+                            } else {
+                                "missing"
+                            },
+                        ));
+                        lines.push(format!(
+                            "models.toml:    {} ({})",
+                            models.display(),
+                            if models.exists() {
+                                "present"
+                            } else {
+                                "missing"
+                            },
+                        ));
+                        if let Some(cwd) = &self.session_cwd {
+                            let proj = std::path::Path::new(cwd).join(".tau").join("models.toml");
+                            lines.push(format!(
+                                "project models: {} ({})",
+                                proj.display(),
+                                if proj.exists() { "present" } else { "missing" },
+                            ));
+                        }
+                        lines.push(
+                            "Edit the files, then run `/config reload` (or `tau config reload`)."
+                                .into(),
+                        );
+                        self.messages.push(MessageItem::Status {
+                            text: lines.join("\n"),
+                        });
+                        None
+                    }
+                    "reload" => Some(Action::ReloadConfig),
+                    other => {
+                        self.messages.push(MessageItem::Error {
+                            text: format!(
+                                "unknown /config subcommand `{}`: usage: /config [reload|show]",
+                                other
+                            ),
+                        });
+                        None
+                    }
+                }
+            }
             "/fork" => Some(Action::ForkSession),
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|status|mq] /project stats [name] /reload /sessions /session <id> /back /fork /new /archive /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|status|mq] /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /help /quit"
                         .into(),
                 });
                 None
@@ -3358,6 +3412,8 @@ pub enum Action {
     ListChildren,
     /// Reload plugins for the current session.
     ReloadPlugins,
+    /// Reload the daemon's provider/model config (providers.toml + global models.toml).
+    ReloadConfig,
     /// Fork the current session: create a new session inheriting model/cwd/system_prompt.
     ForkSession,
     /// Create a fresh session with default settings.
@@ -5796,6 +5852,57 @@ mod tests {
                 assert_eq!(project_name, "my-proj");
             }
             other => panic!("expected Action::ProjectStats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_reload_slash_dispatches_reload_config_action() {
+        let mut app = make_app();
+        let action = app.handle_slash_command("/config reload");
+        assert!(
+            matches!(action, Some(Action::ReloadConfig)),
+            "expected Action::ReloadConfig, got {action:?}"
+        );
+    }
+
+    #[test]
+    fn config_slash_bare_prints_paths_status_message() {
+        let mut app = make_app();
+        let before = app.messages.len();
+        let action = app.handle_slash_command("/config");
+        assert!(
+            action.is_none(),
+            "bare /config should not dispatch an action"
+        );
+        assert_eq!(
+            app.messages.len(),
+            before + 1,
+            "bare /config should push one status message"
+        );
+        match app.messages.last().expect("message pushed") {
+            MessageItem::Status { text } => {
+                assert!(
+                    text.contains("providers.toml") && text.contains("models.toml"),
+                    "expected both filenames in status, got: {text}"
+                );
+            }
+            other => panic!("expected Status message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_slash_unknown_subcommand_reports_error() {
+        let mut app = make_app();
+        let action = app.handle_slash_command("/config nuke");
+        assert!(action.is_none());
+        match app.messages.last().expect("message pushed") {
+            MessageItem::Error { text } => {
+                assert!(
+                    text.contains("/config"),
+                    "expected /config in error text, got: {text}"
+                );
+            }
+            other => panic!("expected Error message, got {other:?}"),
         }
     }
 

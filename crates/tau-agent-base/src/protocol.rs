@@ -181,6 +181,16 @@ pub enum Request {
     ReplyToMessage { msg_id: String, content: String },
     /// Reload plugins for a session (destroy + re-init).
     ReloadPlugins { session_id: String },
+    /// Re-read `providers.toml` and global `models.toml` without restarting
+    /// the server. On success, the in-memory provider/model tables and the
+    /// global alias map are swapped in; on error (IO / parse failure) the
+    /// existing state is left untouched and the server returns
+    /// [`Response::Error`] so a broken edit can't brick a running server.
+    ///
+    /// Narrow by design: this does **not** reload plugins (see
+    /// [`Request::ReloadPlugins`]), `auth.json` (re-read per request),
+    /// or per-project `.tau/models.toml` (re-read per lookup).
+    ReloadConfig,
     /// Garbage-collect archived sessions older than a threshold.
     GcSessions {
         /// Delete archived sessions older than this many days.

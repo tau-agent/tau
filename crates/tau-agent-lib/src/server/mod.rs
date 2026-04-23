@@ -166,6 +166,42 @@ fn prepare_socket_dir(sock: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// Bundled outputs of reading the runtime-mutable config files on disk.
+///
+/// Used by both server startup and the `ReloadConfig` request handler so
+/// they stay in lock-step. Performs the disk I/O (which can fail for
+/// `providers.toml`); callers are expected to merge this into `State`.
+///
+/// `default_model` is always `all_models[0]`; callers that want to
+/// preserve a previously-selected default should pick a matching entry
+/// from `all_models` and fall back to `default_model` when that model is
+/// gone.
+pub(crate) struct RuntimeConfig {
+    pub config: crate::config::Config,
+    pub all_models: Vec<Model>,
+    pub global_aliases: HashMap<String, String>,
+    pub default_model: Model,
+}
+
+/// Read `providers.toml` + global `models.toml` and resolve the model
+/// table. Called from [`run`] at startup and from the `ReloadConfig`
+/// request handler.
+pub(crate) fn load_runtime_config() -> crate::Result<RuntimeConfig> {
+    let cfg = config::load_config()?;
+    let all_models = config::resolve_models(&cfg);
+    let global_aliases = crate::models_config::load_global_aliases();
+    let default_model = all_models
+        .first()
+        .cloned()
+        .ok_or_else(|| crate::Error::Io("no models available".into()))?;
+    Ok(RuntimeConfig {
+        config: cfg,
+        all_models,
+        global_aliases,
+        default_model,
+    })
+}
+
 /// Emit an `InfoMessage` to a session informing the user / agent that
 /// this session was restarted. Used by the startup auto-resume scan so
 /// the transcript stays honest about the gap.
@@ -464,13 +500,12 @@ pub async fn run() -> crate::Result<()> {
     tracing::info!(pid = std::process::id(), "tau server starting");
 
     let registry = build_registry();
-    let cfg = config::load_config()?;
-    let all_models = config::resolve_models(&cfg);
-    let global_aliases = crate::models_config::load_global_aliases();
-    let default_model = all_models
-        .first()
-        .cloned()
-        .ok_or_else(|| crate::Error::Io("no models available".into()))?;
+    let RuntimeConfig {
+        config: cfg,
+        all_models,
+        global_aliases,
+        default_model,
+    } = load_runtime_config()?;
     let sock = socket_path();
     prepare_socket_dir(&sock)?;
 
