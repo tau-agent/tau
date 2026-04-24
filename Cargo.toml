@@ -38,7 +38,7 @@ toml = "1.1"
 base64 = "0.22"
 rand = "0.10"
 fs2 = "0.4"
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.30", features = ["signal", "process", "poll", "fs"] }
 tau-agent-tui = { path = "crates/tau-agent-tui", version = "0.1.0" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
