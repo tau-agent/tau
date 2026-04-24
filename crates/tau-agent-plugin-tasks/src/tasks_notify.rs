@@ -215,6 +215,23 @@ fn collect_recipients(
         .collect()
 }
 
+/// Find the session recorded with role `"creator"` on the task, if any.
+///
+/// Returns the first creator row's `session_id`. The role is recorded
+/// at task creation time in `task_sessions`
+/// (see `create_task` / `create_subtask` paths, which call
+/// `db.record_session(task.id, creator_sid, "creator")`).
+///
+/// Returns `None` if the row isn't there (older tasks that predate the
+/// role stamp, or tasks created via paths that don't record a creator).
+fn find_creator_session(db: &TasksDb, task: &Task) -> Option<String> {
+    db.get_sessions(task.id)
+        .ok()?
+        .into_iter()
+        .find(|ts| ts.role == "creator")
+        .map(|ts| ts.session_id)
+}
+
 /// Resolve the root session for root-broadcast transitions.  Tries the
 /// task's current session first, then the `creator` row on the task, then
 /// the parent task's session.  Returns `None` if none of the anchors
@@ -383,6 +400,93 @@ pub fn notify_state_change_split(
                 }
             }
         }
+
+        // Task #658: LLM-visible wake to the creator so the session
+        // that spawned the task can react to completion in-context.
+        // Other recipients continue to receive only the zero-token
+        // QueueInfo line from the loop above — this extra message is
+        // creator-only.
+        if let Some(creator_sid) = find_creator_session(db, task) {
+            // Archived creator: the user has dismissed that session.
+            // Waking it would resurrect it in listings and burn tokens
+            // — skip. (The QueueInfo line is already suppressed for
+            // archived recipients by `collect_recipients` above.)
+            if !is_session_archived(&creator_sid, writer, reader) {
+                // Dedup with `tasks_merge::notify_parent_of_subtask_done`:
+                // that notifier already sends a QueueMessage to the
+                // parent task's current `session_id` on every terminal
+                // transition. If this subtask's creator IS the parent's
+                // current session, skip here so that session only gets
+                // one LLM-visible wake per event.
+                let parent_session = task
+                    .parent_id
+                    .and_then(|pid| db.get_task(pid).ok().flatten())
+                    .and_then(|p| p.session_id);
+                let dedup = parent_session.as_deref() == Some(creator_sid.as_str());
+                if !dedup {
+                    let content = format_terminal_llm_message(task, context);
+                    let _ = server_request(
+                        writer,
+                        reader,
+                        tau_agent_plugin::Request::QueueMessage {
+                            target_session_id: creator_sid,
+                            content,
+                            sender_info: "task notifier".to_string(),
+                            await_reply: false,
+                            reply_to: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Format the LLM-visible terminal notification posted to the task's
+/// creator session on `merged` / `closed` / `failed`.
+///
+/// The text is concise, mentions the task id / title / terminal state,
+/// and appends `context` when present (commit hash for merges, failure
+/// reason for failed, etc.). Top-level tasks are called `Task #N`;
+/// tasks with a parent are called `Subtask #N`.
+fn format_terminal_llm_message(task: &Task, context: Option<&str>) -> String {
+    let title = capped_title(&task.title);
+    let noun = if task.parent_id.is_some() {
+        "Subtask"
+    } else {
+        "Task"
+    };
+    match task.state {
+        TaskState::Merged => match context {
+            Some(c) if !c.is_empty() => format!(
+                "{} #{} \"{}\" has been merged ({}). If you were waiting on it, you can now proceed.",
+                noun, task.id, title, c
+            ),
+            _ => format!(
+                "{} #{} \"{}\" has been merged. If you were waiting on it, you can now proceed.",
+                noun, task.id, title
+            ),
+        },
+        TaskState::Closed => match context {
+            Some(c) if !c.is_empty() => format!(
+                "{} #{} \"{}\" has been closed ({}).",
+                noun, task.id, title, c
+            ),
+            _ => format!("{} #{} \"{}\" has been closed.", noun, task.id, title),
+        },
+        TaskState::Failed => match context {
+            Some(c) if !c.is_empty() => {
+                format!("{} #{} \"{}\" failed: {}.", noun, task.id, title, c)
+            }
+            _ => format!("{} #{} \"{}\" failed.", noun, task.id, title),
+        },
+        // Unreachable: callers gate on `is_terminal()`. Keep a sane
+        // fallback rather than panic so a future new terminal state
+        // doesn't crash the notifier.
+        _ => format!(
+            "{} #{} \"{}\" reached terminal state {}.",
+            noun, task.id, title, task.state
+        ),
     }
 }
 
@@ -570,6 +674,9 @@ mod tests {
         ancestors: HashMap<String, Vec<SessionInfo>>,
         /// Captured (target_session_id, text) pairs from QueueInfo.
         queue_info_calls: Vec<(String, String)>,
+        /// Captured (target, content, sender_info, await_reply) tuples
+        /// from QueueMessage.
+        queue_message_calls: Vec<(String, String, String, bool)>,
         /// Captured (session_id, tagline) pairs from SetTagline.
         set_tagline_calls: Vec<(String, String)>,
     }
@@ -582,6 +689,7 @@ mod tests {
                 archived_sessions: HashSet::new(),
                 ancestors: HashMap::new(),
                 queue_info_calls: Vec::new(),
+                queue_message_calls: Vec::new(),
                 set_tagline_calls: Vec::new(),
             }
         }
@@ -624,6 +732,21 @@ mod tests {
                 } => {
                     self.queue_info_calls
                         .push((target_session_id.clone(), text.clone()));
+                    Response::Ok
+                }
+                Request::QueueMessage {
+                    target_session_id,
+                    content,
+                    sender_info,
+                    await_reply,
+                    ..
+                } => {
+                    self.queue_message_calls.push((
+                        target_session_id.clone(),
+                        content.clone(),
+                        sender_info.clone(),
+                        *await_reply,
+                    ));
                     Response::Ok
                 }
                 Request::GetSessionInfo { session_id } => Response::SessionInfo {
@@ -1331,6 +1454,401 @@ mod tests {
         let expected_refs: Vec<&str> = expected.iter().map(String::as_str).collect();
 
         assert_eq!(creator_msgs, expected_refs, "full message log mismatch");
+    }
+
+    // -----------------------------------------------------------------
+    // Creator QueueMessage on terminal transitions (task #658)
+    // -----------------------------------------------------------------
+
+    /// Helper: get captured QueueMessage calls in deterministic order.
+    fn captured_messages_sorted(
+        shared: &Arc<Mutex<MockShared>>,
+    ) -> Vec<(String, String, String, bool)> {
+        let mut calls = shared
+            .lock()
+            .expect("mock shared lock")
+            .queue_message_calls
+            .clone();
+        calls.sort();
+        calls
+    }
+
+    /// Terminal `Merged` transition: creator receives both the existing
+    /// QueueInfo line AND a new LLM-visible QueueMessage. Top-level task
+    /// wording is "Task #N" (no parent).
+    #[test]
+    fn terminal_merge_sends_queue_message_to_creator() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Working spinner", None, "ready");
+        db.record_session(task.id, "s-creator", "creator")
+            .expect("rec creator");
+        task.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(
+            &db,
+            &task,
+            TaskState::Merging,
+            Some("commit cafef00d"),
+            &mut w,
+            &mut r,
+        );
+
+        // Existing fanout: creator receives the QueueInfo line.
+        let info_calls = captured_sorted(&shared);
+        let info_to_creator: Vec<&str> = info_calls
+            .iter()
+            .filter(|(sid, _)| sid == "s-creator")
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert_eq!(
+            info_to_creator.len(),
+            1,
+            "creator should get one QueueInfo: {:?}",
+            info_calls
+        );
+
+        // New behaviour: exactly one QueueMessage to the creator.
+        let msg_calls = captured_messages_sorted(&shared);
+        let to_creator: Vec<&(String, String, String, bool)> = msg_calls
+            .iter()
+            .filter(|(sid, _, _, _)| sid == "s-creator")
+            .collect();
+        assert_eq!(
+            to_creator.len(),
+            1,
+            "creator should get exactly one QueueMessage: {:?}",
+            msg_calls
+        );
+        let (_, content, sender_info, await_reply) = to_creator[0];
+        assert!(
+            content.contains(&format!("Task #{}", task.id)),
+            "content missing task id: {:?}",
+            content
+        );
+        assert!(
+            content.contains("merged"),
+            "content missing 'merged': {:?}",
+            content
+        );
+        assert!(
+            content.contains("commit cafef00d"),
+            "content missing commit context: {:?}",
+            content
+        );
+        assert!(
+            content.contains("Working spinner"),
+            "content missing title: {:?}",
+            content
+        );
+        assert_eq!(sender_info, "task notifier");
+        assert!(!*await_reply, "await_reply should be false");
+    }
+
+    /// Terminal `Closed`: creator QueueMessage uses "closed" wording.
+    /// Subtask wording (parent_id set) is "Subtask #N".
+    #[test]
+    fn terminal_closed_sends_queue_message_to_creator() {
+        let db = TasksDb::open_memory().expect("db");
+        let parent = create_task(&db, "Parent", None, "ready");
+        let mut task = create_task(&db, "Renaming foo", Some(parent.id), "ready");
+        db.record_session(task.id, "s-creator", "creator")
+            .expect("rec creator");
+        task.state = TaskState::Closed;
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
+
+        let msg_calls = captured_messages_sorted(&shared);
+        let to_creator: Vec<&(String, String, String, bool)> = msg_calls
+            .iter()
+            .filter(|(sid, _, _, _)| sid == "s-creator")
+            .collect();
+        assert_eq!(
+            to_creator.len(),
+            1,
+            "creator should get one QueueMessage: {:?}",
+            msg_calls
+        );
+        let content = &to_creator[0].1;
+        assert!(
+            content.contains(&format!("Subtask #{}", task.id)),
+            "expected 'Subtask #N': {:?}",
+            content
+        );
+        assert!(
+            content.contains("closed"),
+            "content missing 'closed': {:?}",
+            content
+        );
+    }
+
+    /// Terminal `Failed`: creator QueueMessage includes the failure
+    /// reason after a colon.
+    #[test]
+    fn terminal_failed_sends_queue_message_to_creator() {
+        let db = TasksDb::open_memory().expect("db");
+        let parent = create_task(&db, "Parent", None, "ready");
+        let mut task = create_task(&db, "Refactor x", Some(parent.id), "ready");
+        db.record_session(task.id, "s-creator", "creator")
+            .expect("rec creator");
+        task.state = TaskState::Failed;
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(
+            &db,
+            &task,
+            TaskState::Merging,
+            Some("checklist failed"),
+            &mut w,
+            &mut r,
+        );
+
+        let msg_calls = captured_messages_sorted(&shared);
+        let to_creator: Vec<&(String, String, String, bool)> = msg_calls
+            .iter()
+            .filter(|(sid, _, _, _)| sid == "s-creator")
+            .collect();
+        assert_eq!(to_creator.len(), 1, "{:?}", msg_calls);
+        let content = &to_creator[0].1;
+        assert!(
+            content.contains("failed: checklist failed"),
+            "content: {:?}",
+            content
+        );
+        assert!(
+            content.contains(&format!("Subtask #{}", task.id)),
+            "content: {:?}",
+            content
+        );
+    }
+
+    /// Non-terminal transitions never send a QueueMessage — only the
+    /// existing QueueInfo fanout.
+    #[test]
+    fn non_terminal_transitions_do_not_send_queue_message() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "NT", None, "planning");
+        db.record_session(task.id, "s-creator", "creator")
+            .expect("rec creator");
+
+        let (shared, mut w, mut r) = make_io();
+
+        let steps = [
+            (TaskState::Planning, TaskState::Refining),
+            (TaskState::Refining, TaskState::Ready),
+            (TaskState::Ready, TaskState::Active),
+            (TaskState::Active, TaskState::Review),
+            (TaskState::Review, TaskState::Approved),
+            (TaskState::Approved, TaskState::Merging),
+        ];
+        for (from, to) in steps {
+            task.state = to;
+            notify_state_change(&db, &task, from, None, &mut w, &mut r);
+        }
+
+        // Sanity: QueueInfo fired.
+        assert!(!captured_sorted(&shared).is_empty(), "expected info calls");
+        // The point of the test: no QueueMessage on any non-terminal
+        // transition.
+        assert!(
+            captured_messages_sorted(&shared).is_empty(),
+            "unexpected QueueMessage: {:?}",
+            captured_messages_sorted(&shared)
+        );
+    }
+
+    /// Archived creator: neither QueueInfo nor QueueMessage should
+    /// reach it. Pin the existing archived-filter behaviour too so a
+    /// future refactor can't silently leak info lines to dismissed
+    /// sessions.
+    #[test]
+    fn queue_message_not_sent_when_creator_archived() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "ArcCreator", None, "ready");
+        db.record_session(task.id, "s-creator", "creator")
+            .expect("rec");
+        task.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        shared
+            .lock()
+            .expect("mock lock")
+            .archived_sessions
+            .insert("s-creator".into());
+
+        notify_state_change(&db, &task, TaskState::Merging, None, &mut w, &mut r);
+
+        // No QueueMessage for the archived creator (new behaviour).
+        let msg_calls = captured_messages_sorted(&shared);
+        assert!(
+            msg_calls.iter().all(|(sid, _, _, _)| sid != "s-creator"),
+            "archived creator got a QueueMessage: {:?}",
+            msg_calls
+        );
+        // No QueueInfo either (existing collect_recipients filter).
+        let info_calls = captured_sorted(&shared);
+        assert!(
+            info_calls.iter().all(|(sid, _)| sid != "s-creator"),
+            "archived creator got a QueueInfo: {:?}",
+            info_calls
+        );
+    }
+
+    /// Task with no recorded creator (older task, or task created by a
+    /// path that doesn't stamp the role): skip silently — no
+    /// QueueMessage sent at all.
+    #[test]
+    fn queue_message_not_sent_when_no_creator_recorded() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "NoCreator", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec w");
+        db.record_session(task.id, "s-reviewer", "reviewer")
+            .expect("rec r");
+        task.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, TaskState::Merging, None, &mut w, &mut r);
+
+        let msg_calls = captured_messages_sorted(&shared);
+        assert!(
+            msg_calls.is_empty(),
+            "expected no QueueMessage: {:?}",
+            msg_calls
+        );
+    }
+
+    /// Other recipients (worker, reviewer, parent creator) get
+    /// QueueInfo only; no QueueMessage is sent to them. Only the
+    /// creator receives the new LLM-visible wake.
+    #[test]
+    fn other_recipients_get_info_only_on_terminal() {
+        let db = TasksDb::open_memory().expect("db");
+        let parent = create_task(&db, "Parent", None, "ready");
+        db.record_session(parent.id, "s-pcreator", "creator")
+            .expect("rec pc");
+        // Give parent a distinct session_id so the dedup path doesn't
+        // suppress the new creator QueueMessage.
+        db.set_session_id(parent.id, "s-parent-worker")
+            .expect("psid");
+
+        let mut child = create_task(&db, "Child", Some(parent.id), "ready");
+        db.record_session(child.id, "s-creator", "creator")
+            .expect("rec c");
+        db.record_session(child.id, "s-worker", "worker")
+            .expect("rec w");
+        db.record_session(child.id, "s-reviewer", "reviewer")
+            .expect("rec r");
+        child.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &child, TaskState::Merging, None, &mut w, &mut r);
+
+        // QueueMessage: exactly one, to s-creator.
+        let msg_calls = captured_messages_sorted(&shared);
+        assert_eq!(
+            msg_calls.len(),
+            1,
+            "expected exactly one QueueMessage: {:?}",
+            msg_calls
+        );
+        assert_eq!(msg_calls[0].0, "s-creator");
+
+        // QueueInfo: covers worker, reviewer, parent creator, creator.
+        let info_sids: Vec<String> = captured_sorted(&shared)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+        assert!(info_sids.contains(&"s-creator".into()), "{:?}", info_sids);
+        assert!(info_sids.contains(&"s-worker".into()), "{:?}", info_sids);
+        assert!(info_sids.contains(&"s-reviewer".into()), "{:?}", info_sids);
+        assert!(info_sids.contains(&"s-pcreator".into()), "{:?}", info_sids);
+    }
+
+    /// Dedup: when the subtask's creator session is identical to the
+    /// parent task's current `session_id`, skip the new QueueMessage.
+    /// `tasks_merge::notify_parent_of_subtask_done` already covers that
+    /// session via its own QueueMessage, so we'd be sending two
+    /// LLM-visible wakes for the same event otherwise.
+    #[test]
+    fn queue_message_deduped_when_creator_is_parent_session() {
+        let db = TasksDb::open_memory().expect("db");
+        let parent = create_task(&db, "Parent", None, "ready");
+        db.set_session_id(parent.id, "s-shared").expect("psid");
+
+        let mut child = create_task(&db, "Child", Some(parent.id), "ready");
+        db.record_session(child.id, "s-shared", "creator")
+            .expect("rec c");
+        child.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &child, TaskState::Merging, None, &mut w, &mut r);
+
+        let msg_calls = captured_messages_sorted(&shared);
+        assert!(
+            msg_calls.is_empty(),
+            "creator==parent.session_id should dedup, got: {:?}",
+            msg_calls
+        );
+    }
+
+    /// Non-dedup path: creator distinct from parent.session_id, so the
+    /// new QueueMessage fires normally.
+    #[test]
+    fn queue_message_sent_when_creator_differs_from_parent_session() {
+        let db = TasksDb::open_memory().expect("db");
+        let parent = create_task(&db, "Parent", None, "ready");
+        db.set_session_id(parent.id, "s-parent-worker")
+            .expect("psid");
+
+        let mut child = create_task(&db, "Child", Some(parent.id), "ready");
+        db.record_session(child.id, "s-creator", "creator")
+            .expect("rec c");
+        child.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &child, TaskState::Merging, None, &mut w, &mut r);
+
+        let msg_calls = captured_messages_sorted(&shared);
+        let to_creator: Vec<&(String, String, String, bool)> = msg_calls
+            .iter()
+            .filter(|(sid, _, _, _)| sid == "s-creator")
+            .collect();
+        assert_eq!(to_creator.len(), 1, "{:?}", msg_calls);
+    }
+
+    /// Top-level (no parent) terminal transition: the dedup lookup is
+    /// safe on `parent_id = None` (no false match, no panic), and the
+    /// content uses "Task #N" wording.
+    #[test]
+    fn queue_message_sent_for_top_level_task_with_no_parent() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Top", None, "ready");
+        db.record_session(task.id, "s-creator", "creator")
+            .expect("rec");
+        task.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        notify_state_change(&db, &task, TaskState::Merging, None, &mut w, &mut r);
+
+        let msg_calls = captured_messages_sorted(&shared);
+        let to_creator: Vec<&(String, String, String, bool)> = msg_calls
+            .iter()
+            .filter(|(sid, _, _, _)| sid == "s-creator")
+            .collect();
+        assert_eq!(to_creator.len(), 1, "{:?}", msg_calls);
+        let content = &to_creator[0].1;
+        assert!(
+            content.contains(&format!("Task #{}", task.id)),
+            "expected 'Task #N' for top-level: {:?}",
+            content
+        );
+        assert!(
+            !content.contains("Subtask #"),
+            "top-level task should not say 'Subtask': {:?}",
+            content
+        );
     }
 
     // -----------------------------------------------------------------
