@@ -1662,29 +1662,62 @@ fn handle_task_update(
                 }
             }
 
-            // Session reuse: when refining → planning, resume the planning
-            // session by sending it a message with the refining feedback.
-            if task.state == TaskState::Planning
-                && old_state == Some(TaskState::Refining)
-                && let Some(ref sid) = task.session_id
-            {
-                let msg = format!(
-                    "Task {} was sent back to planning (plan needs revision). \
-                     Please run task_get to read the latest refining feedback \
-                     and revise your plan.",
-                    task.id
-                );
-                let _ = crate::tasks_scheduler::server_request(
-                    writer,
-                    reader,
-                    tau_agent_plugin::Request::QueueMessage {
-                        target_session_id: sid.clone(),
-                        content: msg,
-                        sender_info: format!("task-system (refine task {})", task.id),
-                        await_reply: false,
-                        reply_to: None,
-                    },
-                );
+            // Automated planning resume: when refining → planning, wake
+            // (or recreate) the planner so it can read the refiner's
+            // feedback and revise the plan.
+            //
+            // The inline `QueueMessage` that used to live here was dead
+            // code: `task.session_id` is cleared by
+            // `should_clear_session_id_on_transition((Planning, Refining))`
+            // on the earlier `planning → refining` transition, so the
+            // `Some(sid)` guard was always false by the time we got
+            // here (task #666). Route through `dispatch_planning`
+            // instead — it looks up the live planner by role (robust
+            // to `task.session_id` being cleared), sends the canonical
+            // resume message via `reuse_resume_message`, and falls back
+            // to creating a fresh planner if the old one is archived.
+            //
+            // Mirrors the `review → active` and `planning|interactive
+            // → refining` auto-dispatch blocks immediately above.
+            if task.state == TaskState::Planning && old_state == Some(TaskState::Refining) {
+                match resolver.resolve(&task.project_name) {
+                    Ok(project_path) => {
+                        match tasks_scheduler::dispatch_planning(
+                            db,
+                            &task,
+                            session_id,
+                            &project_path,
+                            writer,
+                            reader,
+                        ) {
+                            Ok(planner_sid) => {
+                                eprintln!(
+                                    "tasks: auto-resumed planning session {} for task {} (refining → planning)",
+                                    planner_sid, task.id
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "tasks: failed to auto-resume planning for task {}: {}",
+                                    task.id, e
+                                );
+                                let warn = format!(
+                                    "⚠️ Auto-resume of planning session failed: {}. \
+                                     Task is back in planning state but the planner has not been woken.",
+                                    e
+                                );
+                                let _ = db.add_message(task.id, &warn, Some("system"));
+                                dispatch_warnings.push(warn);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "tasks: cannot resolve project '{}' for planning resume dispatch: {}",
+                            task.project_name, e
+                        );
+                    }
+                }
             }
 
             // When a task transitions TO interactive (from any other state),
@@ -9117,6 +9150,14 @@ mod tests {
 
     #[test]
     fn test_refining_to_planning_resumes_planning_session() {
+        // Regression test for task #666: when a task transitions
+        // `refining → planning`, the live planner session (looked up by
+        // role, NOT via `task.session_id` which is cleared on the
+        // earlier `planning → refining` transition) must receive a
+        // `QueueMessage` with the canonical "moved back to planning,
+        // revise your plan" resume text. Prior to the fix, the inline
+        // block gated on `task.session_id.is_some()` was dead code, so
+        // the planner stayed idle and the task stalled indefinitely.
         let db = TasksDb::open_memory().unwrap();
         let resolver = test_resolver();
         let (mut writer, mut reader) = mock_io();
@@ -9157,8 +9198,148 @@ mod tests {
             )
             .unwrap();
 
-        // Simulate: assign planning session, then move to refining
+        // Simulate a real planning dispatch: record the planner session
+        // under its role (this is what `find_reusable_session` consults)
+        // AND set `task.session_id`, which the production
+        // `dispatch_task_phase(Planner, …)` does.
+        db.record_session(task.id, "planning-session", "planner")
+            .unwrap();
         db.set_session_id(task.id, "planning-session").unwrap();
+
+        // planning → refining: this will null out `task.session_id`
+        // via `should_clear_session_id_on_transition`, mirroring
+        // production. The auto-dispatch block will also try to
+        // dispatch a refiner; we don't care about that here —
+        // the mock accepts the CreateSession.
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Refining),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        // Sanity: session_id was cleared by the transition rule.
+        let after_refining = db.get_task(task.id).unwrap().unwrap();
+        assert!(
+            after_refining.session_id.is_none(),
+            "planning → refining should clear task.session_id"
+        );
+
+        // Drain the mock's write buffer so we only inspect what the
+        // refining → planning transition writes.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.write_buf.clear();
+            shared.written_lines.clear();
+        }
+
+        // refining -> planning should wake the planner session via
+        // `dispatch_planning` (same path used by the scheduler).
+        let mut events = Vec::new();
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "state": "planning"}),
+            Some("refining-session"),
+            "tc1",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut events,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(updated["state"], "planning");
+
+        // Flush any unprocessed writes into `written_lines` so we can
+        // assert on the full transcript.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            let buf = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+        }
+        let all_written = writer.shared.lock().unwrap().written_lines.join("\n");
+
+        // A QueueMessage must have been sent — targeting the planner
+        // session (found by role), not the stale refiner session.
+        assert!(
+            all_written.contains("queue_message"),
+            "expected a QueueMessage on refining → planning, got:\n{}",
+            all_written
+        );
+        assert!(
+            all_written.contains("planning-session"),
+            "resume QueueMessage should target the planner session, got:\n{}",
+            all_written
+        );
+        assert!(
+            !all_written.contains("\"target_session_id\":\"refining-session\""),
+            "resume must NOT target the refiner session, got:\n{}",
+            all_written
+        );
+        // The body must be the canonical planner resume text
+        // (`TaskPhase::Planner.reuse_resume_message`).
+        assert!(
+            all_written.contains("moved back to planning"),
+            "resume body should explain the backward transition, got:\n{}",
+            all_written
+        );
+        assert!(
+            all_written.contains("task_get"),
+            "resume body should instruct the planner to call task_get, got:\n{}",
+            all_written
+        );
+    }
+
+    /// Companion to the bug-#666 regression test: if the original
+    /// planner session has been archived, the `refining → planning`
+    /// auto-resume must fall through to the fresh-session path in
+    /// `dispatch_task_phase` (never reuse the archived id).
+    #[test]
+    fn test_refining_to_planning_recreates_planner_when_archived() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Archived planner resume",
+                Some(5),
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        db.record_session(task.id, "old-planner-session", "planner")
+            .unwrap();
+        db.set_session_id(task.id, "old-planner-session").unwrap();
+
+        // planning → refining (drives session_id → NULL and spawns a
+        // refiner in the mock; we build the mock with the old planner
+        // already archived so reuse will be rejected later).
+        let mut archived = std::collections::HashSet::new();
+        archived.insert("old-planner-session".to_string());
+        let (mut writer, mut reader) = mock_io_with_archived(archived);
+
         db.update_task(
             task.id,
             &TaskUpdate {
@@ -9169,7 +9350,12 @@ mod tests {
         )
         .unwrap();
 
-        // refining -> planning should send a QueueMessage to the planning session
+        // Now drive refining → planning. The auto-resume block should
+        // see the old planner as archived (via `find_reusable_session`)
+        // and fall through to creating a new session. We don't assert
+        // exact new-session id because mock-create behaviour may vary;
+        // we only assert it is NOT the archived id (that would prove
+        // the archived-session reuse guard is broken).
         let mut events = Vec::new();
         let result = handle_task_update(
             &db,
@@ -9188,12 +9374,25 @@ mod tests {
             extract_text(&result)
         );
 
-        // Check that a QueueMessage was sent to "planning-session"
-        // The mock IO captures ServerRequests in the shared buffer.
-        // Since the mock processes requests synchronously, the QueueMessage
-        // should have been processed. We verify indirectly via the result succeeding.
-        let updated: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(updated["state"], "planning");
+        let all_written = {
+            let mut shared = writer.shared.lock().unwrap();
+            let buf = std::mem::take(&mut shared.write_buf);
+            let text = String::from_utf8_lossy(&buf);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    shared.written_lines.push(line.to_string());
+                }
+            }
+            shared.written_lines.join("\n")
+        };
+
+        // The archived planner must NOT be the target of any
+        // queue_message (which would mean reuse fired wrongly).
+        assert!(
+            !all_written.contains("\"target_session_id\":\"old-planner-session\""),
+            "archived planner must not receive a resume QueueMessage, got:\n{}",
+            all_written
+        );
     }
 
     /// Bug #589: when `dispatch_planning` reuses an existing planner session

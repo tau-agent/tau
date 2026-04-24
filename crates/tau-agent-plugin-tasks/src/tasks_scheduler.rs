@@ -1115,7 +1115,7 @@ pub fn dispatch(
 
 /// Dispatch a planning-state task: create a read-only session (no worktree)
 /// that explores code and produces a plan with affected files.
-fn dispatch_planning(
+pub(crate) fn dispatch_planning(
     db: &TasksDb,
     task: &Task,
     parent_session_id: Option<&str>,
