@@ -942,21 +942,23 @@ pub(super) async fn handle_client(
                 }
 
                 // Send current agent phase so newly connected TUI shows correct state.
-                // Include the server-stamped `turn_started_at_ms` anchor so
-                // that subscribing to a mid-flight session renders the
-                // "Working... Xs" counter from the actual start of the turn,
-                // not from the moment the subscription was established.
+                // Include the server-stamped `turn_started_at_ms` and
+                // `phase_started_at_ms` anchors so that subscribing to a
+                // mid-flight session renders the "Working... Xs" counters
+                // from the actual start of the turn / phase, not from the
+                // moment the subscription was established.
                 let phase_resp = {
                     let st = lock_state(&state);
-                    let (phase, ts) = st
+                    let (phase, turn_ts, phase_ts) = st
                         .phases
                         .get(&session_id)
                         .copied()
-                        .unwrap_or((crate::types::AgentPhase::default(), None));
+                        .unwrap_or((crate::types::AgentPhase::default(), None, None));
                     Response::Stream {
                         event: Box::new(crate::types::StreamEvent::Phase {
                             phase,
-                            turn_started_at_ms: ts,
+                            turn_started_at_ms: turn_ts,
+                            phase_started_at_ms: phase_ts,
                         }),
                     }
                 };

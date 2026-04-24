@@ -304,6 +304,7 @@ pub async fn run(
         let _ = event_tx.try_send(StreamEvent::Phase {
             phase: tau_agent_base::types::AgentPhase::Connecting,
             turn_started_at_ms: None,
+            phase_started_at_ms: None,
         });
 
         // Stream LLM response (with retry)
@@ -544,6 +545,7 @@ async fn run_loop_review(
     let _ = event_tx.try_send(StreamEvent::Phase {
         phase: tau_agent_base::types::AgentPhase::Compacting,
         turn_started_at_ms: None,
+        phase_started_at_ms: None,
     });
 
     // Extract the last N messages for review.
@@ -817,6 +819,7 @@ async fn stream_with_retry(
                 let _ = event_tx.try_send(StreamEvent::Phase {
                     phase: tau_agent_base::types::AgentPhase::RateLimited,
                     turn_started_at_ms: None,
+                    phase_started_at_ms: None,
                 });
                 if delay_ms == 0 {
                     let _ = event_tx.try_send(StreamEvent::Status {

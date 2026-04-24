@@ -389,6 +389,7 @@ fn protocol_session_info_tree_fields() {
         last_exit_status: None,
         is_live: false,
         turn_started_at_ms: None,
+        phase_started_at_ms: None,
         state: "idle".into(),
         context_pct: None,
         project_name: None,

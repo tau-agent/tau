@@ -510,6 +510,12 @@ pub struct SessionInfo {
     /// session from the picker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_started_at_ms: Option<u64>,
+    /// Unix-ms timestamp when the current phase began on the server.
+    /// Re-stamped on every phase transition within a turn; `None` when
+    /// the session is idle. Symmetric to `turn_started_at_ms` so
+    /// late-subscribing clients can anchor the per-phase elapsed counter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_started_at_ms: Option<u64>,
 }
 
 /// Result for a single session in WaitSessions response.

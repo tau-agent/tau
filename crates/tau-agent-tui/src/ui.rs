@@ -176,13 +176,26 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // Idle means no active agent; spinner would be misleading). The
     // spinner is also hidden for the first 1s of a turn so that fast
     // replies never flash one — see task 570.
+    //
+    // Counter format:
+    //   * Single phase elapsed if `turn_elapsed - phase_elapsed < 1s`
+    //     (e.g. turn just started, all in the same phase) — "thinking... 2s".
+    //   * Otherwise both: "running tools... 12s / 1m 34s" where the
+    //     first number is per-phase and the second is total turn.
+    // The 1s reveal threshold gates on `phase_elapsed`, not turn elapsed,
+    // so a fresh phase transition doesn't flash the spinner if the new
+    // phase completes in <1s.
     if app.mode == AppMode::Streaming && app.phase != AgentPhase::Idle {
-        let elapsed = app
+        let turn_elapsed = app
             .streaming_started_at
             .map(|t| t.elapsed())
             .unwrap_or_default();
-        let reveal =
-            app.streaming_started_at.is_some() && elapsed >= std::time::Duration::from_secs(1);
+        let phase_elapsed = app
+            .phase_anchor
+            .map(|t| t.elapsed())
+            .unwrap_or(turn_elapsed);
+        let reveal = app.streaming_started_at.is_some()
+            && phase_elapsed >= std::time::Duration::from_secs(1);
         let needs_indicator = reveal
             && !matches!(
                 app.messages.last(),
@@ -192,7 +205,15 @@ fn draw_messages(frame: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             if !all_lines.is_empty() {
                 all_lines.push(Line::from(""));
             }
-            let elapsed_str = crate::render::format_duration_whole_seconds(elapsed);
+            let phase_str = crate::render::format_duration_whole_seconds(phase_elapsed);
+            let elapsed_str = if turn_elapsed > phase_elapsed
+                && turn_elapsed - phase_elapsed >= std::time::Duration::from_secs(1)
+            {
+                let turn_str = crate::render::format_duration_whole_seconds(turn_elapsed);
+                format!("{} / {}", phase_str, turn_str)
+            } else {
+                phase_str
+            };
             all_lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(app.spinner().to_string(), theme.spinner_style()),

@@ -169,6 +169,19 @@ pub struct App {
     /// "Working... Xs" counter shows the elapsed agent time, not the
     /// local mode-transition time. `None` when no turn is in flight.
     pub turn_anchor: Option<std::time::Instant>,
+    /// Anchor for the *current phase* within the active turn. Stamped
+    /// to `Instant::now()` on every real `self.phase` transition (i.e.
+    /// `old_phase != new_phase`), and cleared whenever `turn_anchor`
+    /// is cleared. Used by the UI to render a per-phase elapsed time
+    /// alongside the total turn elapsed — so a slow tool call doesn't
+    /// keep climbing the counter once the LLM resumes responding.
+    ///
+    /// Owned client-side: the server doesn't ship a per-phase
+    /// timestamp on the wire, and `phase_anchor` is authoritative on
+    /// the `old_phase != new_phase` edge. A `StreamEvent::Phase` with
+    /// `turn_started_at_ms = Some(_)` overwrites `turn_anchor` with
+    /// the server timestamp but **must not** overwrite `phase_anchor`.
+    pub phase_anchor: Option<std::time::Instant>,
     /// Current agent phase — updated explicitly by Phase events and
     /// implicitly by stream events (see `update_phase_from_event`).
     pub phase: AgentPhase,
@@ -316,6 +329,10 @@ pub struct NavEntry {
     /// if any. Restored on `navigate_back` so the "Working..." counter
     /// continues from the correct elapsed time.
     pub turn_anchor: Option<std::time::Instant>,
+    /// Per-phase anchor for the saved session. Restored by
+    /// `navigate_back` so the per-phase elapsed counter resumes from
+    /// the correct moment.
+    pub phase_anchor: Option<std::time::Instant>,
 }
 
 impl App {
@@ -333,6 +350,7 @@ impl App {
             mode: AppMode::Input,
             streaming_started_at: None,
             turn_anchor: None,
+            phase_anchor: None,
             phase: AgentPhase::default(),
             scroll_pos: std::cell::Cell::new(None),
             max_scroll: std::cell::Cell::new(0),
@@ -1962,6 +1980,12 @@ impl App {
         self.turn_anchor = ms.map(Self::instant_from_server_ms);
     }
 
+    /// Record a server-reported phase anchor (or clear it). Mirror of
+    /// [`set_turn_anchor_from_ms`] for the per-phase elapsed counter.
+    pub fn set_phase_anchor_from_ms(&mut self, ms: Option<u64>) {
+        self.phase_anchor = ms.map(Self::instant_from_server_ms);
+    }
+
     /// "Working... Xs" counter and 1s spinner reveal both read from
     /// `streaming_started_at`, so it must be `Some` while in Streaming
     /// mode and `None` outside it.
@@ -2015,6 +2039,7 @@ impl App {
             session_cwd: self.session_cwd.clone(),
             session_project_name: self.session_project_name.clone(),
             turn_anchor: self.turn_anchor.take(),
+            phase_anchor: self.phase_anchor.take(),
         });
     }
 
@@ -2047,6 +2072,7 @@ impl App {
         // `streaming_started_at`; `sync_streaming_timer` will re-derive
         // it from `turn_anchor` on the next mode transition.
         self.set_turn_anchor_from_ms(info.turn_started_at_ms);
+        self.set_phase_anchor_from_ms(info.phase_started_at_ms);
         self.streaming_started_at = None;
     }
 
@@ -2065,6 +2091,7 @@ impl App {
             self.session_cwd = entry.session_cwd;
             self.session_project_name = entry.session_project_name;
             self.turn_anchor = entry.turn_anchor;
+            self.phase_anchor = entry.phase_anchor;
             self.streaming_started_at = None;
             self.current_task_id = None;
             self.scroll_to_bottom();
@@ -2742,30 +2769,30 @@ impl App {
         match event {
             // Thinking tokens → Thinking phase
             StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
-                self.phase = AgentPhase::Thinking;
-                self.ensure_turn_anchor();
+                self.transition_phase(AgentPhase::Thinking);
             }
             // Text/toolcall tokens → Responding phase
             StreamEvent::TextStart { .. }
             | StreamEvent::TextDelta { .. }
             | StreamEvent::ToolcallStart { .. } => {
-                self.phase = AgentPhase::Responding;
-                self.ensure_turn_anchor();
+                self.transition_phase(AgentPhase::Responding);
             }
             // Tool call defined or result received → ToolExec phase
             StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
-                self.phase = AgentPhase::ToolExec;
-                self.ensure_turn_anchor();
+                self.transition_phase(AgentPhase::ToolExec);
             }
             // Explicit phase transition
             StreamEvent::Phase {
                 phase,
                 turn_started_at_ms,
+                phase_started_at_ms,
             } => {
+                let old_phase = self.phase;
                 self.phase = *phase;
                 match (*phase, *turn_started_at_ms) {
                     (AgentPhase::Idle, _) => {
                         self.turn_anchor = None;
+                        self.phase_anchor = None;
                     }
                     (_, Some(ms)) => {
                         let anchor = Self::instant_from_server_ms(ms);
@@ -2786,8 +2813,45 @@ impl App {
                         self.ensure_turn_anchor();
                     }
                 }
+                // Independent of turn_anchor: phase_anchor follows the
+                // server-reported `phase_started_at_ms` when present, or
+                // falls back to local stamping.
+                if !matches!(*phase, AgentPhase::Idle) {
+                    match *phase_started_at_ms {
+                        Some(ms) => {
+                            self.phase_anchor = Some(Self::instant_from_server_ms(ms));
+                        }
+                        None => {
+                            // Older server: stamp now if we crossed a
+                            // real phase boundary, otherwise just keep
+                            // whatever we had (or stamp if absent).
+                            if old_phase != *phase {
+                                self.phase_anchor = Some(std::time::Instant::now());
+                            } else {
+                                self.ensure_phase_anchor();
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Apply an implicit phase derived from a stream event. Stamps
+    /// `phase_anchor` to `Instant::now()` only if `self.phase` actually
+    /// changes (so a burst of `ToolResult` events within the same
+    /// `ToolExec` phase doesn't keep resetting the per-phase counter).
+    /// Always calls `ensure_turn_anchor` / `ensure_phase_anchor` to
+    /// guarantee both anchors are set after this returns.
+    fn transition_phase(&mut self, new_phase: AgentPhase) {
+        let old_phase = self.phase;
+        self.phase = new_phase;
+        self.ensure_turn_anchor();
+        if old_phase != new_phase {
+            self.phase_anchor = Some(std::time::Instant::now());
+        } else {
+            self.ensure_phase_anchor();
         }
     }
 
@@ -2799,6 +2863,16 @@ impl App {
     fn ensure_turn_anchor(&mut self) {
         if self.turn_anchor.is_none() {
             self.turn_anchor = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Stamp `phase_anchor` to now if it's currently `None`. Mirror of
+    /// `ensure_turn_anchor` for the per-phase counter; used when a
+    /// phase-bearing stream event arrives from an older server that
+    /// doesn't ship `phase_started_at_ms`.
+    fn ensure_phase_anchor(&mut self) {
+        if self.phase_anchor.is_none() {
+            self.phase_anchor = Some(std::time::Instant::now());
         }
     }
 
@@ -2826,6 +2900,7 @@ impl App {
                     }
                     self.phase = AgentPhase::Idle;
                     self.turn_anchor = None;
+                    self.phase_anchor = None;
                     return None;
                 }
                 // If we receive stream events while in Input mode,
@@ -2846,6 +2921,7 @@ impl App {
                 self.finalize_in_flight();
                 self.phase = AgentPhase::Idle;
                 self.turn_anchor = None;
+                self.phase_anchor = None;
                 self.set_mode(AppMode::Input);
                 self.pending_steer = None;
             }
@@ -2865,6 +2941,7 @@ impl App {
                 }
                 self.phase = AgentPhase::Idle;
                 self.turn_anchor = None;
+                self.phase_anchor = None;
                 self.set_mode(AppMode::Input);
                 self.pending_steer = None;
             }
@@ -4433,6 +4510,7 @@ mod tests {
             event: Box::new(StreamEvent::Phase {
                 phase: AgentPhase::Idle,
                 turn_started_at_ms: None,
+                phase_started_at_ms: None,
             }),
         });
 
@@ -4458,6 +4536,7 @@ mod tests {
             event: Box::new(StreamEvent::Phase {
                 phase: AgentPhase::Responding,
                 turn_started_at_ms: Some(server_start_ms),
+                phase_started_at_ms: Some(server_start_ms),
             }),
         });
 
@@ -4544,6 +4623,7 @@ mod tests {
             is_live: true,
             project_name: None,
             turn_started_at_ms: Some(started_30s_ago),
+            phase_started_at_ms: Some(started_30s_ago),
         };
 
         app.switch_to_session(&info, vec![]);
@@ -4590,6 +4670,7 @@ mod tests {
             event: Box::new(StreamEvent::Phase {
                 phase: AgentPhase::Responding,
                 turn_started_at_ms: Some(tau_agent_lib::types::timestamp_ms()),
+                phase_started_at_ms: Some(tau_agent_lib::types::timestamp_ms()),
             }),
         });
         assert!(app.turn_anchor.is_some());
@@ -4598,9 +4679,219 @@ mod tests {
             event: Box::new(StreamEvent::Phase {
                 phase: AgentPhase::Idle,
                 turn_started_at_ms: None,
+                phase_started_at_ms: None,
             }),
         });
         assert!(app.turn_anchor.is_none());
+    }
+
+    /// Task 702: a real phase transition advances `phase_anchor` but
+    /// preserves `turn_anchor`. Drives an explicit Phase event from the
+    /// server to switch from Thinking to ToolExec mid-turn.
+    #[test]
+    fn phase_anchor_resets_on_phase_transition() {
+        let mut app = make_app();
+        let turn_started = tau_agent_lib::types::timestamp_ms().saturating_sub(5_000);
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Thinking,
+                turn_started_at_ms: Some(turn_started),
+                phase_started_at_ms: Some(turn_started),
+            }),
+        });
+        let original_turn = app.turn_anchor.expect("turn_anchor stamped");
+        let original_phase = app.phase_anchor.expect("phase_anchor stamped");
+        // Both anchors derive from the same server ms but pass through
+        // separate `Instant::now()` reference points, so they are
+        // approximately equal rather than identical.
+        let drift = if original_turn > original_phase {
+            original_turn - original_phase
+        } else {
+            original_phase - original_turn
+        };
+        assert!(
+            drift < std::time::Duration::from_millis(50),
+            "turn and phase anchors should align at turn start, drift={:?}",
+            drift
+        );
+
+        // New phase a few seconds later — server stamps a new
+        // phase_started_at_ms but keeps the same turn_started_at_ms.
+        let phase_started = tau_agent_lib::types::timestamp_ms();
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::ToolExec,
+                turn_started_at_ms: Some(turn_started),
+                phase_started_at_ms: Some(phase_started),
+            }),
+        });
+        assert_eq!(app.phase, AgentPhase::ToolExec);
+        let new_phase = app.phase_anchor.expect("phase_anchor still set");
+        assert!(
+            new_phase > original_phase
+                && new_phase - original_phase >= std::time::Duration::from_secs(4),
+            "phase_anchor must advance on real phase transition (got {:?} delta)",
+            new_phase.checked_duration_since(original_phase)
+        );
+        let new_turn = app.turn_anchor.expect("turn_anchor preserved");
+        // Same server `turn_started_at_ms` reproduces approximately the
+        // same Instant; assert near-equality (sub-100µs drift) rather
+        // than strict equality since each call re-bases on `Instant::now()`.
+        let turn_drift = if new_turn > original_turn {
+            new_turn - original_turn
+        } else {
+            original_turn - new_turn
+        };
+        assert!(
+            turn_drift < std::time::Duration::from_millis(50),
+            "turn_anchor must not move on phase transition, drift={:?}",
+            turn_drift
+        );
+    }
+
+    /// Task 702: repeated `ToolResult` events within the same `ToolExec`
+    /// phase must not advance `phase_anchor` — it's transition-driven,
+    /// not event-driven.
+    #[test]
+    fn phase_anchor_stable_within_phase() {
+        let mut app = make_app();
+        let now_ms = tau_agent_lib::types::timestamp_ms();
+        // Enter ToolExec via an explicit Phase event from the server.
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::ToolExec,
+                turn_started_at_ms: Some(now_ms),
+                phase_started_at_ms: Some(now_ms),
+            }),
+        });
+        let phase_anchor_before = app.phase_anchor.expect("anchor set");
+
+        // Now drive several implicit ToolResult events. They all keep
+        // us in ToolExec; the per-phase counter must not reset.
+        for _ in 0..3 {
+            app.handle_server_response(Response::Stream {
+                event: Box::new(StreamEvent::ToolResult {
+                    tool_call_id: "tc1".into(),
+                    tool_name: "bash".into(),
+                    is_error: false,
+                    content: "ok".into(),
+                    summary: None,
+                }),
+            });
+            assert_eq!(
+                app.phase_anchor,
+                Some(phase_anchor_before),
+                "phase_anchor must not move on repeated same-phase events"
+            );
+        }
+    }
+
+    /// Task 702: Phase(Idle) clears `phase_anchor` along with
+    /// `turn_anchor` so the next turn starts fresh on both axes.
+    #[test]
+    fn phase_anchor_cleared_on_idle() {
+        let mut app = make_app();
+        let now_ms = tau_agent_lib::types::timestamp_ms();
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Responding,
+                turn_started_at_ms: Some(now_ms),
+                phase_started_at_ms: Some(now_ms),
+            }),
+        });
+        assert!(app.phase_anchor.is_some());
+
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Idle,
+                turn_started_at_ms: None,
+                phase_started_at_ms: None,
+            }),
+        });
+        assert!(app.phase_anchor.is_none());
+        assert!(app.turn_anchor.is_none());
+    }
+
+    /// Task 702: opening/closing the session picker mid-stream does
+    /// **not** advance `phase_anchor`. Mirror of the existing
+    /// `working_timer_anchor_survives_picker_flicker` test, focused on
+    /// the per-phase anchor.
+    #[test]
+    fn phase_anchor_survives_picker_flicker() {
+        let mut app = make_app();
+        let now_ms = tau_agent_lib::types::timestamp_ms().saturating_sub(3_000);
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::ToolExec,
+                turn_started_at_ms: Some(now_ms),
+                phase_started_at_ms: Some(now_ms),
+            }),
+        });
+        let original_phase = app.phase_anchor.expect("anchor set");
+
+        // Open picker.
+        app.picker_previous_mode = app.mode;
+        app.mode = AppMode::SessionPicker;
+        app.sync_streaming_timer();
+        assert!(
+            app.phase_anchor.is_some(),
+            "phase_anchor preserved across mode flicker"
+        );
+        assert_eq!(
+            app.phase_anchor,
+            Some(original_phase),
+            "phase_anchor must not change while picker is open"
+        );
+
+        // Close picker.
+        app.mode = app.picker_previous_mode;
+        app.sync_streaming_timer();
+        assert_eq!(
+            app.phase_anchor,
+            Some(original_phase),
+            "phase_anchor must not change after picker closes"
+        );
+    }
+
+    /// Task 702: `save_nav_state` / `navigate_back` round-trip the
+    /// per-phase anchor the same way they do `turn_anchor`, so the
+    /// counter resumes correctly when the user navigates back to a
+    /// session that's mid-turn.
+    #[test]
+    fn phase_anchor_navigates_with_session() {
+        let mut app = make_app();
+        let now_ms = tau_agent_lib::types::timestamp_ms();
+        app.handle_server_response(Response::Stream {
+            event: Box::new(StreamEvent::Phase {
+                phase: AgentPhase::Thinking,
+                turn_started_at_ms: Some(now_ms),
+                phase_started_at_ms: Some(now_ms),
+            }),
+        });
+        let phase_before = app.phase_anchor.expect("phase anchor set");
+        let turn_before = app.turn_anchor.expect("turn anchor set");
+
+        // Save and clear.
+        app.save_nav_state();
+        assert!(
+            app.phase_anchor.is_none(),
+            "save_nav_state moves phase_anchor into the entry"
+        );
+        assert!(app.turn_anchor.is_none());
+
+        // Restore.
+        let restored = app.navigate_back();
+        assert!(restored, "navigate_back returns true");
+        assert_eq!(
+            app.phase_anchor,
+            Some(phase_before),
+            "phase_anchor restored verbatim"
+        );
+        assert_eq!(
+            app.turn_anchor,
+            Some(turn_before),
+            "turn_anchor restored verbatim"
+        );
     }
 
     /// Cancelled response while picker is open should NOT close the picker.
@@ -4782,6 +5073,7 @@ mod tests {
             event: Box::new(StreamEvent::Phase {
                 phase: AgentPhase::Idle,
                 turn_started_at_ms: None,
+                phase_started_at_ms: None,
             }),
         });
 

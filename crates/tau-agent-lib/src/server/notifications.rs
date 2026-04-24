@@ -281,7 +281,7 @@ fn persist_phase(
     session_id: &str,
     phase: crate::types::AgentPhase,
 ) -> Response {
-    let turn_started_at_ms = {
+    let (turn_started_at_ms, phase_started_at_ms) = {
         let mut st = lock_state(state);
         let ts = set_phase_and_stamp_locked(&mut st, session_id, phase);
         // Persist meaningful phase transitions to DB.
@@ -295,19 +295,27 @@ fn persist_phase(
         event: Box::new(crate::types::StreamEvent::Phase {
             phase,
             turn_started_at_ms,
+            phase_started_at_ms,
         }),
     }
 }
 
-/// Update the in-memory phase map and return the turn-start anchor for the
-/// resulting phase.
+/// Update the in-memory phase map and return the turn-start and
+/// phase-start anchors for the resulting phase.
 ///
 /// Rules:
-/// * Transitioning to `Idle` clears any existing anchor and returns `None`.
-/// * Transitioning to a non-Idle phase stamps `Some(now_ms)` *only if* there
-///   is no existing anchor for this session (i.e. we are starting a fresh
-///   turn). Subsequent non-Idle transitions preserve the existing anchor so
-///   the counter is continuous for the whole turn.
+/// * Transitioning to `Idle` clears any existing anchors and returns
+///   `(None, None)`.
+/// * Transitioning to a non-Idle phase stamps `turn_start = Some(now_ms)`
+///   *only if* there is no existing turn anchor for this session (i.e.
+///   we are starting a fresh turn). Subsequent non-Idle transitions
+///   preserve the existing turn anchor so the counter is continuous for
+///   the whole turn.
+/// * `phase_start` is re-stamped to `Some(now_ms)` on every real phase
+///   transition (`old_phase != new_phase`). On a defensive same-phase
+///   call (incoming phase equals the stored phase) we preserve the
+///   existing `phase_start` so repeated implicit-phase events within
+///   the same phase don't reset the counter.
 ///
 /// Callers: `persist_phase` above, and the stream-event forward loop in
 /// `agent_runner.rs` that derives implicit phases from text/tool events.
@@ -315,38 +323,47 @@ pub(super) fn set_phase_and_stamp_locked(
     st: &mut super::state::State,
     session_id: &str,
     phase: crate::types::AgentPhase,
-) -> Option<u64> {
+) -> (Option<u64>, Option<u64>) {
     let now_ms = crate::types::timestamp_ms();
     match phase {
         crate::types::AgentPhase::Idle => {
-            st.phases.insert(session_id.to_string(), (phase, None));
-            None
+            st.phases
+                .insert(session_id.to_string(), (phase, None, None));
+            (None, None)
         }
         _ => {
-            let entry = st
-                .phases
-                .entry(session_id.to_string())
-                .or_insert((phase, Some(now_ms)));
-            // Preserve existing anchor on phase→phase transitions; stamp only
-            // if there was no anchor (i.e. session was Idle / unknown).
+            let entry = st.phases.entry(session_id.to_string()).or_insert((
+                phase,
+                Some(now_ms),
+                Some(now_ms),
+            ));
+            // Preserve existing turn anchor on phase→phase transitions;
+            // stamp only if there was no anchor (i.e. session was Idle
+            // / unknown).
             if entry.1.is_none() {
                 entry.1 = Some(now_ms);
             }
+            // Re-stamp phase anchor on real transitions; preserve on
+            // same-phase (defensive: implicit-phase events that don't
+            // change the phase shouldn't reset the per-phase counter).
+            if entry.0 != phase || entry.2.is_none() {
+                entry.2 = Some(now_ms);
+            }
             entry.0 = phase;
-            entry.1
+            (entry.1, entry.2)
         }
     }
 }
 
 /// Variant of [`set_phase_and_stamp_locked`] that takes a `SharedState` and
-/// manages the lock internally. Returns the turn-start anchor for the
-/// resulting phase. Used by the stream-forward loop that otherwise only
-/// holds the lock for the mutation.
+/// manages the lock internally. Returns the turn-start and phase-start
+/// anchors for the resulting phase. Used by the stream-forward loop that
+/// otherwise only holds the lock for the mutation.
 pub(super) fn set_phase_and_stamp(
     state: &SharedState,
     session_id: &str,
     phase: crate::types::AgentPhase,
-) -> Option<u64> {
+) -> (Option<u64>, Option<u64>) {
     let mut st = lock_state(state);
     set_phase_and_stamp_locked(&mut st, session_id, phase)
 }
@@ -662,5 +679,95 @@ mod tests {
         // Only the first message is present.
         assert!(matches!(rx.try_recv(), Ok(Response::Ok)));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// Task 702: `set_phase_and_stamp_locked` stamps a fresh
+    /// `phase_started_at_ms` on every real phase transition while
+    /// preserving `turn_started_at_ms` across the same turn.
+    #[test]
+    fn set_phase_and_stamp_stamps_phase_start_on_transition() {
+        let state = mk_state();
+        let sid = "s-test";
+        // Idle → Thinking: both anchors stamped to ~now.
+        let (turn1, phase1) = {
+            let mut st = lock_state(&state);
+            set_phase_and_stamp_locked(&mut st, sid, crate::types::AgentPhase::Thinking)
+        };
+        let turn1 = turn1.expect("turn anchor stamped on Idle→Thinking");
+        let phase1 = phase1.expect("phase anchor stamped on Idle→Thinking");
+        assert!(
+            phase1 >= turn1,
+            "phase anchor must be stamped no earlier than turn anchor"
+        );
+
+        // Pause briefly so timestamps move.
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Thinking → Responding: turn anchor preserved, phase anchor advances.
+        let (turn2, phase2) = {
+            let mut st = lock_state(&state);
+            set_phase_and_stamp_locked(&mut st, sid, crate::types::AgentPhase::Responding)
+        };
+        assert_eq!(
+            turn2,
+            Some(turn1),
+            "turn anchor must persist across phase→phase transitions"
+        );
+        let phase2 = phase2.expect("phase anchor still set");
+        assert!(
+            phase2 > phase1,
+            "phase anchor must advance on real phase transition: phase2={phase2} phase1={phase1}"
+        );
+    }
+
+    /// Task 702: same-phase calls (defensive: shouldn't happen but the
+    /// stream-event forward loop may funnel implicit phase events that
+    /// don't change the phase) preserve the existing `phase_started_at_ms`.
+    #[test]
+    fn set_phase_and_stamp_preserves_phase_start_within_phase() {
+        let state = mk_state();
+        let sid = "s-test";
+        let (_, phase1) = {
+            let mut st = lock_state(&state);
+            set_phase_and_stamp_locked(&mut st, sid, crate::types::AgentPhase::ToolExec)
+        };
+        let phase1 = phase1.expect("phase anchor stamped");
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Same phase again — phase anchor must NOT advance.
+        let (_, phase2) = {
+            let mut st = lock_state(&state);
+            set_phase_and_stamp_locked(&mut st, sid, crate::types::AgentPhase::ToolExec)
+        };
+        assert_eq!(
+            phase2,
+            Some(phase1),
+            "phase anchor must be preserved across same-phase calls"
+        );
+    }
+
+    /// Task 702: any non-Idle → Idle transition clears both anchors and
+    /// returns `(None, None)`.
+    #[test]
+    fn set_phase_and_stamp_idle_clears_both() {
+        let state = mk_state();
+        let sid = "s-test";
+        {
+            let mut st = lock_state(&state);
+            set_phase_and_stamp_locked(&mut st, sid, crate::types::AgentPhase::Responding);
+        }
+        let (turn, phase) = {
+            let mut st = lock_state(&state);
+            set_phase_and_stamp_locked(&mut st, sid, crate::types::AgentPhase::Idle)
+        };
+        assert_eq!(turn, None, "Idle clears turn anchor");
+        assert_eq!(phase, None, "Idle clears phase anchor");
+        // Stored entry is `(Idle, None, None)`.
+        let st = lock_state(&state);
+        let entry = st.phases.get(sid).copied().expect("entry stored");
+        assert!(matches!(entry.0, crate::types::AgentPhase::Idle));
+        assert_eq!(entry.1, None);
+        assert_eq!(entry.2, None);
     }
 }

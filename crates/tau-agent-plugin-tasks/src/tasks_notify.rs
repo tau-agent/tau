@@ -798,6 +798,7 @@ mod tests {
             last_exit_status: None,
             is_live: false,
             turn_started_at_ms: None,
+            phase_started_at_ms: None,
             project_name: None,
         }
     }

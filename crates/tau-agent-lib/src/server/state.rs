@@ -31,12 +31,16 @@ pub(super) struct State {
     /// Other clients watching a session receive streamed responses.
     pub(super) subscribers: HashMap<String, Vec<smol::channel::Sender<Response>>>,
     /// Current agent phase per session, for new subscribers.
-    /// Tuple is `(phase, turn_started_at_ms)`. The timestamp is
-    /// `Some(_)` while the session is in a non-Idle phase, recording
-    /// when the current turn began. It is preserved across
-    /// phase→phase transitions within a single turn and cleared on
-    /// transition back to Idle. See `set_phase_and_stamp`.
-    pub(super) phases: HashMap<String, (crate::types::AgentPhase, Option<u64>)>,
+    /// Tuple is `(phase, turn_started_at_ms, phase_started_at_ms)`.
+    /// `turn_started_at_ms` is `Some(_)` while the session is in a
+    /// non-Idle phase, recording when the current turn began; it is
+    /// preserved across phase→phase transitions within a single turn
+    /// and cleared on transition back to Idle.
+    /// `phase_started_at_ms` is `Some(_)` while non-Idle and is
+    /// re-stamped on every phase transition (so the client can render
+    /// a per-phase elapsed counter); cleared on Idle.
+    /// See `set_phase_and_stamp`.
+    pub(super) phases: HashMap<String, (crate::types::AgentPhase, Option<u64>, Option<u64>)>,
     /// Sessions with an actively running agent turn in this process.
     /// Inserted at the start of each Chat/resume turn, removed on completion.
     /// This is the authoritative "is something happening right now" signal.

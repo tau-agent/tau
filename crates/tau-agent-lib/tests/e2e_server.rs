@@ -329,6 +329,7 @@ fn phase_events_carry_turn_started_at_ms() {
             && let StreamEvent::Phase {
                 phase,
                 turn_started_at_ms,
+                ..
             } = event.as_ref()
         {
             match phase {
@@ -395,6 +396,75 @@ fn phase_events_carry_turn_started_at_ms() {
     assert!(
         info.turn_started_at_ms.is_none(),
         "SessionInfo::turn_started_at_ms must be None after AgentDone"
+    );
+    assert!(
+        info.phase_started_at_ms.is_none(),
+        "SessionInfo::phase_started_at_ms must be None after AgentDone"
+    );
+
+    server.shutdown();
+}
+
+/// Task 702: every non-Idle `StreamEvent::Phase` carries a server-stamped
+/// `phase_started_at_ms`, symmetric to `turn_started_at_ms` but
+/// re-stamped on every phase transition. Phase(Idle) clears it.
+#[test]
+fn phase_events_carry_phase_started_at_ms() {
+    use tau_agent_lib::types::{AgentPhase, StreamEvent, timestamp_ms};
+
+    let server = TestServer::start(vec![MockResponse::Text("hello".into())]);
+    let sid = match CreateSessionBuilder::new(&server).cwd("/tmp").send_raw() {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let before_ms = timestamp_ms();
+    let conn = server.connect();
+    let responses = send_recv_all(
+        &conn,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "hi".into(),
+        },
+    );
+    let after_ms = timestamp_ms();
+
+    let mut saw_non_idle = false;
+    for r in &responses {
+        if let Response::Stream { event } = r
+            && let StreamEvent::Phase {
+                phase,
+                phase_started_at_ms,
+                ..
+            } = event.as_ref()
+        {
+            match phase {
+                AgentPhase::Idle => {
+                    assert!(
+                        phase_started_at_ms.is_none(),
+                        "Phase(Idle) must carry phase_started_at_ms=None, got {:?}",
+                        phase_started_at_ms
+                    );
+                }
+                _ => {
+                    saw_non_idle = true;
+                    let ts = phase_started_at_ms.expect(
+                        "non-Idle Phase events must carry a server-stamped phase_started_at_ms",
+                    );
+                    assert!(
+                        ts >= before_ms && ts <= after_ms,
+                        "phase_started_at_ms={} outside chat window [{}, {}]",
+                        ts,
+                        before_ms,
+                        after_ms
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        saw_non_idle,
+        "expected at least one non-Idle Phase event carrying a phase anchor"
     );
 
     server.shutdown();

@@ -72,7 +72,7 @@ pub(super) fn session_info(
     messages: &[Message],
     last_message_time: Option<i64>,
     child_count: usize,
-    phase: Option<&(crate::types::AgentPhase, Option<u64>)>,
+    phase: Option<&(crate::types::AgentPhase, Option<u64>, Option<u64>)>,
     is_live: bool,
 ) -> SessionInfo {
     let stats = compute_stats(messages, &stored.model, stored.is_subscription);
@@ -85,6 +85,7 @@ pub(super) fn session_info(
     };
     let phase_value = phase.map(|p| p.0);
     let turn_started_at_ms = phase.and_then(|p| p.1);
+    let phase_started_at_ms = phase.and_then(|p| p.2);
     SessionInfo {
         id: stored.id.clone(),
         model: stored.model.id.clone(),
@@ -109,6 +110,7 @@ pub(super) fn session_info(
         is_live,
         project_name: stored.project_name.clone(),
         turn_started_at_ms,
+        phase_started_at_ms,
     }
 }
 
@@ -118,7 +120,7 @@ pub(super) fn session_info_from_db_stats(
     stored: &crate::db::StoredSession,
     db_stats: Option<&crate::db::DbSessionStats>,
     child_count: usize,
-    phase: Option<&(crate::types::AgentPhase, Option<u64>)>,
+    phase: Option<&(crate::types::AgentPhase, Option<u64>, Option<u64>)>,
     is_live: bool,
 ) -> SessionInfo {
     let empty = crate::db::DbSessionStats::default();
@@ -151,6 +153,7 @@ pub(super) fn session_info_from_db_stats(
 
     let phase_value = phase.map(|p| p.0);
     let turn_started_at_ms = phase.and_then(|p| p.1);
+    let phase_started_at_ms = phase.and_then(|p| p.2);
     SessionInfo {
         id: stored.id.clone(),
         model: stored.model.id.clone(),
@@ -174,6 +177,7 @@ pub(super) fn session_info_from_db_stats(
         is_live,
         project_name: stored.project_name.clone(),
         turn_started_at_ms,
+        phase_started_at_ms,
     }
 }
 

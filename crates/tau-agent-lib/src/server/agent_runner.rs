@@ -591,14 +591,15 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                 StreamEvent::Phase { phase, .. } => {
                     // Engine-emitted phase events don't carry a timestamp
                     // (engine is wire-agnostic). Stamp on forward.
-                    let ts = super::notifications::set_phase_and_stamp(
+                    let (turn_ts, phase_ts) = super::notifications::set_phase_and_stamp(
                         &state_clone,
                         &session_id_owned,
                         phase,
                     );
                     StreamEvent::Phase {
                         phase,
-                        turn_started_at_ms: ts,
+                        turn_started_at_ms: turn_ts,
+                        phase_started_at_ms: phase_ts,
                     }
                 }
                 other => other,

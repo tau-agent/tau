@@ -648,10 +648,19 @@ pub enum StreamEvent {
     /// phase→phase transitions within a single turn and cleared on
     /// transition to Idle. Used by clients to anchor the "Working... Xs"
     /// counter so it survives UI mode flicker and late subscribe.
+    ///
+    /// `phase_started_at_ms` is the server-stamped wall-clock (Unix ms)
+    /// when the *current* phase began. Re-stamped on every phase
+    /// transition (Idle→Thinking, Thinking→ToolExec, etc.) and cleared
+    /// on Idle. Used by clients to render a per-phase elapsed counter
+    /// alongside the total turn elapsed so a slow tool call doesn't
+    /// keep climbing once the LLM resumes responding.
     Phase {
         phase: AgentPhase,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_started_at_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_started_at_ms: Option<u64>,
     },
     /// Informational status message (e.g. retry notices).
     Status {
