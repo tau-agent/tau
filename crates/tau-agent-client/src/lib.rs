@@ -106,6 +106,7 @@ impl Client {
                 | Response::TaskTree { .. }
                 | Response::TaskMergeQueue { .. }
                 | Response::ProjectStats { .. }
+                | Response::ProjectInfo { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);

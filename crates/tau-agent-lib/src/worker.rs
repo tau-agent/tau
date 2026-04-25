@@ -184,6 +184,7 @@ async fn async_main() -> crate::Result<()> {
                     arguments,
                     cwd,
                     session_id,
+                    project_name,
                     ..
                 } => {
                     // Spawn a concurrent task for each tool call.
@@ -218,8 +219,16 @@ async fn async_main() -> crate::Result<()> {
                             )
                             .await
                         } else if name == "bash" {
-                            execute_bash_async(&tool_call_id, &arguments, &cwd, &msg_tx, &cancel)
-                                .await
+                            execute_bash_async(
+                                &tool_call_id,
+                                &arguments,
+                                &cwd,
+                                project_name.as_deref(),
+                                &msg_tx,
+                                &pending,
+                                &cancel,
+                            )
+                            .await
                         } else {
                             // read, write, edit — run blocking tool on thread pool
                             let tools = crate::tools::default_tools();
@@ -393,13 +402,31 @@ async fn execute_bash_async(
     tool_call_id: &str,
     args: &serde_json::Value,
     cwd: &str,
+    project_name: Option<&str>,
     msg_tx: &Sender<PluginMessage>,
+    pending: &Arc<Mutex<HashMap<String, Sender<crate::protocol::Response>>>>,
     cancel: &tau_agent_plugin::CancelToken,
 ) -> ToolResultMessage {
     let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
         return ToolResultMessage::error(tool_call_id, "", "missing 'command' argument");
     };
     let timeout_secs = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120);
+
+    // If the session's `cwd` has been removed (e.g. a worktree was
+    // cleaned up under a still-running session), `Command::spawn`
+    // returns a bare `ENOENT` that's indistinguishable from "bash not
+    // found". Disambiguate up front and — when possible — fall back to
+    // the project root with a status note so the LLM can adjust
+    // subsequent commands without spinning on the same broken `cwd`.
+    let (effective_cwd, fallback_note) =
+        match resolve_bash_cwd(cwd, project_name, msg_tx, pending).await {
+            BashCwdResolution::Use(c) => (c, None),
+            BashCwdResolution::Fallback { cwd: new_cwd, note } => (new_cwd, Some(note)),
+            BashCwdResolution::HardError(msg) => {
+                return ToolResultMessage::error(tool_call_id, "", &msg);
+            }
+        };
+    let cwd: &str = &effective_cwd;
 
     // Spawn child with setsid for process-group kill.
     let child = {
@@ -556,14 +583,168 @@ async fn execute_bash_async(
     tau_agent_plugin_worker::tools::bash::untrack_pgid(pgid);
 
     // Format output.
-    format_bash_output(
+    let mut output = format_bash_output(
         tool_call_id,
         collected_stdout,
         collected_stderr,
         exit_code,
         timed_out.load(std::sync::atomic::Ordering::Relaxed),
         cancelled.load(std::sync::atomic::Ordering::Relaxed),
-    )
+    );
+
+    // If we fell back to the project root because the session's `cwd`
+    // had been removed, prepend a note so the LLM sees the substitution.
+    // Important: we do *not* flip `is_error` to true — the command itself
+    // ran in a sane directory.
+    if let Some(note) = fallback_note {
+        prepend_note(&mut output, &note);
+    }
+    output
+}
+
+/// Result of pre-flighting a bash invocation's `cwd`.
+enum BashCwdResolution {
+    /// Use the (possibly already-existing) cwd as-is.
+    Use(String),
+    /// The original cwd was missing/unusable but we have a usable
+    /// fallback (the project root). The bash command runs in `cwd` and
+    /// `note` is prepended to the tool output.
+    Fallback { cwd: String, note: String },
+    /// The original cwd is unusable and no fallback is available.
+    /// Return this string as the tool error.
+    HardError(String),
+}
+
+/// Decide what `cwd` the bash invocation should actually use.
+///
+/// 1. If the session's `cwd` exists and is a directory, use it.
+/// 2. If it's missing/non-directory and we have a `project_name` whose
+///    root path exists, use the project root and emit a substitution
+///    note (Option B in task 720's spec).
+/// 3. Otherwise return a hard error message naming the missing cwd
+///    (Option A).
+async fn resolve_bash_cwd(
+    cwd: &str,
+    project_name: Option<&str>,
+    msg_tx: &Sender<PluginMessage>,
+    pending: &Arc<Mutex<HashMap<String, Sender<crate::protocol::Response>>>>,
+) -> BashCwdResolution {
+    let cwd_state = classify_cwd(cwd);
+    if matches!(cwd_state, CwdState::Ok) {
+        return BashCwdResolution::Use(cwd.to_string());
+    }
+
+    // The cwd is unusable. Try to recover via the project root.
+    if let Some(name) = project_name
+        && let Some(root) = lookup_project_root(name, msg_tx, pending).await
+    {
+        // Check the project root is itself usable.
+        if matches!(classify_cwd(&root), CwdState::Ok) {
+            let note = format!(
+                "note: session cwd {} {}; ran in project root {} instead.",
+                cwd,
+                cwd_state.short_reason(),
+                root,
+            );
+            return BashCwdResolution::Fallback { cwd: root, note };
+        }
+    }
+
+    // No fallback available — return the same hard-error phrasing the
+    // worker plugin uses, so users see a consistent message regardless
+    // of which spawn path they hit.
+    BashCwdResolution::HardError(cwd_state.error_message(cwd))
+}
+
+/// Classification of a candidate `cwd` path.
+enum CwdState {
+    /// Path exists and is a directory.
+    Ok,
+    /// Path does not exist.
+    Missing,
+    /// Path exists but isn't a directory.
+    NotADirectory,
+    /// stat() failed for some other reason (e.g. EACCES). The error
+    /// kind is preserved so we can mention it in the message.
+    Inaccessible(String),
+}
+
+impl CwdState {
+    fn short_reason(&self) -> &'static str {
+        match self {
+            CwdState::Ok => "is usable",
+            CwdState::Missing => "no longer exists",
+            CwdState::NotADirectory => "is not a directory",
+            CwdState::Inaccessible(_) => "is not accessible",
+        }
+    }
+
+    fn error_message(&self, cwd: &str) -> String {
+        match self {
+            CwdState::Ok => format!("cwd {} is usable", cwd),
+            CwdState::Missing => format!(
+                "session cwd no longer exists: {} (was the worktree removed? use /cd <path> to switch to a valid directory)",
+                cwd,
+            ),
+            CwdState::NotADirectory => format!(
+                "session cwd is not a directory: {} (use /cd <path> to switch to a valid directory)",
+                cwd,
+            ),
+            CwdState::Inaccessible(detail) => {
+                format!("cannot access session cwd {}: {}", cwd, detail,)
+            }
+        }
+    }
+}
+
+fn classify_cwd(cwd: &str) -> CwdState {
+    match std::fs::metadata(std::path::Path::new(cwd)) {
+        Ok(m) if m.is_dir() => CwdState::Ok,
+        Ok(_) => CwdState::NotADirectory,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CwdState::Missing,
+        Err(e) => CwdState::Inaccessible(e.to_string()),
+    }
+}
+
+/// Look up a project's root path via the server tunnel. Returns `None`
+/// when the project is unknown or the lookup fails (we treat any error
+/// as "no fallback available" rather than surfacing it).
+async fn lookup_project_root(
+    project_name: &str,
+    msg_tx: &Sender<PluginMessage>,
+    pending: &Arc<Mutex<HashMap<String, Sender<crate::protocol::Response>>>>,
+) -> Option<String> {
+    let req = crate::protocol::Request::GetProjectInfo {
+        project_name: project_name.to_string(),
+    };
+    match server_request(msg_tx, pending, req).await {
+        Ok(crate::protocol::Response::ProjectInfo { project: Some(p) }) => Some(p.path),
+        _ => None,
+    }
+}
+
+/// Prepend a one-shot status note to a bash tool result. Used when we
+/// fall back from a missing session cwd to the project root — the LLM
+/// needs to see the substitution so subsequent commands don't keep
+/// trying the dead path.
+fn prepend_note(output: &mut ToolResultMessage, note: &str) {
+    for content in output.content.iter_mut() {
+        if let crate::types::ToolResultContent::Text(t) = content {
+            t.text = if t.text.is_empty() {
+                note.to_string()
+            } else {
+                format!("{}\n\n{}", note, t.text)
+            };
+            return;
+        }
+    }
+    // No text part yet — add one so the note is still visible.
+    output.content.push(crate::types::ToolResultContent::Text(
+        crate::types::TextContent {
+            text: note.to_string(),
+            text_signature: None,
+        },
+    ));
 }
 
 /// Format bash output into a `ToolResultMessage`, applying truncation for
@@ -1259,5 +1440,314 @@ async fn handle_session_tool(
         },
 
         _ => ToolResultMessage::error(tcid, "", &format!("unknown session tool: {}", name)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_cwd_ok_for_existing_dir() {
+        assert!(matches!(classify_cwd("/tmp"), CwdState::Ok));
+    }
+
+    #[test]
+    fn classify_cwd_missing_for_bogus_path() {
+        let bogus = format!("/tmp/tau-bash-bogus-cwd-classify-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(&bogus);
+        assert!(matches!(classify_cwd(&bogus), CwdState::Missing));
+    }
+
+    #[test]
+    fn classify_cwd_not_a_directory_for_regular_file() {
+        let path = if std::path::Path::new("/etc/hostname").is_file() {
+            "/etc/hostname".to_string()
+        } else {
+            std::env::current_exe()
+                .expect("current_exe")
+                .to_string_lossy()
+                .into_owned()
+        };
+        assert!(matches!(classify_cwd(&path), CwdState::NotADirectory));
+    }
+
+    #[test]
+    fn cwd_state_error_messages_name_the_path_and_omit_os_errno() {
+        let path = "/tmp/totally-bogus-path-for-error-message";
+        let msg = CwdState::Missing.error_message(path);
+        assert!(msg.contains(path));
+        assert!(msg.contains("no longer exists"));
+        assert!(!msg.contains("os error"));
+
+        let msg = CwdState::NotADirectory.error_message(path);
+        assert!(msg.contains(path));
+        assert!(msg.contains("not a directory"));
+    }
+
+    #[test]
+    fn prepend_note_adds_note_before_existing_text() {
+        let mut msg = ToolResultMessage::success("tc", "bash", "hello\n");
+        prepend_note(&mut msg, "note: ran in /root instead.");
+        let text = msg.content[0].text();
+        assert!(text.starts_with("note: ran in /root instead."));
+        assert!(text.contains("hello"));
+        // We must not flip is_error.
+        assert!(!msg.is_error);
+    }
+
+    #[test]
+    fn prepend_note_handles_empty_existing_text() {
+        let mut msg = ToolResultMessage::success("tc", "bash", "");
+        prepend_note(&mut msg, "note: ran in /root.");
+        assert_eq!(msg.content[0].text(), "note: ran in /root.");
+    }
+
+    #[test]
+    fn prepend_note_preserves_error_state() {
+        let mut msg = ToolResultMessage::error("tc", "bash", "boom\n(exit code: 1)");
+        prepend_note(&mut msg, "note: substituted cwd.");
+        let text = msg.content[0].text();
+        assert!(text.starts_with("note: substituted cwd."));
+        assert!(text.contains("(exit code: 1)"));
+        // Errors stay errors.
+        assert!(msg.is_error);
+    }
+
+    /// Spawn a fake "server" task that pulls `ServerRequest`s off
+    /// `msg_rx` and answers them by completing the corresponding entry
+    /// in `pending`. The provided closure decides what to send back for
+    /// each request.
+    fn spawn_fake_server(
+        msg_rx: smol::channel::Receiver<PluginMessage>,
+        pending: Arc<Mutex<HashMap<String, smol::channel::Sender<crate::protocol::Response>>>>,
+        respond: impl Fn(crate::protocol::Request) -> crate::protocol::Response + Send + Sync + 'static,
+    ) -> smol::Task<()> {
+        smol::spawn(async move {
+            while let Ok(msg) = msg_rx.recv().await {
+                if let PluginMessage::ServerRequest {
+                    request_id,
+                    request,
+                } = msg
+                {
+                    let resp = respond(request);
+                    let tx = pending.lock().await.remove(&request_id);
+                    if let Some(tx) = tx {
+                        let _ = tx.send(resp).await;
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn resolve_bash_cwd_uses_existing_cwd_unchanged() {
+        smol::block_on(async {
+            let (msg_tx, msg_rx) = smol::channel::unbounded::<PluginMessage>();
+            let pending: Arc<
+                Mutex<HashMap<String, smol::channel::Sender<crate::protocol::Response>>>,
+            > = Arc::new(Mutex::new(HashMap::new()));
+
+            // Server should never be asked, but spawn one so the test
+            // doesn't hang if the production code accidentally queries.
+            let server = spawn_fake_server(msg_rx, pending.clone(), |_req| {
+                crate::protocol::Response::Error {
+                    message: "unexpected request".into(),
+                }
+            });
+
+            let res = resolve_bash_cwd("/tmp", Some("tau"), &msg_tx, &pending).await;
+            match res {
+                BashCwdResolution::Use(c) => assert_eq!(c, "/tmp"),
+                other => panic!("expected Use, got {:?}", debug_resolution(&other)),
+            }
+            drop(msg_tx);
+            let _ = server.cancel().await;
+        });
+    }
+
+    #[test]
+    fn resolve_bash_cwd_falls_back_to_project_root_when_cwd_missing() {
+        smol::block_on(async {
+            // Use the temp dir as a stand-in project root — it always exists.
+            let project_root = std::env::temp_dir().to_string_lossy().into_owned();
+            let bogus_cwd = format!(
+                "/tmp/tau-bash-bogus-cwd-fallback-{}-{}",
+                std::process::id(),
+                rand_suffix(),
+            );
+            let _ = std::fs::remove_dir_all(&bogus_cwd);
+            assert!(!std::path::Path::new(&bogus_cwd).exists());
+
+            let (msg_tx, msg_rx) = smol::channel::unbounded::<PluginMessage>();
+            let pending: Arc<
+                Mutex<HashMap<String, smol::channel::Sender<crate::protocol::Response>>>,
+            > = Arc::new(Mutex::new(HashMap::new()));
+
+            let project_root_clone = project_root.clone();
+            let server = spawn_fake_server(msg_rx, pending.clone(), move |req| match req {
+                crate::protocol::Request::GetProjectInfo { project_name } => {
+                    assert_eq!(project_name, "tau");
+                    crate::protocol::Response::ProjectInfo {
+                        project: Some(crate::protocol::ProjectInfoEntry {
+                            name: "tau".into(),
+                            path: project_root_clone.clone(),
+                        }),
+                    }
+                }
+                other => crate::protocol::Response::Error {
+                    message: format!("unexpected: {:?}", other),
+                },
+            });
+
+            let res = resolve_bash_cwd(&bogus_cwd, Some("tau"), &msg_tx, &pending).await;
+            match res {
+                BashCwdResolution::Fallback { cwd, note } => {
+                    assert_eq!(cwd, project_root);
+                    assert!(
+                        note.contains(&bogus_cwd),
+                        "note should mention the dead cwd: {}",
+                        note
+                    );
+                    assert!(
+                        note.contains(&project_root),
+                        "note should mention the project root: {}",
+                        note
+                    );
+                    assert!(
+                        note.contains("no longer exists"),
+                        "note should explain why we substituted: {}",
+                        note
+                    );
+                }
+                other => panic!("expected Fallback, got {:?}", debug_resolution(&other)),
+            }
+            drop(msg_tx);
+            let _ = server.cancel().await;
+        });
+    }
+
+    #[test]
+    fn resolve_bash_cwd_hard_errors_when_no_project_name() {
+        smol::block_on(async {
+            let bogus_cwd = format!(
+                "/tmp/tau-bash-bogus-cwd-noproj-{}-{}",
+                std::process::id(),
+                rand_suffix(),
+            );
+            let _ = std::fs::remove_dir_all(&bogus_cwd);
+
+            let (msg_tx, msg_rx) = smol::channel::unbounded::<PluginMessage>();
+            let pending: Arc<
+                Mutex<HashMap<String, smol::channel::Sender<crate::protocol::Response>>>,
+            > = Arc::new(Mutex::new(HashMap::new()));
+            let server = spawn_fake_server(msg_rx, pending.clone(), |_| {
+                crate::protocol::Response::Error {
+                    message: "unexpected".into(),
+                }
+            });
+
+            let res = resolve_bash_cwd(&bogus_cwd, None, &msg_tx, &pending).await;
+            match res {
+                BashCwdResolution::HardError(msg) => {
+                    assert!(msg.contains(&bogus_cwd));
+                    assert!(!msg.contains("os error"));
+                }
+                other => panic!("expected HardError, got {:?}", debug_resolution(&other)),
+            }
+            drop(msg_tx);
+            let _ = server.cancel().await;
+        });
+    }
+
+    #[test]
+    fn resolve_bash_cwd_hard_errors_when_project_unknown() {
+        smol::block_on(async {
+            let bogus_cwd = format!(
+                "/tmp/tau-bash-bogus-cwd-unknownproj-{}-{}",
+                std::process::id(),
+                rand_suffix(),
+            );
+            let _ = std::fs::remove_dir_all(&bogus_cwd);
+
+            let (msg_tx, msg_rx) = smol::channel::unbounded::<PluginMessage>();
+            let pending: Arc<
+                Mutex<HashMap<String, smol::channel::Sender<crate::protocol::Response>>>,
+            > = Arc::new(Mutex::new(HashMap::new()));
+            let server = spawn_fake_server(msg_rx, pending.clone(), |_req| {
+                crate::protocol::Response::ProjectInfo { project: None }
+            });
+
+            let res =
+                resolve_bash_cwd(&bogus_cwd, Some("unknown-project"), &msg_tx, &pending).await;
+            match res {
+                BashCwdResolution::HardError(msg) => assert!(msg.contains(&bogus_cwd)),
+                other => panic!("expected HardError, got {:?}", debug_resolution(&other)),
+            }
+            drop(msg_tx);
+            let _ = server.cancel().await;
+        });
+    }
+
+    #[test]
+    fn resolve_bash_cwd_hard_errors_when_project_root_also_missing() {
+        smol::block_on(async {
+            let bogus_cwd = format!(
+                "/tmp/tau-bash-bogus-cwd-bothdead-{}-{}",
+                std::process::id(),
+                rand_suffix(),
+            );
+            let bogus_root = format!(
+                "/tmp/tau-bash-bogus-root-bothdead-{}-{}",
+                std::process::id(),
+                rand_suffix(),
+            );
+            let _ = std::fs::remove_dir_all(&bogus_cwd);
+            let _ = std::fs::remove_dir_all(&bogus_root);
+
+            let (msg_tx, msg_rx) = smol::channel::unbounded::<PluginMessage>();
+            let pending: Arc<
+                Mutex<HashMap<String, smol::channel::Sender<crate::protocol::Response>>>,
+            > = Arc::new(Mutex::new(HashMap::new()));
+            let bogus_root_clone = bogus_root.clone();
+            let server = spawn_fake_server(msg_rx, pending.clone(), move |_req| {
+                crate::protocol::Response::ProjectInfo {
+                    project: Some(crate::protocol::ProjectInfoEntry {
+                        name: "tau".into(),
+                        path: bogus_root_clone.clone(),
+                    }),
+                }
+            });
+
+            let res = resolve_bash_cwd(&bogus_cwd, Some("tau"), &msg_tx, &pending).await;
+            match res {
+                BashCwdResolution::HardError(msg) => assert!(msg.contains(&bogus_cwd)),
+                other => panic!("expected HardError, got {:?}", debug_resolution(&other)),
+            }
+            drop(msg_tx);
+            let _ = server.cancel().await;
+        });
+    }
+
+    fn debug_resolution(r: &BashCwdResolution) -> String {
+        match r {
+            BashCwdResolution::Use(c) => format!("Use({})", c),
+            BashCwdResolution::Fallback { cwd, note } => {
+                format!("Fallback {{ cwd: {}, note: {} }}", cwd, note)
+            }
+            BashCwdResolution::HardError(m) => format!("HardError({})", m),
+        }
+    }
+
+    fn rand_suffix() -> String {
+        // Cheap, dependency-free unique suffix — not security-sensitive.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_string())
+            .unwrap_or_else(|_| "0".into())
     }
 }

@@ -333,6 +333,30 @@ pub(super) fn project_stats_impl(
     }
 }
 
+/// Look up a project's metadata by name. Returns
+/// [`Response::ProjectInfo`] with `project = None` when the project
+/// doesn't exist (so callers don't have to distinguish "missing" from
+/// "DB error" in the happy path). DB-level failures still surface as
+/// [`Response::Error`].
+pub(super) fn get_project_info_impl(
+    state: &SharedState,
+    project_name: &str,
+) -> crate::protocol::Response {
+    let st = lock_state(state);
+    match st.db.get_project(project_name) {
+        Ok(Some(p)) => crate::protocol::Response::ProjectInfo {
+            project: Some(crate::protocol::ProjectInfoEntry {
+                name: p.name,
+                path: p.path,
+            }),
+        },
+        Ok(None) => crate::protocol::Response::ProjectInfo { project: None },
+        Err(e) => crate::protocol::Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
 pub(super) fn list_sessions_impl(
     state: &SharedState,
     include_archived: bool,
@@ -2180,6 +2204,10 @@ pub(super) async fn handle_client(
             }
             crate::protocol::Request::ProjectStats { project_name } => {
                 let resp = project_stats_impl(&state, &project_name);
+                send(&mut writer, &resp).await?;
+            }
+            crate::protocol::Request::GetProjectInfo { project_name } => {
+                let resp = get_project_info_impl(&state, &project_name);
                 send(&mut writer, &resp).await?;
             }
         }

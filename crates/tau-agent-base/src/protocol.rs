@@ -297,6 +297,11 @@ pub enum Request {
     /// Returns totals across every session (archived included) belonging
     /// to `project_name`.
     ProjectStats { project_name: String },
+    /// Look up a project by name. Returns the project's root path so the
+    /// caller can recover when a session's `cwd` has disappeared
+    /// (worktree removed, etc.) and the worker wants to fall back to the
+    /// project root before executing a bash command. See task 720.
+    GetProjectInfo { project_name: String },
     /// Shut down the server.
     Shutdown {
         /// If true, server is restarting (clients should reconnect).
@@ -439,6 +444,12 @@ pub enum Response {
     TaskMergeQueue { tasks: Vec<TaskInfo> },
     /// Project-wide usage / cost totals (response to `ProjectStats`).
     ProjectStats { stats: ProjectStatsInfo },
+    /// Project metadata (response to `GetProjectInfo`).
+    ///
+    /// `project` is `None` when the named project does not exist; this is
+    /// not treated as an error response so callers can match on "unknown
+    /// project" cleanly.
+    ProjectInfo { project: Option<ProjectInfoEntry> },
     /// Error.
     Error { message: String },
 }
@@ -753,6 +764,17 @@ pub struct ProjectStatsInfo {
     /// project's sessions, or `None` if the project has no messages yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<i64>,
+}
+
+/// Project metadata returned by the `GetProjectInfo` request.
+///
+/// Currently a thin wrapper over the DB row; only `name` and `path` are
+/// surfaced because callers (e.g. the worker bash fallback) only need
+/// the root path. Extend as needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectInfoEntry {
+    pub name: String,
+    pub path: String,
 }
 
 /// Format a token count for display: 1234 → "1.2K", 1234567 → "1.2M".
@@ -1153,6 +1175,9 @@ mod tests {
             Request::ProjectStats {
                 project_name: "tau".into(),
             },
+            Request::GetProjectInfo {
+                project_name: "tau".into(),
+            },
         ];
         for req in &requests {
             let json = serde_json::to_string(req).expect("serialize request");
@@ -1216,6 +1241,13 @@ mod tests {
                     last_activity: Some(1_700_000_000),
                 },
             },
+            Response::ProjectInfo {
+                project: Some(ProjectInfoEntry {
+                    name: "tau".into(),
+                    path: "/home/u/src/tau".into(),
+                }),
+            },
+            Response::ProjectInfo { project: None },
         ];
         for resp in &responses {
             let json = serde_json::to_string(resp).expect("serialize response");

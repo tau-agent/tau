@@ -100,6 +100,29 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
+/// Verify that `cwd` exists and is a directory. Returns `None` if the
+/// path is usable, or `Some(message)` describing the problem otherwise.
+///
+/// We surface this as an explicit pre-spawn check so that callers see
+/// a message naming the missing path, instead of the bare `ENOENT`
+/// that `Command::spawn` returns when either bash *or* `cwd` is
+/// missing — the two are indistinguishable at the syscall level.
+pub fn check_cwd(cwd: &str) -> Option<String> {
+    let path = std::path::Path::new(cwd);
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => None,
+        Ok(_) => Some(format!(
+            "session cwd is not a directory: {} (use /cd <path> to switch to a valid directory)",
+            cwd,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
+            "session cwd no longer exists: {} (was the worktree removed? use /cd <path> to switch to a valid directory)",
+            cwd,
+        )),
+        Err(e) => Some(format!("cannot access session cwd {}: {}", cwd, e,)),
+    }
+}
+
 /// Spawn the bash child process with a new session (setsid) so we can kill
 /// the entire process group on timeout.
 fn spawn_child(command: &str, cwd: &str) -> Result<std::process::Child, std::io::Error> {
@@ -453,6 +476,15 @@ fn run(
 
     let timeout_secs = args.get("timeout").and_then(|t| t.as_u64()).unwrap_or(120);
 
+    // Disambiguate ENOENT-from-missing-cwd from ENOENT-from-missing-bash
+    // by checking the cwd up front. Without this, a deleted session cwd
+    // (e.g. a removed worktree) surfaces as a bare
+    // "failed to execute command: No such file or directory (os error 2)"
+    // which doesn't say *which* path is missing.
+    if let Some(err) = check_cwd(cwd) {
+        return ToolOutput::error(err);
+    }
+
     let mut child = match spawn_child(command, cwd) {
         Ok(c) => c,
         Err(e) => return ToolOutput::error(format!("failed to execute command: {}", e)),
@@ -595,6 +627,80 @@ mod tests {
 
     fn lock_registry() -> std::sync::MutexGuard<'static, ()> {
         REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn bash_missing_cwd_returns_clear_error() {
+        let _guard = lock_registry();
+        // A path that almost certainly doesn't exist.
+        let bogus = format!("/tmp/tau-bash-bogus-cwd-{}", std::process::id());
+        // Make sure it really doesn't exist.
+        let _ = std::fs::remove_dir_all(&bogus);
+        assert!(!std::path::Path::new(&bogus).exists());
+
+        let output = execute(
+            json!({"command": "echo hi"}),
+            &bogus,
+            &tau_agent_plugin::CancelToken::new(),
+        );
+
+        assert!(output.is_error, "missing cwd should be an error");
+        let text = output.content[0].text();
+        assert!(
+            text.contains(&bogus),
+            "error message should name the missing cwd, got: {}",
+            text,
+        );
+        assert!(
+            text.contains("no longer exists"),
+            "error message should mention the cwd is gone, got: {}",
+            text,
+        );
+        assert!(
+            !text.contains("os error 2"),
+            "raw ENOENT should not leak through, got: {}",
+            text,
+        );
+    }
+
+    #[test]
+    fn bash_cwd_is_file_not_directory_returns_clear_error() {
+        let _guard = lock_registry();
+        // Use any regular file that exists — /etc/hostname is universal
+        // on Linux test hosts; fall back to the binary's own path if
+        // somehow missing.
+        let cwd = if std::path::Path::new("/etc/hostname").is_file() {
+            "/etc/hostname".to_string()
+        } else {
+            std::env::current_exe()
+                .expect("current_exe")
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        let output = execute(
+            json!({"command": "echo hi"}),
+            &cwd,
+            &tau_agent_plugin::CancelToken::new(),
+        );
+
+        assert!(output.is_error, "non-directory cwd should be an error");
+        let text = output.content[0].text();
+        assert!(
+            text.contains(&cwd),
+            "error message should name the bad cwd, got: {}",
+            text,
+        );
+        assert!(
+            text.contains("not a directory"),
+            "error should mention not-a-directory, got: {}",
+            text,
+        );
+        assert!(
+            !text.contains("os error"),
+            "raw OS error should not leak, got: {}",
+            text,
+        );
     }
 
     #[test]
