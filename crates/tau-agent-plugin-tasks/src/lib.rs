@@ -10,6 +10,7 @@
 pub(crate) mod err;
 
 pub mod tasks;
+pub(crate) mod tasks_affected_files;
 pub mod tasks_config;
 pub mod tasks_db;
 pub mod tasks_git;

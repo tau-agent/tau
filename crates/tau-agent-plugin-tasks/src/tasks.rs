@@ -670,6 +670,47 @@ fn handle_task_create(
         },
     };
 
+    // affected_files (task #749): reject paths that escape the project
+    // root. Without this guardrail, the scheduler still creates a branch
+    // and worktree under *this* project, but the agent edits files in a
+    // sibling repo — and the silently-empty merge has bitten us at
+    // least twice (the 730 wave and the 739 wave). The check is purely
+    // lexical; it does not touch the filesystem.
+    if let Some(serde_json::Value::Array(arr)) = affected_files_arg.as_ref() {
+        let entries: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        match resolver.resolve(project_name) {
+            Ok(root) => {
+                if let Err(msg) = crate::tasks_affected_files::validate_affected_files(
+                    &entries,
+                    std::path::Path::new(&root),
+                ) {
+                    return tool_err(
+                        tool_call_id,
+                        &format!(
+                            "{} File this task in the project that owns the listed files instead.",
+                            msg
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                // Project not registered: the task will fail downstream
+                // anyway, but bail out clearly here so the caller sees
+                // the real cause instead of a confusing path error.
+                return tool_err(
+                    tool_call_id,
+                    &format!(
+                        "cannot validate affected_files: project '{}' not found in registry: {}",
+                        project_name, e
+                    ),
+                );
+            }
+        }
+    }
+
     // Auto-downgrade (task #596): a `ready`-state task without a usable
     // `affected_files` list serialises against every other file-less
     // task in the scheduler's "at most one file-less task per project"
@@ -1367,6 +1408,63 @@ fn handle_task_update(
             }
         },
     };
+
+    // affected_files (task #749): the planner writes the file list back
+    // via task_update once it has finished its read-only planning pass.
+    // Validate the same way handle_task_create does so cross-repo paths
+    // can't sneak in via the planner write either. Also enforces
+    // array-of-strings, which (historically) the create-time path
+    // validates but the update path didn't.
+    if let Some(v) = args.get("affected_files") {
+        let arr = match v.as_array() {
+            Some(a) => a,
+            None => return tool_err(tool_call_id, "affected_files must be an array of strings"),
+        };
+        if arr.iter().any(|x| !x.is_string()) {
+            return tool_err(tool_call_id, "affected_files must be an array of strings");
+        }
+        // Look up the task once to find its project root.
+        match db.get_task(id) {
+            Ok(Some(t)) => {
+                let entries: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                match resolver.resolve(&t.project_name) {
+                    Ok(root) => {
+                        if let Err(msg) = crate::tasks_affected_files::validate_affected_files(
+                            &entries,
+                            std::path::Path::new(&root),
+                        ) {
+                            return tool_err(
+                                tool_call_id,
+                                &format!(
+                                    "{} File this task in the project that owns the listed files instead.",
+                                    msg
+                                ),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return tool_err(
+                            tool_call_id,
+                            &format!(
+                                "cannot validate affected_files: project '{}' not found in registry: {}",
+                                t.project_name, e
+                            ),
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                // Task doesn't exist; let update_task surface the canonical
+                // "task not found" error below.
+            }
+            Err(e) => {
+                return tool_err(tool_call_id, &format!("get task: {}", e));
+            }
+        }
+    }
 
     let update = TaskUpdate {
         title: args.get("title").and_then(|v| v.as_str()).map(String::from),
@@ -4910,6 +5008,236 @@ mod tests {
             &resolver,
             &mut writer,
             &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(result.is_error);
+        assert!(
+            extract_text(&result).contains("affected_files"),
+            "error should mention affected_files: {}",
+            extract_text(&result)
+        );
+    }
+
+    /// Regression test for task #749: `handle_task_create` must reject
+    /// `affected_files` entries that resolve outside the project root.
+    /// Without this guardrail the scheduler silently builds an empty
+    /// branch in the calling project while the agent edits files in a
+    /// sibling repo (the 730/739 wave bug).
+    #[test]
+    fn test_handle_task_create_rejects_cross_repo_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Cross-repo escape",
+                "initial_state": "ready",
+                "affected_files": ["../../../nitro/x.rs"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(result.is_error, "cross-repo path should be rejected");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("../../../nitro/x.rs"),
+            "error should name the offending entry: {}",
+            text
+        );
+        assert!(
+            text.contains("outside project root"),
+            "error should explain the violation: {}",
+            text
+        );
+        // No row inserted: the DB should still be empty.
+        let tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert!(
+            tasks.is_empty(),
+            "rejected task_create must not insert a row; got {:?}",
+            tasks
+        );
+    }
+
+    /// Companion: an absolute path is also a cross-repo escape route
+    /// (it ignores the project-relative convention entirely).
+    #[test]
+    fn test_handle_task_create_rejects_absolute_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Absolute path",
+                "initial_state": "ready",
+                "affected_files": ["/etc/passwd"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(result.is_error);
+        let text = extract_text(&result);
+        assert!(
+            text.contains("absolute path") && text.contains("/etc/passwd"),
+            "error should name the absolute path and the rule: {}",
+            text
+        );
+    }
+
+    /// The `["*"]` escape hatch must continue to work — it's not a
+    /// path, just a marker that means "this task touches everything".
+    #[test]
+    fn test_handle_task_create_accepts_star_marker_after_path_validation_added() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Touches everything",
+                "initial_state": "ready",
+                "affected_files": ["*"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "['*'] is the documented escape hatch and must remain accepted: {}",
+            extract_text(&result)
+        );
+    }
+
+    /// Regression test for task #749: the planner write path goes
+    /// through `handle_task_update`. Validate cross-repo paths there
+    /// too so the planner can't bypass the create-time guardrail.
+    #[test]
+    fn test_handle_task_update_rejects_cross_repo_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Stand in for a planner-managed task: created in `planning`,
+        // ready to be transitioned by the planner with a fresh
+        // affected_files list.
+        let task = db
+            .create_task(
+                "test-project",
+                "Planner output sanity check",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({
+                "id": task.id,
+                "affected_files": ["../../../nitro/x.rs"],
+            }),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            result.is_error,
+            "cross-repo path on update should be rejected"
+        );
+        let text = extract_text(&result);
+        assert!(
+            text.contains("../../../nitro/x.rs") && text.contains("outside project root"),
+            "update error should name the offending entry and the rule: {}",
+            text
+        );
+
+        // The DB row should be unchanged: affected_files still None.
+        let after = db.get_task(task.id).unwrap().unwrap();
+        assert!(
+            after.affected_files.is_none(),
+            "rejected task_update must not write affected_files; got {:?}",
+            after.affected_files
+        );
+    }
+
+    /// Companion: array-of-strings shape check is now also enforced
+    /// on update (previously only on create). Verifies the shape
+    /// validator hooks the planner path too.
+    #[test]
+    fn test_handle_task_update_rejects_non_string_affected_files() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Shape check",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({
+                "id": task.id,
+                "affected_files": [123, "valid"],
+            }),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
             &mut Vec::new(),
         );
         assert!(result.is_error);
