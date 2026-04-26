@@ -1367,6 +1367,17 @@ fn render_task_row(
     if task.held {
         title_text.push_str("  🔒 held");
     }
+    // Cross-project provenance (#758): show a dim "← other-proj"
+    // suffix when the task was filed from a different project than
+    // the one that owns it. The actual styling is uniform with the
+    // rest of the title here — dim styling on this fragment alone
+    // would require a span split that the rest of the row doesn't
+    // do; cheap-and-readable is enough for a v1 surfacing.
+    if let Some(filed_proj) = task.filed_by_project.as_deref() {
+        if filed_proj != task.project_name {
+            title_text.push_str(&format!("  ← {}", filed_proj));
+        }
+    }
     if let Some(age) = age_hint {
         title_text.push_str(&format!("  {} ago", age.trim_end_matches(" ago")));
     }
@@ -2003,6 +2014,8 @@ mod tests {
             sandbox_profile: None,
             held: false,
             has_live_session: live,
+            filed_by_project: None,
+            filed_by_session_id: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -2080,6 +2093,8 @@ mod tests {
             sandbox_profile: None,
             held: false,
             has_live_session: false,
+            filed_by_project: None,
+            filed_by_session_id: None,
             created_at: 0,
             updated_at: 0,
         }

@@ -616,6 +616,7 @@ mod tests {
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .expect("create task");
         // interactive -> ready -> active -> review -> approved

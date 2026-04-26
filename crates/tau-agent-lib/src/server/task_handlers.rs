@@ -27,6 +27,8 @@ fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
         sandbox_profile: t.sandbox_profile,
         held: t.held,
         has_live_session: false,
+        filed_by_project: t.filed_by_project,
+        filed_by_session_id: t.filed_by_session_id,
         created_at: t.created_at,
         updated_at: t.updated_at,
     }
@@ -258,6 +260,7 @@ pub fn handle_task_create(
         false,
         None,
         false,
+        crate::tasks_db::FiledBy::default(),
     ) {
         Ok(task) => Response::TaskUpdated {
             task: task_to_info(task),

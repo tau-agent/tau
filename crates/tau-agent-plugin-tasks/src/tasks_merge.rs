@@ -965,6 +965,7 @@ mod tests {
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         db.record_session(task.id, "s-worker", "worker").unwrap();
@@ -1325,6 +1326,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         // interactive -> ready
@@ -1382,6 +1384,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
 
@@ -1415,6 +1418,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         db.update_task(
@@ -1476,6 +1480,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         db.update_task(
@@ -1542,6 +1547,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1562,6 +1568,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         let child2 = db
@@ -1579,6 +1586,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
 
@@ -1655,6 +1663,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1674,6 +1683,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         let _child2 = db
@@ -1691,6 +1701,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
 
@@ -1762,6 +1773,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
 
@@ -1791,6 +1803,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         db.set_branch(parent.id, "task-parent").unwrap();
@@ -1811,6 +1824,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
 
@@ -1915,6 +1929,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         db.set_session_id(parent.id, "parent-session").unwrap();
@@ -1934,6 +1949,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
 
@@ -1998,6 +2014,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
 
@@ -2028,6 +2045,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
         // Don't set session_id on parent
@@ -2047,6 +2065,7 @@ command = "cargo test"
                 false,
                 None,
                 false,
+                crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
 

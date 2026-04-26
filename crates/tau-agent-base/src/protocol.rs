@@ -604,6 +604,19 @@ pub struct TaskInfo {
     /// back-compat with older clients / serialised payloads.
     #[serde(default)]
     pub has_live_session: bool,
+    /// Project the task was *filed from* — the calling session's
+    /// project at `task_create` time. Distinct from
+    /// [`TaskInfo::project_name`], which is where the work runs. Equal
+    /// for same-project filing, different for cross-project filing
+    /// (#750). `None` for tasks created before #758. See
+    /// `tasks_db::Task::filed_by_project` for full semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filed_by_project: Option<String>,
+    /// Session id of the caller that ran `task_create`. `None` for
+    /// tasks created before #758, or when no calling session was
+    /// available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filed_by_session_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1105,6 +1118,8 @@ mod tests {
             sandbox_profile: None,
             held: false,
             has_live_session: false,
+            filed_by_project: None,
+            filed_by_session_id: None,
             created_at: 1000,
             updated_at: 2000,
         };

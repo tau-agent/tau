@@ -592,7 +592,21 @@ fn format_tags(tags: &Option<serde_json::Value>) -> String {
 /// Build the multi-line "Task #N created" info-message body.
 fn format_task_created(task: &Task) -> String {
     let title = capped_title(&task.title);
-    let mut out = format!("Task #{} created: {}\n\n", task.id, title);
+    let header = match task.filed_by_project.as_deref() {
+        // Cross-project filing (#758): surface the filer in the header so
+        // the placeholder timeline starts with a clear "this came from
+        // somewhere else" breadcrumb. Same-project filing keeps the
+        // standard header to avoid noise on the common path.
+        Some(filed_proj) if filed_proj != task.project_name => {
+            let sid = task.filed_by_session_id.as_deref().unwrap_or("-");
+            format!(
+                "Task #{} filed by {}/{}: {}\n\n",
+                task.id, filed_proj, sid, title
+            )
+        }
+        _ => format!("Task #{} created: {}\n\n", task.id, title),
+    };
+    let mut out = header;
     out.push_str(&format!("Priority: {}\n", task.priority));
     let tags_str = format_tags(&task.tags);
     out.push_str(&format!("Tags: {}\n", tags_str));
@@ -879,6 +893,7 @@ mod tests {
             false,
             None,
             false,
+            crate::tasks_db::FiledBy::default(),
         )
         .expect("create task")
     }
@@ -2263,6 +2278,51 @@ mod tests {
         assert!(text.contains("\nSkip review: yes\n"));
         assert!(text.contains("\nMerge target: release\n"));
         assert!(text.ends_with("\nInitial state: ready"));
+    }
+
+    /// Task #758: same-project filing keeps the standard "Task #N
+    /// created" header. The `filed_by_*` columns are still recorded
+    /// on the row — they just don't show up in the placeholder's
+    /// info message for this case (avoids noise on the common path).
+    #[test]
+    fn format_task_created_same_project_filing_uses_standard_header() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Same-proj", None, "ready");
+        task.filed_by_project = Some(task.project_name.clone());
+        task.filed_by_session_id = Some("sFiler".into());
+
+        let text = format_task_created(&task);
+        assert!(
+            text.starts_with(&format!("Task #{} created: Same-proj", task.id)),
+            "same-project filing must keep the standard header: {}",
+            text
+        );
+        assert!(
+            !text.contains("filed by"),
+            "same-project header should not contain a filer suffix: {}",
+            text
+        );
+    }
+
+    /// Task #758: cross-project filing surfaces the filer in the
+    /// header so the placeholder timeline starts with a clear "this
+    /// came from somewhere else" breadcrumb.
+    #[test]
+    fn format_task_created_cross_project_filing_shows_filer() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Cross-proj", None, "ready");
+        task.filed_by_project = Some("other-proj".into());
+        task.filed_by_session_id = Some("sFiler".into());
+
+        let text = format_task_created(&task);
+        assert!(
+            text.starts_with(&format!(
+                "Task #{} filed by other-proj/sFiler: Cross-proj",
+                task.id
+            )),
+            "cross-project filing header must surface filer/sid: {}",
+            text
+        );
     }
 
     /// `notify_placeholder_wait` fires a single QueueInfo to the task's

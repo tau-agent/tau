@@ -4987,6 +4987,8 @@ mod tests {
             sandbox_profile: None,
             held: false,
             has_live_session: false,
+            filed_by_project: None,
+            filed_by_session_id: None,
             created_at: 0,
             updated_at: 0,
         }
