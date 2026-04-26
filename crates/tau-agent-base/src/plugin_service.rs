@@ -126,7 +126,7 @@ pub trait PluginService {
     async fn hook(&self, req: HookReq) -> HookResult;
 
     /// Execute a tool call. Returns the final result; intermediate output
-    /// is reported via `output_delta` on the [`ServerCalledByPlugin`]
+    /// is reported via `output_delta` on the [`PluginCallbackService`]
     /// service.
     async fn tool_call(&self, call: ToolCallReq) -> PluginToolResult;
 
@@ -147,7 +147,7 @@ pub trait PluginService {
 /// The server serves this trait; the plugin holds a generated
 /// `PluginCallbackClient` over a `DuplexClientHalf<_, _, …,
 /// PluginCallbackRequest, PluginCallbackResponse>` bound to
-/// [`SERVER_API_ID`].
+/// [`PLUGIN_CALLBACK_API_ID`].
 ///
 /// `output_delta` deserves a note: the existing protocol fires it
 /// one-way (no reply expected) at up to ~200 events/sec during a long
@@ -311,7 +311,7 @@ mod tests {
         let dx_srv: PluginDuplex<_, _> = PluginDuplex::new(r_srv, w_srv);
         let dx_plg: PluginDuplex<_, _> = PluginDuplex::new(r_plg, w_plg);
 
-        // Server: serves SERVER_API_ID (so the plugin can call into us),
+        // Server: serves PLUGIN_CALLBACK_API_ID (so the plugin can call into us),
         // calls into PLUGIN_API_ID.
         let srv_server = dx_srv
             .server_half::<PluginCallbackRequest, PluginCallbackResponse>(PLUGIN_CALLBACK_API_ID);
