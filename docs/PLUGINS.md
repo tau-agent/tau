@@ -4,6 +4,17 @@ Plugins are external processes that communicate with tau via JSON-lines on
 stdin/stdout. Any language can implement a plugin — there is no SDK
 requirement, just a JSON wire protocol.
 
+> **Migration note (task #759).** The transport layer is being replaced by
+> [myelin](https://github.com/kaspar030/myelin)'s `DuplexStreamTransport`
+> with a CBOR codec. The *semantics* (registrations, tool calls, hooks,
+> server-callback tunnel, output streaming, cancellation) stay the same;
+> only the wire format changes. The new service traits live in
+> `tau-agent-base::plugin_service` (`PluginService` + `PluginCallbackService`).
+> The cutover happens one plugin binary at a time — see
+> `crates/tau-agent-base/src/plugin_service.rs` for the current state and
+> `tau` task #759 for the rollout plan. Until that lands, the JSON-lines
+> protocol described below is the source of truth for plugin authors.
+
 A plugin can:
 
 - Register **tools** that the LLM can call (alongside the built-in `bash`,

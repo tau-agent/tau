@@ -2,6 +2,12 @@
 //!
 //! These are the JSON-lines messages exchanged between the server and plugin
 //! processes over stdin/stdout. Pure serde data — no async, no I/O.
+//!
+//! **Status:** scheduled for replacement by [`crate::plugin_service`] (the
+//! myelin-based duplex transport with CBOR codec). Until that migration
+//! lands one plugin at a time, this module is the live wire protocol
+//! for both `tau-agent-plugin-worker` and `tau-agent-plugin-tasks`.
+//! See task #759 for the rollout plan.
 
 use serde::{Deserialize, Serialize};
 

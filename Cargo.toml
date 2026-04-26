@@ -43,6 +43,10 @@ tau-agent-tui = { path = "crates/tau-agent-tui", version = "0.1.0" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
+# myelin: bidirectional RPC over a single byte stream. Used by the plugin
+# transport (server <-> plugin subprocess). Path-dep for the migration
+# phase; switch to a published version before the next tau release.
+myelin = { path = "../myelin/myelin", features = ["std", "smol", "futures-io", "cbor"] }
 
 [profile.release]
 lto = true
