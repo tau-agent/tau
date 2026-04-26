@@ -844,6 +844,26 @@ fn handle_task_create(
                 _ => task,
             };
 
+            // Task #778: record the *original creator* in `task_sessions`
+            // for every task — including non-interactive (`ready` /
+            // `planning`) and held tasks, and subtasks. The notifier in
+            // `tasks_notify.rs` reads this row to decide which session
+            // should receive an LLM-visible wake when the task reaches a
+            // terminal state (`merged` / `closed` / `failed`); without
+            // it, only the zero-token info-line broadcast fires and the
+            // creator session stays asleep. `record_session` uses
+            // `INSERT OR IGNORE`, so this is safe to call once here even
+            // when other code paths (legacy interactive branch, etc.)
+            // would have recorded the same row.
+            if let Some(creator_sid) = session_id
+                && let Err(e) = db.record_session(task.id, creator_sid, "creator")
+            {
+                eprintln!(
+                    "tasks: failed to record creator session {} on task {}: {}",
+                    creator_sid, task.id, e
+                );
+            }
+
             // Task #574: post the one-time "task created" info message
             // to the placeholder so the placeholder's timeline starts
             // with a clear summary of the task at creation time. No-op
@@ -907,14 +927,10 @@ fn handle_task_create(
                                 new_sid, task.id, e
                             );
                         }
-                        if let Some(creator_sid) = session_id {
-                            if let Err(e) = db.record_session(task.id, creator_sid, "creator") {
-                                eprintln!(
-                                    "tasks: failed to record creator session {} on interactive task {}: {}",
-                                    creator_sid, task.id, e
-                                );
-                            }
-                        }
+                        // Note: the `creator` row was already recorded above
+                        // (Task #778) — uniformly for every task, before this
+                        // interactive-only branch. No need to record it again
+                        // here.
                     }
                     None => {
                         dispatch_warnings.push(
@@ -2041,14 +2057,13 @@ fn handle_task_update(
                                     new_sid, task.id, e
                                 );
                             }
-                            if let Some(creator_sid) = session_id {
-                                if let Err(e) = db.record_session(task.id, creator_sid, "creator") {
-                                    eprintln!(
-                                        "tasks: failed to record creator session {} on interactive task {}: {}",
-                                        creator_sid, task.id, e
-                                    );
-                                }
-                            }
+                            // Note: do not record the transitioning session
+                            // as `creator` here. The `creator` row is the
+                            // *original* filer of the task and is recorded
+                            // exactly once at task creation time (Task #778).
+                            // A session that transitions an existing task to
+                            // interactive is not a creator and shouldn't be
+                            // surfaced as the LLM-visible wake target.
                         }
                         None => {
                             dispatch_warnings.push(
@@ -6786,6 +6801,34 @@ mod tests {
         out
     }
 
+    /// Like `captured_queue_info` but for `QueueMessage` requests —
+    /// the LLM-visible wakes used by Task #658 / #778. Returns a
+    /// `(target_session_id, content, sender_info)` triple per request.
+    fn captured_queue_message(
+        shared: &std::sync::Arc<std::sync::Mutex<MockShared>>,
+    ) -> Vec<(String, String, String)> {
+        let mut shared = shared.lock().unwrap();
+        shared.process_pending();
+        let mut out = Vec::new();
+        for line in &shared.written_lines {
+            let msg: PluginMessage = match serde_json::from_str(line) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if let PluginMessage::ServerRequest { request, .. } = msg
+                && let tau_agent_plugin::Request::QueueMessage {
+                    target_session_id,
+                    content,
+                    sender_info,
+                    ..
+                } = request
+            {
+                out.push((target_session_id, content, sender_info));
+            }
+        }
+        out
+    }
+
     /// Ordering regression: `active → review` dispatches a new reviewer
     /// session; that session MUST appear in the QueueInfo recipient set
     /// so it sees the transition that created it in its own history.
@@ -8005,6 +8048,494 @@ mod tests {
             .collect();
         assert!(roles.contains(&("mock-s2", "interactive")));
         assert!(roles.contains(&("creating-session", "creator")));
+    }
+
+    // -----------------------------------------------------------------
+    // Task #778: creator-row recording on every task_create path
+    //
+    // The notifier (`tasks_notify::find_creator_session`) reads from
+    // `task_sessions WHERE role = "creator"` to decide which session
+    // gets an LLM-visible wake on terminal-state transitions. Before
+    // #778 the creator row was only stamped on the interactive
+    // creation path, so non-interactive task_create calls (the common
+    // case for orchestrators filing `ready` / `planning` / held tasks
+    // and subtasks) never produced a wake target. These tests exercise
+    // every initial_state through the real `handle_task_create` path
+    // and assert the creator row is recorded.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_creator_row_recorded_for_ready_task_create() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Ready creation",
+                "initial_state": "ready",
+                "affected_files": ["crates/foo/src/lib.rs"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s-caller"),
+                tool_call_id: "tc1",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "err: {}", extract_text(&result));
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+        assert_eq!(task["state"], "ready");
+
+        let sessions = db.get_sessions(task_id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.contains(&("s-caller", "creator")),
+            "expected (s-caller, creator) in {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_creator_row_recorded_for_planning_task_create() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Planning creation",
+                "initial_state": "planning",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s-caller"),
+                tool_call_id: "tc1",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "err: {}", extract_text(&result));
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+        assert_eq!(task["state"], "planning");
+
+        let sessions = db.get_sessions(task_id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.contains(&("s-caller", "creator")),
+            "expected (s-caller, creator) in {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_creator_row_recorded_for_held_ready_task_create() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Held ready",
+                "initial_state": "ready",
+                "affected_files": ["crates/foo/src/lib.rs"],
+                "hold": true,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s-caller"),
+                tool_call_id: "tc1",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "err: {}", extract_text(&result));
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+        // Held tasks are not dispatched but the creator row must still
+        // be recorded so a future merge/close still wakes the filer.
+        assert_eq!(task["held"], true);
+        let sessions = db.get_sessions(task_id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.contains(&("s-caller", "creator")),
+            "expected (s-caller, creator) in {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_creator_row_recorded_for_subtask_task_create() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // File the parent first.
+        let parent_result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Parent",
+                "initial_state": "planning",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s-parent-caller"),
+                tool_call_id: "tc-p",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        let parent_task: serde_json::Value =
+            serde_json::from_str(&extract_text(&parent_result)).unwrap();
+        let parent_id = parent_task["id"].as_i64().unwrap();
+
+        // File a subtask from a *different* session and assert the
+        // sub-creator row is recorded with that session.
+        let sub_result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Subtask",
+                "parent_id": parent_id,
+                "initial_state": "ready",
+                "affected_files": ["crates/foo/src/sub.rs"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s-sub-caller"),
+                tool_call_id: "tc-s",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!sub_result.is_error, "err: {}", extract_text(&sub_result));
+        let sub_task: serde_json::Value = serde_json::from_str(&extract_text(&sub_result)).unwrap();
+        let sub_id = sub_task["id"].as_i64().unwrap();
+
+        let sessions = db.get_sessions(sub_id).unwrap();
+        let roles: Vec<(&str, &str)> = sessions
+            .iter()
+            .map(|s| (s.session_id.as_str(), s.role.as_str()))
+            .collect();
+        assert!(
+            roles.contains(&("s-sub-caller", "creator")),
+            "expected (s-sub-caller, creator) on subtask, got: {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_creator_row_idempotent_via_handle_task_create() {
+        // Even on the interactive path, where an older code branch
+        // also recorded a creator row, the new uniform top-level call
+        // must be safe: `record_session` is `INSERT OR IGNORE`, so we
+        // end up with exactly one creator row per (task, session).
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Interactive",
+                "initial_state": "interactive",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s-caller"),
+                tool_call_id: "tc1",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "err: {}", extract_text(&result));
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        let creator_rows: Vec<_> = db
+            .get_sessions(task_id)
+            .unwrap()
+            .into_iter()
+            .filter(|ts| ts.role == "creator")
+            .collect();
+        assert_eq!(
+            creator_rows.len(),
+            1,
+            "expected exactly one creator row, got: {:?}",
+            creator_rows
+                .iter()
+                .map(|t| (&t.session_id, &t.role))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(creator_rows[0].session_id, "s-caller");
+    }
+
+    #[test]
+    fn test_creator_row_absent_when_no_caller_session() {
+        // Defensive: when the caller has no session_id (server-internal
+        // task creation), no creator row is recorded — there's no
+        // session to wake. Existing behaviour, asserted here so future
+        // refactors don't accidentally insert an empty / sentinel row.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "No caller",
+                "initial_state": "planning",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: None,
+                tool_call_id: "tc1",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(!result.is_error, "err: {}", extract_text(&result));
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        let roles: Vec<String> = db
+            .get_sessions(task_id)
+            .unwrap()
+            .into_iter()
+            .map(|ts| ts.role)
+            .collect();
+        assert!(
+            !roles.contains(&"creator".to_string()),
+            "unexpected creator row when caller has no session: {:?}",
+            roles
+        );
+    }
+
+    #[test]
+    fn test_record_session_creator_role_is_idempotent() {
+        // Direct DB-level assertion: the schema's `INSERT OR IGNORE`
+        // semantics mean we can call `record_session(.., "creator")`
+        // any number of times for the same (task, session) without
+        // erroring or duplicating rows. This contract is what lets the
+        // top-level Task #778 call coexist with any future per-state
+        // recording without coordination.
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Idempotent",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.record_session(task.id, "s-caller", "creator").unwrap();
+        db.record_session(task.id, "s-caller", "creator").unwrap();
+        db.record_session(task.id, "s-caller", "creator").unwrap();
+
+        let creator_rows: Vec<_> = db
+            .get_sessions(task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|ts| ts.role == "creator" && ts.session_id == "s-caller")
+            .collect();
+        assert_eq!(
+            creator_rows.len(),
+            1,
+            "creator role should be deduplicated, got: {:?}",
+            creator_rows.len()
+        );
+    }
+
+    #[test]
+    fn test_creator_receives_llm_wake_on_closed_via_handle_task_create() {
+        // End-to-end: a `ready` task filed by `s-caller` via
+        // `handle_task_create` must produce a `QueueMessage` to
+        // `s-caller` when the task transitions to `closed` (Task #778
+        // — prior to this fix the only path that recorded a creator
+        // row was the interactive branch, so this scenario silently
+        // skipped the LLM-visible wake).
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let create_result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "E2E ready",
+                "initial_state": "ready",
+                "affected_files": ["crates/foo/src/lib.rs"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s-caller"),
+                tool_call_id: "tc-create",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !create_result.is_error,
+            "create err: {}",
+            extract_text(&create_result)
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&create_result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        // Drain captured messages from creation so we only inspect
+        // post-transition output below.
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.process_pending();
+            shared.written_lines.clear();
+        }
+
+        // ready -> closed via the universal-override path.
+        let close_result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "closed"}),
+            Some("some-other-session"),
+            "tc-close",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            !close_result.is_error,
+            "close err: {}",
+            extract_text(&close_result)
+        );
+
+        let queue_messages = captured_queue_message(&writer.shared);
+        let creator_wakes: Vec<_> = queue_messages
+            .iter()
+            .filter(|(target, _, _)| target == "s-caller")
+            .collect();
+        assert!(
+            !creator_wakes.is_empty(),
+            "expected at least one QueueMessage to creator s-caller, got: {:?}",
+            queue_messages
+        );
+        let (_, content, sender_info) = creator_wakes[0];
+        assert!(
+            content.contains("closed"),
+            "wake content should mention closed state, got: {:?}",
+            content
+        );
+        assert_eq!(sender_info, "task notifier");
+    }
+
+    #[test]
+    fn test_creator_receives_llm_wake_on_failed_via_handle_task_create() {
+        // Same end-to-end pattern as the closed test, but for failed.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let create_result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "E2E planning",
+                "initial_state": "planning",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s-caller-pl"),
+                tool_call_id: "tc-create",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !create_result.is_error,
+            "create err: {}",
+            extract_text(&create_result)
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&create_result)).unwrap();
+        let task_id = task["id"].as_i64().unwrap();
+
+        {
+            let mut shared = writer.shared.lock().unwrap();
+            shared.process_pending();
+            shared.written_lines.clear();
+        }
+
+        let fail_result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task_id, "state": "failed"}),
+            Some("some-other-session"),
+            "tc-fail",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            !fail_result.is_error,
+            "fail err: {}",
+            extract_text(&fail_result)
+        );
+
+        let queue_messages = captured_queue_message(&writer.shared);
+        let creator_wakes: Vec<_> = queue_messages
+            .iter()
+            .filter(|(target, _, _)| target == "s-caller-pl")
+            .collect();
+        assert!(
+            !creator_wakes.is_empty(),
+            "expected at least one QueueMessage to creator s-caller-pl, got: {:?}",
+            queue_messages
+        );
+        let (_, content, _) = creator_wakes[0];
+        assert!(
+            content.contains("failed"),
+            "wake content should mention failed state, got: {:?}",
+            content
+        );
     }
 
     #[test]
@@ -11233,7 +11764,14 @@ mod tests {
             "expected session_id to be set on interactive transition"
         );
 
-        // Check task_sessions has both interactive and creator records
+        // Check task_sessions has the interactive record (the
+        // new interactive session). The transitioning session
+        // (`triggering-session`) is **not** recorded as `creator` here
+        // — the `creator` role belongs to the original filer of the
+        // task and is recorded once at task creation time (Task #778).
+        // This task was created via `db.create_task` directly (bypassing
+        // `handle_task_create`), so no `creator` row exists; the
+        // `task_update` path must not synthesise one.
         let sessions = db.get_sessions(task.id).unwrap();
         let roles: Vec<(&str, &str)> = sessions
             .iter()
@@ -11245,8 +11783,9 @@ mod tests {
             roles
         );
         assert!(
-            roles.iter().any(|(_, role)| *role == "creator"),
-            "expected a creator session to be recorded, got: {:?}",
+            !roles.iter().any(|(_, role)| *role == "creator"),
+            "task_update transition to interactive must not record the \
+             transitioning session as creator (Task #778), got: {:?}",
             roles
         );
     }
@@ -11559,17 +12098,23 @@ mod tests {
             "expected session_id on refining -> interactive"
         );
 
-        // Check that refiner-session is recorded as creator
+        // The transitioning session (`refiner-session`) is **not**
+        // recorded as `creator` on this path — the `creator` role
+        // belongs to the original filer of the task and is recorded
+        // exactly once at task creation time (Task #778). The task
+        // here was created via `db.create_task` directly (bypassing
+        // `handle_task_create`), so no `creator` row exists.
         let sessions = db.get_sessions(task.id).unwrap();
         let roles: Vec<(&str, &str)> = sessions
             .iter()
             .map(|s| (s.session_id.as_str(), s.role.as_str()))
             .collect();
         assert!(
-            roles
+            !roles
                 .iter()
                 .any(|(sid, role)| *sid == "refiner-session" && *role == "creator"),
-            "expected refiner-session as creator, got: {:?}",
+            "task_update transition to interactive must not record the \
+             transitioning session as creator (Task #778), got: {:?}",
             roles
         );
     }

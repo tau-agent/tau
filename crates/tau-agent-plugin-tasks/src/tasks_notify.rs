@@ -218,12 +218,17 @@ fn collect_recipients(
 /// Find the session recorded with role `"creator"` on the task, if any.
 ///
 /// Returns the first creator row's `session_id`. The role is recorded
-/// at task creation time in `task_sessions`
-/// (see `create_task` / `create_subtask` paths, which call
-/// `db.record_session(task.id, creator_sid, "creator")`).
+/// at task creation time in `task_sessions` for **every** task,
+/// regardless of `initial_state` (Task #778). See the top-level
+/// `record_session(.., "creator")` call in `handle_task_create` in
+/// `tasks.rs`, which fires uniformly for `ready` / `planning` /
+/// `interactive` / held tasks and subtasks.
 ///
-/// Returns `None` if the row isn't there (older tasks that predate the
-/// role stamp, or tasks created via paths that don't record a creator).
+/// Returns `None` if the row isn't there — either an older task that
+/// predates the role stamp (no backfill was done; see #778's
+/// non-goals), or a task created via a path that doesn't pass through
+/// `handle_task_create` (e.g. server-internal `db.create_task` calls
+/// from tests / migrations).
 fn find_creator_session(db: &TasksDb, task: &Task) -> Option<String> {
     db.get_sessions(task.id)
         .ok()?
