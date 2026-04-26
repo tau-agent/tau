@@ -108,6 +108,11 @@ pub struct TaskUpdate {
     pub merge_target: Option<String>,
     pub sandbox_profile: Option<String>,
     pub held: Option<bool>,
+    /// Reparent the task to a different project. The handler layer is
+    /// responsible for safety checks (no branch/worktree, schedulable
+    /// state) and for resolving the name against `ProjectResolver`. At
+    /// this layer we just write the column.
+    pub project_name: Option<String>,
 }
 
 /// Result of `assign_task`, containing the updated task plus information
@@ -891,6 +896,23 @@ impl TasksDb {
                 "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, "sandbox_profile", old_str, new_str, session_id, now],
+            )
+            .map_err(plugin_io_err("insert history"))?;
+        }
+
+        // Reparenting (task #751): the handler validates that the task
+        // has no branch/worktree and is in a schedulable state before
+        // setting this; here we only mirror the column update + history
+        // insert pattern used by every other field.
+        if let Some(ref val) = update.project_name {
+            let old_str = Some(task.project_name.clone());
+            let new_str = val.clone();
+            params_vec.push(Box::new(val.clone()));
+            sets.push("project_name = ?".to_string());
+            tx.execute(
+                "INSERT INTO task_history (task_id, field, old_value, new_value, session_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, "project_name", old_str, new_str, session_id, now],
             )
             .map_err(plugin_io_err("insert history"))?;
         }
@@ -7561,6 +7583,121 @@ mod tests {
             )
             .unwrap();
         assert!(held_again.held);
+    }
+
+    /// Task #751: setting `project_name` on `update_task` writes the new
+    /// project to the row and records a history entry. The DB layer is
+    /// dumb here — safety checks live in `handle_task_update` — so this
+    /// test exercises only the column write.
+    #[test]
+    fn test_update_task_sets_project_name() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "old-project",
+                "Reparent me",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(task.project_name, "old-project");
+
+        let updated = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    project_name: Some("new-project".into()),
+                    ..Default::default()
+                },
+                Some("s1"),
+            )
+            .unwrap();
+        assert_eq!(updated.project_name, "new-project");
+
+        // Reload to confirm the column actually persisted.
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "new-project");
+
+        // History records the field change with both old and new values.
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT field, old_value, new_value, session_id
+                 FROM task_history WHERE task_id = ?1 AND field = 'project_name'",
+            )
+            .expect("prepare history query");
+        let row: (String, Option<String>, String, Option<String>) = stmt
+            .query_row(params![task.id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("history row exists");
+        assert_eq!(row.0, "project_name");
+        assert_eq!(row.1.as_deref(), Some("old-project"));
+        assert_eq!(row.2, "new-project");
+        assert_eq!(row.3.as_deref(), Some("s1"));
+    }
+
+    /// Task #751 regression: leaving `project_name = None` must not touch
+    /// the column. The default-initialised TaskUpdate that every other
+    /// caller uses must never accidentally clear/rewrite the project.
+    #[test]
+    fn test_update_task_leaves_project_name_unchanged_when_none() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "original",
+                "Untouched",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let updated = db
+            .update_task(
+                task.id,
+                &TaskUpdate {
+                    title: Some("Renamed".into()),
+                    project_name: None,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(updated.project_name, "original");
+        assert_eq!(updated.title, "Renamed");
+
+        // No history entry for project_name.
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_history
+                 WHERE task_id = ?1 AND field = 'project_name'",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .expect("count history");
+        assert_eq!(
+            count, 0,
+            "project_name = None must not touch the column or record history"
+        );
     }
 
     #[test]

@@ -351,7 +351,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
         },
         PluginToolDef {
             name: "task_update".into(),
-            description: "Update task fields (title, state, priority, tags, etc.). Validates state transitions.".into(),
+            description: "Update task fields (title, state, priority, tags, etc.). Validates state transitions. Pass `project` to reparent the task to a different project (pre-dispatch only — rejected once a branch/worktree exists).".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -400,6 +400,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "hold": {
                         "type": "boolean",
                         "description": "Hold (true) or release (false) a task from scheduler dispatch. A held task remains visible in lists and preserves its state but the scheduler will not dispatch it. See task_create for details."
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Reparent the task to a different project. Rejected if the task already has a branch/worktree (post-dispatch); only allowed for tasks in interactive/planning/refining/ready."
                     }
                 },
                 "required": ["id"]
@@ -410,6 +414,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "Some transitions auto-dispatch sessions (planning→refining, active→review); don't take further action on the task until that session completes.".into(),
                 "When working in an interactive task session and the user wants to start implementation, transition the task to 'ready' (with affected_files set) — do NOT edit project files directly. The scheduler creates an isolated branch/worktree and dispatches a worker session.".into(),
                 "Pass hold=true/false to hold or release a task from scheduler dispatch.".into(),
+                "Pass `project` to reparent a task to a different project. Allowed only pre-dispatch (interactive/planning/refining/ready, no branch/worktree); use `task_create(project=...)` for the create-time case.".into(),
             ],
         },
         PluginToolDef {
@@ -1521,6 +1526,123 @@ fn handle_task_update(
         }
     }
 
+    // Reparenting (task #751): optional `project` argument moves the
+    // task to a different project. Pre-dispatch only — once the
+    // scheduler has prepared a branch/worktree, those live in the *old*
+    // project's repo and reparenting would orphan them. Validate here
+    // so we never write a `TaskUpdate.project_name` that the DB layer
+    // would happily apply.
+    let project_name_update: Option<String> = match args.get("project") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some("") => {
+                return tool_err(
+                    tool_call_id,
+                    "`project` must be a non-empty string (omit the field to leave the task's project unchanged).",
+                );
+            }
+            Some(name) => match resolver.resolve(name) {
+                Ok(_) => Some(name.to_string()),
+                Err(_) => {
+                    let known = resolver.list_names();
+                    let known_str = if known.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        known.join(", ")
+                    };
+                    return tool_err(
+                        tool_call_id,
+                        &format!(
+                            "unknown project '{}'. Known projects: {}. Initialize a project with 'tau project init' inside its repo.",
+                            name, known_str
+                        ),
+                    );
+                }
+            },
+            None => {
+                return tool_err(tool_call_id, "`project` must be a string");
+            }
+        },
+    };
+
+    if let Some(ref new_project) = project_name_update {
+        // Look up the current task to enforce the reparent safety checks.
+        // get_task may surface a transient error; bail out rather than
+        // silently skip validation.
+        let task = match db.get_task(id) {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                return tool_err(tool_call_id, &format!("task {} not found", id));
+            }
+            Err(e) => {
+                return tool_err(tool_call_id, &format!("get task: {}", e));
+            }
+        };
+
+        // Branch / worktree must not yet be set. Either implies the
+        // scheduler has prepared infrastructure in the *current*
+        // project's repo, and reparenting orphans it.
+        if let Some(ref branch) = task.branch {
+            return tool_err(
+                tool_call_id,
+                &format!(
+                    "task #{} has branch '{}' in project '{}' — reparenting would orphan it. \
+                     Either close this task and re-file in '{}', or wait for the merge before reparenting.",
+                    task.id, branch, task.project_name, new_project
+                ),
+            );
+        }
+        if let Some(ref wt) = task.worktree_path {
+            return tool_err(
+                tool_call_id,
+                &format!(
+                    "task #{} has worktree '{}' in project '{}' — reparenting would orphan it. \
+                     Either close this task and re-file in '{}', or wait for the merge before reparenting.",
+                    task.id, wt, task.project_name, new_project
+                ),
+            );
+        }
+
+        // Only schedulable / pre-dispatch states. Active/review/merging/
+        // merged/closed/failed/approved all imply scheduler-prepared
+        // infrastructure or a terminal status; reparenting is either
+        // pointless or destructive.
+        match task.state {
+            TaskState::Interactive
+            | TaskState::Planning
+            | TaskState::Refining
+            | TaskState::Ready => {}
+            other => {
+                return tool_err(
+                    tool_call_id,
+                    &format!(
+                        "cannot reparent task #{} in state '{}': only tasks in interactive/planning/refining/ready may be reparented. \
+                         Post-dispatch reparenting requires moving the branch/worktree to a different repo and is out of scope.",
+                        task.id, other
+                    ),
+                );
+            }
+        }
+
+        // Cascade to attached sessions is intentionally skipped — see
+        // task #751 spec, option (b). The current `SetCwd` RPC only
+        // updates `cwd`, not `project_name`, so a clean cascade would
+        // require a new RPC. Pre-dispatch tasks usually only have a
+        // placeholder + planner/refiner session attached, and those
+        // are short-lived enough that the inconsistency rarely matters.
+        // Log a warning so the operator can spot it in the agent logs
+        // if it ever bites.
+        if new_project != &task.project_name {
+            eprintln!(
+                "[WARNING] task #{} reparented from '{}' to '{}'; attached sessions \
+                 (placeholder/planner/refiner) keep their old project_name and cwd. \
+                 Re-dispatch will pick up the new project. Cascade is a known limitation \
+                 (see task #751 spec, option b).",
+                task.id, task.project_name, new_project
+            );
+        }
+    }
+
     let update = TaskUpdate {
         title: args.get("title").and_then(|v| v.as_str()).map(String::from),
         state: state_arg,
@@ -1538,6 +1660,7 @@ fn handle_task_update(
             .and_then(|v| v.as_str())
             .map(String::from),
         held: args.get("hold").and_then(|v| v.as_bool()),
+        project_name: project_name_update,
     };
 
     // Track session as reviewer if it approves the task — the transition
@@ -5613,6 +5736,462 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // task_update reparenting (task #751)
+    // -----------------------------------------------------------------
+
+    /// Reparent a `planning` task with no branch → succeeds; the row's
+    /// `project_name` reflects the new project. Pre-dispatch is the
+    /// reachable case for reparenting (per the safety checks above).
+    #[test]
+    fn test_handle_task_update_reparent_planning_succeeds() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Wrong project",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "project": "other"}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "planning task with no branch should reparent: {}",
+            extract_text(&result)
+        );
+        let returned: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(returned["project_name"], "other");
+
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "other");
+        // The original project must no longer own the task.
+        let old = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert!(
+            old.is_empty(),
+            "old project must not list the reparented task: {:?}",
+            old
+        );
+    }
+
+    /// Reparent to the current project → no-op success. Sanity check that
+    /// the validation path doesn't object to a self-reparent.
+    #[test]
+    fn test_handle_task_update_reparent_to_same_project_is_noop() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Stay put",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "project": "test-project"}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "self-reparent should succeed: {}",
+            extract_text(&result)
+        );
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "test-project");
+    }
+
+    /// Reparent to an unknown project → `tool_err`, error message lists
+    /// known projects, no DB change.
+    #[test]
+    fn test_handle_task_update_reparent_unknown_project_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Bad target",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "project": "nonexistent"}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(result.is_error, "unknown project must be rejected");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("unknown project 'nonexistent'"),
+            "error should name the offending project: {}",
+            text
+        );
+        for known in ["test-project", "p", "project-a", "project-b", "other"] {
+            assert!(
+                text.contains(known),
+                "error should list known project '{}': {}",
+                known,
+                text
+            );
+        }
+        assert!(
+            text.contains("tau project init"),
+            "error should hint at the registration command: {}",
+            text
+        );
+
+        // No DB change.
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "test-project");
+    }
+
+    /// Empty-string `project` is a caller bug — reject loudly rather
+    /// than silently leaving the project unchanged.
+    #[test]
+    fn test_handle_task_update_reparent_empty_string_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Empty target",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "project": ""}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(result.is_error);
+        assert!(
+            extract_text(&result).contains("non-empty"),
+            "error should explain the rule: {}",
+            extract_text(&result)
+        );
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "test-project");
+    }
+
+    /// A task with `branch = Some(...)` cannot be reparented — the
+    /// branch lives in the *old* project's repo and reparenting would
+    /// orphan it. The error message must spell that out so the agent
+    /// knows the recovery path (close + re-file vs. wait-for-merge).
+    #[test]
+    fn test_handle_task_update_reparent_with_branch_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Already prepared",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        db.set_branch(task.id, "task-99").unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "project": "other"}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            result.is_error,
+            "task with a branch must not be reparentable"
+        );
+        let text = extract_text(&result);
+        assert!(
+            text.contains("task-99") && text.contains("orphan"),
+            "error should name the branch and explain the orphan risk: {}",
+            text
+        );
+
+        // No DB change.
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "test-project");
+    }
+
+    /// Defence-in-depth: a task with `worktree_path = Some(...)` but no
+    /// branch (an unusual half-prepared state) is also rejected. In
+    /// practice the scheduler sets both together, but check both for
+    /// belt-and-braces.
+    #[test]
+    fn test_handle_task_update_reparent_with_worktree_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Half prepared",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        // Skip set_branch; only attach a worktree path. (Direct SQL
+        // bypass since this is an unreachable-via-normal-flow shape
+        // we want to exercise the defence-in-depth check on.)
+        db.set_worktree_path(task.id, "/tmp/orphan-wt").unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "project": "other"}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            result.is_error,
+            "task with a worktree must not be reparentable"
+        );
+        let text = extract_text(&result);
+        assert!(
+            text.contains("/tmp/orphan-wt") && text.contains("orphan"),
+            "error should name the worktree and explain the orphan risk: {}",
+            text
+        );
+
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "test-project");
+    }
+
+    /// Reparenting an `active` task is rejected: the scheduler has
+    /// already prepared infrastructure and a worker is running.
+    #[test]
+    fn test_handle_task_update_reparent_active_state_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Already running",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        // Move to active without setting branch/worktree, so the
+        // failure is attributable to the *state* check rather than
+        // the branch check.
+        db.assign_task(task.id, "s-worker").unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "project": "other"}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(result.is_error, "active state must not be reparentable");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("active") && text.contains("interactive/planning/refining/ready"),
+            "error should name the state and the allowed set: {}",
+            text
+        );
+
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "test-project");
+    }
+
+    /// Reparenting a `merged` task is rejected: terminal status, the
+    /// branch is already in the old project's history.
+    #[test]
+    fn test_handle_task_update_reparent_merged_state_rejected() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "Done already",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        // Walk the state machine without touching branch/worktree, so
+        // the rejection is again attributable to the state check.
+        for st in [
+            TaskState::Ready,
+            TaskState::Active,
+            TaskState::Review,
+            TaskState::Approved,
+            TaskState::Merging,
+            TaskState::Merged,
+        ] {
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some(st),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+        }
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "project": "other"}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(result.is_error, "merged state must not be reparentable");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("merged") && text.contains("interactive/planning/refining/ready"),
+            "error should name the state and the allowed set: {}",
+            text
+        );
+
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(reloaded.project_name, "test-project");
+        assert_eq!(reloaded.state, TaskState::Merged);
+    }
+
     #[test]
     fn test_active_to_approved_requires_skip_review() {
         let db = TasksDb::open_memory().unwrap();
@@ -6492,18 +7071,19 @@ mod tests {
             .map(|t| t.prompt_guidelines.len())
             .sum();
         assert!(
-            total < 20,
+            total < 21,
             "task_* prompt_guidelines total should stay small; got {}",
             total
         );
 
         // task_update's state-machine enumerations were folded into three bullets,
-        // plus the hold bullet added by task #527.
+        // plus the hold bullet added by task #527, plus the reparent bullet added
+        // by task #751.
         let task_update = tools.iter().find(|t| t.name == "task_update").unwrap();
         assert_eq!(
             task_update.prompt_guidelines.len(),
-            4,
-            "task_update should have exactly 4 guidelines after the trim"
+            5,
+            "task_update should have exactly 5 guidelines after the trim"
         );
 
         // Tools whose description fully covers behaviour should carry no guidelines.

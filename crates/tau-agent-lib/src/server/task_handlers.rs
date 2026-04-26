@@ -306,6 +306,7 @@ pub fn handle_task_update(
         merge_target: None,
         sandbox_profile,
         held: None,
+        project_name: None,
     };
     match db.update_task(id, &update, None) {
         Ok(task) => Response::TaskUpdated {
