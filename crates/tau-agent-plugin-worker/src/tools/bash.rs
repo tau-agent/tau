@@ -123,8 +123,78 @@ pub fn check_cwd(cwd: &str) -> Option<String> {
     }
 }
 
+/// Close every open file descriptor ≥ 3 in the current process.
+///
+/// **Must only be called from `pre_exec`** (i.e. after `fork()` in the
+/// child, before `execve()`). It is async-signal-safe: it only invokes
+/// syscalls and does not allocate, take locks, or touch shared state.
+///
+/// ## Why
+///
+/// Without this, any file descriptor the worker process holds open
+/// without `O_CLOEXEC` is inherited by the bash child *and* by every
+/// process bash itself spawns. We have observed cases where a
+/// descendant `exec`'d into a different binary (rustup proxy, in the
+/// motivating bug) and held the parent's pipe-write-ends, inotify fds,
+/// and even spare `/dev/ptmx` masters open long after the original
+/// bash had been SIGKILL'd by the watchdog — the descendant survived
+/// the `killpg` because it had escaped the process group, and kept
+/// the read end of our stdout/stderr pipes write-blocked because *it*
+/// still had the write end. Closing fds ≥ 3 here is the moral
+/// equivalent of Python's `subprocess.Popen(close_fds=True)`.
+///
+/// ## Implementation
+///
+/// Uses the Linux `close_range(2)` syscall (kernel 5.9+) when
+/// available — a single syscall to close an inclusive fd range — and
+/// falls back to a `close()` loop bounded by `RLIMIT_NOFILE` on older
+/// kernels (or any error path).
+///
+/// fds 0, 1, 2 are deliberately preserved: Rust's `std::process::Command`
+/// has already wired up the stdio dup2's by the time `pre_exec` runs,
+/// and the bash child needs them to function.
+pub fn close_fds_from_3() {
+    // SAFETY: `pre_exec` runs in the post-fork child before exec; only
+    // syscalls are permitted. All calls below are syscalls (or thin
+    // wrappers), and we ignore every error — this routine is
+    // best-effort cleanup.
+    unsafe {
+        // Try close_range(3, ~0u32, 0). On a Linux kernel ≥ 5.9 this
+        // closes every open fd ≥ 3 in one syscall. Older kernels
+        // return ENOSYS; we fall through to the loop below.
+        let ret = nix::libc::syscall(nix::libc::SYS_close_range, 3i64, !0u32 as i64, 0i64);
+        if ret == 0 {
+            return;
+        }
+
+        // Fallback: walk fds 3..max and close each. Use
+        // RLIMIT_NOFILE.rlim_cur for the upper bound, capped to a
+        // sane ceiling so a pathological rlimit (e.g. INFINITY)
+        // doesn't make us spin for billions of iterations.
+        let mut max_fd: nix::libc::c_int = 1024;
+        let mut rl: nix::libc::rlimit = std::mem::zeroed();
+        if nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur > 0 {
+            // Cap at i32::MAX (well above any realistic NOFILE) so
+            // the loop bound is always representable as c_int.
+            let cap: u64 = 1 << 20; // 1M fds is far beyond anything sane.
+            let cur: u64 = rl.rlim_cur as u64;
+            let bound = cur.min(cap) as nix::libc::c_int;
+            if bound > max_fd {
+                max_fd = bound;
+            }
+        }
+        let mut fd: nix::libc::c_int = 3;
+        while fd < max_fd {
+            let _ = nix::libc::close(fd);
+            fd += 1;
+        }
+    }
+}
+
 /// Spawn the bash child process with a new session (setsid) so we can kill
-/// the entire process group on timeout.
+/// the entire process group on timeout, and with a clean fd table so
+/// inherited descendants can't survive a process-group kill by holding
+/// our pipe write ends or other inherited fds open.
 fn spawn_child(command: &str, cwd: &str) -> Result<std::process::Child, std::io::Error> {
     use std::os::unix::process::CommandExt;
     unsafe {
@@ -140,6 +210,13 @@ fn spawn_child(command: &str, cwd: &str) -> Result<std::process::Child, std::io:
             .pre_exec(|| {
                 // Create a new session/process group so we can kill all descendants.
                 setsid().map_err(std::io::Error::other)?;
+                // Close every fd ≥ 3 so descendants can't inherit
+                // worker-side fds (smol epoll, inotify, log files,
+                // pipe write-ends from previous bash invocations,
+                // etc.) and survive a watchdog kill by holding them
+                // open. Stdio (fds 0/1/2) is preserved because
+                // Command's stdio dup2 has already happened.
+                close_fds_from_3();
                 Ok(())
             })
             .spawn()
@@ -1163,6 +1240,122 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "escaped-descendant streaming cancel must not hang; took {:?}",
             elapsed
+        );
+    }
+
+    /// Hold an extra fd open in the parent (without `O_CLOEXEC`) and
+    /// verify that the bash child does not see it. This pins the
+    /// `close_fds_from_3` behaviour: any worker-side fd that was missed
+    /// by `O_CLOEXEC` must still be closed before bash takes over,
+    /// otherwise descendants could inherit (and outlive) it.
+    #[test]
+    fn bash_pre_exec_closes_inherited_fds() {
+        use std::os::fd::AsRawFd;
+
+        let _guard = lock_registry();
+
+        // Open a tempfile and clear its CLOEXEC flag so the fd would,
+        // by default, be inherited by any child we fork+exec. This
+        // simulates the kind of leak we're defending against (the
+        // worker's inotify fd, smol epoll fd, etc.).
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let raw = tmp.as_file().as_raw_fd();
+        // Clear FD_CLOEXEC so the fd would normally be inherited.
+        unsafe {
+            let flags = nix::libc::fcntl(raw, nix::libc::F_GETFD);
+            assert!(flags >= 0, "F_GETFD failed");
+            let new = flags & !nix::libc::FD_CLOEXEC;
+            let r = nix::libc::fcntl(raw, nix::libc::F_SETFD, new);
+            assert_eq!(r, 0, "F_SETFD clearing CLOEXEC failed");
+        }
+
+        // Ask bash to peek at its own fd table and report whether the
+        // leaky fd is visible. We pass the raw fd number through an
+        // env var rather than splicing it into the command string so
+        // the test is robust against any quoting weirdness.
+        let cmd = "if [ -e /proc/self/fd/$LEAKY_FD ]; then echo LEAKED; else echo CLEAN; fi";
+        let output = {
+            // Manually invoke spawn_child + drain so we hit the same
+            // code path execute() uses, but with a controlled env.
+            use std::os::unix::process::CommandExt;
+            let leaky = raw.to_string();
+            let child = unsafe {
+                std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(cmd)
+                    .current_dir("/tmp")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .env("LEAKY_FD", &leaky)
+                    .pre_exec(|| {
+                        setsid().map_err(std::io::Error::other)?;
+                        super::close_fds_from_3();
+                        Ok(())
+                    })
+                    .spawn()
+                    .expect("spawn bash")
+            };
+            let out = child.wait_with_output().expect("wait_with_output");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+
+        assert!(
+            output.contains("CLEAN"),
+            "bash child saw the leaky fd; pre_exec close_fds_from_3 didn't close it. output={:?}",
+            output,
+        );
+        assert!(
+            !output.contains("LEAKED"),
+            "bash child observed inherited fd: {:?}",
+            output,
+        );
+
+        // Hold tmp until the assertion has run so the fd we pinned
+        // wasn't closed before bash got to look.
+        drop(tmp);
+    }
+
+    /// End-to-end: a bash command that itself opens the leaky fd by
+    /// path (proxying for rustup-style descendants that re-open
+    /// resources) shouldn't be possible — the fd is gone from the bash
+    /// child's table, so any descendant inherits an empty fd table
+    /// (modulo stdio).
+    #[test]
+    fn bash_pre_exec_leaves_only_stdio_open() {
+        let _guard = lock_registry();
+
+        let output = execute(
+            json!({
+                // List numeric fd entries in /proc/self/fd. We expect
+                // only 0, 1, 2 (stdio) plus the transient fd that
+                // `ls` itself opens for the directory scan.
+                "command": "ls /proc/self/fd | sort -n",
+            }),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+
+        assert!(!output.is_error, "ls /proc/self/fd should succeed");
+        let text = output.content[0].text();
+        // Collect numeric fds.
+        let fds: Vec<u32> = text
+            .lines()
+            .filter_map(|l| l.trim().parse::<u32>().ok())
+            .collect();
+        assert!(fds.contains(&0), "fd 0 should be present, got: {:?}", fds);
+        assert!(fds.contains(&1), "fd 1 should be present, got: {:?}", fds);
+        assert!(fds.contains(&2), "fd 2 should be present, got: {:?}", fds);
+        // ls itself opens one extra fd to scan the directory — that
+        // fd is opened *after* exec by ls itself, so it's expected.
+        // What we want to assert is that no *high-numbered* fd that
+        // the worker held open leaked through. Allow up to one extra
+        // (ls's own); flag anything more.
+        let extra: Vec<&u32> = fds.iter().filter(|&&f| f > 2).collect();
+        assert!(
+            extra.len() <= 1,
+            "expected at most one extra fd (ls's own dirfd), saw fds: {:?}",
+            fds,
         );
     }
 }

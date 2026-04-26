@@ -428,7 +428,13 @@ async fn execute_bash_async(
         };
     let cwd: &str = &effective_cwd;
 
-    // Spawn child with setsid for process-group kill.
+    // Spawn child with setsid for process-group kill, and close every
+    // inherited fd ≥ 3 so descendants can't survive a watchdog kill
+    // by holding our pipe write-ends (or any other worker-side fd)
+    // open. See `tau_agent_plugin_worker::tools::bash::close_fds_from_3`
+    // for the rationale; we duplicate the spawn block (rather than
+    // call `spawn_child` from the tool module) because this path needs
+    // async pipe wiring on the parent side.
     let child = {
         use std::os::unix::process::CommandExt;
         unsafe {
@@ -443,6 +449,7 @@ async fn execute_bash_async(
                 .env("GIT_TERMINAL_PROMPT", "0")
                 .pre_exec(|| {
                     nix::unistd::setsid().map_err(std::io::Error::other)?;
+                    tau_agent_plugin_worker::tools::bash::close_fds_from_3();
                     Ok(())
                 })
                 .spawn()
