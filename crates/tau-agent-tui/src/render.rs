@@ -108,6 +108,9 @@ impl RendererRegistry {
         renderers.insert("edit".into(), Box::new(EditRenderer));
         renderers.insert("read".into(), Box::new(ReadRenderer));
         renderers.insert("write".into(), Box::new(WriteRenderer));
+        for name in TASK_TOOL_NAMES {
+            renderers.insert((*name).into(), Box::new(TaskRenderer));
+        }
         Self {
             renderers,
             default: DefaultRenderer,
@@ -653,6 +656,427 @@ impl ToolRenderer for WriteRenderer {
 }
 
 // ---------------------------------------------------------------------------
+// Task renderer
+// ---------------------------------------------------------------------------
+
+/// All registered task_* tool names. Kept in sync with
+/// `crates/tau-agent-plugin-tasks/src/tasks.rs`.
+const TASK_TOOL_NAMES: &[&str] = &[
+    "task_create",
+    "task_get",
+    "task_list",
+    "task_assign",
+    "task_update",
+    "task_message",
+    "task_message_edit",
+    "task_relate",
+    "task_search",
+    "task_schedule",
+    "task_merge",
+    "task_dispatch",
+    "task_status",
+    "task_overview",
+];
+
+/// Field names treated as long-form text bodies (rendered with real newlines
+/// in expanded mode, truncated for the collapsed one-liner).
+const TASK_LONG_TEXT_FIELDS: &[&str] = &["content", "message"];
+
+/// Stable ordering for known scalar metadata keys in expanded mode.
+const TASK_SCALAR_ORDER: &[&str] = &[
+    "id",
+    "task_id",
+    "parent_id",
+    "message_id",
+    "from_task",
+    "to_task",
+    "relation",
+    "title",
+    "state",
+    "priority",
+    "branch",
+    "merge_target",
+    "tags",
+    "hold",
+    "skip_review",
+    "require_approval",
+    "sandbox_profile",
+    "initial_state",
+    "affected_files",
+    "project",
+    "query",
+    "session_id",
+    "limit",
+    "recent_limit",
+];
+
+struct TaskRenderer;
+
+impl TaskRenderer {
+    /// True if `field` should be rendered as a long-form text body.
+    /// A field qualifies when its value is a string AND either the field
+    /// name is in `TASK_LONG_TEXT_FIELDS`, or the value contains a newline.
+    fn is_long_text(field: &str, value: &Value) -> bool {
+        let Some(s) = value.as_str() else {
+            return false;
+        };
+        if TASK_LONG_TEXT_FIELDS.contains(&field) {
+            return true;
+        }
+        s.contains('\n')
+    }
+
+    /// Render a single scalar value (not an object/long-text body) as a
+    /// short string. Strings come back unquoted; arrays of scalars are
+    /// comma-joined; nested objects fall back to compact JSON.
+    fn format_scalar(value: &Value) -> String {
+        match value {
+            Value::Null => "null".to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::String(s) => s.clone(),
+            Value::Array(arr) => {
+                let parts: Vec<String> = arr
+                    .iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                parts.join(", ")
+            }
+            Value::Object(_) => value.to_string(),
+        }
+    }
+
+    /// Build a compact, human-readable one-line summary. Never returns a
+    /// raw JSON dump: long-text bodies are truncated on the unescaped
+    /// string so the user sees the first words instead of escape sequences.
+    fn collapsed_info(name: &str, args: &Value) -> String {
+        let obj = args.as_object();
+
+        // Helper to fetch primary id-ish fields in priority order.
+        let id_field = |keys: &[&str]| -> Option<String> {
+            obj.and_then(|o| {
+                keys.iter().find_map(|k| {
+                    o.get(*k).and_then(|v| match v {
+                        Value::Number(n) => Some(n.to_string()),
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                })
+            })
+        };
+
+        let get_str = |k: &str| -> Option<String> {
+            obj.and_then(|o| o.get(k))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+
+        match name {
+            "task_message" => {
+                let id = id_field(&["id"]);
+                let body = get_str("content").unwrap_or_default();
+                format_id_with_text(&id, &body)
+            }
+            "task_message_edit" => {
+                let task_id = id_field(&["task_id"]);
+                let msg_id = id_field(&["message_id"]);
+                let body = get_str("content").unwrap_or_default();
+                let id_part = match (task_id.as_deref(), msg_id.as_deref()) {
+                    (Some(t), Some(m)) => format!("#{} msg#{}", t, m),
+                    (Some(t), None) => format!("#{}", t),
+                    _ => "#—".to_string(),
+                };
+                if body.is_empty() {
+                    id_part
+                } else {
+                    format!("{} — {}", id_part, quote_oneline(&body, 60))
+                }
+            }
+            "task_create" => {
+                let title = get_str("title").unwrap_or_default();
+                if title.is_empty() {
+                    "#—".to_string()
+                } else {
+                    format!("#— — {}", quote_oneline(&title, 60))
+                }
+            }
+            "task_update" => {
+                let id = id_field(&["id"]);
+                let mut bits: Vec<String> = Vec::new();
+                if let Some(state) = get_str("state") {
+                    bits.push(format!("state={}", state));
+                }
+                if let Some(o) = obj
+                    && let Some(hold) = o.get("hold").and_then(|v| v.as_bool())
+                {
+                    bits.push(format!("hold={}", hold));
+                }
+                if let Some(prio) = obj.and_then(|o| o.get("priority")) {
+                    bits.push(format!("priority={}", Self::format_scalar(prio)));
+                }
+                let id_part = match id.as_deref() {
+                    Some(s) => format!("#{}", s),
+                    None => "#—".to_string(),
+                };
+                if bits.is_empty() {
+                    id_part
+                } else {
+                    format!("{} {}", id_part, bits.join(" "))
+                }
+            }
+            "task_get" | "task_assign" | "task_dispatch" | "task_merge" => {
+                let id = id_field(&["id"]);
+                match id.as_deref() {
+                    Some(s) => format!("#{}", s),
+                    None => "#—".to_string(),
+                }
+            }
+            "task_relate" => {
+                let from = id_field(&["from_task"]);
+                let to = id_field(&["to_task"]);
+                let relation = get_str("relation").unwrap_or_else(|| "related".to_string());
+                match (from, to) {
+                    (Some(f), Some(t)) => format!("#{} -[{}]-> #{}", f, relation, t),
+                    _ => relation,
+                }
+            }
+            "task_search" => {
+                let q = get_str("query").unwrap_or_default();
+                if q.is_empty() {
+                    String::new()
+                } else {
+                    format!("query={}", quote_oneline(&q, 60))
+                }
+            }
+            "task_list" => {
+                let mut bits: Vec<String> = Vec::new();
+                if let Some(state) = get_str("state") {
+                    bits.push(format!("state={}", state));
+                }
+                if let Some(parent) = id_field(&["parent_id"]) {
+                    bits.push(format!("parent=#{}", parent));
+                }
+                if let Some(tag) = get_str("tag") {
+                    bits.push(format!("tag={}", tag));
+                }
+                bits.join(" ")
+            }
+            "task_schedule" | "task_status" | "task_overview" => {
+                if let Some(p) = get_str("project") {
+                    format!("project={}", p)
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+/// Format `"#<id> — \"<text>...\""` style summary, falling back gracefully
+/// when either piece is missing.
+fn format_id_with_text(id: &Option<String>, body: &str) -> String {
+    let id_part = match id.as_deref() {
+        Some(s) => format!("#{}", s),
+        None => "#—".to_string(),
+    };
+    if body.is_empty() {
+        id_part
+    } else {
+        format!("{} — {}", id_part, quote_oneline(body, 60))
+    }
+}
+
+/// Take a possibly-multiline string and return a quoted single-line
+/// preview truncated to ~`max` chars. Uses real characters (no JSON escape
+/// of `\n`); newlines are replaced by a single space.
+fn quote_oneline(s: &str, max: usize) -> String {
+    let collapsed: String = s
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' | '\t' => ' ',
+            other => other,
+        })
+        .collect();
+    let trimmed = collapsed.trim();
+    let truncated = if trimmed.chars().count() > max {
+        let mut out: String = trimmed.chars().take(max).collect();
+        out.push('…');
+        out
+    } else {
+        trimmed.to_string()
+    };
+    format!("\"{}\"", truncated)
+}
+
+/// Stable iteration order for an args object: known keys in
+/// `TASK_SCALAR_ORDER` first (in that order), then any remaining keys in
+/// the object's insertion order.
+fn ordered_scalar_keys(obj: &serde_json::Map<String, Value>) -> Vec<&str> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<&str> = Vec::new();
+    for known in TASK_SCALAR_ORDER {
+        if obj.contains_key(*known) {
+            out.push(*known);
+            seen.insert(*known);
+        }
+    }
+    for k in obj.keys() {
+        if !seen.contains(k.as_str()) {
+            out.push(k.as_str());
+        }
+    }
+    out
+}
+
+impl ToolRenderer for TaskRenderer {
+    fn render_active(
+        &self,
+        name: &str,
+        args: &Value,
+        output: &[String],
+        started_at: Instant,
+        theme: &Theme,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        let bg = theme.tool_pending_style();
+        let elapsed = format_duration(started_at.elapsed());
+        let summary = TaskRenderer::collapsed_info(name, args);
+        let info = if summary.is_empty() {
+            format!("(elapsed {})", elapsed)
+        } else {
+            format!("{} (elapsed {})", summary, elapsed)
+        };
+        let mut lines = header_lines(name, &info, theme, bg, width);
+        if !output.is_empty() {
+            lines.extend(output_lines(output, theme, bg, DEFAULT_MAX_LINES));
+        }
+        wrap_tool_block(lines, bg, width)
+    }
+
+    fn render_complete(
+        &self,
+        name: &str,
+        args: &Value,
+        output: &str,
+        is_error: bool,
+        _duration: Option<Duration>,
+        theme: &Theme,
+        width: u16,
+        summary: Option<&str>,
+        expanded: bool,
+    ) -> Vec<Line<'static>> {
+        let bg = if is_error {
+            theme.tool_error_style()
+        } else {
+            theme.tool_success_style()
+        };
+
+        // Collapsed (default): server-supplied summary if any, else our
+        // synthesised one-liner. Never a JSON dump.
+        if !expanded {
+            let title_style = bg
+                .fg(theme.tool_title.to_ratatui())
+                .add_modifier(Modifier::BOLD);
+            if let Some(s) = summary {
+                let lines = vec![Line::from(Span::styled(format!(" {}", s), title_style))];
+                return wrap_tool_block(lines, bg, width);
+            }
+            let info = TaskRenderer::collapsed_info(name, args);
+            let lines = header_lines(name, &info, theme, bg, width);
+            return wrap_tool_block(lines, bg, width);
+        }
+
+        // Expanded: metadata block first, then long-text bodies, then
+        // tool output (if any).
+        let header_info = TaskRenderer::collapsed_info(name, args);
+        let mut lines = header_lines(name, &header_info, theme, bg, width);
+
+        let output_style = bg.fg(theme.tool_output.to_ratatui());
+        let title_style = bg
+            .fg(theme.tool_title.to_ratatui())
+            .add_modifier(Modifier::BOLD);
+
+        if let Some(obj) = args.as_object() {
+            // Scalar metadata: every non-long-text field, in stable order.
+            let mut scalar_pairs: Vec<(String, String)> = Vec::new();
+            for key in ordered_scalar_keys(obj) {
+                let value = match obj.get(key) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                if TaskRenderer::is_long_text(key, value) {
+                    continue;
+                }
+                scalar_pairs.push((key.to_string(), TaskRenderer::format_scalar(value)));
+            }
+            for (k, v) in &scalar_pairs {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}: {}", k, v),
+                    output_style,
+                )));
+            }
+
+            // Long-text bodies.
+            let mut body_keys: Vec<&str> = Vec::new();
+            // Preferred order first.
+            for known in TASK_LONG_TEXT_FIELDS {
+                if let Some(v) = obj.get(*known)
+                    && TaskRenderer::is_long_text(known, v)
+                {
+                    body_keys.push(*known);
+                }
+            }
+            // Then any other field whose value is a multi-line string.
+            for (k, v) in obj.iter() {
+                if TASK_LONG_TEXT_FIELDS.contains(&k.as_str()) {
+                    continue;
+                }
+                if TaskRenderer::is_long_text(k, v) {
+                    body_keys.push(k.as_str());
+                }
+            }
+
+            for key in body_keys {
+                let body = match obj.get(key).and_then(|v| v.as_str()) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                if !scalar_pairs.is_empty() || lines.len() > 1 {
+                    lines.push(Line::from(Span::styled(" ", bg)));
+                }
+                lines.push(Line::from(Span::styled(format!(" {}:", key), title_style)));
+                let body_lines: Vec<String> = body.split('\n').map(String::from).collect();
+                lines.extend(output_lines(
+                    &body_lines,
+                    theme,
+                    bg,
+                    DEFAULT_MAX_LINES.max(body_lines.len()),
+                ));
+            }
+        }
+
+        // Tool output / error result.
+        if !output.is_empty() {
+            // Try to pretty-print JSON for readability; fall back to raw.
+            let pretty = serde_json::from_str::<Value>(output)
+                .ok()
+                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                .unwrap_or_else(|| output.to_string());
+            let out: Vec<String> = pretty.lines().map(String::from).collect();
+            lines.push(Line::from(Span::styled(" ", bg)));
+            lines.push(Line::from(Span::styled(" output:", title_style)));
+            lines.extend(output_lines(&out, theme, bg, DEFAULT_MAX_LINES));
+        }
+
+        wrap_tool_block(lines, bg, width)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -866,6 +1290,161 @@ mod tests {
         assert!(
             text.contains("Took 5ms"),
             "Expected 'Took 5ms' in: {}",
+            text
+        );
+    }
+
+    // -- TaskRenderer tests --
+
+    fn render_task(name: &str, args: Value, expanded: bool) -> String {
+        let renderer = TaskRenderer;
+        let theme = test_theme();
+        let lines =
+            renderer.render_complete(name, &args, "", false, None, &theme, 80, None, expanded);
+        lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn task_renderer_collapsed_one_liner_for_task_message() {
+        let text = render_task(
+            "task_message",
+            serde_json::json!({"id": 702, "content": "## Foo\nbar"}),
+            false,
+        );
+        assert!(text.contains("#702"), "missing id: {}", text);
+        assert!(text.contains("## Foo"), "missing content head: {}", text);
+        // No JSON braces or escaped newlines:
+        assert!(!text.contains('{'), "unexpected JSON brace: {}", text);
+        assert!(!text.contains('}'), "unexpected JSON brace: {}", text);
+        assert!(
+            !text.contains("\\n"),
+            "unexpected escape sequence: {}",
+            text
+        );
+    }
+
+    #[test]
+    fn task_renderer_expanded_renders_content_with_real_newlines() {
+        let text = render_task(
+            "task_message",
+            serde_json::json!({"id": 702, "content": "## Foo\nbar"}),
+            true,
+        );
+        // Look for distinct lines containing "## Foo" and "bar".
+        let lines: Vec<&str> = text.split('\n').collect();
+        let foo_line = lines.iter().find(|l| l.contains("## Foo"));
+        let bar_line = lines.iter().find(|l| l.trim() == "bar");
+        assert!(foo_line.is_some(), "no '## Foo' line in:\n{}", text);
+        assert!(bar_line.is_some(), "no 'bar' line in:\n{}", text);
+        // No literal escape sequences:
+        for l in &lines {
+            assert!(!l.contains("\\n"), "escape leaked through: {:?}", l);
+        }
+    }
+
+    #[test]
+    fn task_renderer_expanded_metadata_before_body() {
+        let text = render_task(
+            "task_update",
+            serde_json::json!({"id": 702, "state": "ready", "content": "hi"}),
+            true,
+        );
+        let lines: Vec<&str> = text.split('\n').collect();
+        let state_idx = lines
+            .iter()
+            .position(|l| l.contains("state: ready"))
+            .unwrap_or_else(|| panic!("no 'state: ready' line in:\n{}", text));
+        let body_idx = lines
+            .iter()
+            .position(|l| l.trim() == "hi")
+            .unwrap_or_else(|| panic!("no 'hi' body line in:\n{}", text));
+        assert!(
+            state_idx < body_idx,
+            "metadata should come before body, got state at {} body at {}:\n{}",
+            state_idx,
+            body_idx,
+            text
+        );
+    }
+
+    #[test]
+    fn task_renderer_falls_back_for_unknown_keys() {
+        let text = render_task(
+            "task_update",
+            serde_json::json!({"id": 1, "weird_field": "x"}),
+            true,
+        );
+        assert!(
+            text.contains("weird_field: x"),
+            "expected 'weird_field: x' in:\n{}",
+            text
+        );
+    }
+
+    #[test]
+    fn task_renderer_handles_all_registered_task_tool_names() {
+        // Verify every documented task tool name resolves to a non-default
+        // renderer by comparing rendered output against DefaultRenderer
+        // for the same args/output.
+        let registry = RendererRegistry::new();
+        let theme = test_theme();
+        let args = serde_json::json!({"id": 7, "content": "hello\nworld"});
+        let default = DefaultRenderer;
+
+        for name in TASK_TOOL_NAMES {
+            let task_lines = registry
+                .get(name)
+                .render_complete(name, &args, "", false, None, &theme, 80, None, true);
+            let default_lines =
+                default.render_complete(name, &args, "", false, None, &theme, 80, None, true);
+            let task_text: String = task_lines.iter().map(|l| l.to_string()).collect();
+            let default_text: String = default_lines.iter().map(|l| l.to_string()).collect();
+            assert_ne!(
+                task_text, default_text,
+                "renderer for {} matched DefaultRenderer output",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn task_renderer_collapsed_task_create_uses_title() {
+        let text = render_task(
+            "task_create",
+            serde_json::json!({"title": "TUI: show timing"}),
+            false,
+        );
+        assert!(
+            text.contains("TUI: show timing"),
+            "expected title in collapsed view: {}",
+            text
+        );
+        assert!(!text.contains('{'), "no JSON dump expected: {}", text);
+    }
+
+    #[test]
+    fn task_renderer_expanded_omits_long_text_field_from_metadata() {
+        // 'content' is a known long-text field; it must NOT appear as
+        // 'content: ...' in the scalar metadata block.
+        let text = render_task(
+            "task_message",
+            serde_json::json!({"id": 9, "content": "line1\nline2"}),
+            true,
+        );
+        assert!(
+            !text.contains("content: line1"),
+            "content scalar leaked into metadata block:\n{}",
+            text
+        );
+        // But the heading 'content:' (with no value on the same line)
+        // should be present as the body section heading.
+        assert!(
+            text.lines().any(|l| l.trim() == "content:"),
+            "missing 'content:' body heading in:\n{}",
             text
         );
     }
