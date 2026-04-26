@@ -145,35 +145,25 @@ impl BgJob for GcEmptySessionsJob {
     }
 }
 
-/// Register the on-startup instance of the GC job.  Safe in both
-/// production and test harnesses: the on-startup pass runs
-/// synchronously during [`BgTaskScheduler::run_startup`] and never
-/// outlives the server.
-pub(crate) async fn register_on_startup(bg: &Arc<BgTaskScheduler>) {
+/// Register both the on-startup and periodic instances of the GC
+/// job against `bg`.  Two separate `Arc` instances are fine — the
+/// job is stateless apart from its `grace_secs` field, and sharing
+/// the same [`BgJob::name`] is intentional (it serialises a periodic
+/// tick against a still-running startup pass via the in-flight
+/// guard).
+pub(crate) async fn register_all(bg: &Arc<BgTaskScheduler>) {
+    let grace = gc_empty_grace_secs();
     bg.register(
         BgTrigger::OnStartup,
-        Arc::new(GcEmptySessionsJob::new(gc_empty_grace_secs())),
+        Arc::new(GcEmptySessionsJob::new(grace)),
     )
     .await;
-}
-
-/// Register the periodic instance of the GC job.  Called only from
-/// the production [`super::super::run`] entry point.
-///
-/// Test servers running under [`super::super::run_with_config`] skip
-/// this: the periodic loop's `Timer::after` keeps the global smol
-/// executor alive past server shutdown, blocking
-/// [`smol::block_on`] from returning in the default single-threaded
-/// (`SMOL_THREADS=1`) test harness.  Tests get deterministic
-/// coverage of the GC behaviour via the on-startup pass plus the
-/// in-process unit tests in this module.
-pub(crate) async fn register_periodic(bg: &Arc<BgTaskScheduler>) {
     bg.register(
         BgTrigger::Periodic {
             delay: Duration::from_secs(gc_empty_delay_mins().saturating_mul(60)),
             interval: Duration::from_secs(gc_empty_interval_mins().saturating_mul(60)),
         },
-        Arc::new(GcEmptySessionsJob::new(gc_empty_grace_secs())),
+        Arc::new(GcEmptySessionsJob::new(grace)),
     )
     .await;
 }
