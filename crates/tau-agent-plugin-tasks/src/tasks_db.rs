@@ -1603,6 +1603,53 @@ impl TasksDb {
         Ok(out)
     }
 
+    /// Return every session id referenced by a task whose state is NOT in
+    /// (`merged`, `closed`, `failed`).  The returned set is the union of:
+    ///
+    /// - `tasks.session_id`
+    /// - `tasks.placeholder_session_id`
+    /// - `task_sessions.session_id` (the historical join table)
+    ///
+    /// for non-terminal tasks across **all** projects (no project filter
+    /// — the server's empty-session GC scans the whole sessions DB).
+    ///
+    /// **Terminal-state policy note.**  Most other queries in this file
+    /// treat only `merged` and `closed` as terminal (e.g.
+    /// `get_blocking_dependencies`, the `list_tasks` non-terminal
+    /// filter).  This function additionally treats `failed` as terminal
+    /// because a failed task is no longer an active worker — its
+    /// session, if otherwise empty, is fair game for cleanup.  Future
+    /// readers grepping for `state NOT IN ('merged','closed')` should be
+    /// aware of this deliberate departure.
+    pub fn list_protected_session_ids(
+        &self,
+    ) -> tau_agent_plugin::Result<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT session_id FROM tasks \
+                 WHERE session_id IS NOT NULL \
+                   AND state NOT IN ('merged', 'closed', 'failed') \
+                 UNION \
+                 SELECT placeholder_session_id FROM tasks \
+                 WHERE placeholder_session_id IS NOT NULL \
+                   AND state NOT IN ('merged', 'closed', 'failed') \
+                 UNION \
+                 SELECT ts.session_id FROM task_sessions ts \
+                 INNER JOIN tasks t ON t.id = ts.task_id \
+                 WHERE t.state NOT IN ('merged', 'closed', 'failed')",
+            )
+            .map_err(plugin_io_err("prepare list_protected_session_ids"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(plugin_io_err("list_protected_session_ids"))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            out.insert(row.map_err(plugin_io_err("read protected session row"))?);
+        }
+        Ok(out)
+    }
+
     /// Get all sessions for a task.
     pub fn get_sessions(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<TaskSession>> {
         let mut stmt = self
@@ -3569,6 +3616,107 @@ mod tests {
 
         let empty = db.list_project_task_sessions("proj-c").unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_list_protected_session_ids() {
+        use std::collections::HashSet;
+
+        let db = TasksDb::open_memory().unwrap();
+
+        // Helper: stamp a task to a particular state via raw SQL.
+        // (Skips `validate_transition` which we don't want to fight
+        // for terminal states.)
+        let set_state = |id: i64, state: &str| {
+            db.conn
+                .execute(
+                    "UPDATE tasks SET state = ?1 WHERE id = ?2",
+                    params![state, id],
+                )
+                .unwrap();
+        };
+
+        // Non-terminal task with session_id + placeholder + a task_sessions row.
+        let active = db
+            .create_task(
+                "p", "active", None, None, None, false, "ready", false, None, None, false, None,
+                false,
+            )
+            .unwrap();
+        db.set_session_id(active.id, "s-active").unwrap();
+        db.set_placeholder_session_id(active.id, "s-active-ph")
+            .unwrap();
+        db.record_session(active.id, "s-active-ts", "worker")
+            .unwrap();
+        set_state(active.id, "active");
+
+        // Planning task with placeholder only.
+        let planning = db
+            .create_task(
+                "p", "planning", None, None, None, false, "planning", false, None, None, false,
+                None, false,
+            )
+            .unwrap();
+        db.set_placeholder_session_id(planning.id, "s-plan-ph")
+            .unwrap();
+
+        // Review task with session id.
+        let review = db
+            .create_task(
+                "p", "review", None, None, None, false, "ready", false, None, None, false, None,
+                false,
+            )
+            .unwrap();
+        db.set_session_id(review.id, "s-review").unwrap();
+        set_state(review.id, "review");
+
+        // Merged task with session id + task_sessions row -> NOT protected.
+        let merged = db
+            .create_task(
+                "p", "merged", None, None, None, false, "ready", false, None, None, false, None,
+                false,
+            )
+            .unwrap();
+        db.set_session_id(merged.id, "s-merged").unwrap();
+        db.record_session(merged.id, "s-merged-ts", "worker")
+            .unwrap();
+        set_state(merged.id, "merged");
+
+        // Closed task -> NOT protected.
+        let closed = db
+            .create_task(
+                "p", "closed", None, None, None, false, "ready", false, None, None, false, None,
+                false,
+            )
+            .unwrap();
+        db.set_session_id(closed.id, "s-closed").unwrap();
+        set_state(closed.id, "closed");
+
+        // Failed task -> NOT protected (deliberate departure from
+        // get_blocking_dependencies' terminal set).
+        let failed = db
+            .create_task(
+                "p", "failed", None, None, None, false, "ready", false, None, None, false, None,
+                false,
+            )
+            .unwrap();
+        db.set_session_id(failed.id, "s-failed").unwrap();
+        db.record_session(failed.id, "s-failed-ts", "worker")
+            .unwrap();
+        set_state(failed.id, "failed");
+
+        let got = db.list_protected_session_ids().unwrap();
+        let expected: HashSet<String> = [
+            "s-active",
+            "s-active-ph",
+            "s-active-ts",
+            "s-plan-ph",
+            "s-review",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(got, expected);
     }
 
     #[test]

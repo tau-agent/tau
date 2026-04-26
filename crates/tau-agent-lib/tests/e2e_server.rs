@@ -3761,6 +3761,17 @@ fn insert_stored(db: &tau_agent_lib::db::Db, id: &str, parent_id: Option<&str>, 
         project_name: None,
     })
     .expect("create_session");
+    // Append a stub `Info` message so the empty-session GC running on
+    // server startup doesn't sweep the row away.  We use `Info`
+    // specifically (not `User`/`ToolResult`/dangling `Assistant`) so
+    // these seeded rows are NOT picked up by `sessions_needing_resume`
+    // — otherwise the server would try to auto-resume 70 phantom
+    // sessions on startup.
+    db.append_message(
+        id,
+        &tau_agent_lib::types::Message::Info(tau_agent_lib::types::InfoMessage::new("seed")),
+    )
+    .expect("append seed message");
 }
 
 #[test]

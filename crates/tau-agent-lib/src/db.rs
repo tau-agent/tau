@@ -4,6 +4,7 @@
 //! - `sessions`: one row per session (model, system prompt, metadata)
 //! - `messages`: ordered messages per session, stored as JSON blobs
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -1109,6 +1110,81 @@ impl Db {
             )
             .map_err(db_err("gc_archived_sessions"))?;
         Ok(count)
+    }
+
+    /// Return ids of sessions that are candidates for empty-session GC.
+    ///
+    /// A row qualifies iff:
+    /// - `archived = 0` (we never auto-delete archived sessions — the
+    ///   user explicitly archived those; it's their call when to
+    ///   evict them, handled by [`Self::gc_archived_sessions`]).
+    /// - There are no rows in `messages` for this session id.
+    /// - There is no row in `sessions` whose `parent_id` equals this
+    ///   id.  The child check intentionally ignores `c.archived`:
+    ///   even an archived child counts as a "do not delete the
+    ///   parent" signal.
+    /// - `created_at < now_ms - grace_secs * 1000`, so we don't race
+    ///   a session that was just created and is about to receive its
+    ///   first message.
+    ///
+    /// Caller is responsible for excluding live sessions and sessions
+    /// referenced by active tasks; see [`Self::gc_empty_sessions`].
+    pub fn list_empty_sessions(&self, grace_secs: i64) -> crate::Result<Vec<String>> {
+        let now_ms = crate::types::timestamp_ms() as i64;
+        let cutoff = now_ms.saturating_sub(grace_secs.saturating_mul(1000));
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT s.id
+                 FROM sessions s
+                 WHERE s.archived = 0
+                   AND s.created_at < ?1
+                   AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id)
+                   AND NOT EXISTS (SELECT 1 FROM sessions c WHERE c.parent_id  = s.id)",
+            )
+            .map_err(db_err("prepare list_empty_sessions"))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| row.get::<_, String>(0))
+            .map_err(db_err("list_empty_sessions"))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row.map_err(db_err("list_empty_sessions row"))?);
+        }
+        Ok(ids)
+    }
+
+    /// GC empty sessions, excluding any id present in `live` or
+    /// `task_owned`.
+    ///
+    /// Calls [`Self::delete_session`] (not the tree variant — by
+    /// definition there are no children).  Per-id delete failures are
+    /// logged at `warn` and skipped; one bad row will not abort the
+    /// batch.  Returns the ids that were *successfully* deleted, for
+    /// caller-side info-level logging.
+    pub fn gc_empty_sessions(
+        &self,
+        grace_secs: i64,
+        live: &HashSet<String>,
+        task_owned: &HashSet<String>,
+    ) -> crate::Result<Vec<String>> {
+        let candidates = self.list_empty_sessions(grace_secs)?;
+        let mut deleted = Vec::new();
+        for id in candidates {
+            if live.contains(&id) || task_owned.contains(&id) {
+                continue;
+            }
+            match self.delete_session(&id) {
+                Ok(()) => deleted.push(id),
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %id,
+                        error = %e,
+                        "gc_empty_sessions: delete_session failed; skipping"
+                    );
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// Return session IDs that have pending queued messages.
@@ -2706,5 +2782,166 @@ mod tests {
 
         // Verify cascade deleted messages
         assert!(db.get_messages("old_archived").unwrap().is_empty());
+    }
+
+    // ----- gc_empty_sessions -----
+
+    fn empty_session(id: &str, parent: Option<&str>, archived: bool, age_ms: i64) -> StoredSession {
+        let now = crate::types::timestamp_ms() as i64;
+        StoredSession {
+            id: id.into(),
+            model: test_model(),
+            system_prompt: None,
+            cwd: None,
+            is_subscription: false,
+            created_at: now - age_ms,
+            parent_id: parent.map(|s| s.to_string()),
+            child_budget: 0,
+            tagline: None,
+            archived,
+            last_exit_status: None,
+            last_phase: None,
+            auto_archive: false,
+            notify_parent: true,
+            project_name: None,
+        }
+    }
+
+    #[test]
+    fn gc_empty_past_grace_deleted() {
+        let db = Db::open_memory().unwrap();
+        // 1 hour old, no messages, no children
+        db.create_session(&empty_session("s1", None, false, 3_600_000))
+            .unwrap();
+        let live = HashSet::new();
+        let owned = HashSet::new();
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        assert_eq!(deleted, vec!["s1".to_string()]);
+        assert!(db.get_session("s1").unwrap().is_none());
+    }
+
+    #[test]
+    fn gc_empty_within_grace_kept() {
+        let db = Db::open_memory().unwrap();
+        // Just created (age 0).
+        db.create_session(&empty_session("s1", None, false, 0))
+            .unwrap();
+        let live = HashSet::new();
+        let owned = HashSet::new();
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        assert!(
+            deleted.is_empty(),
+            "within-grace session must not be deleted"
+        );
+        assert!(db.get_session("s1").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_empty_archived_kept() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&empty_session("s1", None, true, 3_600_000))
+            .unwrap();
+        let live = HashSet::new();
+        let owned = HashSet::new();
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        assert!(
+            deleted.is_empty(),
+            "archived sessions must not be auto-GC'd by gc_empty_sessions"
+        );
+        assert!(db.get_session("s1").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_empty_leaf_first_then_parent_next_pass() {
+        let db = Db::open_memory().unwrap();
+        // A is parent, B is child. Both empty, both old.
+        db.create_session(&empty_session("A", None, false, 3_600_000))
+            .unwrap();
+        db.create_session(&empty_session("B", Some("A"), false, 3_600_000))
+            .unwrap();
+        let live = HashSet::new();
+        let owned = HashSet::new();
+        // First pass: only the leaf B is eligible.
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        assert_eq!(deleted, vec!["B".to_string()]);
+        assert!(db.get_session("A").unwrap().is_some());
+        assert!(db.get_session("B").unwrap().is_none());
+        // Second pass: A is now a leaf and gets cleaned up.
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        assert_eq!(deleted, vec!["A".to_string()]);
+        assert!(db.get_session("A").unwrap().is_none());
+    }
+
+    #[test]
+    fn gc_empty_with_archived_child_kept() {
+        // The child check intentionally ignores archived: even an
+        // archived child blocks deletion of its (live) parent.
+        let db = Db::open_memory().unwrap();
+        db.create_session(&empty_session("A", None, false, 3_600_000))
+            .unwrap();
+        db.create_session(&empty_session("B", Some("A"), true, 3_600_000))
+            .unwrap();
+        let live = HashSet::new();
+        let owned = HashSet::new();
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        // B is archived (gc_empty skips it) and A has a child -> nothing deleted.
+        assert!(deleted.is_empty());
+        assert!(db.get_session("A").unwrap().is_some());
+        assert!(db.get_session("B").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_empty_non_empty_kept() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&empty_session("s1", None, false, 3_600_000))
+            .unwrap();
+        db.append_message("s1", &Message::User(UserMessage::text("hi")))
+            .unwrap();
+        let live = HashSet::new();
+        let owned = HashSet::new();
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        assert!(deleted.is_empty());
+        assert!(db.get_session("s1").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_empty_live_set_kept() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&empty_session("s1", None, false, 3_600_000))
+            .unwrap();
+        let mut live = HashSet::new();
+        live.insert("s1".to_string());
+        let owned = HashSet::new();
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        assert!(deleted.is_empty());
+        assert!(db.get_session("s1").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_empty_task_owned_kept() {
+        let db = Db::open_memory().unwrap();
+        db.create_session(&empty_session("s1", None, false, 3_600_000))
+            .unwrap();
+        let live = HashSet::new();
+        let mut owned = HashSet::new();
+        owned.insert("s1".to_string());
+        let deleted = db.gc_empty_sessions(60, &live, &owned).unwrap();
+        assert!(deleted.is_empty());
+        assert!(db.get_session("s1").unwrap().is_some());
+    }
+
+    #[test]
+    fn gc_empty_zero_grace_kept_only_if_blocked() {
+        // grace_secs=0 is allowed (used by tests). All eligible sessions
+        // (those with created_at strictly less than now) are deletable;
+        // live/owned sets still protect them.
+        let db = Db::open_memory().unwrap();
+        // Use age=1ms so created_at < now even at zero grace.
+        db.create_session(&empty_session("s1", None, false, 1))
+            .unwrap();
+        let live = HashSet::new();
+        let owned = HashSet::new();
+        let deleted = db.gc_empty_sessions(0, &live, &owned).unwrap();
+        assert_eq!(deleted, vec!["s1".to_string()]);
     }
 }

@@ -1,6 +1,7 @@
 //! Unix socket server — manages sessions and streams LLM responses.
 
 mod agent_runner;
+mod bg_jobs;
 mod bg_tasks;
 mod dispatch;
 mod notifications;
@@ -378,6 +379,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     // `BgTaskScheduler::new` call below and `bg.run_startup().await`.
     let bg = bg_tasks::BgTaskScheduler::new(state.clone(), shutdown.clone());
     lock_state(&state).bg_scheduler = Some(bg.clone());
+    bg_jobs::gc_empty_sessions::register_on_startup(&bg).await;
     bg.run_startup().await;
 
     let shutdown_watcher = shutdown.clone();
@@ -580,6 +582,8 @@ pub async fn run() -> crate::Result<()> {
     // in `run_with_config` for rationale.
     let bg = bg_tasks::BgTaskScheduler::new(state.clone(), shutdown.clone());
     lock_state(&state).bg_scheduler = Some(bg.clone());
+    bg_jobs::gc_empty_sessions::register_on_startup(&bg).await;
+    bg_jobs::gc_empty_sessions::register_periodic(&bg).await;
     bg.run_startup().await;
 
     // Install signal-driven graceful shutdown.  SIGTERM (e.g. systemd
