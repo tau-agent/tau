@@ -78,6 +78,25 @@ impl ProjectResolver {
             })
     }
 
+    /// List the names of every project in the registry, sorted
+    /// alphabetically. Used to build helpful error messages when an
+    /// unknown project name is supplied (e.g. by `task_create`'s
+    /// optional `project` argument).
+    ///
+    /// Returns an empty vector if the query fails — the caller can
+    /// still produce a generic error message.
+    pub(crate) fn list_names(&self) -> Vec<String> {
+        let mut stmt = match self.conn.prepare("SELECT name FROM projects ORDER BY name") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
     /// Create a resolver for testing with an in-memory database.
     #[cfg(test)]
     pub(crate) fn test(entries: &[(&str, &str)]) -> Self {
@@ -240,6 +259,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Files this task is expected to touch. Used by the scheduler to run disjoint tasks in parallel. Pass `[\"*\"]` to mark a task whose file set is genuinely unpredictable (e.g. a codebase-wide survey) — the scheduler will serialise it. If `initial_state='ready'` is set without this list (and without the `[\"*\"]` marker), the task is auto-routed through planning so the file set can be populated."
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project name to file the task in. Defaults to the calling session's project. Use this when filing cross-repo tasks from an orchestrator session — file one task per repo and link them with `task_relate` / `depends_on`. The named project must be registered (run `tau project init` inside its repo first)."
                     }
                 },
                 "required": ["title"]
@@ -253,6 +276,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "Sessions dispatched for top-level tasks are automatically parented under the project's root (user-facing) session, so new work surfaces in the user's session tree regardless of where in the session tree task_create was called.".into(),
                 "Pass hold=true to create a task without scheduling it. Useful for batch-seeding a backlog on a greenfield project: file N tasks at once, review, then release them in considered order via task_update(hold=false). Held tasks are visible in task_list/task_status with a held indicator but the scheduler skips them.".into(),
                 "When filing with initial_state=\"ready\", pass `affected_files` (the files the work will touch) so the scheduler can run your task in parallel with disjoint tasks. Omit it only if the file set is genuinely unpredictable — in which case the task is auto-routed through a focused planning phase that populates the list. Use `affected_files: [\"*\"]` as the explicit \"touches everything / unknowable\" marker; that bypasses planning but keeps the task serialised against all other work.".into(),
+                "Pass `project` to file a task in a different project from the calling session's. Use this for cross-repo workflows: file one task per repo from the same orchestrator session and link them with `task_relate` / `depends_on`. Defaults to the caller's project; the named project must be registered (run `tau project init` inside its repo first).".into(),
             ],
         },
         PluginToolDef {
@@ -589,14 +613,45 @@ fn handle_task_create(
     reader: &mut impl BufRead,
     pending_events: &mut Vec<SchedulerEvent>,
 ) -> PluginToolResult {
-    let project_name = match ctx.project_name {
-        Some(p) => p,
-        None => {
-            return tool_err(
-                ctx.tool_call_id,
-                "Tasks require a project. Run `tau project init` first.",
-            );
-        }
+    let project_name: &str = match args.get("project") {
+        None | Some(serde_json::Value::Null) => match ctx.project_name {
+            Some(p) => p,
+            None => {
+                return tool_err(
+                    ctx.tool_call_id,
+                    "Tasks require a project. Run `tau project init` first.",
+                );
+            }
+        },
+        Some(v) => match v.as_str() {
+            Some("") => {
+                return tool_err(
+                    ctx.tool_call_id,
+                    "`project` must be a non-empty string (omit the field to use the caller's project).",
+                );
+            }
+            Some(name) => match resolver.resolve(name) {
+                Ok(_) => name,
+                Err(_) => {
+                    let known = resolver.list_names();
+                    let known_str = if known.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        known.join(", ")
+                    };
+                    return tool_err(
+                        ctx.tool_call_id,
+                        &format!(
+                            "unknown project '{}'. Known projects: {}. Initialize a project with 'tau project init' inside its repo.",
+                            name, known_str
+                        ),
+                    );
+                }
+            },
+            None => {
+                return tool_err(ctx.tool_call_id, "`project` must be a string");
+            }
+        },
     };
     let session_id = ctx.session_id;
     let tool_call_id = ctx.tool_call_id;
@@ -5135,6 +5190,316 @@ mod tests {
         );
     }
 
+    /// Task #750: omitting the `project` argument falls back to the
+    /// caller's project (`ctx.project_name`). This is the default
+    /// behaviour every existing caller relies on — protect it.
+    #[test]
+    fn test_handle_task_create_project_arg_absent_uses_ctx() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Default project",
+                "initial_state": "ready",
+                "affected_files": ["src/lib.rs"],
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(task["project_name"], "test-project");
+    }
+
+    /// Task #750: passing `project = caller's project` explicitly
+    /// must round-trip and produce the same row as the implicit
+    /// default. (Sanity check that the new code path doesn't add
+    /// surprising behaviour for the trivial case.)
+    #[test]
+    fn test_handle_task_create_project_arg_explicit_default() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Explicit default",
+                "initial_state": "ready",
+                "affected_files": ["src/lib.rs"],
+                "project": "test-project",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(task["project_name"], "test-project");
+    }
+
+    /// Task #750 — the headline feature: file a task in a different
+    /// known project from the caller's. The row's `project_name`
+    /// must be the named project, not `ctx.project_name`. This is
+    /// what unblocks cross-repo orchestration.
+    #[test]
+    fn test_handle_task_create_project_arg_other_project() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // affected_files validation runs against the *resolved*
+        // project root, so use a path that's clean under any root.
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "File in sibling project",
+                "initial_state": "ready",
+                "affected_files": ["src/lib.rs"],
+                "project": "other",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "unexpected error: {}",
+            extract_text(&result)
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(
+            task["project_name"], "other",
+            "row's project_name should be the explicitly-named project, not the caller's"
+        );
+
+        // The caller's project should have no rows; the named project owns the task.
+        let caller_tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert!(
+            caller_tasks.is_empty(),
+            "caller's project must not own a cross-repo-filed task; got {:?}",
+            caller_tasks
+        );
+        let other_tasks = db.list_tasks("other", None, None, None, None).unwrap();
+        assert_eq!(other_tasks.len(), 1, "named project should own the task");
+    }
+
+    /// Task #750: an unknown project name returns `tool_err` with a
+    /// helpful message that lists the registered projects, and does
+    /// NOT insert a row. The error message format is part of the
+    /// agent-facing UX — if it changes, update the spec.
+    #[test]
+    fn test_handle_task_create_project_arg_unknown_project() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Bad project",
+                "initial_state": "ready",
+                "project": "nonexistent",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(result.is_error, "unknown project should be rejected");
+        let text = extract_text(&result);
+        assert!(
+            text.contains("unknown project 'nonexistent'"),
+            "error should name the offending project: {}",
+            text
+        );
+        // Lists every seeded project name from `test_resolver`.
+        for known in ["test-project", "p", "project-a", "project-b", "other"] {
+            assert!(
+                text.contains(known),
+                "error should list known project '{}': {}",
+                known,
+                text
+            );
+        }
+        assert!(
+            text.contains("tau project init"),
+            "error should hint at the registration command: {}",
+            text
+        );
+
+        // No row inserted in any project.
+        for proj in ["test-project", "other", "project-a", "project-b", "p"] {
+            let tasks = db.list_tasks(proj, None, None, None, None).unwrap();
+            assert!(
+                tasks.is_empty(),
+                "rejected task_create must not insert a row in '{}'; got {:?}",
+                proj,
+                tasks
+            );
+        }
+    }
+
+    /// Task #750: an empty-string `project` is a caller bug, not a
+    /// silent fallback to the default. Reject loudly.
+    #[test]
+    fn test_handle_task_create_project_arg_empty_string() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Empty project",
+                "initial_state": "ready",
+                "project": "",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(result.is_error);
+        let text = extract_text(&result);
+        assert!(
+            text.contains("non-empty"),
+            "error should explain the rule: {}",
+            text
+        );
+        let tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert!(
+            tasks.is_empty(),
+            "empty-string project must not insert a row"
+        );
+    }
+
+    /// Task #750: a non-string `project` (e.g. an integer) is also a
+    /// caller bug. Reject loudly with a shape-check error rather than
+    /// silently coercing.
+    #[test]
+    fn test_handle_task_create_project_arg_non_string() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Wrong shape",
+                "initial_state": "ready",
+                "project": 42,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(result.is_error);
+        let text = extract_text(&result);
+        assert!(
+            text.contains("must be a string"),
+            "error should explain the shape rule: {}",
+            text
+        );
+        let tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert!(tasks.is_empty(), "non-string project must not insert a row");
+    }
+
+    /// Task #750: when `affected_files` is supplied alongside a
+    /// cross-project `project` arg, the path validator must run
+    /// against the **resolved** project root (the named project),
+    /// not the caller's. Otherwise we'd reject perfectly valid
+    /// cross-repo work or, worse, accept paths that escape the named
+    /// project's root just because they happen to live under the
+    /// caller's. Implementation detail today: the validator is
+    /// purely lexical (no realpath), so we exercise the `project`
+    /// being threaded into `resolver.resolve(...)` rather than the
+    /// caller's name.
+    #[test]
+    fn test_handle_task_create_project_arg_affected_files_validate_against_named_project() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "Cross-repo with files",
+                "initial_state": "ready",
+                "affected_files": ["src/lib.rs"],
+                "project": "other",
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "in-project path under named project should validate cleanly: {}",
+            extract_text(&result)
+        );
+        let task: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(task["project_name"], "other");
+    }
+
     /// Regression test for task #749: the planner write path goes
     /// through `handle_task_update`. Validate cross-repo paths there
     /// too so the planner can't bypass the create-time guardrail.
@@ -6127,7 +6492,7 @@ mod tests {
             .map(|t| t.prompt_guidelines.len())
             .sum();
         assert!(
-            total < 19,
+            total < 20,
             "task_* prompt_guidelines total should stay small; got {}",
             total
         );
