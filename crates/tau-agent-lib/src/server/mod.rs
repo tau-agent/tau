@@ -1,6 +1,7 @@
 //! Unix socket server — manages sessions and streams LLM responses.
 
 mod agent_runner;
+mod bg_tasks;
 mod dispatch;
 mod notifications;
 mod post_idle;
@@ -362,12 +363,22 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
         session_done_waiters: Vec::new(),
         reply_waiters: HashMap::new(),
         next_msg_id: 0,
-        post_idle_queue: HashMap::new(),
+        bg_after_idle: HashMap::new(),
+        bg_scheduler: None,
     }));
 
     log_stale_phases_at_startup(&state);
 
     let shutdown = ShutdownHandle::new();
+
+    // Wire up the background-task scheduler.  `State` is constructed
+    // with `bg_scheduler: None`; we attach the real scheduler now that
+    // we have a `SharedState` to clone.  Background-task registrations
+    // (periodic GC, on-startup work, etc.) go between the
+    // `BgTaskScheduler::new` call below and `bg.run_startup().await`.
+    let bg = bg_tasks::BgTaskScheduler::new(state.clone(), shutdown.clone());
+    lock_state(&state).bg_scheduler = Some(bg.clone());
+    bg.run_startup().await;
 
     let shutdown_watcher = shutdown.clone();
     let sock_clone = sock.to_path_buf();
@@ -557,12 +568,19 @@ pub async fn run() -> crate::Result<()> {
         session_done_waiters: Vec::new(),
         reply_waiters: HashMap::new(),
         next_msg_id: 0,
-        post_idle_queue: HashMap::new(),
+        bg_after_idle: HashMap::new(),
+        bg_scheduler: None,
     }));
 
     log_stale_phases_at_startup(&state);
 
     let shutdown = ShutdownHandle::new();
+
+    // Wire up the background-task scheduler.  See the matching block
+    // in `run_with_config` for rationale.
+    let bg = bg_tasks::BgTaskScheduler::new(state.clone(), shutdown.clone());
+    lock_state(&state).bg_scheduler = Some(bg.clone());
+    bg.run_startup().await;
 
     // Install signal-driven graceful shutdown.  SIGTERM (e.g. systemd
     // stop) and SIGHUP (parent shell closed) request the same drain path

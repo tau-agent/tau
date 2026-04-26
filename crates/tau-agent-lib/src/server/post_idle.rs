@@ -1,33 +1,28 @@
-//! Tier-3 post-idle action drain.
+//! Adapter shim: expose `PostIdleAction` over the new `bg_tasks` layer.
 //!
-//! Actions enqueued via [`Request::EnqueuePostIdleAction`](crate::protocol::Request::EnqueuePostIdleAction)
-//! land in [`State::post_idle_queue`](super::state::State::post_idle_queue)
-//! keyed by the caller's session id.  Once the caller's agent loop exits
-//! (session lock released), [`drain`] pops the queue and executes each
-//! action.  Because this runs **after** the lock drops, actions may freely
-//! grab session locks, hit the DB, and archive subtrees — none of which are
-//! safe while the agent loop is alive.
+//! The protocol surface
+//! ([`Request::EnqueuePostIdleAction`](crate::protocol::Request::EnqueuePostIdleAction)
+//! and the [`PostIdleAction`] enum) is unchanged.  Internally each
+//! action variant is converted into a concrete
+//! [`BgJob`](super::bg_tasks::BgJob) impl and registered against the
+//! caller's session id via
+//! [`BgTaskScheduler::enqueue_for_session`](super::bg_tasks::BgTaskScheduler::enqueue_for_session).
 //!
 //! # Retry / give-up policy
 //!
 //! `ArchiveTaskSessions` retries individual session archives up to
-//! [`ARCHIVE_MAX_RETRIES`] times on transient "busy" errors (session still
-//! listed in `live_sessions`), with [`ARCHIVE_RETRY_DELAY_MS`] between
-//! attempts.
-//!
-//! # Re-entrancy
-//!
-//! Actions executed during a drain round may themselves enqueue further
-//! post-idle work.  [`drain`] therefore loops up to [`MAX_ROUNDS`] times,
-//! draining the queue afresh each round, to catch those follow-ups without
-//! risking an infinite loop.
+//! [`ARCHIVE_MAX_RETRIES`] times on transient "busy" errors (session
+//! still listed in `live_sessions`), with [`ARCHIVE_RETRY_DELAY_MS`]
+//! between attempts.  This logic moved verbatim from the previous
+//! `post_idle` module into [`ArchiveTaskSessionsJob`].
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use super::bg_tasks::{BgJob, bg_scheduler};
 use super::state::{SharedState, lock_state};
 use crate::types::PostIdleAction;
-
-/// Maximum number of drain rounds.  Actions that enqueue further work
-/// during execution get drained on the next round, up to this cap.
-const MAX_ROUNDS: usize = 5;
 
 /// Max retries for transient "busy" failures when archiving a session.
 const ARCHIVE_MAX_RETRIES: u32 = 20;
@@ -36,8 +31,8 @@ const ARCHIVE_MAX_RETRIES: u32 = 20;
 const ARCHIVE_RETRY_DELAY_MS: u64 = 1000;
 
 /// Tunables for archival retry behaviour.  In production we use the
-/// constants above (20 attempts, 1s apart); tests override these to avoid
-/// 20-second test durations.
+/// constants above (20 attempts, 1s apart); tests override these to
+/// avoid 20-second test durations.
 #[derive(Debug, Clone, Copy)]
 struct ArchiveRetryPolicy {
     max_retries: u32,
@@ -50,6 +45,33 @@ impl ArchiveRetryPolicy {
             max_retries: ARCHIVE_MAX_RETRIES,
             delay_ms: ARCHIVE_RETRY_DELAY_MS,
         }
+    }
+}
+
+/// `BgJob` implementation for [`PostIdleAction::ArchiveTaskSessions`].
+struct ArchiveTaskSessionsJob {
+    task_id: i64,
+    policy: ArchiveRetryPolicy,
+}
+
+#[async_trait]
+impl BgJob for ArchiveTaskSessionsJob {
+    fn name(&self) -> &'static str {
+        "post_idle.archive_task_sessions"
+    }
+
+    async fn run(&self, state: &SharedState) {
+        execute_archive_task_sessions_action(state, self.task_id, self.policy).await;
+    }
+}
+
+/// Convert a `PostIdleAction` into a concrete background job.
+fn job_for(action: PostIdleAction) -> Arc<dyn BgJob> {
+    match action {
+        PostIdleAction::ArchiveTaskSessions { task_id } => Arc::new(ArchiveTaskSessionsJob {
+            task_id,
+            policy: ArchiveRetryPolicy::production(),
+        }),
     }
 }
 
@@ -67,92 +89,69 @@ pub(super) async fn enqueue_and_maybe_drain(
     session_id: &str,
     action: PostIdleAction,
 ) {
-    let should_drain_inline = {
-        let mut st = lock_state(state);
-        st.post_idle_queue
-            .entry(session_id.to_string())
-            .or_default()
-            .push(action);
-        !st.live_sessions.contains(session_id)
-    };
-    if should_drain_inline {
-        drain(state, session_id).await;
-    }
-}
-
-/// Drain all post-idle actions enqueued for `session_id`.  Call this after
-/// the agent loop has exited and the session's lock has been released.
-pub(super) async fn drain(state: &SharedState, session_id: &str) {
-    drain_with_policy(state, session_id, ArchiveRetryPolicy::production()).await;
-}
-
-async fn drain_with_policy(state: &SharedState, session_id: &str, policy: ArchiveRetryPolicy) {
-    for _round in 0..MAX_ROUNDS {
-        let batch = {
-            let mut st = lock_state(state);
-            match st.post_idle_queue.remove(session_id) {
-                Some(v) if !v.is_empty() => v,
-                _ => return,
-            }
-        };
-
-        for action in batch {
-            execute_action(state, &action, policy).await;
+    match bg_scheduler(state) {
+        Some(sched) => sched.enqueue_for_session(session_id, job_for(action)).await,
+        None => {
+            tracing::warn!(
+                session_id = %session_id,
+                "bg scheduler not initialised; dropping post-idle action"
+            );
         }
     }
+}
 
-    // If we're still producing work after MAX_ROUNDS, drop the remaining
-    // actions with a warning — almost certainly a bug in whatever is
-    // enqueueing them.
-    let remaining = {
-        let mut st = lock_state(state);
-        st.post_idle_queue.remove(session_id).unwrap_or_default()
-    };
-    if !remaining.is_empty() {
+/// Drain all post-idle actions enqueued for `session_id`.  Call this
+/// after the agent loop has exited and the session's lock has been
+/// released.
+pub(super) async fn drain(state: &SharedState, session_id: &str) {
+    if let Some(sched) = bg_scheduler(state) {
+        sched.drain_for_session(session_id).await;
+    } else {
         tracing::warn!(
             session_id = %session_id,
-            remaining = remaining.len(),
-            "post-idle drain exceeded max rounds, dropping remaining actions"
+            "bg scheduler not initialised; nothing to drain"
         );
     }
 }
 
-async fn execute_action(state: &SharedState, action: &PostIdleAction, policy: ArchiveRetryPolicy) {
-    match action {
-        PostIdleAction::ArchiveTaskSessions { task_id } => {
-            // Task #561: prefer the placeholder-subtree cascade when the
-            // task has a placeholder session. The server-side
-            // `archive_session_tree` archives the placeholder and every
-            // descendant in one hop, so we never need the per-role loop
-            // for tasks created post-561. Pre-561 tasks (no placeholder)
-            // fall back to the legacy role-filter archival.
-            let (placeholder_sid, sessions) = match crate::tasks_db::TasksDb::open_default() {
-                Ok(db) => {
-                    let placeholder = db
-                        .get_task(*task_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|t| t.placeholder_session_id);
-                    let sessions = match db.get_sessions(*task_id) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(task_id = *task_id, %e, "post-idle: get_sessions failed");
-                            return;
-                        }
-                    };
-                    (placeholder, sessions)
-                }
+/// Body of `ArchiveTaskSessionsJob::run`, factored out so tests can
+/// invoke it directly with a fast retry policy.
+async fn execute_archive_task_sessions_action(
+    state: &SharedState,
+    task_id: i64,
+    policy: ArchiveRetryPolicy,
+) {
+    // Task #561: prefer the placeholder-subtree cascade when the task
+    // has a placeholder session.  The server-side
+    // `archive_session_tree` archives the placeholder and every
+    // descendant in one hop, so we never need the per-role loop for
+    // tasks created post-561.  Pre-561 tasks (no placeholder) fall
+    // back to the legacy role-filter archival.
+    let (placeholder_sid, sessions) = match crate::tasks_db::TasksDb::open_default() {
+        Ok(db) => {
+            let placeholder = db
+                .get_task(task_id)
+                .ok()
+                .flatten()
+                .and_then(|t| t.placeholder_session_id);
+            let sessions = match db.get_sessions(task_id) {
+                Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(task_id = *task_id, %e, "post-idle: open tasks db failed");
+                    tracing::warn!(task_id, %e, "post-idle: get_sessions failed");
                     return;
                 }
             };
-            if let Some(sid) = placeholder_sid {
-                archive_with_retries(state, &sid, policy).await;
-            } else {
-                execute_archive_task_sessions(state, &sessions, policy).await;
-            }
+            (placeholder, sessions)
         }
+        Err(e) => {
+            tracing::warn!(task_id, %e, "post-idle: open tasks db failed");
+            return;
+        }
+    };
+    if let Some(sid) = placeholder_sid {
+        archive_with_retries(state, &sid, policy).await;
+    } else {
+        execute_archive_task_sessions(state, &sessions, policy).await;
     }
 }
 
@@ -175,8 +174,8 @@ async fn execute_archive_task_sessions(
 /// (a turn is running).  Because this drain is invoked *after* the
 /// caller's own lock is released, the only way this trips is if a
 /// concurrent turn on the same session started — rare, but the retry
-/// keeps us honest.  After `policy.max_retries` attempts we give up with
-/// a warning rather than hang.
+/// keeps us honest.  After `policy.max_retries` attempts we give up
+/// with a warning rather than hang.
 async fn archive_with_retries(state: &SharedState, session_id: &str, policy: ArchiveRetryPolicy) {
     for attempt in 0..policy.max_retries {
         let busy = {
@@ -209,6 +208,8 @@ mod tests {
     use super::*;
     use crate::db::Db;
     use crate::provider::ProviderRegistry;
+    use crate::server::ShutdownHandle;
+    use crate::server::bg_tasks::BgTaskScheduler;
     use crate::server::state::{SharedState, State};
     use crate::types::{Model, ModelCost, PostIdleAction, ThinkingStyle};
     use std::collections::{HashMap, HashSet};
@@ -229,9 +230,11 @@ mod tests {
         }
     }
 
-    fn mk_state() -> SharedState {
+    /// Build a `SharedState` with an attached `BgTaskScheduler`, so
+    /// the shim functions (`enqueue_and_maybe_drain`, `drain`) work.
+    fn mk_state_with_scheduler() -> SharedState {
         let db = Db::open_memory().expect("open memory db");
-        Arc::new(Mutex::new(State {
+        let state: SharedState = Arc::new(Mutex::new(State {
             db,
             registry: ProviderRegistry::new(),
             auth: crate::auth::AuthStorage::open_default(),
@@ -249,8 +252,13 @@ mod tests {
             session_done_waiters: Vec::new(),
             reply_waiters: HashMap::new(),
             next_msg_id: 0,
-            post_idle_queue: HashMap::new(),
-        }))
+            bg_after_idle: HashMap::new(),
+            bg_scheduler: None,
+        }));
+        let shutdown = ShutdownHandle::new();
+        let sched = BgTaskScheduler::new(state.clone(), shutdown);
+        lock_state(&state).bg_scheduler = Some(sched);
+        state
     }
 
     fn insert_session(state: &SharedState, id: &str) {
@@ -284,26 +292,24 @@ mod tests {
         }
     }
 
-    /// `drain` on an empty queue is a cheap no-op.
+    /// Drain on an empty queue is a cheap no-op.
     #[test]
     fn drain_empty_queue_is_noop() {
         smol::block_on(async {
-            let state = mk_state();
+            let state = mk_state_with_scheduler();
             drain(&state, "s-nobody").await;
-            // Nothing to assert: should complete without panic or hang.
             let st = lock_state(&state);
-            assert!(st.post_idle_queue.is_empty());
+            assert!(st.bg_after_idle.is_empty());
         });
     }
 
-    /// Archive action against a session that isn't busy completes on the
-    /// first attempt and archives the session tree.
+    /// Archive action against a session that isn't busy completes on
+    /// the first attempt and archives the session tree.
     #[test]
     fn archive_with_retries_succeeds_when_not_busy() {
         smol::block_on(async {
-            let state = mk_state();
+            let state = mk_state_with_scheduler();
             insert_session(&state, "sid-live");
-            // No entry in live_sessions → archive should succeed.
             archive_with_retries(&state, "sid-live", fast_policy()).await;
             let st = lock_state(&state);
             let info = st
@@ -315,30 +321,26 @@ mod tests {
         });
     }
 
-    /// Session is initially busy, another task clears the live flag during
-    /// the retry loop, and the archive succeeds on a subsequent attempt.
+    /// Session is initially busy, another task clears the live flag
+    /// during the retry loop, and the archive succeeds on a subsequent
+    /// attempt.
     #[test]
     fn archive_with_retries_succeeds_after_session_becomes_idle() {
         smol::block_on(async {
-            let state = mk_state();
+            let state = mk_state_with_scheduler();
             insert_session(&state, "sid-racing");
             {
                 let mut st = lock_state(&state);
                 st.live_sessions.insert("sid-racing".into());
             }
-
-            // Spawn a task that clears the live flag after ~15ms (so at
-            // least one retry happens).
             let state_clear = state.clone();
             let clearer = smol::spawn(async move {
                 smol::Timer::after(std::time::Duration::from_millis(15)).await;
                 let mut st = lock_state(&state_clear);
                 st.live_sessions.remove("sid-racing");
             });
-
             archive_with_retries(&state, "sid-racing", fast_policy()).await;
             clearer.await;
-
             let st = lock_state(&state);
             let info = st
                 .db
@@ -349,25 +351,20 @@ mod tests {
         });
     }
 
-    /// Persistently busy session → archive_with_retries gives up after
-    /// policy.max_retries attempts without hanging.  Session remains
-    /// un-archived.
+    /// Persistently busy session → `archive_with_retries` gives up
+    /// after `policy.max_retries` attempts without hanging.
     #[test]
     fn archive_with_retries_gives_up_when_persistently_busy() {
         smol::block_on(async {
-            let state = mk_state();
+            let state = mk_state_with_scheduler();
             insert_session(&state, "sid-stuck");
             {
                 let mut st = lock_state(&state);
                 st.live_sessions.insert("sid-stuck".into());
             }
-
             let started = std::time::Instant::now();
             archive_with_retries(&state, "sid-stuck", fast_policy()).await;
             let elapsed = started.elapsed();
-
-            // 3 attempts × 10ms ≈ 30ms, bounded by a generous ceiling so
-            // we catch a hang (would be tens of seconds in prod).
             assert!(
                 elapsed < std::time::Duration::from_secs(1),
                 "gave up too slowly: {:?}",
@@ -387,25 +384,16 @@ mod tests {
     }
 
     /// End-to-end: feeding `execute_archive_task_sessions` the list of
-    /// archivable task sessions results in each session being archived
-    /// in the core DB, with archivable-role filtering applied.  Covers
-    /// the spec's "Tier-3 archive" happy path — the action drained by
-    /// the reviewer's turn exit archives the worker + reviewer sessions.
-    ///
-    /// We bypass `TasksDb::open_default()` (which reads a global on-disk
-    /// path) by invoking the inner helper directly with an in-memory
-    /// task session list.  The full `drain(…, ArchiveTaskSessions)` path
-    /// is covered indirectly: its only side effects beyond
-    /// `execute_archive_task_sessions` are DB-open + get_sessions, both
-    /// straight-through helpers.
+    /// archivable task sessions results in each session being
+    /// archived in the core DB, with archivable-role filtering
+    /// applied.
     #[test]
     fn archive_task_sessions_archives_worker_reviewer_skips_creator() {
         smol::block_on(async {
-            let state = mk_state();
+            let state = mk_state_with_scheduler();
             insert_session(&state, "sid-worker");
             insert_session(&state, "sid-reviewer");
-            insert_session(&state, "sid-creator"); // orchestrator — must NOT be archived
-
+            insert_session(&state, "sid-creator");
             let sessions = vec![
                 crate::tasks_db::TaskSession {
                     task_id: 1,
@@ -426,9 +414,7 @@ mod tests {
                     created_at: 0,
                 },
             ];
-
             execute_archive_task_sessions(&state, &sessions, fast_policy()).await;
-
             let st = lock_state(&state);
             let w = st.db.get_session("sid-worker").expect("db").expect("w");
             let r = st.db.get_session("sid-reviewer").expect("db").expect("r");
@@ -439,41 +425,15 @@ mod tests {
         });
     }
 
-    /// An `ArchiveTaskSessions` action enqueued in `post_idle_queue` is
-    /// drained, and the queue entry is removed.  Uses a task_id that the
-    /// on-disk tasks DB likely doesn't know about — the drain handles the
-    /// "no sessions to archive" path without error and still clears the
-    /// queue.
-    #[test]
-    fn drain_consumes_archive_task_sessions_entry() {
-        smol::block_on(async {
-            let state = mk_state();
-            {
-                let mut st = lock_state(&state);
-                st.post_idle_queue.insert(
-                    "s-caller".into(),
-                    vec![PostIdleAction::ArchiveTaskSessions { task_id: i64::MAX }],
-                );
-            }
-            drain_with_policy(&state, "s-caller", fast_policy()).await;
-            let st = lock_state(&state);
-            assert!(
-                !st.post_idle_queue.contains_key("s-caller"),
-                "queue entry should be drained"
-            );
-        });
-    }
-
-    /// `enqueue_and_maybe_drain` drains inline when the target session is
-    /// not currently running an agent turn (the task #594 fix path).
-    /// We use a task_id with no sessions in the on-disk tasks DB — the
-    /// archive action becomes a no-op but the queue entry is still
-    /// drained, proving the inline drain ran.
+    /// `enqueue_and_maybe_drain` drains inline when the target session
+    /// is not currently running an agent turn (the task #594 fix
+    /// path).  We use a task_id with no sessions in the on-disk tasks
+    /// DB — the archive action becomes a no-op but the queue entry is
+    /// still drained, proving the inline drain ran.
     #[test]
     fn enqueue_and_maybe_drain_runs_inline_when_session_idle() {
         smol::block_on(async {
-            let state = mk_state();
-            // Session not in live_sessions → should drain inline.
+            let state = mk_state_with_scheduler();
             enqueue_and_maybe_drain(
                 &state,
                 "s-idle",
@@ -482,20 +442,20 @@ mod tests {
             .await;
             let st = lock_state(&state);
             assert!(
-                !st.post_idle_queue.contains_key("s-idle"),
+                !st.bg_after_idle.contains_key("s-idle"),
                 "queue should have been drained inline"
             );
         });
     }
 
     /// `enqueue_and_maybe_drain` defers to the normal turn-completion
-    /// drain when the target session IS currently running a turn.  The
-    /// queue entry must remain so the running agent loop's exit drain
-    /// picks it up; running it inline would race with the agent.
+    /// drain when the target session IS currently running a turn.
+    /// The queue entry must remain so the running agent loop's exit
+    /// drain picks it up.
     #[test]
     fn enqueue_and_maybe_drain_defers_when_session_live() {
         smol::block_on(async {
-            let state = mk_state();
+            let state = mk_state_with_scheduler();
             {
                 let mut st = lock_state(&state);
                 st.live_sessions.insert("s-busy".into());
@@ -508,10 +468,51 @@ mod tests {
             .await;
             let st = lock_state(&state);
             let queued = st
-                .post_idle_queue
+                .bg_after_idle
                 .get("s-busy")
                 .expect("entry should remain queued for live session");
             assert_eq!(queued.len(), 1, "exactly one action queued");
+        });
+    }
+
+    /// An `ArchiveTaskSessions` action enqueued via the shim is
+    /// drained when the session goes idle, and the queue entry is
+    /// removed.  Uses `i64::MAX` so the on-disk tasks DB has no
+    /// matching task — the archive becomes a no-op but the queue
+    /// entry is still drained, proving the round-trip.
+    #[test]
+    fn drain_consumes_archive_task_sessions_entry() {
+        smol::block_on(async {
+            let state = mk_state_with_scheduler();
+            {
+                let mut st = lock_state(&state);
+                st.live_sessions.insert("s-caller".into());
+            }
+            enqueue_and_maybe_drain(
+                &state,
+                "s-caller",
+                PostIdleAction::ArchiveTaskSessions { task_id: i64::MAX },
+            )
+            .await;
+            assert_eq!(
+                lock_state(&state)
+                    .bg_after_idle
+                    .get("s-caller")
+                    .map(|v| v.len())
+                    .unwrap_or(0),
+                1,
+                "action should be queued while session is live"
+            );
+            {
+                let mut st = lock_state(&state);
+                st.live_sessions.remove("s-caller");
+            }
+            drain(&state, "s-caller").await;
+            let st = lock_state(&state);
+            assert!(
+                !st.bg_after_idle.contains_key("s-caller"),
+                "queue entry should be drained"
+            );
         });
     }
 }

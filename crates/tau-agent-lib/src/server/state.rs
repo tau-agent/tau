@@ -57,11 +57,27 @@ pub(super) struct State {
     pub(super) reply_waiters: HashMap<String, smol::channel::Sender<String>>,
     /// Monotonic counter for generating unique msg_ids.
     pub(super) next_msg_id: u64,
-    /// Per-session Tier-3 post-idle action queue.  Drained after the
-    /// session's lock is released (agent turn exits).  Actions enqueued
-    /// while draining are appended for a bounded number of drain rounds
-    /// to prevent infinite loops.  See `PostIdleAction` for semantics.
-    pub(super) post_idle_queue: HashMap<String, Vec<crate::types::PostIdleAction>>,
+    /// Per-session deferred background-job queue.  Drained after the
+    /// session's lock is released (agent turn exits) by
+    /// [`super::bg_tasks::BgTaskScheduler::drain_for_session`].  Jobs
+    /// enqueued while draining are appended for a bounded number of
+    /// drain rounds to prevent infinite loops.
+    ///
+    /// Lives on `State` (rather than the scheduler) so the
+    /// "push + check `live_sessions`" critical section in
+    /// [`super::bg_tasks::BgTaskScheduler::enqueue_for_session`] is
+    /// atomic — same single-lock discipline as the legacy
+    /// `post_idle_queue` it replaces.
+    pub(super) bg_after_idle: HashMap<String, Vec<Arc<dyn super::bg_tasks::BgJob>>>,
+    /// Background-task scheduler handle.  Set immediately after this
+    /// `State` is wrapped into `SharedState`; `None` only inside test
+    /// fixtures that don't exercise the scheduler.
+    ///
+    /// `Arc<BgTaskScheduler>` itself holds a clone of `SharedState`,
+    /// forming a process-lifetime-scoped reference cycle.  Process
+    /// exit reclaims the memory; we accept the cycle rather than
+    /// pollute every call site with `Weak::upgrade`.
+    pub(super) bg_scheduler: Option<Arc<super::bg_tasks::BgTaskScheduler>>,
 }
 
 pub(super) type SharedState = Arc<Mutex<State>>;
