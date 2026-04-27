@@ -1265,6 +1265,25 @@ fn render_group_header(text: &str, w: usize, theme: &Theme) -> Line<'static> {
     ))
 }
 
+/// Whether the `held` flag should be reflected in the task row's visual
+/// indicators (lock icon, "🔒 held" suffix, suppression of the state
+/// label).
+///
+/// `held` is recorded on tasks regardless of state — including terminal
+/// states like `closed` / `merged` — for audit / historical purposes.
+/// But it's only *operationally* meaningful for tasks the scheduler
+/// might still consider: pre-dispatch and refining states.  For
+/// terminal / in-flight states the state itself is the relevant
+/// indicator, so we drop the held visuals there to avoid a
+/// `🔒 held` row that looks like the task is still waiting.
+fn held_visually(task: &tau_agent_lib::protocol::TaskInfo) -> bool {
+    task.held
+        && matches!(
+            task.state.as_str(),
+            "interactive" | "planning" | "refining" | "ready"
+        )
+}
+
 /// Render a single task row (shared between scheduler and ancestry views).
 #[allow(clippy::too_many_arguments)]
 fn render_task_row(
@@ -1302,7 +1321,8 @@ fn render_task_row(
     used += 2;
 
     // State / held icon.
-    let (icon, icon_style) = if task.held {
+    let held_vis = held_visually(task);
+    let (icon, icon_style) = if held_vis {
         ("🔒", theme.fg(theme.warning))
     } else {
         task_state_style(&task.state, theme)
@@ -1348,7 +1368,7 @@ fn render_task_row(
     // whose rows all share the group's implied state (queued — ready,
     // queued — planning) and for held rows which already carry the 🔒
     // marker.
-    if !suppress_state_label && !task.held {
+    if !suppress_state_label && !held_vis {
         title_text = format!("[{}] {}", task.state, title_text);
     }
     if parent_out_of_group {
@@ -1364,7 +1384,7 @@ fn render_task_row(
             .join(" ");
         title_text.push_str(&format!("  {}", suffix));
     }
-    if task.held {
+    if held_vis {
         title_text.push_str("  🔒 held");
     }
     // Cross-project provenance (#758): show a dim "← other-proj"
@@ -1466,8 +1486,11 @@ pub(crate) fn affected_files_lines(task: &tau_agent_lib::protocol::TaskInfo) -> 
 /// overlay.
 ///
 /// Returns an empty vec when there is nothing to show (no wait reasons and
-/// not held).  `🔒 held` is included as a final line whenever `task.held`
-/// is true, independent of `wait_reasons` (the two categories coexist).
+/// not visually held — see `held_visually`).  `🔒 held` is included as a
+/// final line whenever `held_visually(task)` is true, independent of
+/// `wait_reasons` (the two categories coexist).  Tasks in terminal /
+/// in-flight states do not get a held row even if `task.held` is set,
+/// since the state itself is the relevant indicator there.
 pub(crate) fn wait_reason_lines(
     task: &tau_agent_lib::protocol::TaskInfo,
     wait_reasons: &[tau_agent_lib::protocol::TaskWaitReason],
@@ -1475,7 +1498,8 @@ pub(crate) fn wait_reason_lines(
     use tau_agent_lib::protocol::TaskWaitReason as R;
     const MAX_FILES_IN_CONFLICT: usize = 4;
 
-    if wait_reasons.is_empty() && !task.held {
+    let held_vis = held_visually(task);
+    if wait_reasons.is_empty() && !held_vis {
         return Vec::new();
     }
     let mut out: Vec<String> = Vec::with_capacity(wait_reasons.len() + 1);
@@ -1521,7 +1545,7 @@ pub(crate) fn wait_reason_lines(
         };
         out.push(text);
     }
-    if task.held {
+    if held_vis {
         out.push("    🔒 held".to_string());
     }
     out
@@ -2223,5 +2247,147 @@ mod tests {
     fn wait_reason_lines_empty_when_nothing_to_show() {
         let t = empty_task(1);
         assert!(wait_reason_lines(&t, &[]).is_empty());
+    }
+
+    #[test]
+    fn held_visually_true_for_pre_dispatch_states() {
+        for state in ["interactive", "planning", "refining", "ready"] {
+            let mut t = empty_task(1);
+            t.held = true;
+            t.state = state.into();
+            assert!(
+                held_visually(&t),
+                "held=true state={state} should be visually held"
+            );
+        }
+    }
+
+    #[test]
+    fn held_visually_false_for_terminal_or_in_flight_states() {
+        for state in ["active", "review", "merging", "merged", "closed", "failed"] {
+            let mut t = empty_task(1);
+            t.held = true;
+            t.state = state.into();
+            assert!(
+                !held_visually(&t),
+                "held=true state={state} should NOT be visually held"
+            );
+        }
+    }
+
+    #[test]
+    fn held_visually_false_when_not_held() {
+        for state in [
+            "interactive",
+            "planning",
+            "refining",
+            "ready",
+            "active",
+            "review",
+            "merging",
+            "merged",
+            "closed",
+            "failed",
+        ] {
+            let mut t = empty_task(1);
+            t.held = false;
+            t.state = state.into();
+            assert!(!held_visually(&t));
+        }
+    }
+
+    #[test]
+    fn wait_reason_lines_no_held_row_for_terminal_held_task() {
+        // Regression: a closed task that still carries held=true should
+        // not emit a "🔒 held" row in the detail overlay.
+        let mut t = empty_task(1);
+        t.held = true;
+        t.state = "closed".into();
+        assert!(wait_reason_lines(&t, &[]).is_empty());
+
+        t.state = "merged".into();
+        assert!(wait_reason_lines(&t, &[]).is_empty());
+    }
+
+    /// Helper: render a task row and flatten its spans to a plain string
+    /// so we can substring-match against icons and labels.
+    fn render_row_text(task: &TaskInfo) -> String {
+        let theme = crate::theme::dark();
+        let line = render_task_row(
+            task,
+            /*depth*/ 0,
+            /*parent_out_of_group*/ false,
+            /*suppress_state_label*/ false,
+            /*blocked_on*/ &[],
+            /*age_hint*/ None,
+            /*is_selected*/ false,
+            /*filter_active*/ false,
+            /*w*/ 200,
+            &theme,
+        );
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn render_row_held_ready_shows_lock_and_no_state_prefix() {
+        let mut t = empty_task(1);
+        t.held = true;
+        t.state = "ready".into();
+        t.title = "do-the-thing".into();
+        let s = render_row_text(&t);
+        assert!(s.contains("🔒"), "expected lock icon in row: {s:?}");
+        assert!(s.contains("🔒 held"), "expected held suffix in row: {s:?}");
+        assert!(
+            !s.contains("[ready]"),
+            "held row should suppress state prefix: {s:?}"
+        );
+    }
+
+    #[test]
+    fn render_row_held_closed_shows_state_prefix_no_lock() {
+        let mut t = empty_task(1);
+        t.held = true;
+        t.state = "closed".into();
+        t.title = "old-task".into();
+        let s = render_row_text(&t);
+        assert!(
+            !s.contains("🔒"),
+            "closed-and-held row must not show lock icon: {s:?}"
+        );
+        assert!(
+            !s.contains("🔒 held"),
+            "closed-and-held row must not show held suffix: {s:?}"
+        );
+        assert!(
+            s.contains("[closed]"),
+            "closed-and-held row should show [closed] prefix: {s:?}"
+        );
+    }
+
+    #[test]
+    fn render_row_held_merged_shows_state_prefix_no_lock() {
+        let mut t = empty_task(1);
+        t.held = true;
+        t.state = "merged".into();
+        t.title = "old-merge".into();
+        let s = render_row_text(&t);
+        assert!(!s.contains("🔒"));
+        assert!(!s.contains("🔒 held"));
+        assert!(s.contains("[merged]"));
+    }
+
+    #[test]
+    fn render_row_unheld_closed_shows_state_prefix() {
+        // Sanity — the un-held closed row keeps its [closed] prefix.
+        let mut t = empty_task(1);
+        t.held = false;
+        t.state = "closed".into();
+        t.title = "old-task".into();
+        let s = render_row_text(&t);
+        assert!(!s.contains("🔒"));
+        assert!(s.contains("[closed]"));
     }
 }
