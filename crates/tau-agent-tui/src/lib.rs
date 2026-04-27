@@ -2,6 +2,7 @@
 
 mod app;
 mod events;
+pub mod markdown;
 mod message;
 mod render;
 pub mod settings;

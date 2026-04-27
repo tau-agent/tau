@@ -86,6 +86,14 @@ pub struct Theme {
     pub tool_error_bg: ThemeColor,
     pub tool_title: ThemeColor,
     pub tool_output: ThemeColor,
+
+    // Markdown
+    pub markdown_code_fg: ThemeColor,
+    pub markdown_code_bg: ThemeColor,
+    pub markdown_heading: ThemeColor,
+    pub markdown_link: ThemeColor,
+    pub markdown_quote: ThemeColor,
+    pub markdown_rule: ThemeColor,
 }
 
 impl Theme {
@@ -198,6 +206,13 @@ pub fn dark() -> Theme {
         tool_error_bg: ThemeColor::Rgb(0x3c, 0x28, 0x28),
         tool_title: ThemeColor::Default,
         tool_output: ThemeColor::Rgb(0x80, 0x80, 0x80),
+
+        markdown_code_fg: ThemeColor::Rgb(0x8a, 0xbe, 0xb7),
+        markdown_code_bg: ThemeColor::Rgb(0x28, 0x28, 0x32),
+        markdown_heading: ThemeColor::Default,
+        markdown_link: ThemeColor::Rgb(0x8a, 0xbe, 0xb7),
+        markdown_quote: ThemeColor::Rgb(0x80, 0x80, 0x80),
+        markdown_rule: ThemeColor::Rgb(0x50, 0x50, 0x50),
     }
 }
 
@@ -318,6 +333,19 @@ struct ThemeColorsJson {
     tool_error_bg: String,
     tool_title: String,
     tool_output: String,
+
+    #[serde(default)]
+    markdown_code_fg: Option<String>,
+    #[serde(default)]
+    markdown_code_bg: Option<String>,
+    #[serde(default)]
+    markdown_heading: Option<String>,
+    #[serde(default)]
+    markdown_link: Option<String>,
+    #[serde(default)]
+    markdown_quote: Option<String>,
+    #[serde(default)]
+    markdown_rule: Option<String>,
 }
 
 /// Load a theme from a JSON string (pi-compatible format).
@@ -349,6 +377,37 @@ pub fn from_json(json: &str) -> Result<Theme, String> {
         tool_error_bg: parse_color(&c.tool_error_bg, vars),
         tool_title: parse_color(&c.tool_title, vars),
         tool_output: parse_color(&c.tool_output, vars),
+
+        markdown_code_fg: c
+            .markdown_code_fg
+            .as_deref()
+            .map(|s| parse_color(s, vars))
+            .unwrap_or(ThemeColor::Rgb(0x8a, 0xbe, 0xb7)),
+        markdown_code_bg: c
+            .markdown_code_bg
+            .as_deref()
+            .map(|s| parse_color(s, vars))
+            .unwrap_or(ThemeColor::Rgb(0x28, 0x28, 0x32)),
+        markdown_heading: c
+            .markdown_heading
+            .as_deref()
+            .map(|s| parse_color(s, vars))
+            .unwrap_or(ThemeColor::Default),
+        markdown_link: c
+            .markdown_link
+            .as_deref()
+            .map(|s| parse_color(s, vars))
+            .unwrap_or(ThemeColor::Rgb(0x8a, 0xbe, 0xb7)),
+        markdown_quote: c
+            .markdown_quote
+            .as_deref()
+            .map(|s| parse_color(s, vars))
+            .unwrap_or(ThemeColor::Rgb(0x80, 0x80, 0x80)),
+        markdown_rule: c
+            .markdown_rule
+            .as_deref()
+            .map(|s| parse_color(s, vars))
+            .unwrap_or(ThemeColor::Rgb(0x50, 0x50, 0x50)),
     })
 }
 

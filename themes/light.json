@@ -34,6 +34,13 @@
 		"toolSuccessBg": "toolSuccessBg",
 		"toolErrorBg": "toolErrorBg",
 		"toolTitle": "",
-		"toolOutput": "mediumGray"
+		"toolOutput": "mediumGray",
+
+		"markdownCodeFg": "teal",
+		"markdownCodeBg": "#eaeaf0",
+		"markdownHeading": "",
+		"markdownLink": "blue",
+		"markdownQuote": "mediumGray",
+		"markdownRule": "lightGray"
 	}
 }

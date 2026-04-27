@@ -137,12 +137,8 @@ impl MessageItem {
                 Text::from(lines)
             }
             MessageItem::Assistant { text } | MessageItem::AssistantStreaming { text } => {
-                let usable = (width as usize).saturating_sub(1);
                 let trimmed = text.trim_start_matches('\n');
-                let mut lines: Vec<Line<'static>> = Vec::new();
-                for l in wrap_text(trimmed, usable) {
-                    lines.push(Line::from(format!(" {}", l)));
-                }
+                let mut lines = crate::markdown::render(trimmed, width, theme);
                 if lines.is_empty() {
                     lines.push(Line::from(""));
                 }

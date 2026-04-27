@@ -35,6 +35,13 @@
 		"toolSuccessBg": "toolSuccessBg",
 		"toolErrorBg": "toolErrorBg",
 		"toolTitle": "",
-		"toolOutput": "gray"
+		"toolOutput": "gray",
+
+		"markdownCodeFg": "accent",
+		"markdownCodeBg": "toolPendingBg",
+		"markdownHeading": "",
+		"markdownLink": "accent",
+		"markdownQuote": "gray",
+		"markdownRule": "darkGray"
 	}
 }
