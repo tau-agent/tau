@@ -40,22 +40,30 @@ pub fn tool_def() -> ToolDef {
             description:
                 "Edit a file by replacing exact text or by line-anchor. Each old_text must match exactly (including whitespace and newlines) and be unique in the file. Anchor edits use the `<hash>§` prefixes from the `read` tool's output and re-validate against current file contents. Supports single edit or multiple disjoint edits in one call across one or more files."
                     .into(),
+            // The schema accepts two mutually exclusive shapes — single-file
+            // (`path` + `edits`) and multi-file (`files`) — but does NOT
+            // express that mutual exclusion structurally. Anthropic's
+            // tool-input-schema validator rejects top-level
+            // `oneOf`/`anyOf`/`allOf` with HTTP 400, so the constraint lives
+            // in the descriptions and is enforced at runtime by
+            // `prepare_arguments` and `execute` instead.
             parameters: serde_json::json!({
                 "type": "object",
+                "description": "Provide EITHER `files` (multi-file form) OR `path` + `edits` (single-file form). Do not mix the two — supplying both, or neither, is an error.",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Path to the file to edit (single-file form)"
+                        "description": "Single-file form: path to the file to edit. Pair with `edits`. Mutually exclusive with `files`."
                     },
                     "edits": {
                         "type": "array",
-                        "description": "One or more edits to apply in order. Each edit must be either a legacy `{old_text, new_text}` (old_text unique in the file) or an anchor edit `{edit_type, anchor, end_anchor?, text}` (anchor copied from the read tool's `<hash>§` prefix). Edits must not overlap. Single-file form: pair with `path`.",
+                        "description": "Single-file form: one or more edits to apply in order to `path`. Each edit must be either a legacy `{old_text, new_text}` (old_text unique in the file) or an anchor edit `{edit_type, anchor, end_anchor?, text}` (anchor copied from the read tool's `<hash>§` prefix). Edits must not overlap. Mutually exclusive with `files`.",
                         "minItems": 1,
                         "items": EDIT_ITEM_SCHEMA.clone()
                     },
                     "files": {
                         "type": "array",
-                        "description": "Multi-file form: one entry per file, each with its own edits[]. All edits across all files are validated before any file is written.",
+                        "description": "Multi-file form: one entry per file, each with its own edits[]. All edits across all files are validated before any file is written. Mutually exclusive with top-level `path` / `edits`.",
                         "minItems": 1,
                         "items": {
                             "type": "object",
@@ -73,11 +81,7 @@ pub fn tool_def() -> ToolDef {
                             "required": ["path", "edits"]
                         }
                     }
-                },
-                "oneOf": [
-                    { "required": ["files"] },
-                    { "required": ["path", "edits"] }
-                ]
+                }
             }),
         },
         execute: Box::new(execute),
@@ -234,9 +238,9 @@ fn edit_line_deltas(edit: &Edit, plan: &EditPlan) -> (usize, usize) {
 ///    `edits`, wrap them into `files: [{path, edits}]` and remove the
 ///    top-level `path` / `edits` keys.
 /// 3. If `files` is already present, leave it untouched. (Stray top-level
-///    `path` / `edits` alongside `files` is malformed input — the validator
-///    in `execute` rejects it via the absence of canonical `files` not
-///    matching, but in practice `oneOf` already forbids it.)
+///    `path` / `edits` alongside `files` is malformed input — `execute`
+///    rejects it with a mixed-shapes error, since the schema can't encode
+///    the mutual exclusion structurally.)
 fn prepare_arguments(mut args: serde_json::Value) -> serde_json::Value {
     let Some(obj) = args.as_object_mut() else {
         return args;
@@ -266,7 +270,8 @@ fn prepare_arguments(mut args: serde_json::Value) -> serde_json::Value {
     // Step 2: single-file {path, edits} → {files: [{path, edits}]}
     // Skip if `files` is already present; in that case the existing
     // `files` wins and any stray top-level `path`/`edits` is left alone for
-    // the validator to flag as malformed input (or oneOf to reject).
+    // `execute` to flag as a mixed-shape error (the schema used to encode
+    // this with a top-level `oneOf`, but Anthropic rejects that).
     if !obj.contains_key("files")
         && obj.get("path").map(|v| v.is_string()).unwrap_or(false)
         && obj.get("edits").map(|v| v.is_array()).unwrap_or(false)
@@ -288,6 +293,36 @@ fn execute(
     cwd: &str,
     _cancel: &tau_agent_plugin::CancelToken,
 ) -> ToolOutput {
+    // The schema can't enforce "exactly one of {files} or {path+edits}"
+    // structurally (Anthropic rejects top-level oneOf/anyOf/allOf), so we
+    // validate it here on the post-`prepare_arguments` value. After that
+    // hook runs, a well-formed call has *only* `files`; any stray
+    // top-level `path` or `edits` alongside `files` means the model mixed
+    // the two shapes.
+    let obj = args.as_object();
+    let has_files = obj
+        .and_then(|o| o.get("files"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    let has_path = obj
+        .and_then(|o| o.get("path"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    let has_edits = obj
+        .and_then(|o| o.get("edits"))
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
+    if has_files && (has_path || has_edits) {
+        return ToolOutput::error(
+            "edit: provide EITHER `files` (multi-file form) OR `path` + `edits` (single-file form), not both. Top-level `path`/`edits` were sent alongside `files`.",
+        );
+    }
+    if !has_files && !has_path && !has_edits {
+        return ToolOutput::error(
+            "edit: missing arguments. Provide either `files: [{path, edits: [...]}, ...]` (multi-file form) or `path` + `edits: [...]` (single-file form).",
+        );
+    }
+
     let Some(files_arr) = args.get("files").and_then(|f| f.as_array()) else {
         return ToolOutput::error(
             "missing 'files' array (expected [{ path, edits: [{ old_text, new_text }, ...] }, ...])",
@@ -960,6 +995,74 @@ mod tests {
         assert!(result.is_error);
         // No `edits` and no `files` — execute reports the canonical 'files' miss.
         assert!(result.content[0].text().contains("files"));
+    }
+
+    #[test]
+    fn mixed_shapes_rejected_files_plus_path_and_edits() {
+        // Schema can't structurally forbid this anymore (Anthropic rejects
+        // top-level oneOf), so execute validates it at runtime.
+        let (_dir, path) = setup_file("hello world");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path to str"),
+                "edits": [{"old_text": "hello", "new_text": "goodbye"}],
+                "files": [{
+                    "path": path.to_str().expect("path to str"),
+                    "edits": [{"old_text": "hello", "new_text": "goodbye"}]
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        let msg = result.content[0].text();
+        assert!(
+            msg.contains("EITHER") || msg.contains("both"),
+            "error should mention mutual exclusion, got: {msg}"
+        );
+        // File untouched.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read result"),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn mixed_shapes_rejected_files_plus_path_only() {
+        // Even just a stray top-level `path` next to `files` is rejected.
+        let (_dir, path) = setup_file("hello world");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path to str"),
+                "files": [{
+                    "path": path.to_str().expect("path to str"),
+                    "edits": [{"old_text": "hello", "new_text": "goodbye"}]
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        let msg = result.content[0].text();
+        assert!(
+            msg.contains("EITHER") || msg.contains("both"),
+            "error should mention mutual exclusion, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read result"),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn empty_object_rejected() {
+        // Neither shape provided — must error with a clear message that
+        // names both shapes, since the schema can no longer enforce it.
+        let result = run_tool(serde_json::json!({}), "/tmp");
+        assert!(result.is_error);
+        let msg = result.content[0].text();
+        assert!(
+            msg.contains("files") && msg.contains("path"),
+            "error should reference both shapes, got: {msg}"
+        );
     }
 
     // --- multi-file behaviour --------------------------------------------
