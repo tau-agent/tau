@@ -33,10 +33,11 @@
 //! Other extensions return a per-file `no skeleton support for .<ext>; use
 //! \`read\` instead` error per spec.
 
+use super::tree_sitter_support::{self, Lang};
 use super::{ToolDef, ToolOutput};
 use std::collections::BTreeSet;
 use tau_agent_plugin::Tool;
-use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
+use tree_sitter::{QueryCursor, StreamingIterator};
 
 /// Maximum number of paths accepted in a single call. Mirrors `read`'s cap
 /// so the model has consistent budgeting between the two survey tools.
@@ -73,258 +74,6 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-/// Languages supported in v1. Each variant maps to a tree-sitter grammar
-/// + a query string of `@name.definition.*` captures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lang {
-    Rust,
-    Python,
-    JavaScript,
-    TypeScript,
-    Tsx,
-}
-
-impl Lang {
-    fn from_ext(ext: &str) -> Option<Self> {
-        match ext.to_ascii_lowercase().as_str() {
-            "rs" => Some(Self::Rust),
-            "py" | "pyi" => Some(Self::Python),
-            "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
-            "ts" => Some(Self::TypeScript),
-            "tsx" => Some(Self::Tsx),
-            _ => None,
-        }
-    }
-
-    fn language(self) -> tree_sitter::Language {
-        match self {
-            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
-            Self::Python => tree_sitter_python::LANGUAGE.into(),
-            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        }
-    }
-
-    fn query_src(self) -> &'static str {
-        match self {
-            Self::Rust => RUST_QUERY,
-            Self::Python => PYTHON_QUERY,
-            Self::JavaScript => JAVASCRIPT_QUERY,
-            Self::TypeScript | Self::Tsx => TYPESCRIPT_QUERY,
-        }
-    }
-}
-
-// ----- queries ---------------------------------------------------------
-//
-// Ported from Dirac's `src/services/tree-sitter/queries/{rust,python,
-// typescript,javascript}.ts`. We keep only the `@name.definition.*`
-// captures (and their accompanying `@doc` predicates) — the
-// `@name.reference` clauses for cross-references aren't needed for the
-// outline view and just slow the cursor down.
-
-const RUST_QUERY: &str = r#"
-;; Modules
-(
-  [(line_comment) (block_comment)]* @doc
-  .
-  (mod_item
-    name: (identifier) @name.definition.module) @definition.module
-)
-
-;; Structs
-(
-  [(line_comment) (block_comment)]* @doc
-  .
-  (struct_item
-    name: (type_identifier) @name.definition.class) @definition.class
-)
-
-;; Enums
-(
-  [(line_comment) (block_comment)]* @doc
-  .
-  (enum_item
-    name: (type_identifier) @name.definition.class) @definition.class
-)
-
-;; Traits
-(
-  [(line_comment) (block_comment)]* @doc
-  .
-  (trait_item
-    name: (type_identifier) @name.definition.interface) @definition.interface
-)
-
-;; Type aliases
-(
-  [(line_comment) (block_comment)]* @doc
-  .
-  (type_item
-    name: (type_identifier) @name.definition.type) @definition.type
-)
-
-;; Free functions
-(
-  [(line_comment) (block_comment)]* @doc
-  .
-  (function_item
-    name: (identifier) @name.definition.function) @definition.function
-)
-
-;; Function signatures (e.g. trait methods without a body, extern fn decls)
-(
-  [(line_comment) (block_comment)]* @doc
-  .
-  (function_signature_item
-    name: (identifier) @name.definition.function) @definition.function
-)
-
-;; Impl blocks (so the `impl Foo for Bar` line shows up as a header)
-(impl_item) @definition.impl
-
-;; Methods (functions inside impl blocks)
-(impl_item
-  body: (declaration_list
-    (function_item
-      name: (identifier) @name.definition.method) @definition.method))
-
-;; Trait methods (with body)
-(trait_item
-  body: (declaration_list
-    (function_item
-      name: (identifier) @name.definition.method) @definition.method))
-
-;; Trait method signatures (no body)
-(trait_item
-  body: (declaration_list
-    (function_signature_item
-      name: (identifier) @name.definition.method) @definition.method))
-
-;; Closures assigned to variables
-(let_declaration
-  pattern: (identifier) @name.definition.function
-  value: (closure_expression)) @definition.function
-"#;
-
-const PYTHON_QUERY: &str = r#"
-;; Classes
-(class_definition
-  name: (identifier) @name.definition.class) @definition.class
-
-;; Methods (functions inside classes)
-(class_definition
-  body: (block
-    (function_definition
-      name: (identifier) @name.definition.method) @definition.method))
-
-;; Top-level functions
-(function_definition
-  name: (identifier) @name.definition.function) @definition.function
-
-;; Decorated definitions
-(decorated_definition
-  definition: [
-    (class_definition
-      name: (identifier) @name.definition.class)
-    (function_definition
-      name: (identifier) @name.definition.function)
-  ]) @definition.symbol
-
-;; Lambdas assigned to variables
-(assignment
-  left: (identifier) @name.definition.function
-  right: (lambda)) @definition.function
-"#;
-
-const TYPESCRIPT_QUERY: &str = r#"
-(function_signature
-  name: (identifier) @name.definition.function) @definition.function
-
-(function_declaration
-  name: (identifier) @name.definition.function) @definition.function
-
-(method_signature
-  name: [(property_identifier) (identifier)] @name.definition.method) @definition.method
-
-(method_definition
-  name: [(property_identifier) (identifier)] @name.definition.method) @definition.method
-
-(abstract_method_signature
-  name: [(property_identifier) (identifier)] @name.definition.method) @definition.method
-
-(abstract_class_declaration
-  name: (type_identifier) @name.definition.class) @definition.class
-
-(class_declaration
-  name: (type_identifier) @name.definition.class) @definition.class
-
-(module
-  name: [(identifier) (string)] @name.definition.module) @definition.module
-
-(interface_declaration
-  name: (type_identifier) @name.definition.interface) @definition.interface
-
-(enum_declaration
-  name: (identifier) @name.definition.enum) @definition.enum
-
-(type_alias_declaration
-  name: (type_identifier) @name.definition.type) @definition.type
-
-;; Variable declarations with arrow functions or function expressions
-(lexical_declaration
-  (variable_declarator
-    name: (identifier) @name.definition.function
-    value: [(arrow_function) (function_expression)])) @definition.function
-
-(variable_declaration
-  (variable_declarator
-    name: (identifier) @name.definition.function
-    value: [(arrow_function) (function_expression)])) @definition.function
-
-;; Class properties with arrow functions
-(public_field_definition
-  name: [(property_identifier) (identifier)] @name.definition.method
-  value: [(arrow_function) (function_expression)]) @definition.method
-"#;
-
-const JAVASCRIPT_QUERY: &str = r#"
-(method_definition
-  name: [(property_identifier) (identifier)] @name.definition.method) @definition.method
-
-[
-  (class
-    name: (_) @name.definition.class)
-  (class_declaration
-    name: (_) @name.definition.class)
-] @definition.class
-
-[
-  (function_declaration
-    name: (identifier) @name.definition.function)
-  (generator_function_declaration
-    name: (identifier) @name.definition.function)
-] @definition.function
-
-;; Class fields with arrow functions
-(field_definition
-  property: (property_identifier) @name.definition.method
-  value: [(arrow_function) (function_expression)]) @definition.method
-
-;; Variable declarations with arrow functions / function expressions
-[
-  (lexical_declaration
-    (variable_declarator
-      name: (identifier) @name.definition.function
-      value: [(arrow_function) (function_expression)]))
-  (variable_declaration
-    (variable_declarator
-      name: (identifier) @name.definition.function
-      value: [(arrow_function) (function_expression)]))
-] @definition.function
-"#;
-
 // ----- extraction ------------------------------------------------------
 
 /// Parse `source` with `lang`'s grammar and return the *header lines* of
@@ -337,36 +86,29 @@ const JAVASCRIPT_QUERY: &str = r#"
 /// generics, return types, etc. — high-signal context for ~one line of
 /// output per definition.
 fn extract(source: &str, lang: Lang) -> Result<Vec<String>, String> {
-    let language = lang.language();
-    let mut parser = Parser::new();
-    parser
-        .set_language(&language)
-        .map_err(|e| format!("set_language: {e}"))?;
-    let tree = parser
-        .parse(source, None)
-        .ok_or_else(|| "tree-sitter parse failed".to_string())?;
-    let query =
-        Query::new(&language, lang.query_src()).map_err(|e| format!("query compile: {e}"))?;
+    let tree = tree_sitter_support::parse(lang, source)?;
+    let query = tree_sitter_support::query_for(lang);
 
     let mut cursor = QueryCursor::new();
     let mut rows: BTreeSet<usize> = BTreeSet::new();
     let lines: Vec<&str> = source.lines().collect();
     let capture_names = query.capture_names();
 
-    let mut it = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut it = cursor.matches(query, tree.root_node(), source.as_bytes());
     while let Some(m) = it.next() {
         for cap in m.captures {
             let name = capture_names
                 .get(cap.index as usize)
                 .copied()
                 .unwrap_or_default();
-            // Two kinds of captures contribute a row:
-            // 1. `@name.definition.*` — the identifier; its row is the
-            //    signature line.
-            // 2. `@definition.impl` — the whole `impl …` block; we want
-            //    its first row (the `impl Foo for Bar {` line). This is
-            //    Rust-specific since impls don't have a `name:` child.
-            if name.starts_with("name.definition") || name == "definition.impl" {
+            // The `@name.definition.*` capture sits on the identifier
+            // node naming the definition; its row is the signature line
+            // we want to render (`pub fn foo`, `class Foo:`, etc.). The
+            // shared Rust query also captures the implemented type on
+            // `impl Foo` blocks as `name.definition.class`, so the
+            // `impl Foo {` header line is picked up here too with no
+            // special-casing.
+            if name.starts_with("name.definition") {
                 rows.insert(cap.node.start_position().row);
             }
         }
@@ -396,7 +138,7 @@ fn skeleton_one(cwd: &str, path_str: &str) -> FileSkeleton {
         .and_then(|e| e.to_str())
         .unwrap_or_default();
 
-    let Some(lang) = Lang::from_ext(ext) else {
+    let Some(lang) = Lang::from_extension(ext) else {
         let msg = if ext.is_empty() {
             "no skeleton support for files without an extension; use `read` instead".to_string()
         } else {

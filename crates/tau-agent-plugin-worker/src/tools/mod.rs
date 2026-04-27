@@ -2,9 +2,11 @@
 
 pub mod bash;
 pub mod edit;
+pub mod get_function;
 pub mod line_hash;
 pub mod read;
 pub mod skeleton;
+pub mod tree_sitter_support;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -135,6 +137,7 @@ pub fn default_tools() -> Vec<ToolDef> {
         write::tool_def(),
         edit::tool_def(),
         skeleton::tool_def(),
+        get_function::tool_def(),
     ]
 }
 

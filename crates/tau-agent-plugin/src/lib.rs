@@ -65,5 +65,14 @@ pub fn default_tool_prompts() -> Vec<ToolPrompt> {
                 "Supports Rust, Python, JavaScript, TypeScript, and TSX. Other extensions return a per-file error suggesting `read` instead — partial success is fine, only an all-fail call is flagged as an error.".into(),
             ],
         },
+        ToolPrompt {
+            name: "get_function".into(),
+            snippet: "Extract complete bodies of named functions/methods from one or more files (tree-sitter)".into(),
+            guidelines: vec![
+                "Use get_function to drill into 1-2 specific functions in a large file instead of `read`-ing the whole thing.".into(),
+                "Function names support dot-paths for methods (`Foo.bar`, `ClassName.methodName`); `::` is also accepted for Rust. Bare names (`bar`) match any definition whose qualified name ends in `.bar` — multiple matches are returned together.".into(),
+                "Pairs with get_file_skeleton: skim the skeleton first, then pull bodies you actually need.".into(),
+            ],
+        },
     ]
 }
