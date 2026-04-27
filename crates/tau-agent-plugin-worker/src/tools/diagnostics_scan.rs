@@ -68,6 +68,13 @@ struct Summary {
     errors: usize,
     warnings: usize,
     info: usize,
+    /// Number of paths that were not scanned for any reason — missing
+    /// file, no provider for the extension, provider failed to launch,
+    /// scan cancelled, etc. Mirrors `files_skipped` and is exposed at
+    /// the same level as `errors` / `warnings` so callers can do a
+    /// uniform `summary.errors == 0 && summary.skipped == 0` check
+    /// without having to also inspect the `skipped[]` array.
+    skipped: usize,
     files_scanned: usize,
     files_skipped: usize,
 }
@@ -88,7 +95,7 @@ pub fn tool_def() -> ToolDef {
         tool: Tool {
             name: "diagnostics_scan".into(),
             description:
-                "Run lint/syntax diagnostics on the given files and return structured per-file results. Use this after edits instead of bashing project-wide `cargo check` / `tsc` / `ruff`.".into(),
+                "Run lint/syntax diagnostics on the given files and return structured per-file results. Use this after edits instead of bashing project-wide `cargo check` / `tsc` / `ruff`.\n\nFiles that don't exist, have no registered diagnostics provider for their extension, or whose provider fails to launch are reported in `skipped[]` rather than raising a tool error. Check `summary.skipped` (or `skipped.length`) before trusting `summary.errors == 0` — a typo'd path lands in `skipped[]` with `summary.errors == 0`.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -138,6 +145,7 @@ fn execute(args: serde_json::Value, cwd: &str, cancel: &CancelToken) -> ToolOutp
             errors: 0,
             warnings: 0,
             info: 0,
+            skipped: 0,
             files_scanned: 0,
             files_skipped: 0,
         },
@@ -229,6 +237,7 @@ fn finalize(result: &mut ScanResult) {
     result.summary.warnings = warnings;
     result.summary.info = info;
     result.summary.files_skipped = result.skipped.len();
+    result.summary.skipped = result.skipped.len();
 }
 
 fn render(result: &ScanResult) -> ToolOutput {
@@ -1171,6 +1180,48 @@ mod tests {
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0]["path"], "does_not_exist.rs");
         assert_eq!(skipped[0]["reason"], "file not found");
+        // Summary should surface the skip count at the same level as
+        // errors/warnings so a naive `errors == 0` check doesn't pass
+        // silently for typo'd paths.
+        let summary = body.get("summary").expect("summary");
+        assert_eq!(summary["errors"], 0);
+        assert_eq!(summary["skipped"], 1);
+        assert_eq!(summary["files_skipped"], 1);
+    }
+
+    #[test]
+    fn mixed_valid_and_missing_paths_reflect_in_summary() {
+        if !cargo_available() {
+            eprintln!("skipping: cargo not on PATH");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        write_cargo_crate(dir.path(), "pub fn ok() {}\n");
+
+        let out = execute(
+            json!({"paths": ["src/lib.rs", "missing.rs"]}),
+            &cwd_str(&dir),
+            &cancel(),
+        );
+        let body = decode(&out);
+        let skipped = body
+            .get("skipped")
+            .and_then(|v| v.as_array())
+            .expect("skipped");
+        assert!(
+            skipped.iter().any(|s| s["path"] == "missing.rs"),
+            "expected missing.rs in skipped, got: {:?}",
+            skipped
+        );
+        let summary = body.get("summary").expect("summary");
+        assert_eq!(summary["errors"], 0, "body: {}", body);
+        assert_eq!(summary["skipped"], 1, "body: {}", body);
+        assert_eq!(summary["files_skipped"], 1, "body: {}", body);
+        assert!(
+            summary["files_scanned"].as_u64().unwrap() >= 1,
+            "body: {}",
+            body
+        );
     }
 
     #[test]
