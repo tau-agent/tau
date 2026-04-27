@@ -1,6 +1,7 @@
 //! Tool definitions and execution for the agent loop.
 
 pub mod bash;
+pub mod diagnostics_scan;
 pub mod edit;
 pub mod get_function;
 pub mod line_hash;
@@ -138,6 +139,7 @@ pub fn default_tools() -> Vec<ToolDef> {
         edit::tool_def(),
         skeleton::tool_def(),
         get_function::tool_def(),
+        diagnostics_scan::tool_def(),
     ]
 }
 

@@ -13,11 +13,13 @@ description = "Default worker plugin for the tau agent — provides bash/edit/re
 
 [dependencies]
 tau-agent-plugin.workspace = true
+tau-agent-base.workspace = true
 async-trait.workspace = true
 smol.workspace = true
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 nix.workspace = true
 chrono.workspace = true
 tree-sitter = "0.25"

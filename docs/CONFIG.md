@@ -208,3 +208,114 @@ Look for the last `plugin.hook` span with no matching completion — that
 plugin is the culprit. `TAU_LOG=tau_agent_lib::plugin=debug` enables the
 `sending` / `returned` traces inside each hook span, making it obvious
 where in the round-trip the plugin got stuck.
+
+## Diagnostics scan (`diagnostics.toml`)
+
+The `diagnostics_scan` worker tool runs a configured linter / type-checker
+against specific files and returns structured per-file feedback. By
+default it ships with built-in support for Rust via `cargo check
+--message-format=json`; other languages are wired up through a config
+file.
+
+Resolution order (highest priority first):
+
+| Tier    | Path                                               |
+|---------|----------------------------------------------------|
+| Project | `{project}/.tau/diagnostics.toml`                  |
+| Global  | `~/.config/tau/diagnostics.toml`                   |
+
+The first tier where a file exists wins (no merging across tiers — pick
+one). When neither tier has a config, only the built-in Rust provider
+is active.
+
+### Schema
+
+```toml
+# Each [[providers]] entry maps a set of file extensions to a
+# diagnostics provider. The first matching provider wins; if a
+# `*.rs` provider is not declared, the built-in `rust-cargo-check`
+# is used automatically.
+
+[[providers]]
+extensions = ["rs"]
+builtin = "rust-cargo-check"  # the only built-in for v1
+
+[[providers]]
+extensions = ["py"]
+cmd = ["ruff", "check", "--output-format=json", "{file}"]
+format = "ruff-json"
+timeout_secs = 30
+name = "ruff"
+
+[[providers]]
+extensions = ["ts", "tsx"]
+cmd = ["npx", "tsc", "--noEmit", "--pretty", "false", "{file}"]
+format = "tsc-text"
+```
+
+Field reference:
+
+- `extensions` — list of file extensions (without leading dot, case
+  insensitive). Files whose extension is not covered by any provider
+  are reported as `skipped` with reason `no diagnostics provider for
+  .ext`.
+- `builtin` — name of a built-in provider. Currently the only valid
+  value is `"rust-cargo-check"`.
+- `cmd` — argv template for an external command. The literal token
+  `{file}` is substituted with the absolute file path; if no `{file}`
+  token is present, the path is appended as the last argument.
+- `cwd` — optional working directory (resolved relative to the
+  project root when not absolute). Defaults to the session cwd.
+- `format` — required when `cmd` is set. One of:
+  - `"cargo-json"` — `cargo`'s `compiler-message` JSON stream (one
+    JSON object per line).
+  - `"rustc-json"` — `rustc --error-format=json`. *Parser stub in
+    v1; emits a `TAU0002` "not yet implemented" diagnostic.*
+  - `"ruff-json"` — `ruff --output-format=json`. *Parser stub in v1.*
+  - `"tsc-text"` — `tsc --pretty false` text output. *Parser stub in
+    v1.*
+  - `"eslint-json"` — `eslint --format json`. *Parser stub in v1.*
+- `timeout_secs` — per-file hard timeout for the provider (default
+  60). On timeout the tool emits a `TAU0001` error diagnostic on
+  the file rather than failing the whole call.
+- `name` — optional human-readable identifier used in error messages
+  and to deduplicate command providers when scanning multiple files.
+
+### Output
+
+The tool returns a JSON document of the form:
+
+```json
+{
+  "summary": {"errors": 1, "warnings": 0, "info": 0,
+              "files_scanned": 1, "files_skipped": 1},
+  "diagnostics": [
+    {"path": "src/lib.rs", "line": 42, "column": 5,
+     "severity": "error", "code": "E0308",
+     "message": "mismatched types", "source": "rustc"}
+  ],
+  "skipped": [
+    {"path": "README.md", "reason": "no diagnostics provider for .md"}
+  ]
+}
+```
+
+`is_error` on the tool result is `false` even when diagnostics are
+present — the tool *succeeded*, the project has problems. `is_error`
+is reserved for genuine tool failures (the provider command not being
+on `PATH`, etc.), which surface as `skipped` entries.
+
+### Caveats
+
+- **`cargo check` cost**: the built-in Rust provider runs `cargo
+  check` over the entire workspace each call. This is typically 2–10 s
+  warm-cache for a tau-sized workspace. To trade accuracy for speed,
+  override the `*.rs` provider with a custom `cmd` (e.g. `cargo check
+  -p mycrate`).
+- **Cargo lock contention**: if you also have `cargo build` or another
+  `cargo check` running (e.g. from a `bash` tool call), the
+  `diagnostics_scan` invocation will serialize on the workspace
+  build-script lock. Avoid running both concurrently.
+- **Workspace detection**: the built-in walks up from each file to the
+  nearest `Cargo.toml` and prefers an ancestor with `[workspace]`.
+  Files with no `Cargo.toml` ancestor are reported as `skipped`.

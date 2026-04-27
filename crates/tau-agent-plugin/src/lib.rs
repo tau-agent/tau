@@ -74,5 +74,14 @@ pub fn default_tool_prompts() -> Vec<ToolPrompt> {
                 "Pairs with get_file_skeleton: skim the skeleton first, then pull bodies you actually need.".into(),
             ],
         },
+        ToolPrompt {
+            name: "diagnostics_scan".into(),
+            snippet: "Run lint/syntax diagnostics on specific files and get structured per-file feedback (built-in: Rust via cargo check; configurable via .tau/diagnostics.toml)".into(),
+            guidelines: vec![
+                "Use diagnostics_scan after edits to verify the file compiles/lints cleanly, instead of running full-project `cargo check` via bash.".into(),
+                "Pass only the files you actually changed; the tool resolves project context automatically.".into(),
+                "Output is structured JSON ({summary, diagnostics[], skipped[]}). is_error is false even when diagnostics are present — read the JSON to count errors.".into(),
+            ],
+        },
     ]
 }
