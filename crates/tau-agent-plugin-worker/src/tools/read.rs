@@ -7,6 +7,12 @@
 //! multi-path schema keep working without polluting the public schema shown
 //! to the model.
 //!
+//! Each line in the body is prefixed with `<hash>§<line>` (or
+//! `<hash>.<n>§<line>` for the 2nd+ identical line in a single file). Hash
+//! is FNV-1a 32-bit rendered as 8 lowercase hex chars. The model can use
+//! these anchors with the `edit` tool's anchor shape (`{edit_type, anchor,
+//! end_anchor?, text}`). See `super::line_hash` for the hashing module.
+//!
 //! Output:
 //! - **Single path** (after folding): bytes-for-bytes identical to the old
 //!   single-file format — body and summary unchanged. This is a regression
@@ -43,7 +49,7 @@ pub fn tool_def() -> ToolDef {
         tool: Tool {
             name: "read".into(),
             description:
-                "Read the contents of one or more files. Supports offset/limit for large files (applied per file)."
+                "Read the contents of one or more files. Supports offset/limit for large files (applied per file). Each line in the body is prefixed with `<hash>§` — a stable per-line anchor (FNV-1a 8 hex; `.n` suffix for duplicate lines) you can use with the `edit` tool's anchor shape."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -152,8 +158,14 @@ fn read_one(
         None => total,
     };
 
+    // Hash anchors are computed over the *whole file* so the disambiguator
+    // counts (`.2`, `.3`, ...) reflect the file as a whole, not just the
+    // visible slice. The model can then refer to any line in the file even
+    // if it's outside the offset/limit window of this particular read.
+    let all_anchors = super::line_hash::hash_lines_with_disambiguators(&lines);
     let selected = &lines[start..end];
-    let mut body = selected.join("\n");
+    let selected_anchors = &all_anchors[start..end];
+    let mut body = super::line_hash::format_hashed(selected, selected_anchors);
 
     if end < total {
         body.push_str(&format!(
@@ -384,9 +396,9 @@ mod tests {
 
     #[test]
     fn legacy_single_path_shape_matches_old_format() {
-        // Byte-for-byte regression guard: legacy `{path: ..}` after the
-        // prepare hook must produce the same body/summary as the original
-        // single-file tool — no `===== ... =====` header, classic summary.
+        // Single-path (legacy fold) keeps the legacy summary format and
+        // header-less body. Each line now carries an `<hash>§` prefix —
+        // that is the only intentional change.
         let dir = tempfile::tempdir().expect("tempdir");
         let p = write_file(dir.path(), "f.txt", "line1\nline2\nline3\n");
         let p_str = p.to_str().expect("path str");
@@ -396,7 +408,10 @@ mod tests {
         let result = execute(prepared, "/tmp", &tau_agent_plugin::CancelToken::new());
         assert!(!result.is_error, "got: {:?}", result.content);
         let text = result.content[0].text().to_string();
-        assert_eq!(text, "line1\nline2\nline3");
+        let h1 = super::super::line_hash::fnv1a_8hex("line1");
+        let h2 = super::super::line_hash::fnv1a_8hex("line2");
+        let h3 = super::super::line_hash::fnv1a_8hex("line3");
+        assert_eq!(text, format!("{h1}§line1\n{h2}§line2\n{h3}§line3"));
         assert_eq!(
             result.summary.expect("summary"),
             format!("read: {} (3 lines)", p_str)
@@ -415,7 +430,7 @@ mod tests {
         let r = execute_tool(&tools, &tc, "/tmp", &tau_agent_plugin::CancelToken::new());
         assert!(!r.is_error);
         let body = r.content[0].text().to_string();
-        assert_eq!(body, "line1\nline2\nline3");
+        assert_eq!(body, format!("{h1}§line1\n{h2}§line2\n{h3}§line3"));
         assert_eq!(
             r.summary.expect("summary"),
             format!("read: {} (3 lines)", p_str)
@@ -442,13 +457,23 @@ mod tests {
         assert!(!result.is_error, "got: {:?}", result.content);
         let text = result.content[0].text().to_string();
         // short.txt with offset=2,limit=2 → s2, s3 (no continuation, end of file)
-        assert!(text.contains("s2\ns3"), "missing short slice in: {text}");
+        let hs2 = super::super::line_hash::fnv1a_8hex("s2");
+        let hs3 = super::super::line_hash::fnv1a_8hex("s3");
+        assert!(
+            text.contains(&format!("{hs2}§s2\n{hs3}§s3")),
+            "missing short slice in: {text}"
+        );
         assert!(
             !text.contains("[1 more lines"),
             "short.txt should not have continuation hint: {text}"
         );
         // long.txt with offset=2,limit=2 → l2, l3 + continuation hint (4 more)
-        assert!(text.contains("l2\nl3"), "missing long slice in: {text}");
+        let hl2 = super::super::line_hash::fnv1a_8hex("l2");
+        let hl3 = super::super::line_hash::fnv1a_8hex("l3");
+        assert!(
+            text.contains(&format!("{hl2}§l2\n{hl3}§l3")),
+            "missing long slice in: {text}"
+        );
         assert!(
             text.contains("[3 more lines in file. Use offset=4 to continue.]"),
             "missing continuation hint in: {text}"
@@ -605,5 +630,79 @@ mod tests {
         let input = serde_json::json!({"path": 42});
         let prepared = prepare_arguments(input.clone());
         assert_eq!(prepared, input);
+    }
+
+    // --- hash anchor output -----------------------------------------------
+
+    #[test]
+    fn hashed_output_uses_section_delimiter_per_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = write_file(dir.path(), "f.txt", "alpha\nbeta\n");
+        let p_str = p.to_str().expect("path");
+        let result = execute(
+            serde_json::json!({"paths": [p_str]}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error);
+        let text = result.content[0].text().to_string();
+        let h_alpha = super::super::line_hash::fnv1a_8hex("alpha");
+        let h_beta = super::super::line_hash::fnv1a_8hex("beta");
+        assert_eq!(text, format!("{h_alpha}§alpha\n{h_beta}§beta"));
+    }
+
+    #[test]
+    fn duplicate_lines_get_disambiguators() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Three identical lines → hash, hash.2, hash.3.
+        let p = write_file(dir.path(), "f.txt", "foo\nbar\nfoo\nfoo\n");
+        let p_str = p.to_str().expect("path");
+        let result = execute(
+            serde_json::json!({"paths": [p_str]}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error);
+        let text = result.content[0].text().to_string();
+        let h_foo = super::super::line_hash::fnv1a_8hex("foo");
+        let h_bar = super::super::line_hash::fnv1a_8hex("bar");
+        let expected = format!("{h_foo}§foo\n{h_bar}§bar\n{h_foo}.2§foo\n{h_foo}.3§foo");
+        assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn empty_file_produces_empty_body() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = write_file(dir.path(), "empty.txt", "");
+        let p_str = p.to_str().expect("path");
+        let result = execute(
+            serde_json::json!({"paths": [p_str]}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error);
+        let text = result.content[0].text().to_string();
+        assert_eq!(text, "");
+        let summary = result.summary.expect("summary");
+        assert_eq!(summary, format!("read: {} (0 lines)", p_str));
+    }
+
+    #[test]
+    fn anchors_consistent_across_offset_window() {
+        // The disambiguator counter must reflect the *whole file*, not just
+        // the visible slice. If the model sees the second occurrence of a
+        // duplicate line via offset=2, it must still see `<hash>.2`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = write_file(dir.path(), "f.txt", "foo\nfoo\nfoo\n");
+        let p_str = p.to_str().expect("path");
+        let result = execute(
+            serde_json::json!({"paths": [p_str], "offset": 2, "limit": 2}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error);
+        let text = result.content[0].text().to_string();
+        let h_foo = super::super::line_hash::fnv1a_8hex("foo");
+        assert_eq!(text, format!("{h_foo}.2§foo\n{h_foo}.3§foo"));
     }
 }

@@ -33,17 +33,23 @@ pub fn default_tool_prompts() -> Vec<ToolPrompt> {
         ToolPrompt {
             name: "read".into(),
             snippet: "Read file contents".into(),
-            guidelines: vec!["Use read to examine files instead of cat or sed.".into()],
+            guidelines: vec![
+                "Use read to examine files instead of cat or sed.".into(),
+                "Each line in the output is prefixed with `<hash>§` (or `<hash>.<n>§` for duplicate lines) — these are stable per-line anchors you can pass to the edit tool's anchor shape.".into(),
+            ],
         },
         ToolPrompt {
             name: "edit".into(),
-            snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call across one or more files".into(),
+            snippet: "Make precise file edits with exact text replacement or by line-anchor, including multiple disjoint edits in one call across one or more files".into(),
             guidelines: vec![
                 "Use edit for precise changes (old text must match exactly)".into(),
                 "When changing multiple separate locations in one file, use one edit call with edits[] instead of multiple edit calls".into(),
                 "For refactors that touch several files, batch them into one edit call using `files: [{path, edits: [...]}, ...]` instead of issuing one edit call per file.".into(),
                 "Each edits[].old_text is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.".into(),
                 "Keep edits[].old_text as small as possible while still being unique in the file. Do not pad with large unchanged regions.".into(),
+                "Anchor shape: `{edit_type: \"replace\"|\"insert_before\"|\"insert_after\", anchor, end_anchor?, text}`. `anchor` / `end_anchor` come from the read tool's `<hash>§` prefixes (the bare token or the full hashed line both work). `replace` is inclusive on both ends; omit `end_anchor` for a single-line replace.".into(),
+                "Prefer the anchor shape over `old_text` when whitespace is fiddly or the text appears more than once — anchors sidestep both problems.".into(),
+                "Anchors are validated against the file's current content. If you get an `anchor not found` error, re-read the file to get fresh anchors and try again.".into(),
             ],
         },
         ToolPrompt {

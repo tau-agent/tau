@@ -28,6 +28,7 @@
 //! N sequential single-file edit calls and the box ran out of disk halfway
 //! through.
 
+use super::line_hash::{extract_anchor_token, hash_lines_with_disambiguators};
 use super::{ToolDef, ToolOutput};
 use std::path::PathBuf;
 use tau_agent_plugin::Tool;
@@ -37,7 +38,7 @@ pub fn tool_def() -> ToolDef {
         tool: Tool {
             name: "edit".into(),
             description:
-                "Edit a file by replacing exact text. Each old_text must match exactly (including whitespace and newlines) and be unique in the file. Supports single edit or multiple disjoint edits in one call, including multiple disjoint edits in one call across one or more files."
+                "Edit a file by replacing exact text or by line-anchor. Each old_text must match exactly (including whitespace and newlines) and be unique in the file. Anchor edits use the `<hash>§` prefixes from the `read` tool's output and re-validate against current file contents. Supports single edit or multiple disjoint edits in one call across one or more files."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -48,22 +49,9 @@ pub fn tool_def() -> ToolDef {
                     },
                     "edits": {
                         "type": "array",
-                        "description": "One or more edits to apply in order. Each edit's old_text must be unique in the file. Single-file form: pair with `path`.",
+                        "description": "One or more edits to apply in order. Each edit must be either a legacy `{old_text, new_text}` (old_text unique in the file) or an anchor edit `{edit_type, anchor, end_anchor?, text}` (anchor copied from the read tool's `<hash>§` prefix). Edits must not overlap. Single-file form: pair with `path`.",
                         "minItems": 1,
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "old_text": {
-                                    "type": "string",
-                                    "description": "Exact text to find (must be unique in the file)"
-                                },
-                                "new_text": {
-                                    "type": "string",
-                                    "description": "Replacement text"
-                                }
-                            },
-                            "required": ["old_text", "new_text"]
-                        }
+                        "items": EDIT_ITEM_SCHEMA.clone()
                     },
                     "files": {
                         "type": "array",
@@ -79,14 +67,7 @@ pub fn tool_def() -> ToolDef {
                                 "edits": {
                                     "type": "array",
                                     "minItems": 1,
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "old_text": { "type": "string" },
-                                            "new_text": { "type": "string" }
-                                        },
-                                        "required": ["old_text", "new_text"]
-                                    }
+                                    "items": EDIT_ITEM_SCHEMA.clone()
                                 }
                             },
                             "required": ["path", "edits"]
@@ -104,9 +85,60 @@ pub fn tool_def() -> ToolDef {
     }
 }
 
-struct Edit {
-    old_text: String,
-    new_text: String,
+static EDIT_ITEM_SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+    serde_json::json!({
+        "type": "object",
+        "description": "Either a legacy text edit `{old_text, new_text}` or an anchor edit `{edit_type, anchor, end_anchor?, text}`.",
+        "properties": {
+            "old_text": {
+                "type": "string",
+                "description": "Legacy form: exact text to find (must be unique in the file)."
+            },
+            "new_text": {
+                "type": "string",
+                "description": "Legacy form: replacement text."
+            },
+            "edit_type": {
+                "type": "string",
+                "enum": ["replace", "insert_before", "insert_after"],
+                "description": "Anchor form: kind of edit. `replace` is inclusive on both ends."
+            },
+            "anchor": {
+                "type": "string",
+                "description": "Anchor form: line anchor (the `<hash>` or `<hash>.<n>` token from the read tool's prefix). The full hashed line `<hash>§<line>` is also accepted — everything from the first § onward is ignored."
+            },
+            "end_anchor": {
+                "type": "string",
+                "description": "Anchor form (replace only): end anchor for a multi-line range. Defaults to `anchor` when omitted (single-line replace). Inclusive."
+            },
+            "text": {
+                "type": "string",
+                "description": "Anchor form: text to insert or substitute. Multi-line text is supported as-is."
+            }
+        }
+    })
+});
+
+/// One edit, in either of the two accepted shapes.
+enum Edit {
+    /// Legacy `{old_text, new_text}` find-and-replace.
+    Legacy { old_text: String, new_text: String },
+    /// New anchor-based edit.
+    Anchor {
+        kind: AnchorKind,
+        anchor: String,
+        /// Only meaningful for [`AnchorKind::Replace`]; defaults to `anchor`
+        /// when the model omitted it.
+        end_anchor: String,
+        text: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AnchorKind {
+    Replace,
+    InsertBefore,
+    InsertAfter,
 }
 
 struct FileEdits {
@@ -116,6 +148,79 @@ struct FileEdits {
     /// Resolved absolute path used for read/write and duplicate detection.
     resolved: PathBuf,
     edits: Vec<Edit>,
+}
+
+/// A single edit's resolved line range on the original file. Both ends are
+/// inclusive 0-based line indices. For an insertion edit, both ends point
+/// at the anchor line itself — we use this to detect insertions colliding
+/// with each other or with a replace.
+struct EditPlan {
+    edit_index: usize,
+    line_start: usize,
+    line_end: usize,
+}
+
+/// Convert a `[byte_start, byte_end)` span on `content` to an inclusive
+/// `(line_start, line_end)` 0-based line range. Used to plot legacy
+/// `old_text` matches onto the per-file line grid for overlap detection.
+fn byte_span_to_line_span(content: &str, byte_start: usize, byte_end: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut line_start = 0usize;
+    let mut at_byte = 0usize;
+    let mut found_start = false;
+    for ch in content.chars() {
+        if !found_start && at_byte >= byte_start {
+            line_start = line;
+            found_start = true;
+        }
+        // `byte_end` is exclusive; the last consumed byte is at byte_end-1.
+        if at_byte >= byte_end.saturating_sub(1) {
+            return (line_start, line);
+        }
+        if ch == '\n' {
+            line += 1;
+        }
+        at_byte += ch.len_utf8();
+    }
+    if !found_start {
+        line_start = line;
+    }
+    (line_start, line)
+}
+
+/// Per-edit (added, removed) line counts for the summary line. The plan
+/// is used to recover the inclusive line range of an anchor `replace` so
+/// we can report removed lines accurately.
+fn edit_line_deltas(edit: &Edit, plan: &EditPlan) -> (usize, usize) {
+    match edit {
+        Edit::Legacy { old_text, new_text } => {
+            let added = if new_text.is_empty() {
+                0
+            } else {
+                new_text.lines().count().max(1)
+            };
+            let removed = if old_text.is_empty() {
+                0
+            } else {
+                old_text.lines().count().max(1)
+            };
+            (added, removed)
+        }
+        Edit::Anchor { kind, text, .. } => {
+            let text_lines = if text.is_empty() {
+                0
+            } else {
+                text.split('\n').count()
+            };
+            match kind {
+                AnchorKind::Replace => {
+                    let removed = plan.line_end - plan.line_start + 1;
+                    (text_lines, removed)
+                }
+                AnchorKind::InsertBefore | AnchorKind::InsertAfter => (text_lines, 0),
+            }
+        }
+    }
 }
 
 /// Fold legacy and single-file argument shapes into the canonical
@@ -216,22 +321,87 @@ fn execute(
 
         let mut edits = Vec::with_capacity(edits_arr.len());
         for (ei, edit) in edits_arr.iter().enumerate() {
-            let Some(old_text) = edit.get("old_text").and_then(|o| o.as_str()) else {
-                return ToolOutput::error(format!(
-                    "files[{}].edits[{}]: missing 'old_text'",
-                    fi, ei
-                ));
+            let edit_obj = match edit.as_object() {
+                Some(o) => o,
+                None => {
+                    return ToolOutput::error(format!(
+                        "files[{}].edits[{}]: expected object",
+                        fi, ei
+                    ));
+                }
             };
-            let Some(new_text) = edit.get("new_text").and_then(|n| n.as_str()) else {
-                return ToolOutput::error(format!(
-                    "files[{}].edits[{}]: missing 'new_text'",
-                    fi, ei
-                ));
-            };
-            edits.push(Edit {
-                old_text: old_text.to_string(),
-                new_text: new_text.to_string(),
-            });
+
+            // Anchor edits are detected by the presence of `edit_type`.
+            // Legacy edits use `old_text` + `new_text`. The two shapes are
+            // mutually exclusive on a per-edit basis.
+            if let Some(edit_type) = edit_obj.get("edit_type").and_then(|v| v.as_str()) {
+                let kind = match edit_type {
+                    "replace" => AnchorKind::Replace,
+                    "insert_before" => AnchorKind::InsertBefore,
+                    "insert_after" => AnchorKind::InsertAfter,
+                    other => {
+                        return ToolOutput::error(format!(
+                            "files[{}].edits[{}]: unknown edit_type '{}'; expected one of replace, insert_before, insert_after",
+                            fi, ei, other
+                        ));
+                    }
+                };
+                let Some(anchor_raw) = edit_obj.get("anchor").and_then(|v| v.as_str()) else {
+                    return ToolOutput::error(format!(
+                        "files[{}].edits[{}]: missing 'anchor'",
+                        fi, ei
+                    ));
+                };
+                let Some(text) = edit_obj.get("text").and_then(|v| v.as_str()) else {
+                    return ToolOutput::error(format!(
+                        "files[{}].edits[{}]: missing 'text'",
+                        fi, ei
+                    ));
+                };
+                let anchor = extract_anchor_token(anchor_raw).to_string();
+                if anchor.is_empty() {
+                    return ToolOutput::error(format!(
+                        "files[{}].edits[{}]: 'anchor' is empty after stripping line content",
+                        fi, ei
+                    ));
+                }
+                let end_anchor = match edit_obj.get("end_anchor").and_then(|v| v.as_str()) {
+                    Some(s) => {
+                        let t = extract_anchor_token(s).to_string();
+                        if t.is_empty() {
+                            return ToolOutput::error(format!(
+                                "files[{}].edits[{}]: 'end_anchor' is empty after stripping line content",
+                                fi, ei
+                            ));
+                        }
+                        t
+                    }
+                    None => anchor.clone(),
+                };
+                edits.push(Edit::Anchor {
+                    kind,
+                    anchor,
+                    end_anchor,
+                    text: text.to_string(),
+                });
+            } else {
+                let Some(old_text) = edit_obj.get("old_text").and_then(|o| o.as_str()) else {
+                    return ToolOutput::error(format!(
+                        "files[{}].edits[{}]: missing 'old_text' (or 'edit_type' for an anchor edit)",
+                        fi, ei
+                    ));
+                };
+                let Some(new_text) = edit_obj.get("new_text").and_then(|n| n.as_str()) else {
+                    return ToolOutput::error(format!(
+                        "files[{}].edits[{}]: missing 'new_text'",
+                        fi, ei
+                    ));
+                };
+                edits.push(Edit::Legacy {
+                    old_text: old_text.to_string(),
+                    new_text: new_text.to_string(),
+                });
+            }
         }
 
         let resolved = super::resolve_path(cwd, path_str);
@@ -275,56 +445,240 @@ fn execute(
     }
 
     // ---- Phase 4: validate every edit, aggregating errors ----
-    // Per-file: validate each edit's `old_text` is unique in that file's
-    // *original* content. Edits within a single file are required to be
-    // disjoint by the existing single-file contract (documented in the
-    // edit guidelines), so checking against the original is sound and
-    // matches today's single-file behaviour.
+    //
+    // For each file:
+    //  - Compute per-line anchor tokens once (with disambiguators) and an
+    //    index from token → line number.
+    //  - For each edit, resolve a line range `[start, end]` (inclusive) on
+    //    the file's *original* line vector. Anchor edits resolve via the
+    //    anchor map; legacy edits resolve via `find` on the rejoined
+    //    content and convert the byte span to a line span.
+    //  - Reject overlapping ranges within a file.
+    //  - Reject zero-match / multi-match legacy `old_text` (existing
+    //    behaviour preserved with the same error strings).
+    //  - Reject unknown / stale anchors with a clear "re-read" hint.
     let mut errors: Vec<String> = Vec::new();
+    // Per-file: the resolved line ranges, stored alongside their original
+    // edit index so we can drive apply order from this in Phase 5.
+    let mut per_file_ranges: Vec<Vec<EditPlan>> = Vec::with_capacity(files.len());
+
     for (fi, f) in files.iter().enumerate() {
         let content = &originals[fi];
-        for (ei, edit) in f.edits.iter().enumerate() {
-            let count = content.matches(&edit.old_text[..]).count();
-            // For single-file single-edit calls keep the legacy unlabelled
-            // error message ("old_text not found in /path") so error-string
-            // consumers (logs, tests downstream) don't see a regression.
-            let label = if files.len() == 1 && f.edits.len() == 1 {
+        // Split with `lines()` (drops trailing empty after final \n) so
+        // anchor numbering matches the read tool exactly.
+        let lines: Vec<&str> = content.lines().collect();
+        let anchor_tokens = hash_lines_with_disambiguators(&lines);
+        // token → line index. Tokens are unique by construction (the
+        // disambiguator ensures it), so a HashMap is sufficient.
+        let anchor_index: std::collections::HashMap<&str, usize> = anchor_tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.as_str(), i))
+            .collect();
+
+        let label_for = |ei: usize| -> String {
+            if files.len() == 1 && f.edits.len() == 1 {
                 String::new()
             } else if files.len() == 1 {
                 format!("edits[{}]: ", ei)
             } else {
                 format!("files[{}].edits[{}]: ", fi, ei)
-            };
-            if count == 0 {
-                errors.push(format!(
-                    "{}old_text not found in {}",
-                    label,
-                    f.resolved.display()
-                ));
-            } else if count > 1 {
-                errors.push(format!(
-                    "{}old_text found {} times in {}. Must be unique.",
-                    label,
-                    count,
-                    f.resolved.display()
-                ));
+            }
+        };
+
+        let mut plans: Vec<EditPlan> = Vec::with_capacity(f.edits.len());
+        for (ei, edit) in f.edits.iter().enumerate() {
+            match edit {
+                Edit::Legacy { old_text, .. } => {
+                    let count = content.matches(old_text.as_str()).count();
+                    if count == 0 {
+                        errors.push(format!(
+                            "{}old_text not found in {}",
+                            label_for(ei),
+                            f.resolved.display()
+                        ));
+                        continue;
+                    } else if count > 1 {
+                        errors.push(format!(
+                            "{}old_text found {} times in {}. Must be unique.",
+                            label_for(ei),
+                            count,
+                            f.resolved.display()
+                        ));
+                        continue;
+                    }
+                    // Translate the byte span to a line range for overlap
+                    // detection. Lines are 0-indexed here (internal use only);
+                    // we never surface them to the model.
+                    let byte_start = match content.find(old_text.as_str()) {
+                        Some(b) => b,
+                        None => continue, // unreachable given count == 1
+                    };
+                    let byte_end = byte_start + old_text.len();
+                    let (line_start, line_end) =
+                        byte_span_to_line_span(content, byte_start, byte_end);
+                    plans.push(EditPlan {
+                        edit_index: ei,
+                        line_start,
+                        line_end,
+                    });
+                }
+                Edit::Anchor {
+                    kind,
+                    anchor,
+                    end_anchor,
+                    ..
+                } => {
+                    let Some(&start_idx) = anchor_index.get(anchor.as_str()) else {
+                        errors.push(format!(
+                            "{}anchor `{}` not found in {}; re-read the file to get current anchors",
+                            label_for(ei),
+                            anchor,
+                            f.resolved.display()
+                        ));
+                        continue;
+                    };
+                    match kind {
+                        AnchorKind::Replace => {
+                            let Some(&end_idx) = anchor_index.get(end_anchor.as_str()) else {
+                                errors.push(format!(
+                                    "{}end_anchor `{}` not found in {}; re-read the file to get current anchors",
+                                    label_for(ei),
+                                    end_anchor,
+                                    f.resolved.display()
+                                ));
+                                continue;
+                            };
+                            if end_idx < start_idx {
+                                errors.push(format!(
+                                    "{}end_anchor `{}` precedes anchor `{}` in {}",
+                                    label_for(ei),
+                                    end_anchor,
+                                    anchor,
+                                    f.resolved.display()
+                                ));
+                                continue;
+                            }
+                            plans.push(EditPlan {
+                                edit_index: ei,
+                                line_start: start_idx,
+                                line_end: end_idx,
+                            });
+                        }
+                        AnchorKind::InsertBefore | AnchorKind::InsertAfter => {
+                            // Insertions don't consume lines for overlap
+                            // purposes — model them as a zero-width range
+                            // *between* lines, encoded as a single line
+                            // index for simplicity.
+                            plans.push(EditPlan {
+                                edit_index: ei,
+                                line_start: start_idx,
+                                line_end: start_idx,
+                            });
+                        }
+                    }
+                }
             }
         }
+
+        // Detect overlaps within this file. We only run the overlap check
+        // when at least one anchor edit is present in this file's batch —
+        // pure-legacy batches retain the prior behaviour of allowing two
+        // edits on the same physical line as long as both `old_text`s are
+        // unique (each `replacen` finds a single distinct byte span).
+        let any_anchor = f.edits.iter().any(|e| matches!(e, Edit::Anchor { .. }));
+        if errors.is_empty() && any_anchor {
+            let mut sorted: Vec<&EditPlan> = plans.iter().collect();
+            sorted.sort_by_key(|p| (p.line_start, p.line_end));
+            for w in sorted.windows(2) {
+                let a = w[0];
+                let b = w[1];
+                if a.line_end >= b.line_start {
+                    errors.push(format!(
+                        "{}overlaps with edits[{}] in {} (ranges {}-{} and {}-{})",
+                        label_for(b.edit_index),
+                        a.edit_index,
+                        f.resolved.display(),
+                        a.line_start + 1,
+                        a.line_end + 1,
+                        b.line_start + 1,
+                        b.line_end + 1,
+                    ));
+                }
+            }
+        }
+
+        per_file_ranges.push(plans);
     }
     if !errors.is_empty() {
         return ToolOutput::error(errors.join("\n"));
     }
 
     // ---- Phase 5: apply ----
-    // Run all edits per file against a working copy of the original, then
-    // write. Writes happen in input order; a disk error mid-batch leaves
-    // earlier files written and later ones not — see module docs.
+    //
+    // For each file: operate on a `Vec<String>` of lines, splice anchor
+    // edits in reverse line-index order so earlier indices stay stable,
+    // then rejoin and run any legacy `replacen` pass on the joined string.
+    // Trailing-newline preservation: if the original ended with \n, the
+    // updated file does too.
     let mut updated: Vec<String> = Vec::with_capacity(files.len());
     for (fi, f) in files.iter().enumerate() {
-        let mut content = originals[fi].clone();
-        for edit in &f.edits {
-            content = content.replacen(&edit.old_text, &edit.new_text, 1);
+        let original = &originals[fi];
+        let trailing_newline = original.ends_with('\n');
+        let mut lines: Vec<String> = original.lines().map(|s| s.to_string()).collect();
+
+        // Anchor edits, sorted by descending start so earlier-edit indices
+        // don't shift under our feet. We resolve the same line ranges we
+        // just validated (no re-validation needed).
+        let mut anchor_plans: Vec<&EditPlan> = per_file_ranges[fi]
+            .iter()
+            .filter(|p| matches!(f.edits[p.edit_index], Edit::Anchor { .. }))
+            .collect();
+        anchor_plans.sort_by(|a, b| b.line_start.cmp(&a.line_start));
+
+        for plan in anchor_plans {
+            let edit = &f.edits[plan.edit_index];
+            let Edit::Anchor { kind, text, .. } = edit else {
+                continue;
+            };
+            // `text` may itself be multi-line. We split on '\n' so the
+            // model doesn't have to think about line endings; an empty
+            // `text` means "delete" for replace, or "insert nothing" for
+            // the (unusual) insert case.
+            let new_lines: Vec<String> = if text.is_empty() {
+                Vec::new()
+            } else {
+                text.split('\n').map(|s| s.to_string()).collect()
+            };
+            match kind {
+                AnchorKind::Replace => {
+                    let _ = lines.splice(plan.line_start..=plan.line_end, new_lines);
+                }
+                AnchorKind::InsertBefore => {
+                    let _ = lines.splice(plan.line_start..plan.line_start, new_lines);
+                }
+                AnchorKind::InsertAfter => {
+                    let pos = plan.line_start + 1;
+                    let _ = lines.splice(pos..pos, new_lines);
+                }
+            }
         }
+
+        let mut content = lines.join("\n");
+        if trailing_newline {
+            content.push('\n');
+        }
+
+        // Legacy `old_text → new_text` edits run after anchor edits, on the
+        // rejoined string. Validation already proved each `old_text`
+        // existed exactly once and didn't overlap with any anchor edit; we
+        // run them in input order via `replacen(_, _, 1)`.
+        for edit in &f.edits {
+            if let Edit::Legacy { old_text, new_text } = edit {
+                content = content.replacen(old_text.as_str(), new_text.as_str(), 1);
+            }
+        }
+
         updated.push(content);
     }
 
@@ -342,22 +696,19 @@ fn execute(
     // ---- Phase 6: summarise ----
     let n_files = files.len();
     let total_edits: usize = files.iter().map(|f| f.edits.len()).sum();
-    let (total_added, total_removed): (usize, usize) = files.iter().fold((0, 0), |(a, r), f| {
-        f.edits.iter().fold((a, r), |(a, r), edit| {
-            (
-                a + if edit.new_text.is_empty() {
-                    0
-                } else {
-                    edit.new_text.lines().count().max(1)
-                },
-                r + if edit.old_text.is_empty() {
-                    0
-                } else {
-                    edit.old_text.lines().count().max(1)
-                },
-            )
-        })
-    });
+    let mut total_added = 0usize;
+    let mut total_removed = 0usize;
+    for (fi, f) in files.iter().enumerate() {
+        for (ei, edit) in f.edits.iter().enumerate() {
+            let plan = per_file_ranges[fi]
+                .iter()
+                .find(|p| p.edit_index == ei)
+                .expect("every edit has a plan after validation");
+            let (added, removed) = edit_line_deltas(edit, plan);
+            total_added += added;
+            total_removed += removed;
+        }
+    }
 
     if n_files == 1 {
         // Preserve byte-for-byte the existing single-file summary format so
@@ -887,5 +1238,430 @@ mod tests {
             std::fs::read_to_string(&path).expect("read result"),
             "ALPHA beta"
         );
+    }
+
+    // --- anchor-shape edits ----------------------------------------------
+
+    fn anchor(line: &str) -> String {
+        super::super::line_hash::fnv1a_8hex(line)
+    }
+
+    #[test]
+    fn anchor_replace_single_line() {
+        let (_dir, path) = setup_file("alpha\nbeta\ngamma\n");
+        let h_beta = anchor("beta");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": h_beta,
+                    "text": "BETA"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha\nBETA\ngamma\n"
+        );
+    }
+
+    #[test]
+    fn anchor_replace_range_inclusive() {
+        let (_dir, path) = setup_file("a\nb\nc\nd\ne\n");
+        let h_b = anchor("b");
+        let h_d = anchor("d");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": h_b,
+                    "end_anchor": h_d,
+                    "text": "X\nY"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        // Inclusive: b, c, d are removed; X, Y inserted.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "a\nX\nY\ne\n"
+        );
+    }
+
+    #[test]
+    fn anchor_replace_with_empty_text_deletes_range() {
+        let (_dir, path) = setup_file("a\nb\nc\n");
+        let h_b = anchor("b");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": h_b,
+                    "text": ""
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "a\nc\n");
+    }
+
+    #[test]
+    fn anchor_insert_before() {
+        let (_dir, path) = setup_file("a\nb\nc\n");
+        let h_b = anchor("b");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "insert_before",
+                    "anchor": h_b,
+                    "text": "X\nY"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "a\nX\nY\nb\nc\n"
+        );
+    }
+
+    #[test]
+    fn anchor_insert_after() {
+        let (_dir, path) = setup_file("a\nb\nc\n");
+        let h_b = anchor("b");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "insert_after",
+                    "anchor": h_b,
+                    "text": "X"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "a\nb\nX\nc\n"
+        );
+    }
+
+    #[test]
+    fn anchor_full_form_with_delimiter_accepted() {
+        // The model is allowed to copy the entire `<hash>§<line>` token
+        // straight from the read tool's output — we strip everything from
+        // the first § onward.
+        let (_dir, path) = setup_file("    def foo():\n    pass\n");
+        let h = anchor("    def foo():");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": format!("{}§    def foo():", h),
+                    "text": "    def bar():"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "    def bar():\n    pass\n"
+        );
+    }
+
+    #[test]
+    fn anchor_with_disambiguator() {
+        // Two identical lines — the second carries `<hash>.2`.
+        let (_dir, path) = setup_file("foo\nfoo\nbar\n");
+        let h_foo = anchor("foo");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": format!("{}.2", h_foo),
+                    "text": "FOO2"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "foo\nFOO2\nbar\n"
+        );
+    }
+
+    #[test]
+    fn anchor_unknown_rejected() {
+        let (_dir, path) = setup_file("alpha\nbeta\n");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": "deadbeef",
+                    "text": "X"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        let msg = result.content[0].text().to_string();
+        assert!(msg.contains("anchor `deadbeef` not found"), "got: {msg}");
+        assert!(msg.contains("re-read"), "got: {msg}");
+        // File unchanged.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha\nbeta\n"
+        );
+    }
+
+    #[test]
+    fn anchor_stale_hash_rejected() {
+        // Simulate "file changed since read": pass an anchor whose hash
+        // matches a *different* line in the current file. Validation must
+        // either find the token (then mismatch → error) or not find it
+        // (also error). Either way, the file must not be modified.
+        let (_dir, path) = setup_file("alpha\nbeta\n");
+        // Pretend the model read the file when it contained "old line" and
+        // is now passing that anchor. After the model's read the file was
+        // changed (here: it never contained "old line").
+        let stale = anchor("old line");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": stale,
+                    "text": "X"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        let msg = result.content[0].text().to_string();
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha\nbeta\n"
+        );
+    }
+
+    #[test]
+    fn anchor_replace_missing_end_anchor_defaults_to_single_line() {
+        let (_dir, path) = setup_file("a\nb\nc\n");
+        let h_b = anchor("b");
+        // No `end_anchor` → single-line replace at `anchor`.
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": h_b,
+                    "text": "B"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "a\nB\nc\n");
+    }
+
+    #[test]
+    fn anchor_replace_end_before_start_rejected() {
+        let (_dir, path) = setup_file("a\nb\nc\n");
+        let h_a = anchor("a");
+        let h_c = anchor("c");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": h_c,
+                    "end_anchor": h_a,
+                    "text": "X"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        let msg = result.content[0].text().to_string();
+        assert!(msg.contains("precedes"), "got: {msg}");
+        // File unchanged.
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn unknown_edit_type_rejected() {
+        let (_dir, path) = setup_file("a\n");
+        let h_a = anchor("a");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "clobber",
+                    "anchor": h_a,
+                    "text": "X"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        let msg = result.content[0].text().to_string();
+        assert!(msg.contains("unknown edit_type"), "got: {msg}");
+    }
+
+    #[test]
+    fn mixed_anchor_and_legacy_edits_in_one_call() {
+        let (_dir, path) = setup_file("alpha\nbeta\ngamma\ndelta\n");
+        let h_beta = anchor("beta");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [
+                    { "edit_type": "replace", "anchor": h_beta, "text": "BETA" },
+                    { "old_text": "delta", "new_text": "DELTA" }
+                ]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "alpha\nBETA\ngamma\nDELTA\n"
+        );
+    }
+
+    #[test]
+    fn overlapping_anchor_edits_rejected() {
+        let (_dir, path) = setup_file("a\nb\nc\nd\n");
+        let h_a = anchor("a");
+        let h_c = anchor("c");
+        let h_b = anchor("b");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [
+                    { "edit_type": "replace", "anchor": h_a, "end_anchor": h_c, "text": "X" },
+                    { "edit_type": "replace", "anchor": h_b, "text": "Y" }
+                ]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        let msg = result.content[0].text().to_string();
+        assert!(msg.contains("overlap"), "got: {msg}");
+        // File unchanged.
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "a\nb\nc\nd\n"
+        );
+    }
+
+    #[test]
+    fn anchor_edit_preserves_no_trailing_newline() {
+        // If the original file lacked a final \n, the rewrite must not add one.
+        let (_dir, path) = setup_file("alpha\nbeta");
+        let h_beta = anchor("beta");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{ "edit_type": "replace", "anchor": h_beta, "text": "BETA" }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "alpha\nBETA");
+    }
+
+    #[test]
+    fn anchor_edit_summary_tracks_added_removed_lines() {
+        // A 3-line replace with 2 lines of replacement → +2 -3.
+        let (_dir, path) = setup_file("a\nb\nc\nd\ne\n");
+        let h_b = anchor("b");
+        let h_d = anchor("d");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{
+                    "edit_type": "replace",
+                    "anchor": h_b,
+                    "end_anchor": h_d,
+                    "text": "X\nY"
+                }]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error);
+        let summary = result.summary.expect("summary");
+        assert!(summary.contains("+2 -3"), "got: {summary}");
+    }
+
+    #[test]
+    fn anchor_in_multifile_form() {
+        // Anchor edits work in the multi-file form too.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "alpha\nA\n").expect("write");
+        std::fs::write(&b, "beta\nB\n").expect("write");
+        let h_a = anchor("alpha");
+        let h_b = anchor("beta");
+        let result = run_tool(
+            serde_json::json!({
+                "files": [
+                    {"path": a.to_str().expect("path"),
+                     "edits": [{"edit_type": "replace", "anchor": h_a, "text": "ALPHA"}]},
+                    {"path": b.to_str().expect("path"),
+                     "edits": [{"edit_type": "replace", "anchor": h_b, "text": "BETA"}]}
+                ]
+            }),
+            "/tmp",
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(std::fs::read_to_string(&a).expect("read a"), "ALPHA\nA\n");
+        assert_eq!(std::fs::read_to_string(&b).expect("read b"), "BETA\nB\n");
+    }
+
+    #[test]
+    fn anchor_missing_text_rejected() {
+        let (_dir, path) = setup_file("a\n");
+        let h_a = anchor("a");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{"edit_type": "replace", "anchor": h_a}]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text().contains("missing 'text'"));
+    }
+
+    #[test]
+    fn anchor_missing_anchor_rejected() {
+        let (_dir, path) = setup_file("a\n");
+        let result = run_tool(
+            serde_json::json!({
+                "path": path.to_str().expect("path"),
+                "edits": [{"edit_type": "replace", "text": "X"}]
+            }),
+            "/tmp",
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text().contains("missing 'anchor'"));
     }
 }

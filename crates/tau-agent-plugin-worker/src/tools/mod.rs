@@ -2,6 +2,7 @@
 
 pub mod bash;
 pub mod edit;
+pub mod line_hash;
 pub mod read;
 pub mod write;
 
