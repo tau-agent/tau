@@ -154,6 +154,18 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_mentions_multi_file_edit_batching() {
+        // Regression guard: future edits to the prompt must keep the
+        // multi-file batching guidance, otherwise the model will silently
+        // revert to one edit-call per file.
+        let prompt = build_default(None);
+        assert!(
+            prompt.contains("files: [{path, edits: [...]}"),
+            "expected multi-file edit guidance in prompt:\n{prompt}"
+        );
+    }
+
+    #[test]
     fn prompt_has_identity() {
         let prompt = build_default(None);
         assert!(prompt.contains("operating inside tau"));

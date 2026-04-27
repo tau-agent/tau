@@ -457,8 +457,17 @@ impl ToolRenderer for EditRenderer {
         width: u16,
     ) -> Vec<Line<'static>> {
         let bg = theme.tool_pending_style();
-        let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-        let lines = header_lines("edit", path, theme, bg, width);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        // Multi-file form: header per file. Single-file form: one header.
+        if let Some(files) = args.get("files").and_then(|f| f.as_array()) {
+            for file in files {
+                let path = file.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                lines.extend(header_lines("edit", path, theme, bg, width));
+            }
+        } else {
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+            lines.extend(header_lines("edit", path, theme, bg, width));
+        }
         wrap_tool_block(lines, bg, width)
     }
 
@@ -482,18 +491,35 @@ impl ToolRenderer for EditRenderer {
         } else {
             theme.tool_success_style()
         };
-        let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
 
-        let mut lines = header_lines("edit", path, theme, bg, width);
+        let mut lines: Vec<Line<'static>> = Vec::new();
 
-        // Render a diff-like view from edits
-        if let Some(edits) = args.get("edits").and_then(|e| e.as_array()) {
-            for edit in edits {
-                let old = edit.get("oldText").and_then(|t| t.as_str()).unwrap_or("");
-                let new = edit.get("newText").and_then(|t| t.as_str()).unwrap_or("");
-                let diff_lines = render_edit_diff(old, new, theme, bg);
-                let clamped = clamp_lines(&diff_lines, DEFAULT_MAX_LINES, theme);
-                lines.extend(clamped);
+        if let Some(files) = args.get("files").and_then(|f| f.as_array()) {
+            // Multi-file form: render header + diffs per file entry.
+            for file in files {
+                let path = file.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                lines.extend(header_lines("edit", path, theme, bg, width));
+                if let Some(edits) = file.get("edits").and_then(|e| e.as_array()) {
+                    for edit in edits {
+                        let old = edit.get("old_text").and_then(|t| t.as_str()).unwrap_or("");
+                        let new = edit.get("new_text").and_then(|t| t.as_str()).unwrap_or("");
+                        let diff_lines = render_edit_diff(old, new, theme, bg);
+                        let clamped = clamp_lines(&diff_lines, DEFAULT_MAX_LINES, theme);
+                        lines.extend(clamped);
+                    }
+                }
+            }
+        } else {
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+            lines.extend(header_lines("edit", path, theme, bg, width));
+            if let Some(edits) = args.get("edits").and_then(|e| e.as_array()) {
+                for edit in edits {
+                    let old = edit.get("old_text").and_then(|t| t.as_str()).unwrap_or("");
+                    let new = edit.get("new_text").and_then(|t| t.as_str()).unwrap_or("");
+                    let diff_lines = render_edit_diff(old, new, theme, bg);
+                    let clamped = clamp_lines(&diff_lines, DEFAULT_MAX_LINES, theme);
+                    lines.extend(clamped);
+                }
             }
         }
 

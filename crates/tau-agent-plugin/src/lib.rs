@@ -37,10 +37,11 @@ pub fn default_tool_prompts() -> Vec<ToolPrompt> {
         },
         ToolPrompt {
             name: "edit".into(),
-            snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call".into(),
+            snippet: "Make precise file edits with exact text replacement, including multiple disjoint edits in one call across one or more files".into(),
             guidelines: vec![
                 "Use edit for precise changes (old text must match exactly)".into(),
                 "When changing multiple separate locations in one file, use one edit call with edits[] instead of multiple edit calls".into(),
+                "For refactors that touch several files, batch them into one edit call using `files: [{path, edits: [...]}, ...]` instead of issuing one edit call per file.".into(),
                 "Each edits[].old_text is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.".into(),
                 "Keep edits[].old_text as small as possible while still being unique in the file. Do not pad with large unchanged regions.".into(),
             ],
