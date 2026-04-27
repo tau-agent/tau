@@ -35,9 +35,9 @@
 
 use super::tree_sitter_support::{self, Lang};
 use super::{ToolDef, ToolOutput};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use tau_agent_plugin::Tool;
-use tree_sitter::{QueryCursor, StreamingIterator};
+use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
 /// Maximum number of paths accepted in a single call. Mirrors `read`'s cap
 /// so the model has consistent budgeting between the two survey tools.
@@ -80,44 +80,286 @@ pub fn tool_def() -> ToolDef {
 /// every definition captured by the query, sorted by source position and
 /// deduped by start row.
 ///
-/// We intentionally emit the source line containing each captured name
-/// node rather than reconstructing a trimmed signature. That preserves
-/// indentation, attributes/decorators on the same line, `pub`, `async`,
-/// generics, return types, etc. — high-signal context for ~one line of
-/// output per definition.
+/// We render one logical line per definition: the slice of source from
+/// the start of the definition node up to (but not including) its body
+/// (`{` for Rust/JS/TS, the indented block after `:` for Python). When
+/// that signature spans multiple physical lines — the common case for
+/// long Rust function signatures with one parameter per line — we join
+/// them onto a single virtual line, preserving the indentation of the
+/// first line and collapsing internal whitespace runs to a single space.
+/// Single-line signatures are emitted verbatim, byte-for-byte.
 fn extract(source: &str, lang: Lang) -> Result<Vec<String>, String> {
     let tree = tree_sitter_support::parse(lang, source)?;
     let query = tree_sitter_support::query_for(lang);
 
     let mut cursor = QueryCursor::new();
-    let mut rows: BTreeSet<usize> = BTreeSet::new();
+    // Map: row of the name node → rendered header line. BTreeMap keeps
+    // source order and dedupes when multiple query patterns fire on the
+    // same definition (e.g. trait method captured both as method and as
+    // function-signature). First write wins; later identical rows are
+    // ignored.
+    let mut headers: BTreeMap<usize, String> = BTreeMap::new();
     let lines: Vec<&str> = source.lines().collect();
     let capture_names = query.capture_names();
 
     let mut it = cursor.matches(query, tree.root_node(), source.as_bytes());
     while let Some(m) = it.next() {
+        // Each match emits at least one `name.definition.*` capture and
+        // one `definition.*` capture (modulo a couple of Python rules
+        // that use `@definition.symbol`). Pair them up: the name row is
+        // the dedupe key; the definition node bounds the signature.
+        let mut name_node: Option<Node> = None;
+        let mut def_node: Option<Node> = None;
         for cap in m.captures {
             let name = capture_names
                 .get(cap.index as usize)
                 .copied()
                 .unwrap_or_default();
-            // The `@name.definition.*` capture sits on the identifier
-            // node naming the definition; its row is the signature line
-            // we want to render (`pub fn foo`, `class Foo:`, etc.). The
-            // shared Rust query also captures the implemented type on
-            // `impl Foo` blocks as `name.definition.class`, so the
-            // `impl Foo {` header line is picked up here too with no
-            // special-casing.
             if name.starts_with("name.definition") {
-                rows.insert(cap.node.start_position().row);
+                // Multiple name captures in one match shouldn't happen
+                // in practice, but if they do prefer the first.
+                if name_node.is_none() {
+                    name_node = Some(cap.node);
+                }
+            } else if name.starts_with("definition") {
+                // Prefer the *smallest* enclosing definition — for the
+                // Python decorated_definition rule there is only one
+                // outer `@definition.symbol`, but for the Rust impl
+                // `name.definition.class` rule we want the impl_item
+                // itself, which is the only `@definition.*` capture.
+                def_node = Some(cap.node);
             }
+        }
+        let Some(name_node) = name_node else {
+            continue;
+        };
+        let row = name_node.start_position().row;
+        if headers.contains_key(&row) {
+            continue;
+        }
+        // Fall back to the name node when we somehow didn't get a
+        // `definition.*` capture — degrades gracefully to the old
+        // single-line behaviour.
+        let def_node = def_node.unwrap_or(name_node);
+        if let Some(line) = render_signature(source, &lines, lang, name_node, def_node) {
+            headers.insert(row, line);
         }
     }
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|r| lines.get(r).map(|s| s.to_string()))
-        .collect())
+    Ok(headers.into_values().collect())
+}
+
+/// Render the header line for `def_node`. The signature is the slice
+/// from the node's start byte through (and including) the body opener
+/// — `{` for braced languages, `:` for Python — or the entire node when
+/// there is no body (`pub type Alias = i32;`, trait method signatures).
+///
+/// If the signature fits on a single source line we emit that source
+/// line verbatim, preserving the trailing `}`/`;` a one-liner would
+/// have (e.g. `pub fn one() {}`). If it spans multiple lines we join
+/// them onto one virtual line: leading indentation of the first line is
+/// preserved, internal whitespace runs (including the linebreaks
+/// between argument-list lines) are collapsed to single spaces.
+fn render_signature(
+    source: &str,
+    lines: &[&str],
+    lang: Lang,
+    name_node: Node,
+    def_node: Node,
+) -> Option<String> {
+    // Back up to the start of the line so the leading indentation of
+    // the first signature line is included — tree-sitter's
+    // `start_byte()` skips leading whitespace, but the indent carries
+    // nesting information we want in the rendered header.
+    let start_byte = line_start_byte(source, def_node.start_byte());
+    let start_row = def_node.start_position().row;
+    let end_byte = signature_end_byte(source, lang, def_node)?;
+    if end_byte <= start_byte || end_byte > source.len() {
+        return Some(lines.get(name_node.start_position().row)?.to_string());
+    }
+    let raw = source.get(start_byte..end_byte)?;
+    if !raw.contains('\n') {
+        // Single-line signature: emit the *full* source line so any
+        // body that fits on the same line (e.g. `pub fn one() {}`,
+        // `pub fn first(&self) -> i32 { 1 }`) survives the strip.
+        return Some(lines.get(start_row)?.to_string());
+    }
+    Some(join_multiline(raw))
+}
+
+/// Walk back from `byte` to the byte just after the previous newline
+/// (or to 0 if `byte` is on the first line). The result is always a
+/// valid char boundary because `\n` is single-byte ASCII.
+fn line_start_byte(source: &str, byte: usize) -> usize {
+    let bytes = source.as_bytes();
+    let mut i = byte.min(bytes.len());
+    while i > 0 && bytes[i - 1] != b'\n' {
+        i -= 1;
+    }
+    i
+}
+
+/// Collapse a multi-line signature onto one virtual line.
+///
+/// Rules:
+/// - The leading indentation of the *first* line is preserved so the
+///   rendered header still conveys nesting depth.
+/// - Internal whitespace runs that span a newline are normalised: they
+///   collapse to nothing when the run is adjacent to a "joiner"
+///   character — i.e. immediately follows an opener (`(`, `[`, `{`) or
+///   immediately precedes a closer (`)`, `]`, `}`, `,`, `;`, `:`) —
+///   and to a single space otherwise. This produces a result that
+///   reads like a normally-formatted one-line signature: `fn foo(a, b)`
+///   not `fn foo( a, b )`.
+/// - Single-line whitespace runs (multiple spaces between tokens on the
+///   same source line) are left alone, so any deliberate human
+///   alignment within a single line survives.
+fn join_multiline(raw: &str) -> String {
+    const OPENERS: &[u8] = b"([{";
+    const CLOSERS: &[u8] = b")]},;:";
+
+    let bytes = raw.as_bytes();
+    let indent_len = bytes
+        .iter()
+        .take_while(|b| **b == b' ' || **b == b'\t')
+        .count();
+    let mut out = String::with_capacity(raw.len());
+    out.push_str(&raw[..indent_len]);
+
+    let rest = &raw[indent_len..];
+    let mut chars = rest.char_indices().peekable();
+    while let Some((idx, c)) = chars.next() {
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
+            // Consume the whole whitespace run.
+            let run_start = idx;
+            let mut has_newline = c == '\n' || c == '\r';
+            let mut run_end = idx + c.len_utf8();
+            while let Some(&(_, nc)) = chars.peek() {
+                if nc == ' ' || nc == '\t' || nc == '\n' || nc == '\r' {
+                    if nc == '\n' || nc == '\r' {
+                        has_newline = true;
+                    }
+                    let (i, ch) = chars.next().expect("peeked");
+                    run_end = i + ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if !has_newline {
+                // Pure intra-line whitespace — keep verbatim.
+                out.push_str(&rest[run_start..run_end]);
+                continue;
+            }
+            // Cross-line run: pick zero-or-one space based on neighbours.
+            let prev = out.as_bytes().last().copied();
+            let next = rest.as_bytes().get(run_end).copied();
+            let drop = match (prev, next) {
+                (Some(p), _) if OPENERS.contains(&p) => true,
+                (_, Some(n)) if CLOSERS.contains(&n) => true,
+                (None, _) => true,
+                _ => false,
+            };
+            if !drop {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Byte offset where the header line ends (exclusive). For definitions
+/// with a body block this is one byte past the body opener (`{` or `:`)
+/// so the rendered header includes that opener — matching how the
+/// previous line-based renderer presented things. For body-less
+/// definitions we use the end of the definition node.
+fn signature_end_byte(source: &str, lang: Lang, def_node: Node) -> Option<usize> {
+    if let Some(body) = direct_body(lang, def_node) {
+        return Some(body_opener_end(source, lang, def_node, body));
+    }
+    Some(def_node.end_byte())
+}
+
+/// Resolve the body block of `def_node`, looking through one level of
+/// indirection for wrapper nodes that don't expose a `body` field
+/// directly (Python `decorated_definition`, JS/TS variable declarations
+/// whose value is an arrow / function expression).
+fn direct_body<'tree>(lang: Lang, def_node: Node<'tree>) -> Option<Node<'tree>> {
+    if let Some(body) = def_node.child_by_field_name("body") {
+        return Some(body);
+    }
+    if matches!(lang, Lang::Python)
+        && let Some(inner) = def_node.child_by_field_name("definition")
+        && let Some(body) = inner.child_by_field_name("body")
+    {
+        return Some(body);
+    }
+    if matches!(lang, Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
+        && let Some(body) = find_value_body(def_node)
+    {
+        return Some(body);
+    }
+    None
+}
+
+/// Compute the byte offset just past the body opener (`{` for braced
+/// languages, `:` for Python). Falls back to `body.start_byte()` if we
+/// can't pinpoint the opener — the resulting header is then trimmed
+/// short of the brace, which is still readable.
+fn body_opener_end(source: &str, lang: Lang, def_node: Node, body: Node) -> usize {
+    match lang {
+        Lang::Python => {
+            // The `:` is an anonymous child of the class/function
+            // definition, sitting between the parameter list / name
+            // and the indented `block` body. Scan backwards from the
+            // body's start byte for the colon — robust to whitespace
+            // and comments between `:` and the indented block.
+            let bytes = source.as_bytes();
+            let upper = body.start_byte().min(bytes.len());
+            let lower = def_node.start_byte();
+            for i in (lower..upper).rev() {
+                if bytes[i] == b':' {
+                    return i + 1;
+                }
+            }
+            body.start_byte()
+        }
+        _ => {
+            // Braced languages: body starts at the `{`. Include it.
+            let bytes = source.as_bytes();
+            let start = body.start_byte();
+            if bytes.get(start) == Some(&b'{') {
+                start + 1
+            } else {
+                start
+            }
+        }
+    }
+}
+
+/// Walk into a JS/TS `lexical_declaration` / `variable_declaration` /
+/// `field_definition` looking for the body of an arrow / function
+/// expression on the right-hand side.
+fn find_value_body<'tree>(def_node: Node<'tree>) -> Option<Node<'tree>> {
+    // `field_definition` / `public_field_definition` carry `value`
+    // directly.
+    if let Some(value) = def_node.child_by_field_name("value")
+        && let Some(body) = value.child_by_field_name("body")
+    {
+        return Some(body);
+    }
+    // `lexical_declaration` / `variable_declaration` wrap one or more
+    // `variable_declarator` children, each of which carries `value`.
+    let mut cursor = def_node.walk();
+    for child in def_node.named_children(&mut cursor) {
+        if let Some(value) = child.child_by_field_name("value")
+            && let Some(body) = value.child_by_field_name("body")
+        {
+            return Some(body);
+        }
+    }
+    None
 }
 
 // ----- per-file dispatch -----------------------------------------------
@@ -662,5 +904,232 @@ pub fn charlie() {}
         let b = text.find("bravo").expect("bravo present");
         let c = text.find("charlie").expect("charlie present");
         assert!(a < b && b < c, "out of order:\n{text}");
+    }
+
+    // ---- multi-line signature joining --------------------------------
+
+    #[test]
+    fn rust_multi_line_function_signature_joined() {
+        // Mirrors the spec's `execute_tool` example: a top-level fn
+        // whose parameter list and return type wrap across several
+        // lines should collapse to one logical line in the skeleton.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = "\
+pub fn execute_tool(
+    tools: &[ToolDef],
+    tool_call: &ToolCall,
+    cwd: &str,
+    cancel: &CancelToken,
+) -> ToolResultMessage {
+    todo!()
+}
+
+pub fn one_liner() -> i32 { 7 }
+";
+        let p = write_file(dir.path(), "lib.rs", src);
+        let out = run(&[&p]);
+        assert!(!out.is_error, "out: {:?}", out.content);
+        let text = body(&out);
+        assert!(
+            text.contains(
+                "pub fn execute_tool(tools: &[ToolDef], tool_call: &ToolCall, cwd: &str, cancel: &CancelToken,) -> ToolResultMessage {"
+            ),
+            "missing joined signature in:\n{text}"
+        );
+        // Single-line signature must remain byte-for-byte unchanged.
+        assert!(
+            text.contains("pub fn one_liner() -> i32 { 7 }"),
+            "single-line signature corrupted in:\n{text}"
+        );
+        // The body line must not leak.
+        assert!(
+            !text.contains("todo!()"),
+            "skeleton leaked body in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn rust_multi_line_method_signature_joined_inside_impl() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = "\
+impl Foo {
+    pub fn long_method(
+        &self,
+        arg_one: i32,
+        arg_two: &str,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+";
+        let p = write_file(dir.path(), "lib.rs", src);
+        let out = run(&[&p]);
+        assert!(!out.is_error);
+        let text = body(&out);
+        assert!(
+            text.contains(
+                "    pub fn long_method(&self, arg_one: i32, arg_two: &str,) -> Result<(), Error> {"
+            ),
+            "missing joined method signature in:\n{text}"
+        );
+        assert!(
+            !text.contains("Ok(())"),
+            "skeleton leaked method body in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn rust_multi_line_trait_method_signature_joined() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = "\
+pub trait Big {
+    fn wrapped(
+        &self,
+        x: i32,
+    ) -> i32;
+}
+";
+        let p = write_file(dir.path(), "lib.rs", src);
+        let out = run(&[&p]);
+        assert!(!out.is_error);
+        let text = body(&out);
+        assert!(
+            text.contains("    fn wrapped(&self, x: i32,) -> i32;"),
+            "missing joined trait method sig in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn python_multi_line_def_signature_joined() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = "\
+def wide(
+    a,
+    b,
+    c,
+):
+    return a + b + c
+
+class C:
+    def m(
+        self,
+        x,
+    ):
+        return x
+";
+        let p = write_file(dir.path(), "thing.py", src);
+        let out = run(&[&p]);
+        assert!(!out.is_error);
+        let text = body(&out);
+        assert!(
+            text.contains("def wide(a, b, c,):"),
+            "missing joined def in:\n{text}"
+        );
+        assert!(
+            text.contains("    def m(self, x,):"),
+            "missing joined method in:\n{text}"
+        );
+        assert!(
+            !text.contains("return a + b + c"),
+            "skeleton leaked body in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn typescript_multi_line_function_and_method_joined() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = "\
+export function wide(
+  a: number,
+  b: number,
+): number {
+  return a + b;
+}
+
+export class K {
+  long(
+    x: number,
+    y: number,
+  ): number {
+    return x + y;
+  }
+}
+
+export function tight(z: number): number { return z; }
+";
+        let p = write_file(dir.path(), "thing.ts", src);
+        let out = run(&[&p]);
+        assert!(!out.is_error);
+        let text = body(&out);
+        assert!(
+            text.contains("export function wide(a: number, b: number,): number {"),
+            "missing joined fn in:\n{text}"
+        );
+        assert!(
+            text.contains("  long(x: number, y: number,): number {"),
+            "missing joined method in:\n{text}"
+        );
+        // Single-line stays untouched.
+        assert!(
+            text.contains("export function tight(z: number): number { return z; }"),
+            "single-line sig corrupted in:\n{text}"
+        );
+        assert!(
+            !text.contains("return a + b;"),
+            "skeleton leaked body in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn javascript_multi_line_function_joined() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = "\
+function wide(
+  a,
+  b,
+  c,
+) {
+  return a + b + c;
+}
+
+function tight(x) { return x; }
+";
+        let p = write_file(dir.path(), "thing.js", src);
+        let out = run(&[&p]);
+        assert!(!out.is_error);
+        let text = body(&out);
+        assert!(
+            text.contains("function wide(a, b, c,) {"),
+            "missing joined fn in:\n{text}"
+        );
+        assert!(
+            text.contains("function tight(x) { return x; }"),
+            "single-line sig corrupted in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn smoke_test_execute_tool_signature_in_worker_crate() {
+        // The spec calls out `execute_tool` in this crate's
+        // `tools/mod.rs` as the canonical multi-line signature that
+        // should now collapse onto one virtual line. Re-skeletonise it
+        // and assert the joined header is present — this guards both
+        // the join logic and the `definition.*` query plumbing.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("tools")
+            .join("mod.rs");
+        // If the file ever moves we want the test to flag it loudly
+        // rather than silently no-op.
+        assert!(path.is_file(), "missing source file: {}", path.display());
+        let out = run(&[&path]);
+        assert!(!out.is_error, "out: {:?}", out.content);
+        let text = body(&out);
+        assert!(
+            text.contains(
+                "pub fn execute_tool(tools: &[ToolDef], tool_call: &ToolCall, cwd: &str, cancel: &CancelToken,) -> ToolResultMessage {"
+            ),
+            "missing joined `execute_tool` signature in:\n{text}"
+        );
     }
 }
