@@ -4,6 +4,7 @@ pub mod bash;
 pub mod edit;
 pub mod line_hash;
 pub mod read;
+pub mod skeleton;
 pub mod write;
 
 use std::path::{Path, PathBuf};
@@ -133,6 +134,7 @@ pub fn default_tools() -> Vec<ToolDef> {
         read::tool_def(),
         write::tool_def(),
         edit::tool_def(),
+        skeleton::tool_def(),
     ]
 }
 

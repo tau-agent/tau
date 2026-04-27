@@ -57,5 +57,13 @@ pub fn default_tool_prompts() -> Vec<ToolPrompt> {
             snippet: "Create or overwrite files".into(),
             guidelines: vec!["Use write only for new files or complete rewrites.".into()],
         },
+        ToolPrompt {
+            name: "get_file_skeleton".into(),
+            snippet: "Quickly outline source files (classes / functions / methods, no bodies) using tree-sitter".into(),
+            guidelines: vec![
+                "Prefer get_file_skeleton over reading whole files when surveying a codebase — pass several paths in one call to skim 10 files for ~5% the tokens of reading them, then use `read` for the parts you need to see in full.".into(),
+                "Supports Rust, Python, JavaScript, TypeScript, and TSX. Other extensions return a per-file error suggesting `read` instead — partial success is fine, only an all-fail call is flagged as an error.".into(),
+            ],
+        },
     ]
 }
