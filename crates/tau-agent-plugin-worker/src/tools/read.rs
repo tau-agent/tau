@@ -1,35 +1,197 @@
-//! Read tool — read file contents.
+//! Read tool — read the contents of one or more files.
+//!
+//! Input shape is `paths: [string, ...]` with optional `offset` / `limit`
+//! applied per file. A pre-validation [`prepare_arguments`] hook silently
+//! folds the legacy single-path `{path, offset?, limit?}` shape into
+//! `{paths: [path], …}`, so resumed sessions whose history predates the
+//! multi-path schema keep working without polluting the public schema shown
+//! to the model.
+//!
+//! Output:
+//! - **Single path** (after folding): bytes-for-bytes identical to the old
+//!   single-file format — body and summary unchanged. This is a regression
+//!   guard for transcripts on resumed sessions.
+//! - **Multiple paths**: per-file sections, each headed by `===== <path> =====`,
+//!   separated by a blank line. A failed file renders an inline `error: …`
+//!   in its section but does not block other files (partial success). The
+//!   call is reported as an error only when *every* file failed.
+//!
+//! Caps:
+//! - At most [`MAX_PATHS`] paths per call.
+//! - At most [`MAX_TOTAL_BYTES`] bytes of file content (post offset/limit
+//!   slicing) returned across the whole call. When the cap is reached
+//!   mid-iteration, remaining files are replaced with a truncation marker.
+//!
+//! Duplicate paths are read independently and each occurrence counts against
+//! the byte cap on its own — the simplest behaviour, matches what the model
+//! probably expected.
 
 use super::{ToolDef, ToolOutput};
 use tau_agent_plugin::Tool;
+
+/// Maximum number of paths accepted in a single `read` call. Prevents the
+/// model from accidentally enumerating a whole tree.
+pub const MAX_PATHS: usize = 20;
+
+/// Maximum total bytes of file content returned across all paths in a single
+/// call (post offset/limit slicing). Once reached, remaining files are
+/// dropped with a truncation marker rather than ballooning the response.
+pub const MAX_TOTAL_BYTES: usize = 256 * 1024;
 
 pub fn tool_def() -> ToolDef {
     ToolDef {
         tool: Tool {
             name: "read".into(),
-            description: "Read the contents of a file. Supports offset/limit for large files."
-                .into(),
+            description:
+                "Read the contents of one or more files. Supports offset/limit for large files (applied per file)."
+                    .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path to the file to read"
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": MAX_PATHS,
+                        "description": "Paths to the files to read (1–20)."
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Line number to start reading from (1-indexed)"
+                        "description": "Line number to start reading from (1-indexed). Applied to each file independently."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of lines to read"
+                        "description": "Maximum number of lines to read per file."
                     }
                 },
-                "required": ["path"]
+                "required": ["paths"]
             }),
         },
         execute: Box::new(execute),
-        prepare_arguments: None,
+        prepare_arguments: Some(Box::new(prepare_arguments)),
+    }
+}
+
+/// Fold a legacy `{path: "..."}` tool-call argument into the multi-path
+/// `{paths: ["..."]}` shape. Used as the `prepare_arguments` hook so resumed
+/// sessions that recorded the old shape in their history validate cleanly.
+///
+/// If the input isn't an object, already carries a `paths` field, or has a
+/// non-string `path`, it is returned unchanged.
+fn prepare_arguments(mut args: serde_json::Value) -> serde_json::Value {
+    let Some(obj) = args.as_object_mut() else {
+        return args;
+    };
+
+    if obj.contains_key("paths") {
+        return args;
+    }
+
+    let Some(path_val) = obj.get("path") else {
+        return args;
+    };
+    if !path_val.is_string() {
+        return args;
+    }
+
+    let Some(path_val) = obj.remove("path") else {
+        return args;
+    };
+    obj.insert(
+        "paths".to_string(),
+        serde_json::Value::Array(vec![path_val]),
+    );
+
+    args
+}
+
+/// Per-file outcome — either a rendered body + summary fragment, or an
+/// inline error string to render in the file's section.
+struct FileRead {
+    /// Path string as the caller requested it (echoed back verbatim).
+    path_str: String,
+    /// On success: rendered body (joined lines + optional continuation hint).
+    /// On failure: `Err(message)` rendered as an inline `error: …` line.
+    body: Result<String, String>,
+    /// Total lines in the file (used for the multi-file summary). Zero on
+    /// error.
+    total_lines: usize,
+    /// Bytes the body contributes to the global byte cap. Zero on error.
+    bytes: usize,
+    /// `Some((start1, end))` when offset/limit selected a sub-range; used
+    /// for the single-file summary path. `None` for full reads or errors.
+    range: Option<(usize, usize)>,
+}
+
+fn read_one(
+    cwd: &str,
+    path_str: &str,
+    offset: usize,
+    limit: Option<usize>,
+    remaining_bytes: usize,
+) -> FileRead {
+    let path = super::resolve_path(cwd, path_str);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            return FileRead {
+                path_str: path_str.to_string(),
+                body: Err(format!("failed to read {}: {}", path.display(), e)),
+                total_lines: 0,
+                bytes: 0,
+                range: None,
+            };
+        }
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = (offset.max(1) - 1).min(total);
+    let end = match limit {
+        Some(l) => (start + l).min(total),
+        None => total,
+    };
+
+    let selected = &lines[start..end];
+    let mut body = selected.join("\n");
+
+    if end < total {
+        body.push_str(&format!(
+            "\n\n[{} more lines in file. Use offset={} to continue.]",
+            total - end,
+            end + 1,
+        ));
+    }
+
+    // Enforce the per-call byte cap by truncating this file's body if it
+    // would push past the remaining budget. We slice on a char boundary to
+    // keep `String` valid; the marker tells the model what happened.
+    let bytes = body.len();
+    let (body, bytes) = if bytes > remaining_bytes {
+        let mut cut = remaining_bytes.min(body.len());
+        while cut > 0 && !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut truncated: String = body[..cut].to_string();
+        truncated.push_str("\n\n[truncated: per-call byte cap reached]");
+        let trunc_bytes = truncated.len();
+        (truncated, trunc_bytes)
+    } else {
+        (body, bytes)
+    };
+
+    let range = if start == 0 && end == total {
+        None
+    } else {
+        Some((start + 1, end))
+    };
+
+    FileRead {
+        path_str: path_str.to_string(),
+        body: Ok(body),
+        total_lines: total,
+        bytes,
+        range,
     }
 }
 
@@ -38,15 +200,30 @@ fn execute(
     cwd: &str,
     _cancel: &tau_agent_plugin::CancelToken,
 ) -> ToolOutput {
-    let Some(path_str) = args.get("path").and_then(|p| p.as_str()) else {
-        return ToolOutput::error("missing 'path' argument");
+    let Some(paths_val) = args.get("paths") else {
+        return ToolOutput::error("missing 'paths' argument (expected an array of strings)");
     };
+    let Some(paths_arr) = paths_val.as_array() else {
+        return ToolOutput::error("'paths' must be an array of strings");
+    };
+    if paths_arr.is_empty() {
+        return ToolOutput::error("'paths' array is empty — provide at least one path");
+    }
+    if paths_arr.len() > MAX_PATHS {
+        return ToolOutput::error(format!(
+            "too many paths: {} (max {})",
+            paths_arr.len(),
+            MAX_PATHS
+        ));
+    }
 
-    let path = super::resolve_path(cwd, path_str);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => return ToolOutput::error(format!("failed to read {}: {}", path.display(), e)),
-    };
+    let mut paths: Vec<String> = Vec::with_capacity(paths_arr.len());
+    for (i, v) in paths_arr.iter().enumerate() {
+        let Some(s) = v.as_str() else {
+            return ToolOutput::error(format!("paths[{}] is not a string", i));
+        };
+        paths.push(s.to_string());
+    }
 
     let offset = args
         .get("offset")
@@ -58,36 +235,375 @@ fn execute(
         .and_then(|l| l.as_u64())
         .map(|l| l as usize);
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    let start = (offset - 1).min(total);
-    let end = match limit {
-        Some(l) => (start + l).min(total),
-        None => total,
-    };
+    let n_paths = paths.len();
+    let mut results: Vec<FileRead> = Vec::with_capacity(n_paths);
+    let mut used_bytes: usize = 0;
+    let mut cap_reached = false;
+    let mut skipped_after_cap: usize = 0;
 
-    let selected = &lines[start..end];
-    let mut result = selected.join("\n");
-
-    if end < total {
-        result.push_str(&format!(
-            "\n\n[{} more lines in file. Use offset={} to continue.]",
-            total - end,
-            end + 1,
-        ));
+    for path_str in &paths {
+        if cap_reached {
+            skipped_after_cap += 1;
+            continue;
+        }
+        let remaining = MAX_TOTAL_BYTES.saturating_sub(used_bytes);
+        let fr = read_one(cwd, path_str, offset, limit, remaining);
+        used_bytes = used_bytes.saturating_add(fr.bytes);
+        if used_bytes >= MAX_TOTAL_BYTES {
+            cap_reached = true;
+        }
+        results.push(fr);
     }
 
-    let summary = if start == 0 && end == total {
-        format!("read: {} ({} lines)", path_str, total)
+    // Render output. Single-path calls get the legacy format byte-for-byte.
+    if n_paths == 1 {
+        // Safe: we just pushed exactly one entry above.
+        let fr = results.into_iter().next().expect("one result for one path");
+        match fr.body {
+            Ok(body) => {
+                let summary = match fr.range {
+                    None => format!("read: {} ({} lines)", fr.path_str, fr.total_lines),
+                    Some((s, e)) => format!(
+                        "read: {} (lines {}-{}, {} total)",
+                        fr.path_str, s, e, fr.total_lines
+                    ),
+                };
+                ToolOutput::text(body).with_summary(summary)
+            }
+            Err(msg) => ToolOutput::error(msg),
+        }
     } else {
-        format!(
-            "read: {} (lines {}-{}, {} total)",
-            path_str,
-            start + 1,
-            end,
-            total
-        )
-    };
+        let mut out = String::new();
+        let mut total_lines = 0usize;
+        let mut errors = 0usize;
+        let mut successes = 0usize;
+        for (i, fr) in results.iter().enumerate() {
+            if i > 0 {
+                out.push_str("\n\n");
+            }
+            out.push_str(&format!("===== {} =====\n", fr.path_str));
+            match &fr.body {
+                Ok(body) => {
+                    out.push_str(body);
+                    total_lines += fr.total_lines;
+                    successes += 1;
+                }
+                Err(msg) => {
+                    out.push_str("error: ");
+                    out.push_str(msg);
+                    errors += 1;
+                }
+            }
+        }
+        if cap_reached && skipped_after_cap > 0 {
+            out.push_str(&format!(
+                "\n\n[truncated: byte cap reached, {} file(s) not read]",
+                skipped_after_cap
+            ));
+        }
 
-    ToolOutput::text(result).with_summary(summary)
+        let summary = if errors == 0 {
+            format!("read: {} files ({} total lines)", n_paths, total_lines)
+        } else {
+            format!(
+                "read: {} files ({} total lines, {} error{})",
+                n_paths,
+                total_lines,
+                errors,
+                if errors == 1 { "" } else { "s" }
+            )
+        };
+
+        let mut output = ToolOutput::text(out).with_summary(summary);
+        // Partial success is not an error; only flag the call as errored
+        // when *every* path failed.
+        output.is_error = successes == 0;
+        output
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_file(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, content).expect("write test file");
+        p
+    }
+
+    #[test]
+    fn multi_path_happy_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = write_file(dir.path(), "a.txt", "alpha-1\nalpha-2\n");
+        let b = write_file(dir.path(), "b.txt", "bravo-1\nbravo-2\nbravo-3\n");
+        let result = execute(
+            serde_json::json!({
+                "paths": [
+                    a.to_str().expect("a path"),
+                    b.to_str().expect("b path"),
+                ]
+            }),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        let text = result.content[0].text().to_string();
+        assert!(text.contains(&format!("===== {} =====", a.to_str().expect("a path"))));
+        assert!(text.contains(&format!("===== {} =====", b.to_str().expect("b path"))));
+        assert!(text.contains("alpha-1"));
+        assert!(text.contains("bravo-3"));
+        let summary = result.summary.expect("summary");
+        assert!(summary.starts_with("read: 2 files"), "got: {summary}");
+        assert!(summary.contains("5 total lines"), "got: {summary}");
+        assert!(!summary.contains("error"), "got: {summary}");
+    }
+
+    #[test]
+    fn partial_success_one_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = write_file(dir.path(), "a.txt", "alpha\n");
+        let missing = dir.path().join("missing.txt");
+        let result = execute(
+            serde_json::json!({
+                "paths": [
+                    a.to_str().expect("a path"),
+                    missing.to_str().expect("missing path"),
+                ]
+            }),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error, "partial success should not be error");
+        let text = result.content[0].text().to_string();
+        assert!(text.contains("alpha"));
+        assert!(text.contains("error: failed to read"));
+        let summary = result.summary.expect("summary");
+        assert!(summary.contains("1 error"), "got: {summary}");
+    }
+
+    #[test]
+    fn legacy_single_path_shape_matches_old_format() {
+        // Byte-for-byte regression guard: legacy `{path: ..}` after the
+        // prepare hook must produce the same body/summary as the original
+        // single-file tool — no `===== ... =====` header, classic summary.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = write_file(dir.path(), "f.txt", "line1\nline2\nline3\n");
+        let p_str = p.to_str().expect("path str");
+
+        // Drive through prepare_arguments + execute as the agent loop does.
+        let prepared = prepare_arguments(serde_json::json!({"path": p_str}));
+        let result = execute(prepared, "/tmp", &tau_agent_plugin::CancelToken::new());
+        assert!(!result.is_error, "got: {:?}", result.content);
+        let text = result.content[0].text().to_string();
+        assert_eq!(text, "line1\nline2\nline3");
+        assert_eq!(
+            result.summary.expect("summary"),
+            format!("read: {} (3 lines)", p_str)
+        );
+
+        // Also drive through execute_tool against default_tools() to exercise
+        // the wired-up prepare hook.
+        use super::super::{ToolDef, default_tools, execute_tool};
+        use tau_agent_plugin::ToolCall;
+        let tools: Vec<ToolDef> = default_tools();
+        let tc = ToolCall {
+            id: "tc1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": p_str}),
+        };
+        let r = execute_tool(&tools, &tc, "/tmp", &tau_agent_plugin::CancelToken::new());
+        assert!(!r.is_error);
+        let body = r.content[0].text().to_string();
+        assert_eq!(body, "line1\nline2\nline3");
+        assert_eq!(
+            r.summary.expect("summary"),
+            format!("read: {} (3 lines)", p_str)
+        );
+    }
+
+    #[test]
+    fn offset_and_limit_applied_per_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let short = write_file(dir.path(), "short.txt", "s1\ns2\ns3\n"); // 3 lines
+        let long = write_file(dir.path(), "long.txt", "l1\nl2\nl3\nl4\nl5\nl6\n"); // 6 lines
+        let result = execute(
+            serde_json::json!({
+                "paths": [
+                    short.to_str().expect("short path"),
+                    long.to_str().expect("long path"),
+                ],
+                "offset": 2,
+                "limit": 2,
+            }),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        let text = result.content[0].text().to_string();
+        // short.txt with offset=2,limit=2 → s2, s3 (no continuation, end of file)
+        assert!(text.contains("s2\ns3"), "missing short slice in: {text}");
+        assert!(
+            !text.contains("[1 more lines"),
+            "short.txt should not have continuation hint: {text}"
+        );
+        // long.txt with offset=2,limit=2 → l2, l3 + continuation hint (4 more)
+        assert!(text.contains("l2\nl3"), "missing long slice in: {text}");
+        assert!(
+            text.contains("[3 more lines in file. Use offset=4 to continue.]"),
+            "missing continuation hint in: {text}"
+        );
+    }
+
+    #[test]
+    fn path_count_cap_rejects() {
+        // 21 paths → top-level error, no files read.
+        let many: Vec<String> = (0..(MAX_PATHS + 1))
+            .map(|i| format!("/nonexistent/{i}.txt"))
+            .collect();
+        let result = execute(
+            serde_json::json!({"paths": many}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(result.is_error);
+        let msg = result.content[0].text().to_string();
+        assert!(msg.contains("too many paths"), "got: {msg}");
+    }
+
+    #[test]
+    fn total_byte_cap_truncates_remaining() {
+        // Three files where each is just under half the cap. The first two
+        // fit; the third gets dropped with a truncation marker.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big_line = "x".repeat(1024); // 1 KiB per line
+        let body = (0..120)
+            .map(|_| big_line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n"); // ~120 KiB per file
+        let a = write_file(dir.path(), "a.txt", &body);
+        let b = write_file(dir.path(), "b.txt", &body);
+        let c = write_file(dir.path(), "c.txt", &body);
+        let result = execute(
+            serde_json::json!({
+                "paths": [
+                    a.to_str().expect("a"),
+                    b.to_str().expect("b"),
+                    c.to_str().expect("c"),
+                ]
+            }),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error);
+        let text = result.content[0].text().to_string();
+        // c.txt was either truncated mid-body or skipped entirely with a
+        // marker. Either way, the global cap marker should appear OR the
+        // third file's body should carry the per-file truncation marker.
+        assert!(
+            text.contains("[truncated:"),
+            "expected a truncation marker in: {}…",
+            &text[..text.len().min(300)]
+        );
+    }
+
+    #[test]
+    fn all_paths_fail_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let m1 = dir.path().join("missing1.txt");
+        let m2 = dir.path().join("missing2.txt");
+        let result = execute(
+            serde_json::json!({
+                "paths": [
+                    m1.to_str().expect("m1"),
+                    m2.to_str().expect("m2"),
+                ]
+            }),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(result.is_error, "all-failed must be flagged as error");
+    }
+
+    #[test]
+    fn empty_paths_array_rejected() {
+        let result = execute(
+            serde_json::json!({"paths": []}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text().contains("empty"));
+    }
+
+    #[test]
+    fn non_string_path_entry_rejected() {
+        let result = execute(
+            serde_json::json!({"paths": ["ok.txt", 42]}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text().contains("paths[1]"));
+    }
+
+    #[test]
+    fn missing_paths_argument_rejected() {
+        let result = execute(
+            serde_json::json!({}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(result.is_error);
+        assert!(result.content[0].text().contains("paths"));
+    }
+
+    // --- prepare_arguments (legacy input fold) ---------------------------
+
+    #[test]
+    fn prepare_arguments_folds_legacy_path() {
+        let input = serde_json::json!({"path": "x.txt"});
+        let prepared = prepare_arguments(input);
+        assert_eq!(prepared, serde_json::json!({"paths": ["x.txt"]}));
+    }
+
+    #[test]
+    fn prepare_arguments_folds_legacy_path_with_offset_limit() {
+        let input = serde_json::json!({"path": "x.txt", "offset": 5, "limit": 10});
+        let prepared = prepare_arguments(input);
+        assert_eq!(
+            prepared,
+            serde_json::json!({"paths": ["x.txt"], "offset": 5, "limit": 10})
+        );
+    }
+
+    #[test]
+    fn prepare_arguments_passthrough_when_paths_present() {
+        let input = serde_json::json!({"paths": ["a.txt", "b.txt"]});
+        let prepared = prepare_arguments(input.clone());
+        assert_eq!(prepared, input);
+    }
+
+    #[test]
+    fn prepare_arguments_passthrough_when_paths_present_and_legacy_path_present() {
+        // If both shapes coexist (defensive), prefer the new shape and
+        // leave the legacy `path` field alone — downstream just uses paths.
+        let input = serde_json::json!({"paths": ["a.txt"], "path": "ignored.txt"});
+        let prepared = prepare_arguments(input.clone());
+        assert_eq!(prepared, input);
+    }
+
+    #[test]
+    fn prepare_arguments_passthrough_non_object() {
+        let input = serde_json::json!("not an object");
+        let prepared = prepare_arguments(input.clone());
+        assert_eq!(prepared, input);
+    }
+
+    #[test]
+    fn prepare_arguments_passthrough_non_string_path() {
+        let input = serde_json::json!({"path": 42});
+        let prepared = prepare_arguments(input.clone());
+        assert_eq!(prepared, input);
+    }
 }
