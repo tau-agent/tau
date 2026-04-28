@@ -414,16 +414,27 @@ impl App {
     /// Populate message history from stored messages (for session resume).
     pub fn restore_messages(&mut self, messages: &[Message]) {
         // Build a map of tool_call_id -> arguments from assistant messages
-        // so we can recover args when displaying ToolResult entries.
+        // so we can recover args when displaying ToolResult entries, and a
+        // set of tool_call_ids that already have a matching ToolResult so we
+        // can distinguish in-flight tool calls (no result yet) from completed
+        // ones when restoring transcript rows.
         let mut tool_call_args: std::collections::HashMap<&str, &serde_json::Value> =
             std::collections::HashMap::new();
+        let mut completed_tool_call_ids: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
         for msg in messages {
-            if let Message::Assistant(a) = msg {
-                for content in &a.content {
-                    if let AssistantContent::ToolCall(tc) = content {
-                        tool_call_args.insert(&tc.id, &tc.arguments);
+            match msg {
+                Message::Assistant(a) => {
+                    for content in &a.content {
+                        if let AssistantContent::ToolCall(tc) = content {
+                            tool_call_args.insert(&tc.id, &tc.arguments);
+                        }
                     }
                 }
+                Message::ToolResult(tr) => {
+                    completed_tool_call_ids.insert(tr.tool_call_id.as_str());
+                }
+                _ => {}
             }
         }
 
@@ -458,6 +469,28 @@ impl App {
                         .join("\n");
                     if !text.is_empty() {
                         self.messages.push(MessageItem::Assistant { text });
+                    }
+                    // Reconstruct an in-flight ToolActive row for every
+                    // persisted tool call that does not yet have a matching
+                    // ToolResult in the same history. This ensures that
+                    // session resume / session switch / picker close paths
+                    // (which all re-derive the transcript via this method)
+                    // keep the in-flight tool-call row visible, instead of
+                    // dropping it until the ToolResult finally arrives.
+                    for content in &assistant_msg.content {
+                        if let AssistantContent::ToolCall(tc) = content {
+                            if !completed_tool_call_ids.contains(tc.id.as_str()) {
+                                self.messages.push(MessageItem::ToolActive {
+                                    tool_call_id: tc.id.clone(),
+                                    name: tc.name.clone(),
+                                    args: tc.arguments.clone(),
+                                    output_lines: Vec::new(),
+                                    started_at: Self::instant_from_server_ms(
+                                        assistant_msg.timestamp,
+                                    ),
+                                });
+                            }
+                        }
                     }
                     self.totals.add(&assistant_msg.usage);
                 }
@@ -5794,6 +5827,280 @@ mod tests {
         app.restore_messages(&messages);
 
         assert_eq!(app.input_history, vec!["first message", "second message"]);
+        assert!(
+            app.messages
+                .iter()
+                .all(|m| !matches!(m, MessageItem::ToolActive { .. })),
+            "plain user messages must not produce ToolActive rows"
+        );
+    }
+
+    /// An assistant turn that contains a `ToolCall` content block but has
+    /// no matching `ToolResult` in the same persisted history must be
+    /// reconstructed as a `MessageItem::ToolActive` row, so that session
+    /// resume / session switch / picker close paths keep the in-flight
+    /// tool-call row visible in the transcript.
+    #[test]
+    fn restore_messages_emits_tool_active_for_unmatched_tool_call() {
+        use tau_agent_lib::types::ToolCall;
+
+        let mut app = make_app();
+        let mut asst = assistant_message("thinking aloud", StopReason::ToolUse, None);
+        asst.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"cmd": "sleep 30"}),
+        }));
+        let messages = vec![Message::Assistant(asst)];
+
+        app.restore_messages(&messages);
+
+        let actives: Vec<&MessageItem> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m, MessageItem::ToolActive { .. }))
+            .collect();
+        assert_eq!(
+            actives.len(),
+            1,
+            "unmatched ToolCall should produce exactly one ToolActive row, got {} (messages = {:?})",
+            actives.len(),
+            app.messages,
+        );
+        match actives[0] {
+            MessageItem::ToolActive {
+                tool_call_id,
+                name,
+                args,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "t1");
+                assert_eq!(name, "bash");
+                assert_eq!(args, &serde_json::json!({"cmd": "sleep 30"}));
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::ToolComplete { .. })),
+            "no ToolResult was persisted, so no ToolComplete row should be emitted"
+        );
+    }
+
+    /// A persisted `ToolCall` *with* a matching `ToolResult` must NOT
+    /// produce a `ToolActive` row — the existing `ToolComplete` path
+    /// already covers it. Otherwise we'd double-render the tool call.
+    #[test]
+    fn restore_messages_skips_tool_call_with_matching_result() {
+        use tau_agent_lib::types::{ToolCall, ToolResultContent};
+
+        let mut app = make_app();
+        let mut asst = assistant_message("", StopReason::ToolUse, None);
+        asst.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"cmd": "echo hi"}),
+        }));
+        let messages = vec![
+            Message::Assistant(asst),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "t1".to_string(),
+                tool_name: "bash".to_string(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "hi".to_string(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+                duration_ms: Some(42),
+                summary: None,
+                post_persist_actions: Vec::new(),
+            }),
+        ];
+
+        app.restore_messages(&messages);
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::ToolActive { .. })),
+            "a completed tool call must not produce a ToolActive row"
+        );
+        let completes: Vec<&MessageItem> = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m, MessageItem::ToolComplete { .. }))
+            .collect();
+        assert_eq!(
+            completes.len(),
+            1,
+            "a single ToolResult should produce exactly one ToolComplete row"
+        );
+    }
+
+    /// Mixed case: an assistant turn with two tool calls (`t1`, `t2`)
+    /// where only `t1` has a `ToolResult`. We must end up with one
+    /// `ToolComplete` for `t1` and one `ToolActive` for `t2`.
+    #[test]
+    fn restore_messages_handles_mixed_in_flight_and_completed_tool_calls() {
+        use tau_agent_lib::types::{ToolCall, ToolResultContent};
+
+        let mut app = make_app();
+        let mut asst = assistant_message("", StopReason::ToolUse, None);
+        asst.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"cmd": "echo done"}),
+        }));
+        asst.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "t2".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"cmd": "sleep 30"}),
+        }));
+        let messages = vec![
+            Message::Assistant(asst),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "t1".to_string(),
+                tool_name: "bash".to_string(),
+                content: vec![ToolResultContent::Text(TextContent {
+                    text: "done".to_string(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+                duration_ms: Some(10),
+                summary: None,
+                post_persist_actions: Vec::new(),
+            }),
+        ];
+
+        app.restore_messages(&messages);
+
+        let active_ids: Vec<&str> = app
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                MessageItem::ToolActive { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            active_ids,
+            vec!["t2"],
+            "only the unmatched tool call should produce a ToolActive row"
+        );
+
+        let complete_count = app
+            .messages
+            .iter()
+            .filter(|m| matches!(m, MessageItem::ToolComplete { .. }))
+            .count();
+        assert_eq!(
+            complete_count, 1,
+            "the completed tool call must produce exactly one ToolComplete row"
+        );
+    }
+
+    /// `ToolActive.started_at` is anchored to the assistant message's
+    /// server-side timestamp via `instant_from_server_ms`. Build an
+    /// assistant turn whose timestamp is ~5 seconds in the past and
+    /// assert the reconstructed row has `elapsed() >= 5s` (with a loose
+    /// upper bound to keep this resilient to clock skew on slow CI).
+    #[test]
+    fn restore_messages_started_at_close_to_assistant_timestamp() {
+        use tau_agent_lib::types::{ToolCall, timestamp_ms};
+
+        let mut app = make_app();
+        let now_ms = timestamp_ms();
+        let mut asst = assistant_message("", StopReason::ToolUse, None);
+        asst.timestamp = now_ms.saturating_sub(5_000);
+        asst.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({}),
+        }));
+        let messages = vec![Message::Assistant(asst)];
+
+        app.restore_messages(&messages);
+
+        let started_at = app
+            .messages
+            .iter()
+            .find_map(|m| match m {
+                MessageItem::ToolActive { started_at, .. } => Some(*started_at),
+                _ => None,
+            })
+            .expect("reconstructed ToolActive row should exist");
+        let elapsed = started_at.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_secs(4),
+            "started_at should anchor ~5s ago, got elapsed = {elapsed:?}"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_secs(60),
+            "started_at should not be wildly in the past (clock skew?), got elapsed = {elapsed:?}"
+        );
+    }
+
+    /// End-to-end regression: the original bug reproduces via
+    /// `switch_to_session`, which clears `app.messages` and rebuilds it
+    /// from server history. After the switch, an in-flight tool call
+    /// must still appear as a `ToolActive` row in the transcript.
+    #[test]
+    fn switch_to_session_preserves_in_flight_tool_call() {
+        use tau_agent_lib::protocol::{SessionInfo, SessionStats};
+        use tau_agent_lib::types::ToolCall;
+
+        let mut app = make_app();
+        let mut asst = assistant_message("", StopReason::ToolUse, None);
+        asst.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "t-inflight".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"cmd": "sleep 30"}),
+        }));
+        let messages = vec![Message::Assistant(asst)];
+
+        let info = SessionInfo {
+            id: "sess-other".to_string(),
+            model: "test-model".to_string(),
+            provider: "test".to_string(),
+            cwd: None,
+            message_count: 0,
+            stats: SessionStats::default(),
+            last_activity: 0,
+            parent_id: None,
+            child_count: 0,
+            child_budget: 0,
+            tagline: None,
+            state: "tool_exec".into(),
+            context_pct: None,
+            archived: false,
+            last_exit_status: None,
+            is_live: true,
+            project_name: None,
+            turn_started_at_ms: None,
+            phase_started_at_ms: None,
+        };
+
+        app.switch_to_session(&info, messages);
+
+        let active_ids: Vec<&str> = app
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                MessageItem::ToolActive { tool_call_id, .. } => Some(tool_call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            active_ids,
+            vec!["t-inflight"],
+            "in-flight tool call must survive a session switch (messages = {:?})",
+            app.messages,
+        );
     }
 
     // ---- retry countdown replace-in-place tests ----
