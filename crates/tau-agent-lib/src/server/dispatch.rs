@@ -964,6 +964,7 @@ pub(super) async fn handle_client(
                 // The connection stays open — we forward events via the channel.
                 // No ack is sent; the client waits for Stream/AgentDone/Cancelled.
                 let (tx, rx) = smol::channel::unbounded::<Response>();
+                let tx_for_cleanup = tx.clone();
                 {
                     let mut st = lock_state(&state);
                     st.subscribers
@@ -995,28 +996,77 @@ pub(super) async fn handle_client(
                 };
                 send(&mut writer, &phase_resp).await.ok();
 
-                // Forward events until the channel closes or client disconnects.
+                // Forward events until the channel closes, the client
+                // disconnects, or the server shuts down.
+                //
+                // We three-way `select` over: channel recv, shutdown notice,
+                // and the client's read half. The read half is included so
+                // that a TUI dropping its socket (close / session-switch /
+                // crash) wakes the loop immediately via EOF, rather than
+                // pinning the subscriber slot until the next broadcast.
+                // Subscribe consumes the connection, so we don't expect any
+                // further bytes from the client; if some arrive (protocol
+                // violation), we also exit and clean up.
                 loop {
-                    let resp = {
-                        let recv_fut = rx.recv();
-                        let shutdown_fut = shutdown_rx.recv();
-                        match futures::future::select(
-                            std::pin::pin!(recv_fut),
+                    let recv_fut = rx.recv();
+                    let shutdown_fut = shutdown_rx.recv();
+                    let read_fut = lines.next();
+                    let send_now = match futures::future::select(
+                        std::pin::pin!(recv_fut),
+                        futures::future::select(
                             std::pin::pin!(shutdown_fut),
-                        )
-                        .await
-                        {
-                            futures::future::Either::Left((Ok(resp), _)) => resp,
-                            futures::future::Either::Left((Err(_), _)) => break, // channel closed
-                            futures::future::Either::Right((Ok(msg), _)) => {
-                                send(&mut writer, &msg).await.ok();
-                                break;
-                            }
-                            futures::future::Either::Right((Err(_), _)) => break,
+                            std::pin::pin!(read_fut),
+                        ),
+                    )
+                    .await
+                    {
+                        futures::future::Either::Left((Ok(resp), _)) => Some(resp),
+                        futures::future::Either::Left((Err(_), _)) => None, // channel closed
+                        futures::future::Either::Right((
+                            futures::future::Either::Left((Ok(msg), _)),
+                            _,
+                        )) => {
+                            // Shutdown — try to forward the message, then exit.
+                            send(&mut writer, &msg).await.ok();
+                            None
+                        }
+                        futures::future::Either::Right((
+                            futures::future::Either::Left((Err(_), _)),
+                            _,
+                        )) => None,
+                        futures::future::Either::Right((
+                            futures::future::Either::Right((_read_outcome, _)),
+                            _,
+                        )) => {
+                            // Read-half resolved: either EOF (client closed),
+                            // an I/O error, or unexpected bytes after the
+                            // Subscribe request. All three are exit signals.
+                            None
                         }
                     };
-                    if send(&mut writer, &resp).await.is_err() {
-                        break; // client disconnected
+                    match send_now {
+                        Some(resp) => {
+                            if send(&mut writer, &resp).await.is_err() {
+                                break; // client disconnected mid-write
+                            }
+                        }
+                        None => break,
+                    }
+                }
+
+                // Always remove this handler's tx from the subscribers map
+                // on loop exit, regardless of cause. Without this, a quiet
+                // session whose only client disconnected would keep its
+                // (dead) subscriber forever, blocking the idle sweep from
+                // recycling the worker. Match by `same_channel` so we only
+                // drop our own tx, not someone else's clone.
+                {
+                    let mut st = lock_state(&state);
+                    if let Some(subs) = st.subscribers.get_mut(&session_id) {
+                        subs.retain(|t| !t.same_channel(&tx_for_cleanup));
+                        if subs.is_empty() {
+                            st.subscribers.remove(&session_id);
+                        }
                     }
                 }
                 break; // Subscribe consumes the connection
@@ -2349,4 +2399,179 @@ pub(super) async fn handle_client(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+    use crate::provider::ProviderRegistry;
+    use crate::server::state::State;
+    use crate::types::{Model, ModelCost, ThinkingStyle};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn mk_model() -> Model {
+        Model {
+            id: "test/test".into(),
+            name: "test".into(),
+            api: "anthropic".into(),
+            provider: "test".into(),
+            base_url: "".into(),
+            thinking: ThinkingStyle::default(),
+            cost: ModelCost::default(),
+            context_window: 100_000,
+            max_tokens: 4096,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn mk_state() -> SharedState {
+        let db = Db::open_memory().expect("open memory db");
+        Arc::new(Mutex::new(State {
+            db,
+            registry: ProviderRegistry::new(),
+            auth: crate::auth::AuthStorage::open_default(),
+            config: crate::config::Config::default(),
+            global_aliases: HashMap::new(),
+            default_model: mk_model(),
+            all_models: vec![mk_model()],
+            usage_cache: None,
+            cancel_flags: HashMap::new(),
+            has_queued: HashMap::new(),
+            subscribers: HashMap::new(),
+            phases: HashMap::new(),
+            live_sessions: HashSet::new(),
+            waited_sessions: HashSet::new(),
+            session_done_waiters: Vec::new(),
+            reply_waiters: HashMap::new(),
+            next_msg_id: 0,
+            bg_after_idle: HashMap::new(),
+            bg_scheduler: None,
+        }))
+    }
+
+    /// Subscribing then dropping the client socket without any broadcast
+    /// must clean up the subscriber entry within a bounded window. This
+    /// is the disconnect-EOF race: previously the forwarding loop could
+    /// only wake on `rx.recv()` or shutdown, leaving a dead `tx` clone
+    /// pinned in `state.subscribers[sid]` indefinitely on a quiet
+    /// session and blocking the idle sweep.
+    #[test]
+    fn subscriber_is_cleaned_up_on_client_disconnect() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = Arc::new(Mutex::new(crate::plugin::PluginManager::new(
+                crate::plugin::PluginsConfig {
+                    no_default_worker: true,
+                    ..Default::default()
+                },
+            )));
+            let shutdown = ShutdownHandle::new();
+            let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
+            let throttle = crate::throttle::ProviderThrottle::new();
+            let test_overrides: SharedTestOverrides =
+                Arc::new(super::super::TestOverrides::default());
+            let (bg_chat_tx, _bg_chat_rx) = smol::channel::unbounded::<(String, String)>();
+
+            let (client_std, server_std) =
+                std::os::unix::net::UnixStream::pair().expect("socketpair");
+            let server_async = Async::new(server_std).expect("async server stream");
+
+            let sid = "s-disconnect-test".to_string();
+            let state_for_handler = state.clone();
+            let handler_task = smol::spawn(async move {
+                let _ = handle_client(
+                    server_async,
+                    state_for_handler,
+                    plugins,
+                    shutdown,
+                    session_locks,
+                    throttle,
+                    test_overrides,
+                    bg_chat_tx,
+                )
+                .await;
+            });
+
+            // Send Subscribe request over the client end. We use a
+            // smol::Async wrapper so writes interleave cleanly with the
+            // server's task on the same executor.
+            let client_async = Async::new(client_std).expect("async client stream");
+            {
+                use futures::AsyncWriteExt;
+                let req = serde_json::to_string(&crate::protocol::Request::Subscribe {
+                    session_id: sid.clone(),
+                })
+                .expect("serialize subscribe");
+                let mut line = req;
+                line.push('\n');
+                let mut w = &client_async;
+                w.write_all(line.as_bytes()).await.expect("write subscribe");
+                w.flush().await.expect("flush");
+            }
+
+            // Wait for the subscriber to appear in state.subscribers.
+            // The handler registers it before sending the initial Phase
+            // event, so this should resolve within a few ms.
+            let appeared = {
+                let deadline = Instant::now() + Duration::from_millis(500);
+                loop {
+                    let count = lock_state(&state)
+                        .subscribers
+                        .get(&sid)
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    if count == 1 {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    smol::Timer::after(Duration::from_millis(5)).await;
+                }
+            };
+            assert!(
+                appeared,
+                "subscriber was not registered in state.subscribers"
+            );
+
+            // Drop the client end of the socket without any broadcast
+            // to the session. The server-side forwarding loop must
+            // notice the EOF on its read half and exit, removing the
+            // subscriber from the map.
+            drop(client_async);
+
+            // Within a bounded window, the entry must be gone.
+            let cleaned = {
+                let deadline = Instant::now() + Duration::from_millis(500);
+                loop {
+                    let still_present = lock_state(&state)
+                        .subscribers
+                        .get(&sid)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false);
+                    if !still_present {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    smol::Timer::after(Duration::from_millis(5)).await;
+                }
+            };
+            assert!(
+                cleaned,
+                "subscriber was not cleaned up within 500ms of client disconnect"
+            );
+
+            // Best-effort: let the handler task finish cleanly.
+            let _ = futures::future::select(
+                handler_task,
+                std::pin::pin!(smol::Timer::after(Duration::from_millis(200))),
+            )
+            .await;
+        });
+    }
 }
