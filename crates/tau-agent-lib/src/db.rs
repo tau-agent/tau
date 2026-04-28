@@ -310,6 +310,16 @@ impl Db {
         Ok(Self { conn })
     }
 
+    /// Borrow the underlying SQLite connection.
+    ///
+    /// This is intended for read-only analytics queries (see [`crate::profile`])
+    /// that don't fit cleanly behind a typed accessor on `Db`. Callers must not
+    /// mutate any tables owned by `Db` itself; views and idempotent
+    /// `CREATE VIEW IF NOT EXISTS` statements are fine.
+    pub fn conn(&self) -> &rusqlite::Connection {
+        &self.conn
+    }
+
     // ----- sessions -----
 
     /// Create a session. Does not insert any messages.

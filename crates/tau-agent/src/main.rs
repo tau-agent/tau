@@ -90,6 +90,56 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Analyse historical session timing (read-only)
+    #[command(alias = "prof")]
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// Bucket leaderboard: total / mean / p50 / p95 / max per bucket
+    Buckets {
+        /// Time window lower bound (e.g. `7d`, `24h`, `30m`, `2024-01-01`,
+        /// or a raw ms timestamp). Default: 30 days ago.
+        #[arg(long)]
+        since: Option<String>,
+        /// Time window upper bound. Defaults to "now".
+        #[arg(long)]
+        until: Option<String>,
+        /// Restrict to a project.
+        #[arg(long)]
+        project: Option<String>,
+        /// Restrict to a single session.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Slow events above a duration threshold
+    Slow {
+        /// Minimum duration (`30s`, `2m`, `1h`, or a raw ms count).
+        #[arg(long, default_value = "30s")]
+        min: String,
+        /// Cap on rows printed.
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Time window lower bound. Default: 30 days ago.
+        #[arg(long)]
+        since: Option<String>,
+        /// Time window upper bound. Defaults to "now".
+        #[arg(long)]
+        until: Option<String>,
+        /// Restrict to a project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Per-session bucket breakdown
+    Session {
+        /// Session ID
+        #[arg(add = ArgValueCandidates::new(completer::session_completer))]
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -589,6 +639,9 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
             ConfigAction::Reload => cmd_config_reload().await?,
             ConfigAction::Show => cmd_config_show(),
         },
+        Commands::Profile { action } => {
+            cmd_profile(action)?;
+        }
     }
     Ok(())
 }
@@ -2684,6 +2737,215 @@ fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `tau profile` — historical session timing analysis
+// ---------------------------------------------------------------------------
+
+fn cmd_profile(action: ProfileAction) -> tau_agent_lib::Result<()> {
+    let db = tau_agent_lib::db::Db::open_default()?;
+    let now_ms = tau_agent_lib::types::timestamp_ms() as i64;
+    let default_since = now_ms - 30 * 24 * 60 * 60 * 1_000;
+
+    match action {
+        ProfileAction::Buckets {
+            since,
+            until,
+            project,
+            session,
+        } => {
+            let since_ms = match since {
+                Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
+                None => Some(default_since),
+            };
+            let until_ms = match until {
+                Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
+                None => None,
+            };
+            let filter = tau_agent_lib::profile::ProfileFilter {
+                since_ms,
+                until_ms,
+                session_id: session,
+                project,
+                limit: 0,
+            };
+            let rows = tau_agent_lib::profile::buckets(&db, &filter)?;
+            print_buckets(&rows);
+        }
+        ProfileAction::Slow {
+            min,
+            limit,
+            since,
+            until,
+            project,
+        } => {
+            // `parse_since(d, 0)` returns `0 - d` for any `d`-style suffix
+            // duration; we negate to recover the duration in ms. For raw
+            // millisecond inputs the value is positive, also fine.
+            let min_ms =
+                tau_agent_lib::profile::parse_since(&min, 0).map(|v| if v < 0 { -v } else { v })?;
+            let since_ms = match since {
+                Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
+                None => Some(default_since),
+            };
+            let until_ms = match until {
+                Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
+                None => None,
+            };
+            let filter = tau_agent_lib::profile::ProfileFilter {
+                since_ms,
+                until_ms,
+                session_id: None,
+                project,
+                limit,
+            };
+            let rows = tau_agent_lib::profile::slow_events(&db, &filter, min_ms)?;
+            print_slow_events(&rows);
+        }
+        ProfileAction::Session { id } => {
+            print_session_breakdown(&db, &id)?;
+        }
+    }
+    Ok(())
+}
+
+fn fmt_dur(ms: i64) -> String {
+    if ms < 1_000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1_000.0)
+    } else if ms < 3_600_000 {
+        format!("{:.1}m", ms as f64 / 60_000.0)
+    } else {
+        format!("{:.2}h", ms as f64 / 3_600_000.0)
+    }
+}
+
+fn print_buckets(rows: &[tau_agent_lib::profile::BucketSummary]) {
+    if rows.is_empty() {
+        println!("(no events in window)");
+        return;
+    }
+    let bucket_w = rows
+        .iter()
+        .map(|r| r.bucket.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    println!(
+        "{:<width$}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "bucket",
+        "n",
+        "total",
+        "mean",
+        "p50",
+        "p95",
+        "max",
+        width = bucket_w,
+    );
+    for r in rows {
+        println!(
+            "{:<width$}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+            r.bucket,
+            r.n,
+            fmt_dur(r.total_ms),
+            fmt_dur(r.mean_ms.round() as i64),
+            fmt_dur(r.p50_ms),
+            fmt_dur(r.p95_ms),
+            fmt_dur(r.max_ms),
+            width = bucket_w,
+        );
+    }
+}
+
+fn print_slow_events(rows: &[tau_agent_lib::profile::SlowEvent]) {
+    if rows.is_empty() {
+        println!("(no slow events)");
+        return;
+    }
+    let session_w = rows
+        .iter()
+        .map(|r| r.session_id.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let bucket_w = rows
+        .iter()
+        .map(|r| r.bucket.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+    println!(
+        "{:<sw$}  {:>8}  {:<bw$}  {:>10}  {}",
+        "session",
+        "id",
+        "bucket",
+        "duration",
+        "detail",
+        sw = session_w,
+        bw = bucket_w,
+    );
+    for r in rows {
+        let detail = r.detail.as_deref().unwrap_or("");
+        // Single-line detail; truncate if outrageous.
+        let detail = detail.replace('\n', " ");
+        // Prepend an LLM-gen / tool-exec attribution hint for tool buckets.
+        let detail = if let Some(gen_ms) = r.llm_gen_ms {
+            let exec_ms = (r.dur_ms - gen_ms).max(0);
+            let prefix = format!(
+                "[≈{} LLM-gen, {} tool-exec] ",
+                fmt_dur(gen_ms),
+                fmt_dur(exec_ms),
+            );
+            format!("{}{}", prefix, detail)
+        } else {
+            detail
+        };
+        let detail = if detail.len() > 160 {
+            format!("{}…", &detail[..160])
+        } else {
+            detail
+        };
+        println!(
+            "{:<sw$}  {:>8}  {:<bw$}  {:>10}  {}",
+            r.session_id,
+            r.message_id,
+            r.bucket,
+            fmt_dur(r.dur_ms),
+            detail,
+            sw = session_w,
+            bw = bucket_w,
+        );
+    }
+}
+
+fn print_session_breakdown(
+    db: &tau_agent_lib::db::Db,
+    session_id: &str,
+) -> tau_agent_lib::Result<()> {
+    let rows = tau_agent_lib::profile::session_breakdown(db, session_id)?;
+    let total_ms: i64 = rows.iter().map(|r| r.total_ms).sum();
+    let total_msgs = db.message_count(session_id)?;
+    let total_cost = aggregate_session_cost(db, session_id)?;
+
+    println!(
+        "session {}: total={} messages={} cost=${:.4}",
+        session_id,
+        fmt_dur(total_ms),
+        total_msgs,
+        total_cost,
+    );
+    print_buckets(&rows);
+    Ok(())
+}
+
+/// Sum `usage.cost.total` over all messages in the session.
+fn aggregate_session_cost(
+    db: &tau_agent_lib::db::Db,
+    session_id: &str,
+) -> tau_agent_lib::Result<f64> {
+    tau_agent_lib::profile::session_cost_total(db, session_id)
 }
 
 #[cfg(test)]

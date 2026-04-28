@@ -6,6 +6,7 @@ pub mod logging;
 pub mod migration;
 pub mod models_config;
 pub mod plugin;
+pub mod profile;
 pub mod replay;
 pub mod server;
 pub mod shutdown;
