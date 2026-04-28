@@ -49,7 +49,7 @@ pub fn tool_def() -> ToolDef {
         tool: Tool {
             name: "read".into(),
             description:
-                "Read the contents of one or more files. Supports offset/limit for large files (applied per file). Each line in the body is prefixed with `<hash>§` — a stable per-line anchor (FNV-1a 8 hex; `.n` suffix for duplicate lines) you can use with the `edit` tool's anchor shape."
+                "Read the contents of one or more files. Supports offset/limit for large files (applied per file). Each line in the body is prefixed with `<hash>§` — a stable per-line anchor (FNV-1a 8 hex; `.n` suffix for duplicate lines) you can use with the `edit` tool's anchor shape. Prefer `get_file_skeleton` to outline a file's structure cheaply, or `get_function` to pull a specific function body, when you don't need the whole file."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
