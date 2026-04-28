@@ -872,9 +872,7 @@ impl TaskPhase {
                 build_initial_message(task, merge_target, project_instructions, checklist)
             }
             Self::Planner => build_planning_message(task, project_instructions, merge_target),
-            Self::Reviewer => {
-                build_review_message(task, project_instructions, merge_target, checklist)
-            }
+            Self::Reviewer => build_review_message(task, project_instructions, merge_target),
             Self::Refiner => build_refining_message(task, project_instructions, merge_target),
         }
     }
@@ -1294,12 +1292,15 @@ pub fn dispatch_review(
 }
 
 /// Build the initial message for a review session.
-fn build_review_message(
-    task: &Task,
-    project_instructions: &str,
-    merge_target: &str,
-    checklist: &[crate::tasks_merge::CheckItem],
-) -> String {
+///
+/// The reviewer's job is purely semantic: "does this diff match the spec's
+/// intent?". Mechanical checks (the project checklist — `just build`,
+/// `cargo test`, etc.) are run by the merge step after approval, not by the
+/// reviewer. A failing checklist bounces the task to `failed` where the
+/// worker can re-engage. Keeping the reviewer focused on semantics avoids
+/// the duplicate checklist run that used to consume 8-12 minutes of
+/// reviewer wall-clock per task.
+fn build_review_message(task: &Task, project_instructions: &str, merge_target: &str) -> String {
     let branch = task.branch.as_deref().unwrap_or("(unknown)");
     let worktree = task.worktree_path.as_deref().unwrap_or("(unknown)");
 
@@ -1314,35 +1315,6 @@ fn build_review_message(
         String::new()
     };
 
-    // Build the checklist sections for the review message.
-    // When non-empty: item 5 in the numbered list + a run-checks block.
-    // When empty: nothing — no extra lines, preserving the original spacing.
-    let checklist_item = if checklist.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n5. Run these project checks and verify they pass:\n{}",
-            checklist
-                .iter()
-                .map(|c| format!("   - `{}` ({})", c.command, c.name))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    };
-
-    let checklist_run_block = if checklist.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "Run these checks before making your decision:\n{}\n\n",
-            checklist
-                .iter()
-                .map(|c| format!("- `{}`", c.command))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    };
-
     let mut msg = format!(
         "You are REVIEWING task {id}: {title}\n\
          \n\
@@ -1355,14 +1327,20 @@ fn build_review_message(
          \n\
          ## Your mission\n\
          \n\
-         Review the work done on this task. Check:\n\
-         1. Does the implementation match the spec?\n\
-         2. Code quality, correctness, and completeness\n\
-         3. Are there any bugs or edge cases missed?\n\
-         4. Does the code follow project conventions?\
-         {checklist_item}\n\
+         Review the work done on this task. Focus on **semantic correctness** — \
+         does the implementation match the spec's intent? Do not run the project \
+         checklist (build/test/lint commands); the merge step runs it automatically \
+         after you approve, and a failing checklist will bounce the task to \
+         `failed` state where the worker can re-engage. Your job is the thing the \
+         merge step *can't* do: judging whether the change solves the problem the \
+         spec describes.\n\
          \n\
-         {checklist_run_block}\
+         Check:\n\
+         1. Does the implementation match the spec?\n\
+         2. Code quality, correctness, and obvious-bug review (logic errors, \
+         missed edge cases, unsafe assumptions).\n\
+         3. Does the code follow project conventions?\n\
+         \n\
          Examine the changes using git diff and read the modified files.\n\
          Use `bash` with `git diff {target}...HEAD` or similar to see all changes.\n\
          \n\
@@ -1376,8 +1354,6 @@ fn build_review_message(
         worktree = worktree,
         target = merge_target,
         nested = nested_warning,
-        checklist_item = checklist_item,
-        checklist_run_block = checklist_run_block,
     );
 
     if !project_instructions.is_empty() {
@@ -3288,40 +3264,36 @@ mod tests {
     }
 
     #[test]
-    fn test_build_review_message_empty_checklist() {
+    fn test_build_review_message_no_checklist_text() {
+        // Regression: reviewer must NOT mention checklist commands. The merge
+        // step runs the checklist; the reviewer's job is purely semantic.
         let mut task = make_task(22, 0, None);
         task.branch = Some("task-1-22".into());
         task.worktree_path = Some("/tmp/wt-22".into());
-        let msg = build_review_message(&task, "", "main", &[]);
-        // No checklist: should not mention any checklist or checks item 5.
-        assert!(!msg.contains("run the project checklist"));
-        assert!(!msg.contains("Run these project checks"));
-        // No extra blank lines.
+        let msg = build_review_message(&task, "", "main");
         assert!(
-            !msg.contains("\n\n\n"),
-            "extra blank line in empty-checklist review message"
+            !msg.contains("just build"),
+            "reviewer message should not mention `just build`"
         );
-    }
-
-    #[test]
-    fn test_build_review_message_with_checklist() {
-        let mut task = make_task(23, 0, None);
-        task.branch = Some("task-1-23".into());
-        task.worktree_path = Some("/tmp/wt-23".into());
-        let checklist = vec![crate::tasks_merge::CheckItem {
-            name: "test".into(),
-            command: "cargo test --workspace".into(),
-        }];
-        let msg = build_review_message(&task, "", "main", &checklist);
-        // Should include concrete check.
-        assert!(msg.contains("cargo test --workspace"));
-        assert!(msg.contains("Run these project checks"));
-        // Should NOT contain the old vague text.
-        assert!(!msg.contains("run the project checklist"));
+        assert!(
+            !msg.contains("cargo test"),
+            "reviewer message should not mention `cargo test`"
+        );
+        assert!(
+            !msg.contains("Run these checks"),
+            "reviewer message should not contain `Run these checks` block"
+        );
+        assert!(
+            !msg.contains("Run these project checks"),
+            "reviewer message should not contain `Run these project checks` item"
+        );
+        // Mission section explains the new boundary.
+        assert!(msg.contains("semantic correctness"));
+        assert!(msg.contains("the merge step runs it"));
         // No extra blank lines.
         assert!(
             !msg.contains("\n\n\n"),
-            "extra blank line in non-empty-checklist review message"
+            "extra blank line in reviewer message"
         );
     }
 
@@ -3330,7 +3302,7 @@ mod tests {
         let mut task = make_task(10, 0, None);
         task.branch = Some("task-14-10".into());
         task.worktree_path = Some("/tmp/wt-10".into());
-        let msg = build_review_message(&task, "", "task-1-5", &[]);
+        let msg = build_review_message(&task, "", "task-1-5");
         assert!(msg.contains("git diff task-1-5...HEAD"));
         assert!(!msg.contains("git diff main...HEAD"));
         // Branch and worktree must be stated.
@@ -4682,7 +4654,7 @@ mod tests {
         let mut task = make_task(10, 0, None);
         task.branch = Some("task-1-10".into());
         task.worktree_path = Some("/tmp/wt-10".into());
-        let msg = build_review_message(&task, "", "main", &[]);
+        let msg = build_review_message(&task, "", "main");
         assert!(msg.contains("REVIEWING task 10"));
         assert!(msg.contains("task_get"));
         assert!(msg.contains("git diff main...HEAD"));
@@ -4701,7 +4673,7 @@ mod tests {
         let mut task = make_task(10, 0, None);
         task.branch = Some("task-1-10".into());
         task.worktree_path = Some("/tmp/wt-10".into());
-        let msg = build_review_message(&task, "Check for SQL injection.", "main", &[]);
+        let msg = build_review_message(&task, "Check for SQL injection.", "main");
         assert!(msg.contains("Check for SQL injection"));
         assert!(msg.contains("Project-specific review instructions"));
     }
