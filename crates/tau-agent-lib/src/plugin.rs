@@ -732,8 +732,20 @@ impl PluginHandle {
         self.is_alive();
     }
 
-    /// Respawn the plugin process using the original command and cwd.
-    /// Preserves the existing registration.
+    /// Respawn the plugin process using the original command, cwd, and env.
+    ///
+    /// Reads a fresh `Register` message from the new child but **discards**
+    /// it — `self.registration` is left holding the value cached at the
+    /// initial spawn (see `PluginHandle::spawn`). Callers that read
+    /// `self.registration` (notably `tool_schemas`, `tool_prompts`,
+    /// `has_tool`, `has_hook`) therefore observe the original registration
+    /// even after a respawn.
+    ///
+    /// If the new registration differs from the original (tool list, hooks,
+    /// command name), the difference is silently ignored. This is fine for
+    /// the current set of plugins, all of which produce deterministic
+    /// registrations, but it is not enforced. See the `// Read registration`
+    /// comment in the body.
     pub fn respawn(&mut self) -> crate::Result<()> {
         if self.is_alive() {
             return Ok(()); // Already running
@@ -1683,6 +1695,11 @@ impl PluginManager {
 
     /// Send idle notifications to session plugins that have been inactive
     /// and have no active subscribers. Returns list of session IDs that were idled.
+    ///
+    /// Note: only session plugins are eligible for idling. Global plugins
+    /// (e.g. tasks) are long-lived and may hold stateful in-process workers
+    /// (e.g. the tasks merge queue) that must not be torn down on idle, so
+    /// `self.global_plugins` is intentionally excluded from this sweep.
     pub fn idle_sweep(
         &mut self,
         idle_timeout: std::time::Duration,

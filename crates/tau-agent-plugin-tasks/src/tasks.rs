@@ -3257,6 +3257,17 @@ pub fn run_tasks_plugin() {
                 );
             }
             PluginRequest::Idle => {
+                // Currently unreachable. The host's `idle_sweep` only sends
+                // `Idle` to *session* plugins; tasks is a *global* plugin
+                // and is never idled today. See
+                // `crates/tau-agent-lib/src/plugin.rs::PluginManager::idle_sweep`.
+                //
+                // If you ever wire global plugins into idling, this arm
+                // needs to gate on `MergeWorker` queue length
+                // (`tasks_merge_worker.rs`): exiting while a merge job is
+                // queued or in-flight drops the job when `MergeWorker`'s
+                // `Drop` shuts down its thread, losing the merge. Either
+                // refuse to exit while busy, or drain the queue first.
                 break;
             }
             PluginRequest::ServerResponse { .. } => {
