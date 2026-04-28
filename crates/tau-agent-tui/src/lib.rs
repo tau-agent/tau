@@ -903,9 +903,16 @@ async fn run_inner(
             break;
         }
 
-        // Only tick when streaming (spinner animation + throttled redraws).
+        // Tick when streaming OR when any tool call is still in flight.
+        // The bottom-bar phase counter is driven by `mode == Streaming`,
+        // but tool elapsed counters live on individual `ToolActive`
+        // entries and must keep ticking even if `mode` flickers out of
+        // Streaming for some reason. Belt-and-suspenders: an active tool
+        // alone is enough to keep redraws coming. When neither holds,
+        // ticking is false and the tick task sleeps in 500ms blocks (see
+        // events.rs) so idle CPU stays at zero.
         app.sync_streaming_timer();
-        event_loop.set_ticking(app.mode == AppMode::Streaming);
+        event_loop.set_ticking(app.mode == AppMode::Streaming || app.has_active_tool());
 
         // Periodic subscription usage refresh (every 60s)
         if app.totals.is_subscription

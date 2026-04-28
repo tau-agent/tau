@@ -2024,6 +2024,19 @@ impl App {
         }
     }
 
+    /// Returns `true` if any in-flight (streaming) tool call is currently
+    /// in the message list.
+    ///
+    /// Used by the main loop to keep the tick task alive (and thus drive
+    /// per-frame redraws) so the in-flight tool's `(elapsed …)` header
+    /// ticks up live, even if the app's `mode` has flickered out of
+    /// `Streaming` for some other reason.
+    pub fn has_active_tool(&self) -> bool {
+        self.messages
+            .iter()
+            .any(|m| matches!(m, MessageItem::ToolActive { .. }))
+    }
+
     /// Save current session state to navigation stack.
     pub fn save_nav_state(&mut self) {
         self.nav_stack.push(NavEntry {
@@ -6726,6 +6739,50 @@ mod tests {
                 MessageItem::Error { text } if text.contains("turn is running")
             )),
             "expected an Error message about a running turn"
+        );
+    }
+
+    /// `App::has_active_tool` returns true iff there is at least one
+    /// `MessageItem::ToolActive` in the message list — completed tools
+    /// (`ToolComplete`) and other variants don't count.
+    #[test]
+    fn has_active_tool_detects_in_flight_tools() {
+        let mut app = make_app();
+        // Empty message list: no active tool.
+        assert!(!app.has_active_tool(), "empty list has no active tool");
+
+        // Just an Assistant + ToolComplete: no active tool.
+        app.messages.push(MessageItem::Assistant {
+            text: "hi".to_string(),
+        });
+        app.messages.push(MessageItem::ToolComplete {
+            name: "bash".to_string(),
+            args: serde_json::json!({}),
+            output: String::new(),
+            is_error: false,
+            duration: Some(std::time::Duration::from_secs(1)),
+            summary: None,
+            expanded: false,
+        });
+        assert!(
+            !app.has_active_tool(),
+            "only completed tools => no active tool"
+        );
+
+        // Add a ToolActive in the middle: now true.
+        app.messages.push(MessageItem::ToolActive {
+            tool_call_id: "tc1".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({}),
+            output_lines: Vec::new(),
+            started_at: std::time::Instant::now(),
+        });
+        app.messages.push(MessageItem::Status {
+            text: "working".to_string(),
+        });
+        assert!(
+            app.has_active_tool(),
+            "a ToolActive anywhere in the list should be detected"
         );
     }
 }
