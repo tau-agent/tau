@@ -3009,18 +3009,22 @@ pub fn run_tasks_plugin() {
             run_stale_ready_watchdog_pass(&db, &mut followup_events, &mut writer, &mut chan_reader);
         for w in stale_warnings {
             eprintln!("tasks startup stale-ready watchdog: {}", w);
+        }
 
-            // Stuck-merging watchdog (task #850).
-            let stuck_merging_warnings = run_stuck_merging_watchdog_pass(
-                &db,
-                &resolver,
-                &mut followup_events,
-                &mut writer,
-                &mut chan_reader,
-            );
-            for w in stuck_merging_warnings {
-                eprintln!("tasks startup stuck-merging watchdog: {}", w);
-            }
+        // Stuck-merging watchdog (task #850). Peer to the two
+        // watchdog calls above — must NOT be nested in the
+        // stale-ready warnings loop, or it would only fire when
+        // there is at least one stale-ready warning AND would fire
+        // once per warning (over-counting attempt markers).
+        let stuck_merging_warnings = run_stuck_merging_watchdog_pass(
+            &db,
+            &resolver,
+            &mut followup_events,
+            &mut writer,
+            &mut chan_reader,
+        );
+        for w in stuck_merging_warnings {
+            eprintln!("tasks startup stuck-merging watchdog: {}", w);
         }
         // Drain the follow-up events synchronously so recovered
         // tasks are dispatched before we start servicing tool
@@ -4190,6 +4194,14 @@ fn count_stuck_merging_attempts(db: &TasksDb, task_id: i64) -> usize {
 /// the current code is step 7b of `merge_task_for_caller`, which runs
 /// after `git update-ref` lands. If that ordering changes, this
 /// heuristic must be revisited.
+///
+/// Implementation note: this helper shells out to `git` directly via
+/// `std::process::Command` rather than going through `execute_bash`
+/// (which the rest of `tasks_merge.rs` uses). The watchdog runs on
+/// the plugin's own thread inside `drain_scheduler_events`, not on
+/// the merge worker, so it has no log session to route a tunnelled
+/// `ExecuteTool` request through. Direct `Command` invocation keeps
+/// the heuristic synchronous and dependency-free.
 fn merge_landed_for_stuck_task(project_dir: &str, task: &crate::tasks_db::Task) -> Option<bool> {
     let branch = task.branch.as_ref()?;
     let merge_target = task.merge_target.clone().unwrap_or_else(|| "main".into());
@@ -14607,6 +14619,59 @@ mod tests {
         );
         // But must still record an attempt marker so the give-up
         // counter ticks up across passes.
+        assert_eq!(count_stuck_merging_attempts(&db, task.id), 1);
+    }
+
+    #[test]
+    fn test_stuck_merging_watchdog_runs_independently_of_stale_ready_findings() {
+        // Regression for the review of task #850: the startup wiring
+        // had the stuck-merging watchdog nested inside the
+        // `for w in stale_warnings` loop, so it never fired when
+        // there were zero stale-ready tasks (the common case on a
+        // clean restart). This test exercises the same call sequence
+        // as the startup block and verifies the stuck-merging
+        // watchdog reconciles the task even when stale-ready returns
+        // nothing.
+        let repo = init_repo_with_task_branch(true, false);
+        let db = TasksDb::open_memory().unwrap();
+        let resolver =
+            ProjectResolver::test(&[("test-project", repo.path().to_str().expect("path utf8"))]);
+        let (mut writer, mut reader) = mock_io();
+
+        let task = make_stuck_merging_task(&db, "merging-only", 120_000);
+
+        // Mirror the startup block: stale-ready first (no tasks =
+        // empty warnings vec), then stuck-merging — peers, NOT
+        // nested.
+        let mut followup_events: Vec<SchedulerEvent> = Vec::new();
+        let stale_warnings =
+            run_stale_ready_watchdog_pass(&db, &mut followup_events, &mut writer, &mut reader);
+        assert!(
+            stale_warnings.is_empty(),
+            "precondition: no stale-ready tasks for this regression"
+        );
+
+        let stuck_warnings = run_stuck_merging_watchdog_pass(
+            &db,
+            &resolver,
+            &mut followup_events,
+            &mut writer,
+            &mut reader,
+        );
+        assert!(
+            stuck_warnings.iter().any(|w| w.contains("reconciled")),
+            "stuck-merging watchdog must run unconditionally at startup, \
+             not only when stale-ready also fired; got {:?}",
+            stuck_warnings
+        );
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Merged,
+            "task should have been reconciled to Merged"
+        );
+        // Exactly one attempt marker — not N (which would have
+        // happened if the watchdog had been called once per
+        // stale-ready warning).
         assert_eq!(count_stuck_merging_attempts(&db, task.id), 1);
     }
 }

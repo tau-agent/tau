@@ -370,6 +370,15 @@ const DB_UPDATE_RETRY_DELAY_MS: u64 = 50;
 /// backoff. Returns the last error if every attempt fails.
 ///
 /// Mirrors `archive_session_with_busy_retry` in [`crate::tasks_merge`].
+///
+/// We retry on every error variant rather than narrowing to transient
+/// (sqlite BUSY/LOCKED) ones. The only production caller is
+/// `finish_success`'s `Merging → Merged` transition, which is always
+/// a valid state-machine edge if reached, so the worst case for a
+/// genuinely deterministic failure is a 100 ms delay (2 × 50 ms
+/// backoffs) before the error surfaces. That trade-off keeps the
+/// helper simple and matches the precedent set by
+/// `archive_session_with_busy_retry`.
 fn db_update_with_retry(
     db: &TasksDb,
     task_id: i64,
