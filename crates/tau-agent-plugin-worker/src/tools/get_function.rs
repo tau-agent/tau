@@ -78,7 +78,8 @@ pub fn tool_def() -> ToolDef {
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": MAX_NAMES,
-                        "description": "Names to extract. Methods may be qualified with `.` (`Foo.bar`) or `::` (Rust)."
+                        "description": "Names to extract. Methods may be qualified with `.` (`Foo.bar`) or `::` (Rust).",
+                        "examples": [["execute_tool", "Foo.bar", "MyTrait::method"]]
                     }
                 },
                 "required": ["paths", "function_names"]

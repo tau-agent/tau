@@ -119,7 +119,12 @@ static EDIT_ITEM_SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::Laz
                 "type": "string",
                 "description": "Anchor form: text to insert or substitute. Multi-line text is supported as-is."
             }
-        }
+        },
+        "examples": [
+            { "old_text": "fn old_name(", "new_text": "fn new_name(" },
+            { "edit_type": "replace", "anchor": "a1b2c3d4", "end_anchor": "e5f6a7b8", "text": "// new content\n" },
+            { "edit_type": "insert_after", "anchor": "a1b2c3d4", "text": "// inserted line\n" }
+        ]
     })
 });
 
