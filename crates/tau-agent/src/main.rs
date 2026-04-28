@@ -115,6 +115,20 @@ enum ProfileAction {
         /// Restrict to a single session.
         #[arg(long)]
         session: Option<String>,
+        /// Per-event duration clamp (`30s`, `5m`, `1h`, raw ms, or `0` to
+        /// disable). Events longer than this are excluded from aggregates
+        /// and reported as a per-bucket drop count. The default of 1h
+        /// filters out stale-session noise where async messages land
+        /// hours/days after the parent went quiet — almost any real
+        /// tool/LLM gap is well under an hour.
+        #[arg(long, default_value = "1h")]
+        clamp: String,
+        /// Include `other:*` buckets (info<-info, user<-info, etc.) in
+        /// the ranking. They are excluded by default because they catch
+        /// every non-canonical adjacency and are dominated by
+        /// async-notification artifacts, not real performance signal.
+        #[arg(long)]
+        include_other: bool,
     },
     /// Slow events above a duration threshold
     Slow {
@@ -133,12 +147,33 @@ enum ProfileAction {
         /// Restrict to a project.
         #[arg(long)]
         project: Option<String>,
+        /// Per-event duration clamp (`30s`, `5m`, `1h`, raw ms, or `0` to
+        /// disable). Events longer than this are dropped from the slow
+        /// list. Default 1h filters stale-session async-arrival noise.
+        #[arg(long, default_value = "1h")]
+        clamp: String,
+        /// Include `other:*` buckets (info<-info, user<-info, etc.) in
+        /// the slow list. Excluded by default because they are dominated
+        /// by async-notification artifacts rather than real perf signal.
+        #[arg(long)]
+        include_other: bool,
     },
     /// Per-session bucket breakdown
     Session {
         /// Session ID
         #[arg(add = ArgValueCandidates::new(completer::session_completer))]
         id: String,
+        /// Per-event duration clamp (`30s`, `5m`, `1h`, raw ms, or `0` to
+        /// disable). Default 1h filters stale-session async-arrival
+        /// noise. Pass `0` to keep every event when investigating a
+        /// specific long-idle session.
+        #[arg(long, default_value = "1h")]
+        clamp: String,
+        /// Suppress `other:*` buckets. By default per-session view
+        /// includes them — user-thinking gaps and idle-info adjacencies
+        /// are contextually informative when investigating one session.
+        #[arg(long)]
+        exclude_other: bool,
     },
 }
 
@@ -2743,6 +2778,16 @@ fn cmd_task(action: TaskAction) -> tau_agent_lib::Result<()> {
 // `tau profile` — historical session timing analysis
 // ---------------------------------------------------------------------------
 
+/// Parse the `--clamp` flag value into an optional millisecond cap.
+///
+/// Accepts the same forms as `parse_since` (durations like `1h`, raw ms,
+/// etc.) plus a literal `0` to disable the clamp. Returns `None` for `0`
+/// and `Some(ms)` otherwise.
+fn parse_clamp(s: &str) -> tau_agent_lib::Result<Option<i64>> {
+    let v = tau_agent_lib::profile::parse_since(s, 0).map(|v| if v < 0 { -v } else { v })?;
+    if v == 0 { Ok(None) } else { Ok(Some(v)) }
+}
+
 fn cmd_profile(action: ProfileAction) -> tau_agent_lib::Result<()> {
     let db = tau_agent_lib::db::Db::open_default()?;
     let now_ms = tau_agent_lib::types::timestamp_ms() as i64;
@@ -2754,6 +2799,8 @@ fn cmd_profile(action: ProfileAction) -> tau_agent_lib::Result<()> {
             until,
             project,
             session,
+            clamp,
+            include_other,
         } => {
             let since_ms = match since {
                 Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
@@ -2763,15 +2810,18 @@ fn cmd_profile(action: ProfileAction) -> tau_agent_lib::Result<()> {
                 Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
                 None => None,
             };
+            let max_event_ms = parse_clamp(&clamp)?;
             let filter = tau_agent_lib::profile::ProfileFilter {
                 since_ms,
                 until_ms,
                 session_id: session,
                 project,
                 limit: 0,
+                max_event_ms,
+                exclude_other: !include_other,
             };
             let rows = tau_agent_lib::profile::buckets(&db, &filter)?;
-            print_buckets(&rows);
+            print_buckets(&rows, max_event_ms);
         }
         ProfileAction::Slow {
             min,
@@ -2779,6 +2829,8 @@ fn cmd_profile(action: ProfileAction) -> tau_agent_lib::Result<()> {
             since,
             until,
             project,
+            clamp,
+            include_other,
         } => {
             // `parse_since(d, 0)` returns `0 - d` for any `d`-style suffix
             // duration; we negate to recover the duration in ms. For raw
@@ -2793,18 +2845,26 @@ fn cmd_profile(action: ProfileAction) -> tau_agent_lib::Result<()> {
                 Some(s) => Some(tau_agent_lib::profile::parse_since(&s, now_ms)?),
                 None => None,
             };
+            let max_event_ms = parse_clamp(&clamp)?;
             let filter = tau_agent_lib::profile::ProfileFilter {
                 since_ms,
                 until_ms,
                 session_id: None,
                 project,
                 limit,
+                max_event_ms,
+                exclude_other: !include_other,
             };
             let rows = tau_agent_lib::profile::slow_events(&db, &filter, min_ms)?;
             print_slow_events(&rows);
         }
-        ProfileAction::Session { id } => {
-            print_session_breakdown(&db, &id)?;
+        ProfileAction::Session {
+            id,
+            clamp,
+            exclude_other,
+        } => {
+            let max_event_ms = parse_clamp(&clamp)?;
+            print_session_breakdown(&db, &id, max_event_ms, exclude_other)?;
         }
     }
     Ok(())
@@ -2822,7 +2882,7 @@ fn fmt_dur(ms: i64) -> String {
     }
 }
 
-fn print_buckets(rows: &[tau_agent_lib::profile::BucketSummary]) {
+fn print_buckets(rows: &[tau_agent_lib::profile::BucketSummary], clamp_ms: Option<i64>) {
     if rows.is_empty() {
         println!("(no events in window)");
         return;
@@ -2845,8 +2905,16 @@ fn print_buckets(rows: &[tau_agent_lib::profile::BucketSummary]) {
         width = bucket_w,
     );
     for r in rows {
+        let suffix = if r.dropped_over_clamp > 0 {
+            match clamp_ms {
+                Some(c) => format!("  [+{} dropped >{}]", r.dropped_over_clamp, fmt_dur(c)),
+                None => format!("  [+{} dropped]", r.dropped_over_clamp),
+            }
+        } else {
+            String::new()
+        };
         println!(
-            "{:<width$}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+            "{:<width$}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}{}",
             r.bucket,
             r.n,
             fmt_dur(r.total_ms),
@@ -2854,6 +2922,7 @@ fn print_buckets(rows: &[tau_agent_lib::profile::BucketSummary]) {
             fmt_dur(r.p50_ms),
             fmt_dur(r.p95_ms),
             fmt_dur(r.max_ms),
+            suffix,
             width = bucket_w,
         );
     }
@@ -2923,8 +2992,16 @@ fn print_slow_events(rows: &[tau_agent_lib::profile::SlowEvent]) {
 fn print_session_breakdown(
     db: &tau_agent_lib::db::Db,
     session_id: &str,
+    clamp_ms: Option<i64>,
+    exclude_other: bool,
 ) -> tau_agent_lib::Result<()> {
-    let rows = tau_agent_lib::profile::session_breakdown(db, session_id)?;
+    let filter = tau_agent_lib::profile::ProfileFilter {
+        session_id: Some(session_id.to_string()),
+        max_event_ms: clamp_ms,
+        exclude_other,
+        ..Default::default()
+    };
+    let rows = tau_agent_lib::profile::buckets(db, &filter)?;
     let total_ms: i64 = rows.iter().map(|r| r.total_ms).sum();
     let total_msgs = db.message_count(session_id)?;
     let total_cost = aggregate_session_cost(db, session_id)?;
@@ -2936,7 +3013,7 @@ fn print_session_breakdown(
         total_msgs,
         total_cost,
     );
-    print_buckets(&rows);
+    print_buckets(&rows, clamp_ms);
     Ok(())
 }
 

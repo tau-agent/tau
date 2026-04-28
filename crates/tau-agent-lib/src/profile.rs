@@ -76,6 +76,24 @@ pub struct ProfileFilter {
     /// Cap on result rows for "top N" queries (`slow_events`). 0 means
     /// unbounded.
     pub limit: usize,
+    /// Per-event duration clamp (ms). Events with `dur_ms > max_event_ms`
+    /// are excluded from aggregates and from `slow_events` output. The
+    /// dropped count is tracked separately per bucket. `None` disables the
+    /// clamp.
+    ///
+    /// Rationale: stale sessions accumulate huge gaps when an async info
+    /// message lands hours/days after the parent went quiet. These gaps
+    /// are not real "tool time" or "LLM time" and they swamp the
+    /// rankings. A 1h cutoff is a reasonable default — almost any real
+    /// tool/LLM gap is well under an hour, and almost any genuine "user
+    /// walked away" gap exceeds it.
+    pub max_event_ms: Option<i64>,
+    /// When `true`, suppress `other:*` buckets from `buckets()` output and
+    /// drop `other:*` events from `slow_events()`. The `other:*` buckets
+    /// are inherently noisy — they catch every adjacency that isn't a
+    /// clean role transition (info<-info, info<-user, etc.) and most are
+    /// async-notification artifacts, not real perf signal.
+    pub exclude_other: bool,
 }
 
 /// One row of an aggregated bucket leaderboard.
@@ -88,6 +106,10 @@ pub struct BucketSummary {
     pub p50_ms: i64,
     pub p95_ms: i64,
     pub max_ms: i64,
+    /// Count of events excluded from this bucket because their duration
+    /// exceeded [`ProfileFilter::max_event_ms`]. Always `0` when the
+    /// clamp is disabled.
+    pub dropped_over_clamp: i64,
 }
 
 /// One slow event surfaced by [`slow_events`].
@@ -176,8 +198,19 @@ pub fn buckets(db: &Db, filter: &ProfileFilter) -> crate::Result<Vec<BucketSumma
 
     let mut by_bucket: std::collections::HashMap<String, Vec<i64>> =
         std::collections::HashMap::new();
+    let mut dropped_by_bucket: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     for r in rows {
         let (bucket, dur) = r.map_err(|e| crate::Error::Io(format!("row buckets: {}", e)))?;
+        if filter.exclude_other && bucket.starts_with("other:") {
+            continue;
+        }
+        if let Some(max) = filter.max_event_ms {
+            if dur > max {
+                *dropped_by_bucket.entry(bucket).or_default() += 1;
+                continue;
+            }
+        }
         by_bucket.entry(bucket).or_default().push(dur);
     }
 
@@ -189,12 +222,33 @@ pub fn buckets(db: &Db, filter: &ProfileFilter) -> crate::Result<Vec<BucketSumma
     let gen_estimates = assistant_gen_estimates(db, filter)?;
     if !gen_estimates.is_empty() {
         let durs: Vec<i64> = gen_estimates.iter().map(|(_, gen_ms, _)| *gen_ms).collect();
-        by_bucket.insert("llm_generation".to_string(), durs);
+        // Apply the clamp to llm_generation as well, for consistency.
+        let (kept, dropped): (Vec<i64>, Vec<i64>) = if let Some(max) = filter.max_event_ms {
+            durs.into_iter().partition(|d| *d <= max)
+        } else {
+            (durs, Vec::new())
+        };
+        if !dropped.is_empty() {
+            dropped_by_bucket.insert("llm_generation".to_string(), dropped.len() as i64);
+        }
+        if !kept.is_empty() {
+            by_bucket.insert("llm_generation".to_string(), kept);
+        }
     }
 
+    // Buckets that ONLY had drops (no surviving events) still need a row
+    // so the user sees the noise count. Insert empty vecs for them.
+    for bucket in dropped_by_bucket.keys() {
+        by_bucket.entry(bucket.clone()).or_default();
+    }
     let mut out: Vec<BucketSummary> = by_bucket
         .into_iter()
-        .map(|(bucket, mut durs)| summarize(bucket, &mut durs))
+        .map(|(bucket, mut durs)| {
+            let dropped = dropped_by_bucket.get(&bucket).copied().unwrap_or(0);
+            let mut s = summarize(bucket, &mut durs);
+            s.dropped_over_clamp = dropped;
+            s
+        })
         .collect();
     out.sort_by(|a, b| b.total_ms.cmp(&a.total_ms));
     Ok(out)
@@ -216,7 +270,14 @@ pub fn slow_events(db: &Db, filter: &ProfileFilter, min_ms: i64) -> crate::Resul
     let conn = db.conn();
     ensure_view(conn)?;
 
-    let extra = format!("e.dur_ms >= {}", min_ms);
+    let mut extras: Vec<String> = vec![format!("e.dur_ms >= {}", min_ms)];
+    if let Some(max) = filter.max_event_ms {
+        extras.push(format!("e.dur_ms <= {}", max));
+    }
+    if filter.exclude_other {
+        extras.push("e.bucket NOT LIKE 'other:%'".to_string());
+    }
+    let extra = extras.join(" AND ");
     let order_limit = if filter.limit > 0 {
         format!(" ORDER BY e.dur_ms DESC LIMIT {}", filter.limit)
     } else {
@@ -352,6 +413,7 @@ fn summarize(bucket: String, durs: &mut [i64]) -> BucketSummary {
         p50_ms: p50,
         p95_ms: p95,
         max_ms: max,
+        dropped_over_clamp: 0,
     }
 }
 
@@ -1210,5 +1272,184 @@ mod tests {
             .expect("llm_generation");
         // 300 tokens / 60 tps = 5s
         assert_eq!(llm_gen.total_ms, 5_000);
+    }
+
+    #[test]
+    fn clamp_drops_events_above_threshold() {
+        // user@0, assistant@1_000 (llm_first=1000ms),
+        // user@1_000_000 (user_thinking gap = 999_000ms = 16.65m),
+        // assistant@1_001_000 (llm_first=1000ms).
+        // With clamp = 60_000ms (60s), the 999_000ms user_thinking event
+        // should be dropped, but the two 1_000ms llm_first events stay.
+        let db = Db::open_memory().expect("open mem");
+        make_session(&db, "c", None);
+        let msgs: Vec<Message> = vec![
+            user_at(0, ""),
+            assistant_at(1_000, vec![]),
+            user_at(1_000_000, ""),
+            assistant_at(1_001_000, vec![]),
+        ];
+        for m in &msgs {
+            db.append_message("c", m).expect("append");
+        }
+
+        // Without clamp: user_thinking is the largest bucket.
+        let unclamped = buckets(&db, &ProfileFilter::default()).expect("unclamped");
+        let ut = unclamped
+            .iter()
+            .find(|s| s.bucket == "user_thinking")
+            .expect("user_thinking present");
+        assert_eq!(ut.n, 1);
+        assert_eq!(ut.total_ms, 999_000);
+        assert_eq!(ut.dropped_over_clamp, 0);
+
+        // With a 60s clamp the user_thinking event is excluded but the
+        // bucket row is still emitted with `dropped_over_clamp = 1`.
+        let clamped = buckets(
+            &db,
+            &ProfileFilter {
+                max_event_ms: Some(60_000),
+                ..Default::default()
+            },
+        )
+        .expect("clamped");
+        let llm = clamped
+            .iter()
+            .find(|s| s.bucket == "llm_first")
+            .expect("llm_first present");
+        assert_eq!(llm.n, 2);
+        assert_eq!(llm.total_ms, 2_000);
+        assert_eq!(llm.dropped_over_clamp, 0);
+        let ut = clamped
+            .iter()
+            .find(|s| s.bucket == "user_thinking")
+            .expect("user_thinking row still emitted with drop count");
+        assert_eq!(ut.n, 0);
+        assert_eq!(ut.total_ms, 0);
+        assert_eq!(ut.dropped_over_clamp, 1);
+    }
+
+    #[test]
+    fn slow_events_respects_clamp_and_exclude_other() {
+        // Build a session with an info adjacency that produces a long
+        // `other:*` event, plus a real bash event.
+        let db = Db::open_memory().expect("open mem");
+        make_session(&db, "s", None);
+        // info -> info -> ... produces other:* buckets.
+        let info1 = Message::Info(InfoMessage {
+            text: "early".into(),
+            timestamp: 0,
+        });
+        let info2 = Message::Info(InfoMessage {
+            text: "much later (stale session noise)".into(),
+            timestamp: 10 * 60 * 60 * 1_000, // 10h gap
+        });
+        db.append_message("s", &info1).expect("info1");
+        db.append_message("s", &info2).expect("info2");
+        // A normal user/assistant/tool sequence.
+        let msgs: Vec<Message> = vec![
+            user_at(11 * 60 * 60 * 1_000, "hi"),
+            assistant_at(
+                11 * 60 * 60 * 1_000 + 1_000,
+                vec![tool_call(
+                    "c1",
+                    "bash",
+                    serde_json::json!({"command": "ls"}),
+                )],
+            ),
+            tool_result_at(11 * 60 * 60 * 1_000 + 6_000, "c1", "bash", "ok"),
+        ];
+        for m in &msgs {
+            db.append_message("s", m).expect("append");
+        }
+
+        // Default (no clamp, include other): everything visible.
+        let all = slow_events(&db, &ProfileFilter::default(), 1_000).expect("slow");
+        assert!(all.iter().any(|e| e.bucket.starts_with("other:")));
+        assert!(all.iter().any(|e| e.bucket == "tool:bash"));
+
+        // exclude_other suppresses the other:* row.
+        let no_other = slow_events(
+            &db,
+            &ProfileFilter {
+                exclude_other: true,
+                ..Default::default()
+            },
+            1_000,
+        )
+        .expect("slow no_other");
+        assert!(no_other.iter().all(|e| !e.bucket.starts_with("other:")));
+        assert!(no_other.iter().any(|e| e.bucket == "tool:bash"));
+
+        // 1h clamp drops the 10h other:* event regardless of exclude_other.
+        let clamped = slow_events(
+            &db,
+            &ProfileFilter {
+                max_event_ms: Some(60 * 60 * 1_000),
+                ..Default::default()
+            },
+            1_000,
+        )
+        .expect("slow clamped");
+        assert!(clamped.iter().all(|e| e.dur_ms <= 60 * 60 * 1_000));
+        assert!(clamped.iter().any(|e| e.bucket == "tool:bash"));
+    }
+
+    #[test]
+    fn buckets_exclude_other_drops_other_buckets() {
+        // Two info messages followed by a user — produces an `other:*`
+        // bucket (info<-info, user<-info) plus nothing else.
+        let db = Db::open_memory().expect("open mem");
+        make_session(&db, "o", None);
+        let info1 = Message::Info(InfoMessage {
+            text: "first".into(),
+            timestamp: 100,
+        });
+        let info2 = Message::Info(InfoMessage {
+            text: "second".into(),
+            timestamp: 500,
+        });
+        let user = user_at(1_000, "");
+        db.append_message("o", &info1).expect("info1");
+        db.append_message("o", &info2).expect("info2");
+        db.append_message("o", &user).expect("user");
+
+        let with_other = buckets(&db, &ProfileFilter::default()).expect("with");
+        assert!(with_other.iter().any(|b| b.bucket.starts_with("other:")));
+
+        let without = buckets(
+            &db,
+            &ProfileFilter {
+                exclude_other: true,
+                ..Default::default()
+            },
+        )
+        .expect("without");
+        assert!(
+            without.iter().all(|b| !b.bucket.starts_with("other:")),
+            "buckets: {:?}",
+            without
+        );
+    }
+
+    #[test]
+    fn drop_counter_is_zero_when_no_clamp() {
+        // Without a clamp, every BucketSummary should report
+        // dropped_over_clamp = 0.
+        let db = Db::open_memory().expect("open mem");
+        make_session(&db, "z", None);
+        let msgs: Vec<Message> = vec![user_at(0, ""), assistant_at(1_000, vec![])];
+        for m in &msgs {
+            db.append_message("z", m).expect("append");
+        }
+        let summaries = buckets(&db, &ProfileFilter::default()).expect("buckets");
+        assert!(!summaries.is_empty());
+        for s in &summaries {
+            assert_eq!(
+                s.dropped_over_clamp, 0,
+                "bucket {} should have 0 drops without clamp",
+                s.bucket
+            );
+        }
     }
 }
