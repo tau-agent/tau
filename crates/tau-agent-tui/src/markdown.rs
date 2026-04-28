@@ -3,13 +3,13 @@
 //! Drives `pulldown_cmark` and translates the event stream into ratatui
 //! `Line`s.  Supports a deliberately small subset (see task 832 spec):
 //! bold/italic/code spans, headings, ordered & unordered lists, fenced
-//! code blocks, blockquotes, thematic breaks, and links.  No tables,
-//! HTML, footnotes, etc.
+//! code blocks, blockquotes, thematic breaks, links, and GFM tables.
+//! HTML, footnotes, etc. are not rendered.
 //!
 //! Streaming-safe: pulldown-cmark handles unterminated constructs
 //! gracefully, so the caller can pass partial input every frame.
 
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
@@ -26,7 +26,7 @@ use crate::theme::Theme;
 pub fn render(text: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let usable = (width as usize).saturating_sub(1).max(1);
     let mut renderer = Renderer::new(theme, usable, width as usize);
-    for event in Parser::new(text) {
+    for event in Parser::new_ext(text, Options::ENABLE_TABLES) {
         renderer.handle(event);
     }
     renderer.finish()
@@ -70,6 +70,23 @@ struct Renderer<'t> {
     /// Output blocks.  Each block is one or more lines; blank lines are
     /// inserted between blocks at finish time.
     blocks: Vec<Vec<Line<'static>>>,
+
+    /// True while inside a GFM table.
+    in_table: bool,
+    /// Per-column alignment captured from `Tag::Table(alignments)`.
+    table_alignments: Vec<Alignment>,
+    /// True while inside the table head.
+    table_in_head: bool,
+    /// True while inside a table cell — inline events route into the
+    /// regular `current_spans` buffer; on cell end we move the buffer
+    /// into the current row.
+    table_in_cell: bool,
+    /// Cells of the row currently being built.
+    table_current_row: Vec<Vec<Span<'static>>>,
+    /// Header row (single row of cells, each a vec of styled spans).
+    table_header: Vec<Vec<Span<'static>>>,
+    /// Body rows.
+    table_body: Vec<Vec<Vec<Span<'static>>>>,
 }
 
 impl<'t> Renderer<'t> {
@@ -89,6 +106,13 @@ impl<'t> Renderer<'t> {
             pending_list_prefix: None,
             current_spans: Vec::new(),
             blocks: Vec::new(),
+            in_table: false,
+            table_alignments: Vec::new(),
+            table_in_head: false,
+            table_in_cell: false,
+            table_current_row: Vec::new(),
+            table_header: Vec::new(),
+            table_body: Vec::new(),
         }
     }
 
@@ -228,7 +252,15 @@ impl<'t> Renderer<'t> {
                     .push(Span::styled(" ".to_string(), style));
             }
             Event::HardBreak => {
-                self.flush_line();
+                if self.in_table && self.table_in_cell {
+                    // Inside a table cell, hard breaks collapse to a space
+                    // so the cell stays a single logical line.
+                    let style = self.current_style();
+                    self.current_spans
+                        .push(Span::styled(" ".to_string(), style));
+                } else {
+                    self.flush_line();
+                }
             }
             Event::Rule => {
                 // Flush anything pending, then emit a horizontal rule line.
@@ -335,13 +367,35 @@ impl<'t> Renderer<'t> {
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
             | Tag::Superscript
             | Tag::Subscript
             | Tag::MetadataBlock(_) => {}
+            Tag::Table(alignments) => {
+                if !self.current_spans.is_empty() {
+                    self.flush_line();
+                }
+                self.in_table = true;
+                self.table_alignments = alignments;
+                self.table_in_head = false;
+                self.table_in_cell = false;
+                self.table_current_row.clear();
+                self.table_header.clear();
+                self.table_body.clear();
+            }
+            Tag::TableHead => {
+                self.table_in_head = true;
+                self.table_current_row.clear();
+            }
+            Tag::TableRow => {
+                self.table_current_row.clear();
+            }
+            Tag::TableCell => {
+                self.table_in_cell = true;
+                // Defensive: any stray inline content shouldn't accumulate
+                // between cells. Drop it rather than risk leaking into the
+                // next cell.
+                self.current_spans.clear();
+            }
         }
     }
 
@@ -447,14 +501,212 @@ impl<'t> Renderer<'t> {
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::Superscript
             | TagEnd::Subscript
             | TagEnd::MetadataBlock(_) => {}
+            TagEnd::TableCell => {
+                let cell = std::mem::take(&mut self.current_spans);
+                self.table_current_row.push(cell);
+                self.table_in_cell = false;
+            }
+            TagEnd::TableRow => {
+                let row = std::mem::take(&mut self.table_current_row);
+                if self.table_in_head {
+                    self.table_header = row;
+                } else {
+                    self.table_body.push(row);
+                }
+            }
+            TagEnd::TableHead => {
+                // Some pulldown-cmark versions don't emit an enclosing
+                // TableRow inside the head; if cells were collected
+                // directly, promote them here.
+                if !self.table_current_row.is_empty() {
+                    self.table_header = std::mem::take(&mut self.table_current_row);
+                }
+                self.table_in_head = false;
+            }
+            TagEnd::Table => {
+                self.emit_table();
+                self.in_table = false;
+                self.table_alignments.clear();
+                self.table_in_head = false;
+                self.table_in_cell = false;
+                self.table_current_row.clear();
+                self.table_header.clear();
+                self.table_body.clear();
+                self.close_block();
+            }
         }
+    }
+
+    /// Render the buffered table rows as an aligned text grid into the
+    /// current block.  Truncates cells with `…` when they exceed their
+    /// column budget; honours per-column alignment.
+    fn emit_table(&mut self) {
+        // If anything is still pending in the current row (e.g. a
+        // streaming-truncated table without a final TableRow end),
+        // promote it to the body so the partial row still renders.
+        if !self.table_current_row.is_empty() {
+            let row = std::mem::take(&mut self.table_current_row);
+            if self.table_in_head && self.table_header.is_empty() {
+                self.table_header = row;
+            } else {
+                self.table_body.push(row);
+            }
+        }
+
+        let header = std::mem::take(&mut self.table_header);
+        let body = std::mem::take(&mut self.table_body);
+        let alignments = self.table_alignments.clone();
+
+        // Determine column count.
+        let n_cols = std::iter::once(header.len())
+            .chain(body.iter().map(|r| r.len()))
+            .max()
+            .unwrap_or(0);
+        if n_cols == 0 {
+            return;
+        }
+
+        // Pad rows to n_cols.
+        let mut header = header;
+        header.resize_with(n_cols, Vec::new);
+        let body: Vec<Vec<Vec<Span<'static>>>> = body
+            .into_iter()
+            .map(|mut r| {
+                r.resize_with(n_cols, Vec::new);
+                r
+            })
+            .collect();
+
+        // Per-column alignments (default to None / Left).
+        let mut aligns = alignments;
+        aligns.resize(n_cols, Alignment::None);
+
+        // Natural per-column widths.
+        let mut col_w: Vec<usize> = vec![1; n_cols];
+        for (c, cell) in header.iter().enumerate() {
+            col_w[c] = col_w[c].max(cell_display_width(cell));
+        }
+        for row in &body {
+            for (c, cell) in row.iter().enumerate() {
+                col_w[c] = col_w[c].max(cell_display_width(cell));
+            }
+        }
+        for w in col_w.iter_mut() {
+            if *w == 0 {
+                *w = 1;
+            }
+        }
+
+        // Total width = sum(col_w + 2 padding) + (n_cols + 1) borders.
+        let content_width = self.content_width;
+        let overhead = (n_cols + 1) + 2 * n_cols; // borders + 1 pad on each side
+        let natural_total: usize = col_w.iter().sum::<usize>() + overhead;
+        if natural_total > content_width {
+            // Shrink columns proportionally to fit.
+            let available = content_width.saturating_sub(overhead);
+            if available < n_cols {
+                // Degenerate case: not even 1 column per col.  Give each
+                // column 1 char; the right border will overflow but every
+                // line is still produced.
+                for w in col_w.iter_mut() {
+                    *w = 1;
+                }
+            } else {
+                let total: usize = col_w.iter().sum();
+                let mut new_w: Vec<usize> = col_w
+                    .iter()
+                    .map(|w| {
+                        let scaled = (*w as u128 * available as u128) / total as u128;
+                        (scaled as usize).max(1)
+                    })
+                    .collect();
+                // Distribute remainder so the sum equals `available`.
+                let mut sum: usize = new_w.iter().sum();
+                let mut idx = 0;
+                while sum < available && !new_w.is_empty() {
+                    new_w[idx % n_cols] += 1;
+                    sum += 1;
+                    idx += 1;
+                }
+                while sum > available && !new_w.is_empty() {
+                    // Trim the widest column down by 1 until we fit.
+                    let mut max_i = 0;
+                    for (i, w) in new_w.iter().enumerate() {
+                        if *w > new_w[max_i] {
+                            max_i = i;
+                        }
+                    }
+                    if new_w[max_i] <= 1 {
+                        break;
+                    }
+                    new_w[max_i] -= 1;
+                    sum -= 1;
+                }
+                col_w = new_w;
+            }
+        }
+
+        let border_style = Style::default().fg(self.theme.markdown_rule.to_ratatui());
+
+        // Build border-line variants.
+        let make_border = |left: char, mid: char, right: char| -> Line<'static> {
+            let mut s = String::new();
+            s.push(left);
+            for (i, w) in col_w.iter().enumerate() {
+                for _ in 0..(w + 2) {
+                    s.push('─');
+                }
+                if i + 1 < col_w.len() {
+                    s.push(mid);
+                }
+            }
+            s.push(right);
+            Line::from(vec![Span::raw(" "), Span::styled(s, border_style)])
+        };
+
+        let top = make_border('┌', '┬', '┐');
+        let sep = make_border('├', '┼', '┤');
+        let bot = make_border('└', '┴', '┘');
+
+        let bar = || Span::styled("│".to_string(), border_style);
+        let pad_space = || Span::raw(" ".to_string());
+
+        // Render a single content row into a Line.
+        let render_row = |row: Vec<Vec<Span<'static>>>, bold: bool| -> Line<'static> {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(Span::raw(" "));
+            spans.push(bar());
+            for (c, cell) in row.into_iter().enumerate() {
+                spans.push(pad_space());
+                let mut shaped = truncate_and_pad(cell, col_w[c], aligns[c]);
+                if bold {
+                    for span in shaped.iter_mut() {
+                        let style = span.style.add_modifier(Modifier::BOLD);
+                        span.style = style;
+                    }
+                }
+                spans.append(&mut shaped);
+                spans.push(pad_space());
+                spans.push(bar());
+            }
+            Line::from(spans)
+        };
+
+        let header_line = render_row(header, true);
+        let body_lines: Vec<Line<'static>> =
+            body.into_iter().map(|r| render_row(r, false)).collect();
+
+        let block = self.ensure_open_block();
+        block.push(top);
+        block.push(header_line);
+        block.push(sep);
+        for l in body_lines {
+            block.push(l);
+        }
+        block.push(bot);
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
@@ -468,6 +720,10 @@ impl<'t> Renderer<'t> {
             // Pretend a CodeBlock end happened so the buffered content is
             // emitted.
             self.end(TagEnd::CodeBlock);
+        }
+        // Flush any unterminated table (streaming).
+        if self.in_table {
+            self.end(TagEnd::Table);
         }
 
         // Stitch blocks together with single blank separators.
@@ -485,6 +741,120 @@ impl<'t> Renderer<'t> {
         }
         out
     }
+}
+
+/// Sum the display width (`UnicodeWidthStr`) of every span's content.
+fn cell_display_width(cell: &[Span<'_>]) -> usize {
+    cell.iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+/// Truncate `cell` to `col_w` display columns (appending `…` if it
+/// overflowed) and pad with spaces to exactly `col_w` columns according
+/// to `align`.  Styles on the original spans are preserved through the
+/// truncation; padding spaces are unstyled.
+fn truncate_and_pad(
+    cell: Vec<Span<'static>>,
+    col_w: usize,
+    align: Alignment,
+) -> Vec<Span<'static>> {
+    if col_w == 0 {
+        return Vec::new();
+    }
+
+    // Flatten into (char, width, style) cells.
+    #[derive(Clone)]
+    struct Cell {
+        ch: char,
+        w: usize,
+        style: Style,
+    }
+    let mut cells: Vec<Cell> = Vec::new();
+    for span in &cell {
+        let style = span.style;
+        for ch in span.content.chars() {
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+            cells.push(Cell { ch, w, style });
+        }
+    }
+
+    let total_w: usize = cells.iter().map(|c| c.w).sum();
+    let kept = if total_w <= col_w {
+        cells
+    } else {
+        // Need to leave room for an ellipsis (width 1).
+        let budget = col_w.saturating_sub(1);
+        let mut acc_w = 0usize;
+        let mut taken = 0usize;
+        for c in &cells {
+            if acc_w + c.w > budget {
+                break;
+            }
+            acc_w += c.w;
+            taken += 1;
+        }
+        let mut kept: Vec<Cell> = cells.into_iter().take(taken).collect();
+        let ellipsis_style = kept.last().map(|c| c.style).unwrap_or_default();
+        kept.push(Cell {
+            ch: '…',
+            w: 1,
+            style: ellipsis_style,
+        });
+        kept
+    };
+
+    // Coalesce contiguous cells with equal style into spans.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut current_style: Option<Style> = None;
+    let mut content_w = 0usize;
+    for c in kept {
+        content_w += c.w;
+        match current_style {
+            Some(s) if s == c.style => buf.push(c.ch),
+            _ => {
+                if let Some(s) = current_style.take() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), s));
+                }
+                buf.push(c.ch);
+                current_style = Some(c.style);
+            }
+        }
+    }
+    if let Some(s) = current_style {
+        spans.push(Span::styled(buf, s));
+    }
+
+    // Pad to col_w according to alignment.
+    let pad_total = col_w.saturating_sub(content_w);
+    if pad_total > 0 {
+        match align {
+            Alignment::Right => {
+                let mut out: Vec<Span<'static>> = Vec::new();
+                out.push(Span::raw(" ".repeat(pad_total)));
+                out.extend(spans);
+                return out;
+            }
+            Alignment::Center => {
+                let left = pad_total / 2;
+                let right = pad_total - left;
+                let mut out: Vec<Span<'static>> = Vec::new();
+                if left > 0 {
+                    out.push(Span::raw(" ".repeat(left)));
+                }
+                out.extend(spans);
+                if right > 0 {
+                    out.push(Span::raw(" ".repeat(right)));
+                }
+                return out;
+            }
+            Alignment::Left | Alignment::None => {
+                spans.push(Span::raw(" ".repeat(pad_total)));
+            }
+        }
+    }
+    spans
 }
 
 /// Wrap a sequence of styled spans to `width` display columns, splitting
@@ -866,5 +1236,186 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- Tables -------------------------------------------------------------
+
+    #[test]
+    fn table_basic_renders_grid() {
+        let lines = render("| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |", 40, &theme());
+        let texts: Vec<String> = lines.iter().map(line_text).collect();
+        let joined = texts.join("\n");
+        // Border glyphs.
+        assert!(joined.contains('┌'), "missing top-left in {:?}", joined);
+        assert!(joined.contains('┐'), "missing top-right in {:?}", joined);
+        assert!(joined.contains('└'), "missing bot-left in {:?}", joined);
+        assert!(joined.contains('┘'), "missing bot-right in {:?}", joined);
+        assert!(joined.contains('├'), "missing left-tee in {:?}", joined);
+        assert!(joined.contains('┴'), "missing bot-tee in {:?}", joined);
+        // Header cells must be present and BOLD; body cells present and not
+        // bold.
+        let header_a = lines
+            .iter()
+            .find_map(|l| span_with(l, "a").map(|s| s.style.clone()))
+            .expect("header span 'a'");
+        assert!(header_a.add_modifier.contains(Modifier::BOLD));
+        let body_one = lines
+            .iter()
+            .find_map(|l| span_with(l, "1").map(|s| s.style.clone()))
+            .expect("body span '1'");
+        assert!(!body_one.add_modifier.contains(Modifier::BOLD));
+        // 4 must also appear.
+        assert!(
+            joined.contains('4'),
+            "missing body cell '4' in {:?}",
+            joined
+        );
+    }
+
+    #[test]
+    fn table_alignment_markers_respected() {
+        // Three columns: left, center, right.  Cell contents are single
+        // chars in a column wider than the content so the padding
+        // direction is unambiguous.
+        let src = "\
+| LH | CH | RH |\n\
+|:---|:---:|---:|\n\
+| L | C | R |";
+        let lines = render(src, 60, &theme());
+        // Pick the body row line (contains 'L', 'C', 'R' single-letter cells).
+        let body_line = lines
+            .iter()
+            .find(|l| {
+                let t = line_text(l);
+                // Body row, not header (which contains "LH").
+                t.contains(" L ") || t.contains(" L ") && !t.contains("LH")
+            })
+            .expect("body row");
+        let text = line_text(body_line);
+        // Split on the vertical bar and inspect each cell's padding.
+        let parts: Vec<&str> = text.split('│').collect();
+        // parts[0] is the leading gutter, parts[1..] are cells (last empty).
+        // Each cell content is `" " + padded + " "`.
+        // Left-aligned: data char comes right after the leading pad-space.
+        let left_cell = parts.get(1).expect("left cell");
+        // " L    " or similar: trim the outer single-space padding then
+        // confirm 'L' is the first non-space char.
+        let trimmed = left_cell.trim_start_matches(' ');
+        assert!(
+            trimmed.starts_with('L'),
+            "left cell not left-aligned: {:?}",
+            left_cell
+        );
+        // Right-aligned: 'R' should be the last non-space char before the
+        // trailing single-space padding.
+        let right_cell = parts.get(3).expect("right cell");
+        let trimmed_r = right_cell.trim_end_matches(' ');
+        assert!(
+            trimmed_r.ends_with('R'),
+            "right cell not right-aligned: {:?}",
+            right_cell
+        );
+        // Center-aligned: 'C' should have whitespace on both sides within
+        // the cell padding.
+        let center_cell = parts.get(2).expect("center cell");
+        let inner = center_cell.trim_matches(' ');
+        // After trimming the outer single-space pad, there should still be
+        // padding on at least one side (header "CH" forces col_w >= 2).
+        // For "C" in a >=2-wide column, expect leading or trailing space
+        // around the 'C' inside the cell content.
+        let _ = inner;
+        let chars: Vec<char> = center_cell.chars().collect();
+        // Find the index of 'C'.
+        let c_idx = chars.iter().position(|c| *c == 'C').expect("C present");
+        // There must be at least one space before AND after C inside the cell.
+        assert!(
+            c_idx > 0 && chars.get(c_idx - 1) == Some(&' '),
+            "center cell missing left padding: {:?}",
+            center_cell
+        );
+        assert!(
+            chars.get(c_idx + 1) == Some(&' '),
+            "center cell missing right padding: {:?}",
+            center_cell
+        );
+    }
+
+    #[test]
+    fn table_wider_than_width_does_not_panic() {
+        let src = "\
+| really long header A | really long header B | really long header C |\n\
+|---|---|---|\n\
+| aaaaaaaaaaaaaaaaaa | bbbbbbbbbbbbbbbb | cccccccccccccc |\n\
+\nafter table";
+        let width: u16 = 20;
+        let lines = render(src, width, &theme());
+        assert!(!lines.is_empty(), "expected output");
+        // Every line's display width <= width.
+        for line in &lines {
+            assert!(
+                line.width() <= width as usize,
+                "line wider than width: width={} line={:?}",
+                line.width(),
+                line_text(line),
+            );
+        }
+        let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            joined.contains('…'),
+            "expected ellipsis truncation marker in {:?}",
+            joined
+        );
+        // The trailing paragraph still renders.
+        assert!(
+            joined.contains("after table"),
+            "trailing paragraph missing in {:?}",
+            joined
+        );
+    }
+
+    #[test]
+    fn table_inline_styles_preserved() {
+        let src = "| **bold** | *italic* | `code` |\n|---|---|---|\n| a | b | c |";
+        let t = theme();
+        let lines = render(src, 60, &t);
+        // Header span 'bold' should be BOLD (header overlay BOLD also).
+        let bold_span = lines
+            .iter()
+            .find_map(|l| span_with(l, "bold"))
+            .expect("bold header span");
+        assert!(bold_span.style.add_modifier.contains(Modifier::BOLD));
+        let italic_span = lines
+            .iter()
+            .find_map(|l| span_with(l, "italic"))
+            .expect("italic header span");
+        assert!(italic_span.style.add_modifier.contains(Modifier::ITALIC));
+        let code_span = lines
+            .iter()
+            .find_map(|l| span_with(l, "code"))
+            .expect("code header span");
+        assert_eq!(code_span.style.fg, Some(t.markdown_code_fg.to_ratatui()));
+        assert_eq!(code_span.style.bg, Some(t.markdown_code_bg.to_ratatui()));
+    }
+
+    #[test]
+    fn table_followed_by_paragraph_separator() {
+        let src = "| a | b |\n|---|---|\n| 1 | 2 |\n\nafter";
+        let lines = render(src, 40, &theme());
+        let bottom_idx = lines
+            .iter()
+            .position(|l| line_text(l).contains('└'))
+            .expect("bottom border");
+        let after_idx = lines
+            .iter()
+            .position(|l| line_text(l).contains("after"))
+            .expect("after paragraph");
+        assert!(
+            after_idx > bottom_idx + 1,
+            "expected blank line between table and paragraph (bottom={}, after={})",
+            bottom_idx,
+            after_idx,
+        );
+        let between = &lines[bottom_idx + 1];
+        assert_eq!(between.width(), 0);
     }
 }
