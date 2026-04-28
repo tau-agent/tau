@@ -308,14 +308,41 @@ impl AuthStorage {
     /// Read all credentials (under shared lock).
     fn read_locked(&self) -> crate::Result<AuthData> {
         if !self.path.exists() {
+            tracing::warn!(
+                path = %self.path.display(),
+                "auth read_locked: file does not exist, returning empty AuthData"
+            );
             return Ok(AuthData::new());
         }
         let file = fs::File::open(&self.path).map_err(|e| crate::Error::Io(e.to_string()))?;
+        let size_before_lock = file.metadata().map(|m| m.len()).unwrap_or(0);
         file.lock_shared()
             .map_err(|e| crate::Error::Io(format!("lock {}: {}", self.path.display(), e)))?;
-        let data: AuthData =
-            serde_json::from_reader(&file).map_err(|e| crate::Error::Parse(e.to_string()))?;
+        let size_after_lock = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let data: AuthData = match serde_json::from_reader(&file) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.path.display(),
+                    size_before_lock,
+                    size_after_lock,
+                    err = %e,
+                    "auth read_locked: parse failed under shared lock"
+                );
+                file.unlock().ok();
+                return Err(crate::Error::Parse(e.to_string()));
+            }
+        };
         file.unlock().map_err(|e| crate::Error::Io(e.to_string()))?;
+
+        let providers: Vec<&str> = data.keys().map(|s| s.as_str()).collect();
+        tracing::trace!(
+            path = %self.path.display(),
+            size_before_lock,
+            size_after_lock,
+            ?providers,
+            "auth read_locked ok"
+        );
         Ok(data)
     }
 
@@ -361,8 +388,12 @@ impl AuthStorage {
 
     /// Get credential for a provider.
     pub fn get(&self, provider: &str) -> crate::Result<Option<AuthCredential>> {
+        let span = tracing::trace_span!("auth.get", provider = provider);
+        let _enter = span.enter();
         let data = self.read_locked()?;
-        Ok(data.get(provider).cloned())
+        let cred = data.get(provider).cloned();
+        tracing::trace!(present = cred.is_some(), "auth.get result");
+        Ok(cred)
     }
 
     /// List all providers with credentials.
@@ -403,7 +434,19 @@ impl AuthStorage {
             Some(c) => c,
             None => {
                 // Fallback to env var
-                return Ok(env_api_key(provider));
+                let env = env_api_key(provider);
+                if env.is_none() {
+                    tracing::warn!(
+                        provider,
+                        "auth.get_api_key_excluding: no auth entry and no env var — returning Ok(None)"
+                    );
+                } else {
+                    tracing::trace!(
+                        provider,
+                        "auth.get_api_key_excluding: no auth entry, falling back to env var"
+                    );
+                }
+                return Ok(env);
             }
         };
 
@@ -414,6 +457,10 @@ impl AuthStorage {
                 // and is still valid, adopt it without refreshing.  This is
                 // the fast path that breaks the thrash cycle.
                 if !oauth.is_expired() && stale != Some(oauth.access.as_str()) {
+                    tracing::trace!(
+                        provider,
+                        "auth.get_api_key_excluding: returning stored OAuth access token"
+                    );
                     return Ok(Some(oauth.access));
                 }
                 // Either the stored token is expired, or it equals the
@@ -423,9 +470,25 @@ impl AuthStorage {
                 if !oauth.is_expired() {
                     // Stored equals stale but not expired: the server has
                     // already rejected this token, so force a refresh.
-                    return self.refresh_locked(provider, &oauth.refresh);
+                    let result = self.refresh_locked(provider, &oauth.refresh);
+                    if matches!(result, Ok(None)) {
+                        tracing::warn!(
+                            provider,
+                            reason = "refresh_locked returned None for non-expired-but-stale token",
+                            "auth.get_api_key_excluding: refresh produced None"
+                        );
+                    }
+                    return result;
                 }
-                self.refresh_locked(provider, &oauth.refresh)
+                let result = self.refresh_locked(provider, &oauth.refresh);
+                if matches!(result, Ok(None)) {
+                    tracing::warn!(
+                        provider,
+                        reason = "refresh_locked returned None for expired token",
+                        "auth.get_api_key_excluding: refresh produced None"
+                    );
+                }
+                result
             }
         }
     }
@@ -433,6 +496,7 @@ impl AuthStorage {
     /// Refresh token under exclusive file lock, re-reading first in case
     /// another process already refreshed.
     fn refresh_locked(&self, provider: &str, stale_refresh: &str) -> crate::Result<Option<String>> {
+        tracing::debug!(provider, "auth refresh_locked: entry");
         ensure_parent(&self.path)?;
 
         // Open or create the file
@@ -447,9 +511,27 @@ impl AuthStorage {
             .map_err(|e| crate::Error::Io(format!("lock: {}", e)))?;
 
         // Re-read under lock — another process may have refreshed
-        let mut data: AuthData = if file.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
-            serde_json::from_reader(&file).unwrap_or_default()
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut data: AuthData = if file_len > 0 {
+            match serde_json::from_reader(&file) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        provider,
+                        file_len,
+                        err = %e,
+                        "auth refresh_locked: parse failed under exclusive lock — falling back to empty AuthData (existing creds may be lost!)"
+                    );
+                    AuthData::default()
+                }
+            }
         } else {
+            tracing::warn!(
+                path = %self.path.display(),
+                provider,
+                "auth refresh_locked: file is empty under exclusive lock — starting from empty AuthData"
+            );
             AuthData::new()
         };
 
@@ -458,6 +540,10 @@ impl AuthStorage {
         {
             // Another process already refreshed
             let key = existing.access.clone();
+            tracing::debug!(
+                provider,
+                "auth refresh_locked: another process already refreshed under lock — adopting stored token"
+            );
             file.unlock().map_err(|e| crate::Error::Io(e.to_string()))?;
             return Ok(Some(key));
         }
@@ -469,9 +555,15 @@ impl AuthStorage {
             stale_refresh.to_string()
         };
 
+        tracing::debug!(provider, "auth refresh_locked: calling do_refresh");
         let new_creds = match do_refresh(&refresh_tok) {
             Ok(c) => c,
             Err(e) => {
+                tracing::warn!(
+                    provider,
+                    err = %e,
+                    "auth refresh_locked: do_refresh failed"
+                );
                 file.unlock().ok();
                 return Err(crate::Error::Http(format!(
                     "token refresh failed for {}: {}",
@@ -492,6 +584,10 @@ impl AuthStorage {
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         file.unlock().map_err(|e| crate::Error::Io(e.to_string()))?;
 
+        tracing::debug!(
+            provider,
+            "auth refresh_locked: refresh succeeded, wrote new credential"
+        );
         Ok(Some(key))
     }
 }
@@ -499,6 +595,13 @@ impl AuthStorage {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Diagnostic accessor for `env_api_key` so the resolver can report
+/// `has_env` in its `Ok(None)` warning without exposing module internals
+/// or duplicating the env-var convention.
+pub(crate) fn env_api_key_for_diagnostics(provider: &str) -> Option<String> {
+    env_api_key(provider)
+}
 
 fn env_api_key(provider: &str) -> Option<String> {
     let var = match provider {

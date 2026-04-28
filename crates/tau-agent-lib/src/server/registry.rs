@@ -220,8 +220,22 @@ pub(super) fn resolve_api_key_excluding(
     if let Some(pc) = cfg.providers.get(provider)
         && let Some(key) = crate::config::resolve_provider_api_key(pc)
     {
+        tracing::debug!(provider, "resolve_api_key: from config");
         return Ok(Some(key));
     }
+    // Diagnostic: nothing produced a key. Capture which sources had
+    // *any* presence of the provider so the post-hoc log narrows the
+    // hypothesis space (auth race vs config typo vs env unset).
+    let has_auth_entry = auth.get(provider).ok().flatten().is_some();
+    let has_env = crate::auth::env_api_key_for_diagnostics(provider).is_some();
+    let has_config = cfg.providers.get(provider).is_some();
+    tracing::warn!(
+        provider,
+        has_auth_entry,
+        has_env,
+        has_config,
+        "resolve_api_key: returning Ok(None) — caller will surface NoApiKey"
+    );
     Ok(None)
 }
 

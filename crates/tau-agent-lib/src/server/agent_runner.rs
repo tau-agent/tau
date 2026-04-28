@@ -341,6 +341,13 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
         match api_key {
             Some(key) => Some(key),
             None => {
+                tracing::error!(
+                    session_id = %session_id,
+                    model = %model.id,
+                    provider = %model.provider,
+                    ts_ms = crate::types::timestamp_ms(),
+                    "agent_runner: NoApiKey early-return — see resolve_api_key warning above"
+                );
                 return Err(crate::Error::NoApiKey(model.provider.clone()));
             }
         }
