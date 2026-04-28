@@ -153,6 +153,15 @@ pub enum Request {
     /// The message is inserted as a user message between tool results
     /// and the next LLM call. If no agent is running, treated as Chat.
     Steer { session_id: String, text: String },
+    /// Trigger context compaction now. Optional `keep_hint` is free-form
+    /// text the summarizer is asked to preserve in addition to its standard
+    /// sections (advisory, not a hard filter).
+    Compact {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_hint: Option<String>,
+    },
+
     /// Queue a message for delivery to a target session.
     /// When `await_reply` is true the caller blocks until the target
     /// calls `session_reply` with the corresponding `msg_id`.

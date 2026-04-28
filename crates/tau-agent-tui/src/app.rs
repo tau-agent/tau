@@ -2266,11 +2266,43 @@ impl App {
             "/new" => Some(Action::NewSession),
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /task [list|get|create|search|claim|approve|ready|status|mq] /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /compact [keep hint] /task [list|get|create|search|claim|approve|ready|status|mq] /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /help /quit"
                         .into(),
                 });
                 None
             }
+            "/compact" => {
+                // `/compact` triggers manual context compaction. The optional
+                // free-form `args` becomes a `keep_hint` the summarizer is
+                // asked to preserve in addition to its standard sections.
+                //
+                // We mirror the daemon-side guard client-side: if a turn is
+                // streaming, surface a local Error and don't emit the action.
+                // Other slash commands fire-and-forget regardless of mode;
+                // for `/compact` the user benefits from immediate feedback
+                // because the daemon would also reject it.
+                if matches!(self.mode, AppMode::Streaming) {
+                    self.messages.push(MessageItem::Error {
+                        text: "can't compact while a turn is running. Cancel it first (Ctrl+C)."
+                            .into(),
+                    });
+                    return None;
+                }
+                let keep_hint = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
+                self.messages.push(MessageItem::Status {
+                    text: if let Some(ref h) = keep_hint {
+                        format!("compacting (keep hint: {})…", h)
+                    } else {
+                        "compacting…".into()
+                    },
+                });
+                Some(Action::Compact { keep_hint })
+            }
+
             "/cwd" => {
                 if args.is_empty() {
                     Some(Action::GetStatus)
@@ -3574,6 +3606,11 @@ pub enum Action {
     QueueMessage(String),
     /// Inject a steering message into the running agent loop.
     Steer(String),
+    /// Trigger manual context compaction with an optional keep hint.
+    Compact {
+        keep_hint: Option<String>,
+    },
+
     /// Open the session picker overlay.
     OpenSessionPicker,
     /// Delete a session.
@@ -6646,5 +6683,49 @@ mod tests {
         app.handle_input_key(&key_h);
         let typed = app.textarea.lines().iter().any(|l| l.contains('h'));
         assert!(typed, "textarea should accept input after force reset");
+    }
+
+    /// `/compact` with no args parses to a `Compact` action with no hint.
+    #[test]
+    fn slash_compact_no_args_emits_compact_action_with_none() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_slash_command("/compact");
+        match action {
+            Some(Action::Compact { keep_hint: None }) => {}
+            other => panic!("expected Action::Compact{{None}}, got {other:?}"),
+        }
+    }
+
+    /// `/compact <text>` parses to a `Compact` action whose `keep_hint`
+    /// preserves the free-form remainder verbatim.
+    #[test]
+    fn slash_compact_with_args_emits_compact_action_with_hint() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_slash_command("/compact keep failing test names");
+        match action {
+            Some(Action::Compact { keep_hint: Some(h) }) => {
+                assert_eq!(h, "keep failing test names");
+            }
+            other => panic!("expected Action::Compact{{Some(_)}}, got {other:?}"),
+        }
+    }
+
+    /// `/compact` while a turn is streaming is rejected client-side
+    /// with a local Error message and emits no action.
+    #[test]
+    fn slash_compact_during_streaming_is_rejected() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        let action = app.handle_slash_command("/compact");
+        assert!(action.is_none(), "no action emitted while streaming");
+        assert!(
+            app.messages.iter().any(|m| matches!(
+                m,
+                MessageItem::Error { text } if text.contains("turn is running")
+            )),
+            "expected an Error message about a running turn"
+        );
     }
 }

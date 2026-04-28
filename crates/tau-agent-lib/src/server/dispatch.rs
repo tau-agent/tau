@@ -844,8 +844,15 @@ pub(super) async fn handle_client(
                             )
                         };
                         if should
-                            && let Err(e) =
-                                run_compaction(&state, &session_id, &model, &mut writer).await
+                            && let Err(e) = run_compaction(
+                                &state,
+                                &session_id,
+                                &model,
+                                &mut writer,
+                                None,
+                                false,
+                            )
+                            .await
                         {
                             tracing::warn!(%e, "compaction error");
                         }
@@ -1046,6 +1053,134 @@ pub(super) async fn handle_client(
                 );
                 send(&mut writer, &Response::Ok).await.ok();
             }
+            crate::protocol::Request::Compact {
+                session_id,
+                keep_hint,
+            } => {
+                if shutdown.is_shutting_down() {
+                    send(
+                        &mut writer,
+                        &Response::Error {
+                            message: crate::protocol::SHUTTING_DOWN_ERROR.into(),
+                        },
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
+
+                // Reject if a turn is in flight: compaction mutates message
+                // history and racing it against an active agent loop would
+                // be confusing. The user can cancel the turn first.
+                let is_live = {
+                    let st = lock_state(&state);
+                    st.live_sessions.contains(&session_id)
+                };
+                if is_live {
+                    let info = Response::Stream {
+                        event: Box::new(StreamEvent::Status {
+                            message: "compaction rejected: a turn is currently running. \
+                                 Cancel it first (Ctrl+C) and retry."
+                                .to_string(),
+                        }),
+                    };
+                    broadcast_to_subscribers(&state, &session_id, &info);
+                    send(&mut writer, &info).await.ok();
+                    send(&mut writer, &Response::Ok).await.ok();
+                    continue;
+                }
+
+                // Look up the session's model. Compute the lookup result
+                // synchronously so the DB lock is dropped before any await.
+                enum ModelLookup {
+                    Found(crate::types::Model),
+                    NotFound,
+                    DbErr(String),
+                }
+                let lookup = {
+                    let st = lock_state(&state);
+                    match st.db.get_session(&session_id) {
+                        Ok(Some(stored)) => ModelLookup::Found(stored.model.clone()),
+                        Ok(None) => ModelLookup::NotFound,
+                        Err(e) => ModelLookup::DbErr(e.to_string()),
+                    }
+                };
+                let model = match lookup {
+                    ModelLookup::Found(m) => m,
+                    ModelLookup::NotFound => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("session not found: {}", session_id),
+                            },
+                        )
+                        .await
+                        .ok();
+                        continue;
+                    }
+                    ModelLookup::DbErr(msg) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("db error: {}", msg),
+                            },
+                        )
+                        .await
+                        .ok();
+                        continue;
+                    }
+                };
+
+                // Acquire the per-session lock to serialize against any
+                // other Chat / Compact request.
+                let session_mutex = session_lock(&session_locks, &session_id);
+                let _guard = match session_mutex.try_lock_arc() {
+                    Some(guard) => guard,
+                    None => {
+                        emit_phase(&state, &session_id, crate::types::AgentPhase::Waiting);
+                        session_mutex.lock_arc().await
+                    }
+                };
+
+                // Mark live for the duration so subscribers see Compacting.
+                {
+                    let mut st = lock_state(&state);
+                    st.live_sessions.insert(session_id.clone());
+                }
+
+                let res = run_compaction(
+                    &state,
+                    &session_id,
+                    &model,
+                    &mut writer,
+                    keep_hint.as_deref(),
+                    true, // manual
+                )
+                .await;
+
+                {
+                    let mut st = lock_state(&state);
+                    st.live_sessions.remove(&session_id);
+                }
+                emit_phase_and_wait(&state, &session_id, crate::types::AgentPhase::Idle).await;
+
+                match res {
+                    Ok(()) => {
+                        send(&mut writer, &Response::Ok).await.ok();
+                    }
+                    Err(e) => {
+                        send(
+                            &mut writer,
+                            &Response::Error {
+                                message: format!("compaction error: {}", e),
+                            },
+                        )
+                        .await
+                        .ok();
+                    }
+                }
+            }
+
             crate::protocol::Request::ListSessions {
                 include_archived,
                 project_name,

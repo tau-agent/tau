@@ -1140,6 +1140,8 @@ pub(super) async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
     session_id: &str,
     model: &Model,
     writer: &mut W,
+    keep_hint: Option<&str>,
+    manual: bool,
 ) -> crate::Result<()> {
     emit_phase(state, session_id, crate::types::AgentPhase::Compacting);
 
@@ -1154,7 +1156,19 @@ pub(super) async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
     };
 
     if cut_idx == 0 {
-        return Ok(()); // Nothing to compact
+        // Nothing meaningful to compact. Auto-compaction silently no-ops; for
+        // a manual `/compact` request, surface a Status so the user knows
+        // their command was received and why nothing happened.
+        if manual {
+            let info = Response::Stream {
+                event: Box::new(crate::types::StreamEvent::Status {
+                    message: "nothing to compact yet".to_string(),
+                }),
+            };
+            broadcast_to_subscribers(state, session_id, &info);
+            send(writer, &info).await.ok();
+        }
+        return Ok(());
     }
 
     let messages_to_summarize = &messages[..cut_idx];
@@ -1173,7 +1187,7 @@ pub(super) async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
     .await?;
 
     // Build summarization context and call LLM
-    let summary_ctx = compaction::build_summarization_context(messages_to_summarize);
+    let summary_ctx = compaction::build_summarization_context(messages_to_summarize, keep_hint);
 
     let api_key = {
         let st = lock_state(state);

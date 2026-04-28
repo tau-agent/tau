@@ -442,6 +442,16 @@ async fn run_inner(
                     })
                     .await?;
                 }
+                Action::Compact { keep_hint } => {
+                    // Fire-and-forget: server emits Status events on the
+                    // subscribe connection (Compacting phase, then Idle).
+                    send_fire_and_forget(Request::Compact {
+                        session_id: sid,
+                        keep_hint,
+                    })
+                    .await?;
+                }
+
                 Action::ListModels => {
                     send_request_and_recv(Request::ListModels, server_tx.clone()).await?;
                 }

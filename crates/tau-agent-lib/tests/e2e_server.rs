@@ -4697,3 +4697,86 @@ fn create_session_with_none_model_and_log_parent_uses_default() {
     conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     send_recv(&conn, &Request::Shutdown { restart: false });
 }
+
+/// `Request::Compact` on a brand-new session (no messages) returns Ok
+/// and emits a Status event explaining there's nothing to compact —
+/// covers the manual-compaction "empty session" branch in run_compaction.
+#[test]
+fn server_compact_on_empty_session_emits_nothing_to_compact() {
+    use tau_agent_lib::types::StreamEvent;
+
+    let server = TestServer::start(vec![]);
+
+    let sid = match CreateSessionBuilder::new(&server).cwd("/tmp").send_raw() {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+
+    // Send Compact and read every response on the request socket. The
+    // handler emits a Status event ("nothing to compact yet") followed by
+    // Response::Ok, since this session has zero messages and `cut_idx == 0`.
+    let req_conn = server.connect();
+    let responses = send_recv_all(
+        &req_conn,
+        &Request::Compact {
+            session_id: sid.clone(),
+            keep_hint: None,
+        },
+    );
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::Ok)),
+        "expected Response::Ok in compact responses, got: {:?}",
+        responses
+    );
+    let saw_status = responses.iter().any(|r| {
+        matches!(
+            r,
+            Response::Stream { event }
+                if matches!(event.as_ref(), StreamEvent::Status { message } if message.contains("nothing to compact"))
+        )
+    });
+    assert!(
+        saw_status,
+        "expected a 'nothing to compact' Status before Ok, got: {:?}",
+        responses
+    );
+
+    server.shutdown();
+}
+
+/// Sanity check: `Request::Compact` round-trips through the server when
+/// invoked on an idle session with a keep_hint set. The hint is harmless
+/// here because the empty session takes the "nothing to compact" path and
+/// no LLM call is made.
+#[test]
+fn server_compact_with_keep_hint_round_trips() {
+    use tau_agent_lib::types::StreamEvent;
+
+    let server = TestServer::start(vec![]);
+    let sid = match CreateSessionBuilder::new(&server).cwd("/tmp").send_raw() {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("expected SessionCreated, got {:?}", other),
+    };
+    let req_conn = server.connect();
+    let responses = send_recv_all(
+        &req_conn,
+        &Request::Compact {
+            session_id: sid,
+            keep_hint: Some("keep file paths verbatim".into()),
+        },
+    );
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::Ok)),
+        "expected Ok in responses, got: {:?}",
+        responses
+    );
+    assert!(
+        responses.iter().any(|r| matches!(
+            r,
+            Response::Stream { event } if matches!(event.as_ref(), StreamEvent::Status { .. })
+        )),
+        "expected at least one Status event, got: {:?}",
+        responses
+    );
+    server.shutdown();
+}

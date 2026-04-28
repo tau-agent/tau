@@ -251,12 +251,35 @@ fn serialize_messages(messages: &[Message]) -> String {
 
 /// Build the context for the summarization LLM call.
 /// Returns (system_prompt, user_messages) ready to send.
-pub fn build_summarization_context(messages_to_summarize: &[Message]) -> Context {
+///
+/// `keep_hint` is optional free-form text the user explicitly asked the
+/// summarizer to preserve. It is appended to the standard prompt as an
+/// advisory `<keep_hint>` block; the standard sections are still required.
+/// Whitespace-only hints are treated the same as `None`.
+pub fn build_summarization_context(
+    messages_to_summarize: &[Message],
+    keep_hint: Option<&str>,
+) -> Context {
     let conversation = serialize_messages(messages_to_summarize);
-    let prompt = format!(
+    let mut prompt = format!(
         "<conversation>\n{}</conversation>\n\n{}",
         conversation, SUMMARIZATION_PROMPT
     );
+
+    if let Some(hint) = keep_hint {
+        let trimmed = hint.trim();
+        if !trimmed.is_empty() {
+            prompt.push_str(
+                "\n\n## User-specified focus\n\
+                 The user explicitly asked you to preserve the following in the summary, \
+                 in addition to (not instead of) the standard sections above. \
+                 Treat it as advisory guidance, not a hard filter:\n\n\
+                 <keep_hint>\n",
+            );
+            prompt.push_str(trimmed);
+            prompt.push_str("\n</keep_hint>");
+        }
+    }
 
     Context {
         system_prompt: Some(SUMMARIZATION_SYSTEM_PROMPT.to_string()),
@@ -524,6 +547,70 @@ mod tests {
         assert!(
             matches!(&messages[cut], Message::User(_) | Message::Info(_)),
             "cut point must be at a valid boundary"
+        );
+    }
+
+    #[test]
+    fn build_summarization_context_without_hint_has_no_keep_hint_block() {
+        let messages = vec![user("hi"), assistant("hello", 5)];
+        let ctx = build_summarization_context(&messages, None);
+        let prompt = match &ctx.messages[0] {
+            Message::User(u) => match &u.content[0] {
+                UserContent::Text(t) => t.text.clone(),
+                _ => panic!("expected text content"),
+            },
+            _ => panic!("expected user message"),
+        };
+        assert!(prompt.contains("## Goal"), "standard sections present");
+        assert!(
+            !prompt.contains("<keep_hint>"),
+            "no keep_hint block when hint=None"
+        );
+        assert!(
+            !prompt.contains("User-specified focus"),
+            "no focus header when hint=None"
+        );
+    }
+
+    #[test]
+    fn build_summarization_context_with_hint_includes_block() {
+        let messages = vec![user("hi"), assistant("hello", 5)];
+        let ctx = build_summarization_context(&messages, Some("keep file paths verbatim"));
+        let prompt = match &ctx.messages[0] {
+            Message::User(u) => match &u.content[0] {
+                UserContent::Text(t) => t.text.clone(),
+                _ => panic!("expected text content"),
+            },
+            _ => panic!("expected user message"),
+        };
+        assert!(
+            prompt.contains("## Goal"),
+            "standard sections must still be present"
+        );
+        assert!(
+            prompt.contains("<keep_hint>\nkeep file paths verbatim\n</keep_hint>"),
+            "hint must appear inside <keep_hint> tags, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("advisory"),
+            "hint block must mark itself as advisory"
+        );
+    }
+
+    #[test]
+    fn build_summarization_context_with_blank_hint_omits_block() {
+        let messages = vec![user("hi"), assistant("hello", 5)];
+        let ctx = build_summarization_context(&messages, Some("   \n  \t"));
+        let prompt = match &ctx.messages[0] {
+            Message::User(u) => match &u.content[0] {
+                UserContent::Text(t) => t.text.clone(),
+                _ => panic!("expected text content"),
+            },
+            _ => panic!("expected user message"),
+        };
+        assert!(
+            !prompt.contains("<keep_hint>"),
+            "whitespace-only hint must be treated as None"
         );
     }
 }
