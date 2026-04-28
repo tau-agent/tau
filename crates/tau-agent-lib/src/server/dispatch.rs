@@ -844,15 +844,8 @@ pub(super) async fn handle_client(
                             )
                         };
                         if should
-                            && let Err(e) = run_compaction(
-                                &state,
-                                &session_id,
-                                &model,
-                                &mut writer,
-                                None,
-                                false,
-                            )
-                            .await
+                            && let Err(e) =
+                                run_compaction(&state, &session_id, &model, None, false).await
                         {
                             tracing::warn!(%e, "compaction error");
                         }
@@ -1202,7 +1195,6 @@ pub(super) async fn handle_client(
                     &state,
                     &session_id,
                     &model,
-                    &mut writer,
                     keep_hint.as_deref(),
                     true, // manual
                 )
@@ -1216,17 +1208,22 @@ pub(super) async fn handle_client(
 
                 match res {
                     Ok(()) => {
-                        send(&mut writer, &Response::Ok).await.ok();
+                        // Outcome already broadcast by run_compaction and
+                        // persisted as an Info message in the transcript;
+                        // nothing more to send on the request connection.
                     }
                     Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: format!("compaction error: {}", e),
-                            },
-                        )
-                        .await
-                        .ok();
+                        // Surface the error to subscribers (the TUI's Subscribe
+                        // connection) and persist a matching Info message so
+                        // there's a durable record of the failure.
+                        let err_text = format!("compaction error: {}", e);
+                        let resp = Response::Stream {
+                            event: Box::new(StreamEvent::Status {
+                                message: err_text.clone(),
+                            }),
+                        };
+                        broadcast_to_subscribers(&state, &session_id, &resp);
+                        super::notifications::queue_info_to_session(&state, &session_id, &err_text);
                     }
                 }
             }

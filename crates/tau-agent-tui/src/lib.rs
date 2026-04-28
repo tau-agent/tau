@@ -443,8 +443,13 @@ async fn run_inner(
                     .await?;
                 }
                 Action::Compact { keep_hint } => {
-                    // Fire-and-forget: server emits Status events on the
-                    // subscribe connection (Compacting phase, then Idle).
+                    // Fire-and-forget: progress and result are broadcast to
+                    // subscribers (the Subscribe connection), so the dedicated
+                    // request connection can be closed immediately. Server-side:
+                    // run_compaction broadcasts Status events for "compacting
+                    // session (N messages → summary)", "compaction done: X → Y
+                    // tokens", and any error; an Info message is also persisted
+                    // to the transcript for durable evidence.
                     send_fire_and_forget(Request::Compact {
                         session_id: sid,
                         keep_hint,

@@ -4698,12 +4698,14 @@ fn create_session_with_none_model_and_log_parent_uses_default() {
     send_recv(&conn, &Request::Shutdown { restart: false });
 }
 
-/// `Request::Compact` on a brand-new session (no messages) returns Ok
-/// and emits a Status event explaining there's nothing to compact —
-/// covers the manual-compaction "empty session" branch in run_compaction.
+/// `Request::Compact` on a brand-new session (no messages) broadcasts a
+/// Status event explaining there's nothing to compact and persists a
+/// matching Info message to the transcript — covers the manual-compaction
+/// "empty session" branch in run_compaction.
 #[test]
 fn server_compact_on_empty_session_emits_nothing_to_compact() {
-    use tau_agent_lib::types::StreamEvent;
+    use std::io::BufRead;
+    use tau_agent_lib::types::{AgentPhase, Message, StreamEvent};
 
     let server = TestServer::start(vec![]);
 
@@ -4712,33 +4714,114 @@ fn server_compact_on_empty_session_emits_nothing_to_compact() {
         other => panic!("expected SessionCreated, got {:?}", other),
     };
 
-    // Send Compact and read every response on the request socket. The
-    // handler emits a Status event ("nothing to compact yet") followed by
-    // Response::Ok, since this session has zero messages and `cut_idx == 0`.
+    // Spin up a subscriber on a background thread to capture broadcast
+    // events for the session — Compact's progress / outcome is delivered
+    // via the broadcast channel, not the request socket.
+    let sub_conn = server.connect();
+    let sub_sid = sid.clone();
+    let sub_handle = std::thread::spawn(move || {
+        let mut s = sub_conn;
+        let req = Request::Subscribe {
+            session_id: sub_sid,
+        };
+        let line = format!("{}\n", serde_json::to_string(&req).unwrap());
+        s.write_all(line.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let reader = std::io::BufReader::new(s);
+        let mut collected: Vec<Response> = Vec::new();
+        for line_res in reader.lines() {
+            let Ok(line) = line_res else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(resp) = serde_json::from_str::<Response>(&line) else {
+                continue;
+            };
+            // Stop after the post-compact Idle phase — that's our terminal
+            // marker for an empty-session Compact.
+            let saw_status = matches!(
+                &resp,
+                Response::Stream { event }
+                    if matches!(
+                        event.as_ref(),
+                        StreamEvent::Status { message } if message.contains("nothing to compact")
+                    )
+            );
+            let is_idle_after_compacting = matches!(
+                &resp,
+                Response::Stream { event }
+                    if matches!(event.as_ref(), StreamEvent::Phase { phase, .. } if *phase == AgentPhase::Idle)
+            ) && collected.iter().any(|r| matches!(
+                r,
+                Response::Stream { event }
+                    if matches!(event.as_ref(), StreamEvent::Phase { phase, .. } if *phase == AgentPhase::Compacting)
+            ));
+            collected.push(resp);
+            if saw_status && is_idle_after_compacting {
+                break;
+            }
+            if is_idle_after_compacting && collected.iter().any(|r| matches!(
+                r,
+                Response::Stream { event }
+                    if matches!(
+                        event.as_ref(),
+                        StreamEvent::Status { message } if message.contains("nothing to compact")
+                    )
+            )) {
+                break;
+            }
+        }
+        collected
+    });
+
+    // Give the subscriber a moment to register before we trigger the work.
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Fire-and-forget Compact on a fresh connection — the request socket
+    // gets no Status / Ok back, only the subscriber does.
     let req_conn = server.connect();
-    let responses = send_recv_all(
-        &req_conn,
-        &Request::Compact {
-            session_id: sid.clone(),
-            keep_hint: None,
-        },
-    );
-    assert!(
-        responses.iter().any(|r| matches!(r, Response::Ok)),
-        "expected Response::Ok in compact responses, got: {:?}",
-        responses
-    );
-    let saw_status = responses.iter().any(|r| {
+    let req = Request::Compact {
+        session_id: sid.clone(),
+        keep_hint: None,
+    };
+    let line = format!("{}\n", serde_json::to_string(&req).unwrap());
+    req_conn
+        .try_clone()
+        .unwrap()
+        .write_all(line.as_bytes())
+        .unwrap();
+    req_conn.try_clone().unwrap().flush().unwrap();
+
+    let events = sub_handle.join().expect("subscriber thread panicked");
+    let saw_status = events.iter().any(|r| {
         matches!(
             r,
             Response::Stream { event }
-                if matches!(event.as_ref(), StreamEvent::Status { message } if message.contains("nothing to compact"))
+                if matches!(
+                    event.as_ref(),
+                    StreamEvent::Status { message } if message.contains("nothing to compact")
+                )
         )
     });
     assert!(
         saw_status,
-        "expected a 'nothing to compact' Status before Ok, got: {:?}",
-        responses
+        "expected a 'nothing to compact' Status broadcast, got: {:?}",
+        events
+    );
+
+    // The same outcome must also be persisted as an Info message on the
+    // session transcript, so a user can find evidence of the no-op later.
+    let messages = common::get_session_messages(&server, &sid);
+    let saw_info = messages.iter().any(|m| {
+        matches!(
+            m,
+            Message::Info(info) if info.text.contains("nothing to compact")
+        )
+    });
+    assert!(
+        saw_info,
+        "expected an Info message recording the no-op compaction, got: {:?}",
+        messages
     );
 
     server.shutdown();
@@ -4750,33 +4833,76 @@ fn server_compact_on_empty_session_emits_nothing_to_compact() {
 /// no LLM call is made.
 #[test]
 fn server_compact_with_keep_hint_round_trips() {
-    use tau_agent_lib::types::StreamEvent;
+    use std::io::BufRead;
+    use tau_agent_lib::types::{AgentPhase, StreamEvent};
 
     let server = TestServer::start(vec![]);
     let sid = match CreateSessionBuilder::new(&server).cwd("/tmp").send_raw() {
         Response::SessionCreated { session_id } => session_id,
         other => panic!("expected SessionCreated, got {:?}", other),
     };
+
+    let sub_conn = server.connect();
+    let sub_sid = sid.clone();
+    let sub_handle = std::thread::spawn(move || {
+        let mut s = sub_conn;
+        let req = Request::Subscribe {
+            session_id: sub_sid,
+        };
+        let line = format!("{}\n", serde_json::to_string(&req).unwrap());
+        s.write_all(line.as_bytes()).unwrap();
+        s.flush().unwrap();
+        let reader = std::io::BufReader::new(s);
+        let mut collected: Vec<Response> = Vec::new();
+        for line_res in reader.lines() {
+            let Ok(line) = line_res else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(resp) = serde_json::from_str::<Response>(&line) else {
+                continue;
+            };
+            let saw_compacting = collected.iter().any(|r| matches!(
+                r,
+                Response::Stream { event }
+                    if matches!(event.as_ref(), StreamEvent::Phase { phase, .. } if *phase == AgentPhase::Compacting)
+            ));
+            let is_idle = matches!(
+                &resp,
+                Response::Stream { event }
+                    if matches!(event.as_ref(), StreamEvent::Phase { phase, .. } if *phase == AgentPhase::Idle)
+            );
+            collected.push(resp);
+            if saw_compacting && is_idle {
+                break;
+            }
+        }
+        collected
+    });
+
+    std::thread::sleep(Duration::from_millis(100));
+
     let req_conn = server.connect();
-    let responses = send_recv_all(
-        &req_conn,
-        &Request::Compact {
-            session_id: sid,
-            keep_hint: Some("keep file paths verbatim".into()),
-        },
-    );
+    let req = Request::Compact {
+        session_id: sid,
+        keep_hint: Some("keep file paths verbatim".into()),
+    };
+    let line = format!("{}\n", serde_json::to_string(&req).unwrap());
+    req_conn
+        .try_clone()
+        .unwrap()
+        .write_all(line.as_bytes())
+        .unwrap();
+    req_conn.try_clone().unwrap().flush().unwrap();
+
+    let events = sub_handle.join().expect("subscriber thread panicked");
     assert!(
-        responses.iter().any(|r| matches!(r, Response::Ok)),
-        "expected Ok in responses, got: {:?}",
-        responses
-    );
-    assert!(
-        responses.iter().any(|r| matches!(
+        events.iter().any(|r| matches!(
             r,
             Response::Stream { event } if matches!(event.as_ref(), StreamEvent::Status { .. })
         )),
-        "expected at least one Status event, got: {:?}",
-        responses
+        "expected at least one Status event from the subscriber, got: {:?}",
+        events
     );
     server.shutdown();
 }

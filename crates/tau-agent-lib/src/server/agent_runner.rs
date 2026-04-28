@@ -1135,11 +1135,10 @@ pub(super) async fn resume_child_session(
     Ok(())
 }
 
-pub(super) async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
+pub(super) async fn run_compaction(
     state: &SharedState,
     session_id: &str,
     model: &Model,
-    writer: &mut W,
     keep_hint: Option<&str>,
     manual: bool,
 ) -> crate::Result<()> {
@@ -1157,16 +1156,22 @@ pub(super) async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
 
     if cut_idx == 0 {
         // Nothing meaningful to compact. Auto-compaction silently no-ops; for
-        // a manual `/compact` request, surface a Status so the user knows
-        // their command was received and why nothing happened.
+        // a manual `/compact` request, broadcast a Status so any subscriber
+        // (the requesting TUI plus any others watching) sees that the
+        // command was received and why nothing happened, and persist a
+        // matching Info message so there's a durable record in the
+        // transcript. Auto-compaction (manual=false) stays silent: it
+        // shouldn't spam the transcript with no-op notes.
         if manual {
+            let text = "manual compaction: nothing to compact yet \
+                        (history fits within keep-recent window)";
             let info = Response::Stream {
                 event: Box::new(crate::types::StreamEvent::Status {
-                    message: "nothing to compact yet".to_string(),
+                    message: text.to_string(),
                 }),
             };
             broadcast_to_subscribers(state, session_id, &info);
-            send(writer, &info).await.ok();
+            queue_info_to_session(state, session_id, text);
         }
         return Ok(());
     }
@@ -1174,17 +1179,20 @@ pub(super) async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
     let messages_to_summarize = &messages[..cut_idx];
     let ctx_before = compaction::estimate_context_tokens(&messages);
 
-    // Notify client
-    send(
-        writer,
-        &Response::Error {
-            message: format!(
-                "compacting session ({} messages → summary)...",
-                messages_to_summarize.len()
-            ),
-        },
-    )
-    .await?;
+    // Notify subscribers that compaction is starting. The requesting
+    // client (TUI) is also a subscriber on its Subscribe connection, so
+    // it sees this Status alongside any other attached subscribers.
+    {
+        let progress = Response::Stream {
+            event: Box::new(crate::types::StreamEvent::Status {
+                message: format!(
+                    "compacting session ({} messages \u{2192} summary)...",
+                    messages_to_summarize.len()
+                ),
+            }),
+        };
+        broadcast_to_subscribers(state, session_id, &progress);
+    }
 
     // Build summarization context and call LLM
     let summary_ctx = compaction::build_summarization_context(messages_to_summarize, keep_hint);
@@ -1233,13 +1241,22 @@ pub(super) async fn run_compaction<W: futures::io::AsyncWrite + Unpin>(
         compaction::estimate_context_tokens(&messages)
     };
 
-    send(
-        writer,
-        &Response::Error {
-            message: format!("compaction done: {} → {} tokens", ctx_before, after_tokens),
-        },
-    )
-    .await?;
+    let done_text = format!(
+        "compaction done: {} \u{2192} {} tokens",
+        ctx_before, after_tokens
+    );
+    let done = Response::Stream {
+        event: Box::new(crate::types::StreamEvent::Status {
+            message: done_text.clone(),
+        }),
+    };
+    broadcast_to_subscribers(state, session_id, &done);
+    if manual {
+        // Persist a durable record of the outcome to the transcript so a
+        // user asking "did /compact work?" days later can find evidence
+        // even if they missed the live Status.
+        queue_info_to_session(state, session_id, &done_text);
+    }
 
     Ok(())
 }
@@ -1249,4 +1266,256 @@ pub(super) async fn send<W: futures::io::AsyncWrite + Unpin>(
     resp: &Response,
 ) -> crate::Result<()> {
     crate::write_json_line_async(writer, resp).await
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    //! Regression tests for task #875: compaction must broadcast progress /
+    //! outcome to subscribers and persist a durable Info message to the
+    //! transcript so a user can answer "did /compact actually work?" days
+    //! later.
+
+    use super::*;
+    use crate::db::{Db, StoredSession};
+    use crate::provider::ProviderRegistry;
+    use crate::server::state::State;
+    use std::collections::{HashMap, HashSet};
+    use tau_agent_engine::providers::mock::{MockProvider, MockResponse, mock_model};
+
+    fn mk_state_with_mock() -> SharedState {
+        let db = Db::open_memory().expect("open in-memory db");
+        let mut registry = ProviderRegistry::new();
+        registry.register(MockProvider::new(vec![MockResponse::Text(
+            "## Summary\n- did stuff\n".to_string(),
+        )]));
+        let model = mock_model();
+        Arc::new(Mutex::new(State {
+            db,
+            registry,
+            auth: crate::auth::AuthStorage::open_default(),
+            config: crate::config::Config::default(),
+            global_aliases: HashMap::new(),
+            default_model: model.clone(),
+            all_models: vec![model],
+            usage_cache: None,
+            cancel_flags: HashMap::new(),
+            has_queued: HashMap::new(),
+            subscribers: HashMap::new(),
+            phases: HashMap::new(),
+            live_sessions: HashSet::new(),
+            waited_sessions: HashSet::new(),
+            session_done_waiters: Vec::new(),
+            reply_waiters: HashMap::new(),
+            next_msg_id: 0,
+            bg_after_idle: HashMap::new(),
+            bg_scheduler: None,
+        }))
+    }
+
+    fn seed_compactable_session(state: &SharedState, session_id: &str, model: &Model) {
+        let st = lock_state(state);
+        st.db
+            .create_session(&StoredSession {
+                id: session_id.to_string(),
+                model: model.clone(),
+                system_prompt: None,
+                cwd: None,
+                is_subscription: false,
+                created_at: 0,
+                parent_id: None,
+                child_budget: 0,
+                tagline: None,
+                archived: false,
+                last_exit_status: None,
+                last_phase: None,
+                auto_archive: false,
+                notify_parent: true,
+                project_name: None,
+            })
+            .expect("create session");
+
+        // Build a transcript whose backwards walk forces find_cut_point to
+        // land at message index 2 (the second User). The big assistant blob
+        // ensures `keep_recent_tokens=20_000` is exceeded before we walk
+        // past it.
+        let big_text: String = "x".repeat(120_000); // ~30k token estimate
+        let messages = vec![
+            Message::User(UserMessage::text("hello")),
+            Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: big_text,
+                    text_signature: None,
+                })],
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: model.id.clone(),
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }),
+            Message::User(UserMessage::text("follow up")),
+            Message::Assistant(AssistantMessage {
+                content: vec![AssistantContent::Text(TextContent {
+                    text: "ok".into(),
+                    text_signature: None,
+                })],
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: model.id.clone(),
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }),
+        ];
+        for msg in &messages {
+            st.db
+                .append_message(session_id, msg)
+                .expect("append message");
+        }
+    }
+
+    /// Acceptance criterion #6: a successful manual compaction must (a)
+    /// persist a `compaction_summary` row in the DB, (b) persist an Info
+    /// message with "compaction done" text to the transcript, and (c)
+    /// broadcast a Status event with that text to attached subscribers.
+    #[test]
+    fn run_compaction_persists_info_and_broadcasts_status() {
+        smol::block_on(async {
+            let state = mk_state_with_mock();
+            let model = mock_model();
+            let session_id = "s-compact-test";
+            seed_compactable_session(&state, session_id, &model);
+
+            // Register a subscriber on the session so we can capture the
+            // Status broadcasts emitted by run_compaction.
+            let (tx, rx) = smol::channel::unbounded::<Response>();
+            {
+                let mut st = lock_state(&state);
+                st.subscribers.insert(session_id.into(), vec![tx]);
+            }
+
+            run_compaction(&state, session_id, &model, None, /* manual */ true)
+                .await
+                .expect("run_compaction");
+
+            // -- (a) compaction_summary row present.
+            let messages_after = {
+                let st = lock_state(&state);
+                st.db.get_messages(session_id).expect("get messages")
+            };
+            assert!(
+                messages_after
+                    .iter()
+                    .any(|m| matches!(m, Message::CompactionSummary(_))),
+                "expected a CompactionSummary in the transcript, got: {:?}",
+                messages_after
+            );
+
+            // -- (b) Info message recording the outcome is present.
+            let saw_info_done = messages_after.iter().any(|m| {
+                matches!(
+                    m,
+                    Message::Info(info) if info.text.contains("compaction done")
+                )
+            });
+            assert!(
+                saw_info_done,
+                "expected an Info(\"compaction done...\") message after manual compaction, \
+                 got: {:?}",
+                messages_after
+            );
+
+            // -- (c) Subscriber received progress + completion Status
+            //        broadcasts.
+            let mut collected = Vec::new();
+            while let Ok(resp) = rx.try_recv() {
+                collected.push(resp);
+            }
+            let saw_progress = collected.iter().any(|r| {
+                matches!(
+                    r,
+                    Response::Stream { event }
+                        if matches!(
+                            event.as_ref(),
+                            StreamEvent::Status { message } if message.contains("compacting session")
+                        )
+                )
+            });
+            let saw_done = collected.iter().any(|r| {
+                matches!(
+                    r,
+                    Response::Stream { event }
+                        if matches!(
+                            event.as_ref(),
+                            StreamEvent::Status { message } if message.contains("compaction done")
+                        )
+                )
+            });
+            assert!(
+                saw_progress,
+                "subscriber should have observed a 'compacting session' Status, got: {:?}",
+                collected
+            );
+            assert!(
+                saw_done,
+                "subscriber should have observed a 'compaction done' Status, got: {:?}",
+                collected
+            );
+        });
+    }
+
+    /// Auto-compaction (manual=false) must NOT persist an Info message on
+    /// the no-op path — that would spam the transcript every turn.
+    #[test]
+    fn auto_compaction_no_op_does_not_persist_info() {
+        smol::block_on(async {
+            let state = mk_state_with_mock();
+            let model = mock_model();
+            let session_id = "s-auto-noop";
+            // Seed a session with no compactable prefix — just one turn.
+            {
+                let st = lock_state(&state);
+                st.db
+                    .create_session(&StoredSession {
+                        id: session_id.to_string(),
+                        model: model.clone(),
+                        system_prompt: None,
+                        cwd: None,
+                        is_subscription: false,
+                        created_at: 0,
+                        parent_id: None,
+                        child_budget: 0,
+                        tagline: None,
+                        archived: false,
+                        last_exit_status: None,
+                        last_phase: None,
+                        auto_archive: false,
+                        notify_parent: true,
+                        project_name: None,
+                    })
+                    .expect("create session");
+                st.db
+                    .append_message(session_id, &Message::User(UserMessage::text("hi")))
+                    .expect("append user");
+            }
+
+            run_compaction(&state, session_id, &model, None, /* manual */ false)
+                .await
+                .expect("run_compaction");
+
+            let messages_after = {
+                let st = lock_state(&state);
+                st.db.get_messages(session_id).expect("get messages")
+            };
+            assert!(
+                !messages_after.iter().any(|m| matches!(m, Message::Info(_))),
+                "auto-compaction must not persist Info messages on the no-op path, got: {:?}",
+                messages_after
+            );
+        });
+    }
 }
