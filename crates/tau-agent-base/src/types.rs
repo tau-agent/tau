@@ -476,6 +476,52 @@ pub enum ThinkingDisplay {
     Omitted,
 }
 
+/// Prompt-cache retention hint. Mirrors pi-ai's `CacheRetention`.
+///
+/// `Short` is the default and matches OpenAI's ~5-minute prefix cache TTL.
+/// `Long` requests the 24h retention tier (sent to OpenAI as
+/// `prompt_cache_retention: "24h"`). `None` opts out of provider-side prompt
+/// caching where applicable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheRetention {
+    None,
+    Short,
+    Long,
+}
+
+impl Default for CacheRetention {
+    fn default() -> Self {
+        Self::Short
+    }
+}
+
+impl CacheRetention {
+    /// Resolve an optional retention hint into a concrete value.
+    ///
+    /// `None` falls back to `Short`. Pure: callers that want to honour the
+    /// `PI_CACHE_RETENTION=long` env override should call
+    /// [`Self::resolve_with_env`] instead.
+    pub fn resolve(opt: Option<Self>) -> Self {
+        opt.unwrap_or_default()
+    }
+
+    /// Resolve an optional retention hint, honouring `PI_CACHE_RETENTION=long`
+    /// from the environment when `opt` is `None`.
+    ///
+    /// Mirrors pi-ai's `resolveCacheRetention` helper. An explicit
+    /// `Some(...)` always wins over the env var.
+    pub fn resolve_with_env(opt: Option<Self>) -> Self {
+        if let Some(v) = opt {
+            return v;
+        }
+        match std::env::var("PI_CACHE_RETENTION").ok().as_deref() {
+            Some("long") => Self::Long,
+            _ => Self::Short,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -506,6 +552,17 @@ pub struct StreamOptions {
     /// is enabled on the Anthropic provider.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_display: Option<ThinkingDisplay>,
+    /// Opaque session identifier for provider-side prompt-cache affinity.
+    ///
+    /// Currently used by the OpenAI provider as `prompt_cache_key` so
+    /// consecutive turns of the same conversation hit the same cache shard.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Prompt-cache retention hint. `None` defers to the provider default
+    /// (currently `Short`, with `PI_CACHE_RETENTION=long` env override
+    /// honoured by the OpenAI provider).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_retention: Option<CacheRetention>,
 }
 
 // ---------------------------------------------------------------------------
@@ -782,6 +839,38 @@ mod tests {
     }
 
     #[test]
+    fn cache_retention_resolve_defaults_to_short() {
+        assert_eq!(CacheRetention::resolve(None), CacheRetention::Short);
+        assert_eq!(
+            CacheRetention::resolve(Some(CacheRetention::Long)),
+            CacheRetention::Long
+        );
+        assert_eq!(
+            CacheRetention::resolve(Some(CacheRetention::None)),
+            CacheRetention::None
+        );
+    }
+
+    #[test]
+    fn cache_retention_resolve_with_env_explicit_wins() {
+        // An explicit Some(...) must always beat the env var, regardless of
+        // what PI_CACHE_RETENTION says in this process.
+        assert_eq!(
+            CacheRetention::resolve_with_env(Some(CacheRetention::None)),
+            CacheRetention::None
+        );
+        assert_eq!(
+            CacheRetention::resolve_with_env(Some(CacheRetention::Short)),
+            CacheRetention::Short
+        );
+        assert_eq!(
+            CacheRetention::resolve_with_env(Some(CacheRetention::Long)),
+            CacheRetention::Long
+        );
+    }
+
+    #[test]
+
     fn tool_result_message_summary_none_not_serialized() {
         let msg = ToolResultMessage::success("tc1", "bash", "ok");
         let json = serde_json::to_string(&msg).expect("serialize");

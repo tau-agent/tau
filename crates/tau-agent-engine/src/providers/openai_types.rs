@@ -25,6 +25,16 @@ pub struct ChatCompletionRequest {
     /// Qwen-style thinking toggle
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
+    /// Opaque cache-affinity key for OpenAI's prompt cache. Only sent when
+    /// talking directly to `api.openai.com` — OpenAI-compatible backends
+    /// (LiteLLM, OpenRouter, Groq, …) typically reject it with 400.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    /// Prompt-cache retention tier. Only `"24h"` is meaningful today; sent
+    /// only when the caller opts into long retention against
+    /// `api.openai.com`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<&'static str>,
 }
 
 #[derive(Serialize)]

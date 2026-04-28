@@ -637,6 +637,8 @@ async fn run_loop_review(
         thinking_enabled: Some(false),
         thinking_effort: None,
         thinking_display: None,
+        session_id: None,
+        cache_retention: None,
     };
 
     // Single-shot LLM call with retry.

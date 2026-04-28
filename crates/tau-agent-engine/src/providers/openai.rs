@@ -483,6 +483,22 @@ fn build_request_body(
         _ => (None, None),
     };
 
+    // Prompt caching: only send to api.openai.com directly. OpenAI-compatible
+    // backends (LiteLLM, Anthropic-via-proxy, Groq, OpenRouter, …) reject
+    // these fields. Mirrors pi-ai upstream.
+    let is_openai = model.base_url.contains("api.openai.com");
+    let retention = CacheRetention::resolve_with_env(options.cache_retention);
+    let prompt_cache_key = if is_openai && retention != CacheRetention::None {
+        options.session_id.clone()
+    } else {
+        None
+    };
+    let prompt_cache_retention = if is_openai && retention == CacheRetention::Long {
+        Some("24h")
+    } else {
+        None
+    };
+
     Ok(openai_types::ChatCompletionRequest {
         model: model.id.clone(),
         messages,
@@ -495,6 +511,8 @@ fn build_request_body(
         }),
         reasoning_effort,
         enable_thinking,
+        prompt_cache_key,
+        prompt_cache_retention,
     })
 }
 
@@ -580,5 +598,132 @@ fn map_finish_reason(reason: &str) -> StopReason {
         "tool_calls" => StopReason::ToolUse,
         "content_filter" => StopReason::Error,
         _ => StopReason::Stop,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_model(base_url: &str) -> Model {
+        Model {
+            id: "gpt-test".into(),
+            name: "GPT Test".into(),
+            api: API_ID.into(),
+            provider: "openai".into(),
+            base_url: base_url.into(),
+            thinking: ThinkingStyle::None,
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 16_000,
+            headers: Default::default(),
+        }
+    }
+
+    fn ctx() -> Context {
+        Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage::text("hi"))],
+            tools: Vec::new(),
+        }
+    }
+
+    fn build(base_url: &str, options: &StreamOptions) -> serde_json::Value {
+        let model = test_model(base_url);
+        let req = build_request_body(&model, &ctx(), options).expect("build_request_body");
+        serde_json::to_value(req).expect("serialize")
+    }
+
+    #[test]
+    fn prompt_cache_key_set_for_openai_with_session_id() {
+        let opts = StreamOptions {
+            session_id: Some("sess-abc".into()),
+            ..Default::default()
+        };
+        let body = build("https://api.openai.com/v1", &opts);
+        assert_eq!(body["prompt_cache_key"], "sess-abc");
+    }
+
+    #[test]
+    fn prompt_cache_key_omitted_for_compatible_backend() {
+        let opts = StreamOptions {
+            session_id: Some("sess-abc".into()),
+            cache_retention: Some(CacheRetention::Long),
+            ..Default::default()
+        };
+        let body = build("https://api.litellm.example/v1", &opts);
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "non-OpenAI backends must not receive prompt_cache_key, got {body}"
+        );
+        assert!(
+            body.get("prompt_cache_retention").is_none(),
+            "non-OpenAI backends must not receive prompt_cache_retention, got {body}"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_retention_long_emits_24h() {
+        let opts = StreamOptions {
+            session_id: Some("sess-abc".into()),
+            cache_retention: Some(CacheRetention::Long),
+            ..Default::default()
+        };
+        let body = build("https://api.openai.com/v1", &opts);
+        assert_eq!(body["prompt_cache_retention"], "24h");
+        assert_eq!(body["prompt_cache_key"], "sess-abc");
+    }
+
+    #[test]
+    fn prompt_cache_retention_short_omits_field() {
+        let opts = StreamOptions {
+            session_id: Some("sess-abc".into()),
+            cache_retention: Some(CacheRetention::Short),
+            ..Default::default()
+        };
+        let body = build("https://api.openai.com/v1", &opts);
+        assert!(
+            body.get("prompt_cache_retention").is_none(),
+            "Short retention should omit prompt_cache_retention, got {body}"
+        );
+        // session_id is still wired through as the cache key.
+        assert_eq!(body["prompt_cache_key"], "sess-abc");
+    }
+
+    #[test]
+    fn cache_retention_none_disables_key() {
+        let opts = StreamOptions {
+            session_id: Some("sess-abc".into()),
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let body = build("https://api.openai.com/v1", &opts);
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "CacheRetention::None must suppress prompt_cache_key, got {body}"
+        );
+        assert!(
+            body.get("prompt_cache_retention").is_none(),
+            "CacheRetention::None must suppress prompt_cache_retention, got {body}"
+        );
+    }
+
+    #[test]
+    fn prompt_cache_key_omitted_without_session_id() {
+        // Default options on api.openai.com: no session_id supplied, so no
+        // cache key (but no retention either since retention defaults to Short).
+        let body = build("https://api.openai.com/v1", &StreamOptions::default());
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "no session_id means no prompt_cache_key, got {body}"
+        );
+        assert!(
+            body.get("prompt_cache_retention").is_none(),
+            "default retention is Short -> no prompt_cache_retention, got {body}"
+        );
     }
 }
