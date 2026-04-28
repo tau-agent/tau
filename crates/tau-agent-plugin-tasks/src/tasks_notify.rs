@@ -667,6 +667,109 @@ pub fn notify_placeholder_wait(
     }
 }
 
+/// Broadcast a freshly-added `task_message` body to every currently-active
+/// session associated with the task, except the calling session itself.
+///
+/// Recipients are the union of:
+///   * `task.session_id` (the task's currently-dispatched primary session,
+///     if any), and
+///   * every row in `task_sessions` whose role is one of `worker`,
+///     `reviewer`, or `interactive`,
+///
+/// minus:
+///   * the calling session (`caller_session_id`), to avoid re-injecting
+///     the call into the author's own conversation history, and
+///   * archived sessions (filtered via `GetSessionInfo`).
+///
+/// `creator` and `contributor` rows are intentionally excluded:
+/// `creator` is typically a long-finished session that filed the task and
+/// moved on, and `contributor` is added when *other* sessions call
+/// `task_message` — broadcasting back to contributors creates a wake-loop
+/// where every contributor wakes on every subsequent `task_message`.
+///
+/// The injected message is a normal user-shaped wake (not an info
+/// message): it is shown to the recipient's LLM on the next turn and the
+/// host's `QueueMessage` handler resumes idle target sessions via
+/// `queue_and_maybe_resume`.
+///
+/// Delivery is best-effort: per-recipient RPC failures are logged and
+/// the loop continues so a single broken target can't drop the rest of
+/// the broadcast. DB lookup failures cause the function to return
+/// silently, matching the rest of `tasks_notify.rs`.
+pub fn broadcast_task_message(
+    db: &TasksDb,
+    task_id: i64,
+    author: &str,
+    content: &str,
+    caller_session_id: Option<&str>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let task = match db.get_task(task_id) {
+        Ok(Some(t)) => t,
+        _ => return,
+    };
+
+    let mut recipients: HashSet<String> = HashSet::new();
+
+    // 1. The task's currently-dispatched primary session, if any. This
+    //    may be ahead of the per-role records during transitions, so it
+    //    is included regardless of role bookkeeping.
+    if let Some(ref sid) = task.session_id {
+        recipients.insert(sid.clone());
+    }
+
+    // 2. Per-role rows: only worker / reviewer / interactive. See the
+    //    function-level doc comment for why creator / contributor are
+    //    excluded.
+    if let Ok(sessions) = db.get_sessions(task_id) {
+        for ts in sessions {
+            if matches!(ts.role.as_str(), "worker" | "reviewer" | "interactive") {
+                recipients.insert(ts.session_id);
+            }
+        }
+    }
+
+    // 3. Drop the caller. The caller already has the task_message tool
+    //    call recorded in its own conversation history; re-injecting
+    //    the same content as a user-shaped wake would be noise (and
+    //    would also wake the caller mid-turn, which is exactly wrong).
+    if let Some(caller) = caller_session_id {
+        recipients.remove(caller);
+    }
+
+    if recipients.is_empty() {
+        return;
+    }
+
+    let body = format!("[task #{} message from {}]\n{}", task_id, author, content);
+    let sender_info = format!("task #{} message", task_id);
+
+    for sid in recipients {
+        // Skip archived recipients: the user has dismissed those
+        // sessions, and waking them resurrects them in listings.
+        if is_session_archived(&sid, writer, reader) {
+            continue;
+        }
+        if let Err(e) = server_request(
+            writer,
+            reader,
+            tau_agent_plugin::Request::QueueMessage {
+                target_session_id: sid.clone(),
+                content: body.clone(),
+                sender_info: sender_info.clone(),
+                await_reply: false,
+                reply_to: None,
+            },
+        ) {
+            eprintln!(
+                "tasks broadcast: failed to deliver task #{} message to {}: {}",
+                task_id, sid, e
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2372,5 +2475,224 @@ mod tests {
     #[test]
     fn format_duration_ms_negative_clamps_to_zero() {
         assert_eq!(format_duration_ms(-5), "0ms");
+    }
+
+    // -----------------------------------------------------------------
+    // broadcast_task_message (task #851)
+    // -----------------------------------------------------------------
+
+    /// Worker, reviewer, and interactive sessions all receive the
+    /// broadcast; creator and contributor sessions are explicitly
+    /// excluded so they don't get woken up unnecessarily.
+    #[test]
+    fn broadcast_task_message_delivers_to_worker_and_reviewer() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Spec", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec worker");
+        db.record_session(task.id, "s-reviewer", "reviewer")
+            .expect("rec reviewer");
+        db.record_session(task.id, "s-interactive", "interactive")
+            .expect("rec interactive");
+        db.record_session(task.id, "s-creator", "creator")
+            .expect("rec creator");
+        db.record_session(task.id, "s-contrib", "contributor")
+            .expect("rec contributor");
+
+        let (shared, mut w, mut r) = make_io();
+        broadcast_task_message(
+            &db,
+            task.id,
+            "caller-author",
+            "please add X",
+            None,
+            &mut w,
+            &mut r,
+        );
+
+        let calls = captured_messages_sorted(&shared);
+        let recipients: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert!(
+            recipients.contains(&"s-worker"),
+            "worker should receive: {:?}",
+            recipients
+        );
+        assert!(
+            recipients.contains(&"s-reviewer"),
+            "reviewer should receive: {:?}",
+            recipients
+        );
+        assert!(
+            recipients.contains(&"s-interactive"),
+            "interactive should receive: {:?}",
+            recipients
+        );
+        assert!(
+            !recipients.contains(&"s-creator"),
+            "creator should NOT receive: {:?}",
+            recipients
+        );
+        assert!(
+            !recipients.contains(&"s-contrib"),
+            "contributor should NOT receive: {:?}",
+            recipients
+        );
+        assert_eq!(
+            recipients.len(),
+            3,
+            "exactly three recipients: {:?}",
+            recipients
+        );
+    }
+
+    /// The calling session is excluded from the broadcast even if it is
+    /// recorded under one of the broadcast roles — the caller already
+    /// has the task_message tool call in its own conversation history.
+    #[test]
+    fn broadcast_task_message_excludes_caller_even_if_in_role() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Spec", None, "ready");
+        db.record_session(task.id, "s1", "worker")
+            .expect("rec worker");
+        db.record_session(task.id, "s2", "reviewer")
+            .expect("rec reviewer");
+
+        let (shared, mut w, mut r) = make_io();
+        broadcast_task_message(&db, task.id, "s1", "hello", Some("s1"), &mut w, &mut r);
+
+        let calls = captured_messages_sorted(&shared);
+        let recipients: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(recipients, vec!["s2"], "only s2: {:?}", recipients);
+    }
+
+    /// Archived recipients are filtered out via GetSessionInfo. The
+    /// user has dismissed those sessions; waking them resurrects them.
+    #[test]
+    fn broadcast_task_message_excludes_archived_recipient() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Spec", None, "ready");
+        db.record_session(task.id, "s-archived", "worker")
+            .expect("rec worker");
+        db.record_session(task.id, "s-live", "reviewer")
+            .expect("rec reviewer");
+
+        let shared = Arc::new(Mutex::new(MockShared::new()));
+        shared
+            .lock()
+            .expect("lock")
+            .archived_sessions
+            .insert("s-archived".to_string());
+        let mut w = MockWriter {
+            shared: shared.clone(),
+        };
+        let mut r = BufReader::new(MockReader {
+            shared: shared.clone(),
+        });
+        broadcast_task_message(&db, task.id, "author", "hello", None, &mut w, &mut r);
+
+        let calls = captured_messages_sorted(&shared);
+        let recipients: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(recipients, vec!["s-live"], "only s-live: {:?}", recipients);
+    }
+
+    /// `task.session_id` is included regardless of role bookkeeping —
+    /// it's the dispatcher's notion of the task's currently-active
+    /// primary session, which may be ahead of the per-role records.
+    #[test]
+    fn broadcast_task_message_includes_task_session_id() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Spec", None, "ready");
+        db.assign_task(task.id, "s-current").expect("assign");
+
+        let (shared, mut w, mut r) = make_io();
+        broadcast_task_message(&db, task.id, "author", "hello", None, &mut w, &mut r);
+
+        let calls = captured_messages_sorted(&shared);
+        let recipients: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert!(
+            recipients.contains(&"s-current"),
+            "s-current should receive: {:?}",
+            recipients
+        );
+    }
+
+    /// `task.session_id` is included even when the only per-role row
+    /// is one of the excluded roles (contributor in this case).
+    #[test]
+    fn broadcast_task_message_includes_task_session_id_even_when_role_unknown() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Spec", None, "ready");
+        db.assign_task(task.id, "s-current").expect("assign");
+        db.record_session(task.id, "s-contrib", "contributor")
+            .expect("rec contributor");
+
+        let (shared, mut w, mut r) = make_io();
+        broadcast_task_message(&db, task.id, "author", "hello", None, &mut w, &mut r);
+
+        let calls = captured_messages_sorted(&shared);
+        let recipients: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert!(
+            recipients.contains(&"s-current"),
+            "s-current should receive: {:?}",
+            recipients
+        );
+        assert!(
+            !recipients.contains(&"s-contrib"),
+            "contributor should NOT receive: {:?}",
+            recipients
+        );
+    }
+
+    /// Body and sender_info follow the documented format.
+    #[test]
+    fn broadcast_task_message_format() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Spec", None, "ready");
+        db.record_session(task.id, "s-worker", "worker")
+            .expect("rec worker");
+
+        let (shared, mut w, mut r) = make_io();
+        broadcast_task_message(&db, task.id, "alice", "please add X", None, &mut w, &mut r);
+
+        let calls = captured_messages_sorted(&shared);
+        assert_eq!(calls.len(), 1);
+        let (target, content, sender_info, await_reply) = &calls[0];
+        assert_eq!(target, "s-worker");
+        assert_eq!(
+            content,
+            &format!("[task #{} message from alice]\nplease add X", task.id),
+        );
+        assert!(
+            sender_info.starts_with("task #"),
+            "sender_info: {:?}",
+            sender_info
+        );
+        assert!(!await_reply, "broadcasts must be fire-and-forget");
+    }
+
+    /// No recipients (no associated sessions, no task.session_id) is a
+    /// silent no-op.
+    #[test]
+    fn broadcast_task_message_no_recipients_is_noop() {
+        let db = TasksDb::open_memory().expect("db");
+        let task = create_task(&db, "Spec", None, "ready");
+
+        let (shared, mut w, mut r) = make_io();
+        broadcast_task_message(&db, task.id, "author", "hello", None, &mut w, &mut r);
+
+        let calls = captured_messages_sorted(&shared);
+        assert!(calls.is_empty(), "unexpected QueueMessage: {:?}", calls);
+    }
+
+    /// A nonexistent task id returns silently — no QueueMessage, no
+    /// panic. Mirrors the rest of `tasks_notify.rs` failure handling.
+    #[test]
+    fn broadcast_task_message_db_failure_silent() {
+        let db = TasksDb::open_memory().expect("db");
+        let (shared, mut w, mut r) = make_io();
+        broadcast_task_message(&db, 9_999_999, "author", "hello", None, &mut w, &mut r);
+
+        let calls = captured_messages_sorted(&shared);
+        assert!(calls.is_empty(), "unexpected QueueMessage: {:?}", calls);
     }
 }

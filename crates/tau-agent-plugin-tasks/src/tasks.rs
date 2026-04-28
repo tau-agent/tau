@@ -2344,6 +2344,8 @@ fn handle_task_message(
     args: &serde_json::Value,
     session_id: Option<&str>,
     tool_call_id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
 ) -> PluginToolResult {
     let id = match args.get("id").and_then(|v| v.as_i64()) {
         Some(id) => id,
@@ -2363,13 +2365,24 @@ fn handle_task_message(
 
     let author = session_id.unwrap_or("user");
     match db.add_message(id, content, Some(author)) {
-        Ok(msg) => match serde_json::to_string_pretty(&msg) {
-            Ok(json) => {
-                let summary = format!("task_message: #{} (message added)", id);
-                tool_ok_summary(tool_call_id, &json, summary)
+        Ok(msg) => {
+            // Broadcast the message to every active session associated
+            // with the task, except the caller. Best-effort; failures
+            // are logged and don't affect the tool result. Use
+            // `session_id` (the Option) for the caller filter rather
+            // than `author`: if the caller is anonymous ("user") there
+            // is no session to exclude.
+            crate::tasks_notify::broadcast_task_message(
+                db, id, author, content, session_id, writer, reader,
+            );
+            match serde_json::to_string_pretty(&msg) {
+                Ok(json) => {
+                    let summary = format!("task_message: #{} (message added)", id);
+                    tool_ok_summary(tool_call_id, &json, summary)
+                }
+                Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
             }
-            Err(e) => tool_err(tool_call_id, &format!("serialize: {}", e)),
-        },
+        }
         Err(e) => tool_err(tool_call_id, &format!("add message: {}", e)),
     }
 }
@@ -3110,7 +3123,14 @@ pub fn run_tasks_plugin() {
                         &mut pending_events,
                         &mut post_persist_actions,
                     ),
-                    "task_message" => handle_task_message(&db, &arguments, session, &tool_call_id),
+                    "task_message" => handle_task_message(
+                        &db,
+                        &arguments,
+                        session,
+                        &tool_call_id,
+                        &mut writer,
+                        &mut chan_reader,
+                    ),
                     "task_message_edit" => handle_task_message_edit(&db, &arguments, &tool_call_id),
                     "task_relate" => handle_task_relate(&db, &arguments, &tool_call_id),
                     "task_search" => {
@@ -4532,6 +4552,7 @@ mod tests {
             create_session_error: None,
             written_lines: Vec::new(),
             session_ancestors: std::collections::HashMap::new(),
+            queue_message_calls: Vec::new(),
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -4555,6 +4576,7 @@ mod tests {
             create_session_error: None,
             written_lines: Vec::new(),
             session_ancestors: std::collections::HashMap::new(),
+            queue_message_calls: Vec::new(),
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -4573,6 +4595,7 @@ mod tests {
             create_session_error: Some(error.to_string()),
             written_lines: Vec::new(),
             session_ancestors: std::collections::HashMap::new(),
+            queue_message_calls: Vec::new(),
         }));
         let writer = MockWriter {
             shared: shared.clone(),
@@ -4608,6 +4631,9 @@ mod tests {
         /// to its leaf-first ancestor list. If unset for a session, the
         /// default response treats the session as its own root.
         session_ancestors: std::collections::HashMap<String, Vec<tau_agent_plugin::SessionInfo>>,
+        /// Captured (target, content, sender_info, await_reply) tuples
+        /// from QueueMessage so tests can assert on broadcast delivery.
+        queue_message_calls: Vec<(String, String, String, bool)>,
     }
 
     impl MockShared {
@@ -4696,7 +4722,19 @@ mod tests {
                                 });
                             tau_agent_plugin::Response::SessionAncestors { sessions }
                         }
-                        tau_agent_plugin::Request::QueueMessage { .. } => {
+                        tau_agent_plugin::Request::QueueMessage {
+                            target_session_id,
+                            content,
+                            sender_info,
+                            await_reply,
+                            ..
+                        } => {
+                            self.queue_message_calls.push((
+                                target_session_id.clone(),
+                                content.clone(),
+                                sender_info.clone(),
+                                *await_reply,
+                            ));
                             tau_agent_plugin::Response::Ok
                         }
                         tau_agent_plugin::Request::ArchiveSession { .. } => {
@@ -4887,6 +4925,8 @@ mod tests {
             &serde_json::json!({"id": task_id, "content": "New message"}),
             Some("s2"),
             "tc6",
+            &mut writer,
+            &mut reader,
         );
         assert!(!result.is_error);
 
@@ -6867,11 +6907,14 @@ mod tests {
             .unwrap();
 
         // Add a message with a session — should record contributor
+        let (mut writer, mut reader) = mock_io();
         let result = handle_task_message(
             &db,
             &serde_json::json!({"id": task.id, "content": "hello"}),
             Some("contributor-session"),
             "tc1",
+            &mut writer,
+            &mut reader,
         );
         assert!(!result.is_error);
 
@@ -6879,6 +6922,80 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "contributor-session");
         assert_eq!(sessions[0].role, "contributor");
+    }
+
+    /// Task #851: `task_message` broadcasts the new message to every
+    /// active worker / reviewer / interactive session associated with
+    /// the task, but NOT to the calling session.
+    #[test]
+    fn task_message_broadcasts_to_active_worker() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "Broadcast me",
+                None,
+                None,
+                None,
+                false,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.record_session(task.id, "worker-s", "worker")
+            .expect("rec worker");
+
+        let (mut writer, mut reader) = mock_io();
+        let shared = writer.shared.clone();
+        let result = handle_task_message(
+            &db,
+            &serde_json::json!({"id": task.id, "content": "please add X"}),
+            Some("caller-s"),
+            "tc-bcast",
+            &mut writer,
+            &mut reader,
+        );
+        assert!(!result.is_error);
+
+        let calls = {
+            let mut shared = shared.lock().unwrap();
+            // Drain any pending writes through the responder so all
+            // outbound RPCs are captured.
+            shared.process_pending();
+            shared.queue_message_calls.clone()
+        };
+        let recipients: Vec<&str> = calls.iter().map(|c| c.0.as_str()).collect();
+        assert!(
+            recipients.contains(&"worker-s"),
+            "worker-s should receive: {:?}",
+            recipients
+        );
+        assert!(
+            !recipients.contains(&"caller-s"),
+            "caller-s should NOT receive (would echo): {:?}",
+            recipients
+        );
+        let (_, body, sender_info, await_reply) = calls
+            .iter()
+            .find(|c| c.0 == "worker-s")
+            .expect("worker-s call");
+        assert!(
+            body.contains("please add X"),
+            "body should carry the message: {}",
+            body
+        );
+        assert!(
+            sender_info.starts_with("task #"),
+            "sender_info should be tagged: {}",
+            sender_info
+        );
+        assert!(!await_reply, "broadcasts must be fire-and-forget");
     }
 
     #[test]
@@ -8994,6 +9111,7 @@ mod tests {
             archived_sessions: std::collections::HashSet::new(),
             create_session_error: None,
             written_lines: Vec::new(),
+            queue_message_calls: Vec::new(),
             session_ancestors: ancestors,
         }));
         let writer = MockWriter {
