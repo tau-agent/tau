@@ -356,6 +356,42 @@ fn run_one_job<W>(
     }
 }
 
+/// Maximum number of retries when transitioning a task state in the
+/// merge worker. Used by `finish_success`'s `Merging → Merged`
+/// transition: a transient sqlite busy hiccup here would otherwise
+/// leave the task wedged in `merging` until the watchdog notices
+/// (≥60 s). Three quick retries with 50 ms backoff cover the common
+/// transient cases without delaying the worker; the watchdog still
+/// catches us if all retries fail.
+const DB_UPDATE_RETRIES: u32 = 3;
+const DB_UPDATE_RETRY_DELAY_MS: u64 = 50;
+
+/// Wrap [`TasksDb::update_task`] in a small retry loop with a fixed
+/// backoff. Returns the last error if every attempt fails.
+///
+/// Mirrors `archive_session_with_busy_retry` in [`crate::tasks_merge`].
+fn db_update_with_retry(
+    db: &TasksDb,
+    task_id: i64,
+    update: &TaskUpdate,
+) -> tau_agent_plugin::Result<crate::tasks_db::Task> {
+    let mut last_err: Option<tau_agent_plugin::Error> = None;
+    for attempt in 0..DB_UPDATE_RETRIES {
+        match db.update_task(task_id, update, None) {
+            Ok(t) => return Ok(t),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt + 1 < DB_UPDATE_RETRIES {
+                    std::thread::sleep(std::time::Duration::from_millis(DB_UPDATE_RETRY_DELAY_MS));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        tau_agent_plugin::Error::Io("db_update_with_retry: no error captured".into())
+    }))
+}
+
 fn finish_success<W>(
     db: &TasksDb,
     resolver: &ProjectResolver,
@@ -366,17 +402,23 @@ fn finish_success<W>(
 ) where
     W: Write,
 {
-    if let Err(e) = db.update_task(
+    if let Err(e) = db_update_with_retry(
+        db,
         task_id,
         &TaskUpdate {
             state: Some(TaskState::Merged),
             ..Default::default()
         },
-        None,
     ) {
+        // All retries exhausted. The stuck-merging watchdog (task
+        // #850) will catch this within `STUCK_MERGING_THRESHOLD_MS`
+        // and reconcile the task once it observes the merge landed
+        // on the target branch. Surface loudly so the failure is
+        // discoverable in stderr.
         eprintln!(
-            "tasks merge worker: merge succeeded but transition to merged failed for task {}: {}",
-            task_id, e
+            "tasks merge worker: merge succeeded but transition to merged failed for task {} \
+             after {} retries: {} — stuck-merging watchdog will reconcile",
+            task_id, DB_UPDATE_RETRIES, e
         );
     }
 
@@ -683,5 +725,81 @@ mod tests {
 
         // Clean up the temp DB file.
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn db_update_with_retry_succeeds_on_first_attempt() {
+        // Smoke-check the retry helper: a normal update returns Ok
+        // immediately and the new state is persisted.
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "p",
+                "t",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+
+        let res = db_update_with_retry(
+            &db,
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Active),
+                ..Default::default()
+            },
+        );
+        assert!(res.is_ok(), "expected Ok, got {:?}", res);
+        assert_eq!(
+            db.get_task(task.id).unwrap().unwrap().state,
+            TaskState::Active
+        );
+    }
+
+    #[test]
+    fn db_update_with_retry_propagates_terminal_error() {
+        // Asking for an invalid transition is a deterministic error
+        // (not transient). The helper retries DB_UPDATE_RETRIES times
+        // and then surfaces the underlying error.
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "p",
+                "t",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+
+        // Ready -> Merged is not a valid transition.
+        let res = db_update_with_retry(
+            &db,
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Merged),
+                ..Default::default()
+            },
+        );
+        assert!(res.is_err(), "expected Err, got {:?}", res);
     }
 }

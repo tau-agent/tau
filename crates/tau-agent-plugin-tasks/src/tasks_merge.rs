@@ -299,6 +299,51 @@ pub fn merge_task_for_caller(
         });
     }
 
+    // 3c. Verify the main worktree's HEAD is on the merge target branch.
+    //
+    // Step 6 lands the merge with `git update-ref refs/heads/<target>` and
+    // step 6b syncs the main worktree's index/working tree only when its
+    // HEAD already matches `<target>`. If the user has manually checked out
+    // a different branch (or detached HEAD) in the main checkout, the
+    // update-ref still lands but step 6b's reset is silently skipped, so
+    // the user's checkout looks "behind" main and they may force-move it,
+    // racing the merge worker. Refuse loudly here instead so the failure
+    // mode is self-explanatory and recoverable.
+    //
+    // See task #850 for the wedge that prompted this guard.
+    let (main_head_preflight, head_err) = execute_bash(
+        writer,
+        reader,
+        &log_session,
+        &format!("git -C '{}' rev-parse --abbrev-ref HEAD", project_dir),
+    )?;
+    let head_branch = main_head_preflight.trim();
+    if head_err || head_branch.is_empty() || head_branch != merge_target {
+        if let Err(e) = archive_session(writer, reader, &log_session) {
+            eprintln!(
+                "tasks: warning: failed to archive log session {}: {}",
+                log_session, e
+            );
+        }
+        let observed = if head_err || head_branch.is_empty() {
+            "<unable to read HEAD>".to_string()
+        } else if head_branch == "HEAD" {
+            "a detached HEAD".to_string()
+        } else {
+            format!("branch '{}'", head_branch)
+        };
+        return Ok(MergeResult {
+            success: false,
+            log: format!(
+                "Main checkout at '{project_dir}' is on {observed}, not '{merge_target}'. \
+                 Refusing to merge to avoid leaving the user's checkout out of sync \
+                 with the merged ref. To recover: run \
+                 `git -C '{project_dir}' checkout {merge_target}` (and reconcile any \
+                 manual changes), then re-approve the task."
+            ),
+        });
+    }
+
     // 4. Rebase onto merge target
     //
     // Set GIT_EDITOR and GIT_SEQUENCE_EDITOR to `true` so git never opens an
@@ -391,22 +436,54 @@ pub fn merge_task_for_caller(
     // the index becomes stale and `git status` shows a phantom staged diff
     // that reverts the merge. Fix this by running `git reset --hard HEAD` in
     // the main worktree, but only when its HEAD branch matches the merge target.
-    let (main_head, _) = execute_bash(
+    //
+    // From this point on, the merge has landed: the target ref now
+    // points at the rebased branch tip and any downstream observer
+    // (`git log <target>`, the watchdog's `merge-base --is-ancestor`
+    // check) will see the merge as successful. Cleanup steps that
+    // follow MUST therefore not propagate transient tunnel/IO errors
+    // as `Err` from this function — doing so would cause the worker
+    // thread's error arm to revert the task to `Active` even though
+    // the ref already moved, leaving a wedged-but-merged task.
+    //
+    // The pattern below: every post-FF `execute_bash` / `server_request`
+    // call uses `match` instead of `?`, logs failures into `log`, and
+    // continues. The caller still gets `MergeResult{success: true}`
+    // and a discoverable warning trail.
+    let main_head = match execute_bash(
         writer,
         reader,
         &log_session,
         &format!("git -C '{}' rev-parse --abbrev-ref HEAD", project_dir),
-    )?;
+    ) {
+        Ok((output, _is_error)) => output,
+        Err(e) => {
+            log.push_str(&format!(
+                "WARNING: post-merge: failed to read main worktree HEAD: {}\n",
+                e
+            ));
+            String::new()
+        }
+    };
     if main_head.trim() == merge_target {
         log.push_str("=== Sync main worktree index ===\n");
-        let (output, _) = execute_bash(
+        match execute_bash(
             writer,
             reader,
             &log_session,
             &format!("git -C '{}' reset --hard HEAD", project_dir),
-        )?;
-        log.push_str(&output);
-        log.push('\n');
+        ) {
+            Ok((output, _)) => {
+                log.push_str(&output);
+                log.push('\n');
+            }
+            Err(e) => {
+                log.push_str(&format!(
+                    "WARNING: post-merge: failed to sync main worktree index: {}\n",
+                    e
+                ));
+            }
+        }
     }
 
     // 7. Clean up: remove worktree, delete branch, archive session, clear DB
@@ -424,7 +501,7 @@ pub fn merge_task_for_caller(
         eprintln!("tasks: warning: {}", msg.trim());
         log.push_str(&msg);
     } else {
-        let (output, wt_err) = execute_bash(
+        match execute_bash(
             writer,
             reader,
             &log_session,
@@ -432,16 +509,26 @@ pub fn merge_task_for_caller(
                 "cd $(git rev-parse --show-toplevel) && git worktree remove --force {}",
                 worktree_path
             ),
-        )?;
-        log.push_str(&output);
-        if wt_err {
-            eprintln!(
-                "tasks: warning: failed to remove worktree for task {}: {}",
-                task_id,
-                output.trim()
-            );
+        ) {
+            Ok((output, wt_err)) => {
+                log.push_str(&output);
+                if wt_err {
+                    eprintln!(
+                        "tasks: warning: failed to remove worktree for task {}: {}",
+                        task_id,
+                        output.trim()
+                    );
+                }
+            }
+            Err(e) => {
+                log.push_str(&format!(
+                    "WARNING: post-merge: failed to remove worktree for task {}: {}\n",
+                    task_id, e
+                ));
+            }
         }
     }
+
     let _ = db.clear_worktree(task_id);
 
     // 7a'. Update session cwds: any session still pointing at the removed
@@ -490,14 +577,23 @@ pub fn merge_task_for_caller(
     // but the explicit `-C` here is what makes this step robust
     // against any future cwd weirdness.
     let br_cmd = build_branch_delete_command(project_dir, branch);
-    let (output, br_err) = execute_bash(writer, reader, &log_session, &br_cmd)?;
-    log.push_str(&output);
-    if br_err {
-        eprintln!(
-            "tasks: warning: failed to delete branch for task {}: {}",
-            task_id,
-            output.trim()
-        );
+    match execute_bash(writer, reader, &log_session, &br_cmd) {
+        Ok((output, br_err)) => {
+            log.push_str(&output);
+            if br_err {
+                eprintln!(
+                    "tasks: warning: failed to delete branch for task {}: {}",
+                    task_id,
+                    output.trim()
+                );
+            }
+        }
+        Err(e) => {
+            log.push_str(&format!(
+                "WARNING: post-merge: failed to delete branch for task {}: {}\n",
+                task_id, e
+            ));
+        }
     }
 
     // 7c. Archive task-spawned sessions (worker, planner, reviewer, refiner,
@@ -2414,5 +2510,334 @@ command = "cargo test"
             "giving up after {} busy-retries: {}",
             INLINE_ARCHIVE_MAX_RETRIES, last_err
         ))
+    }
+
+    // -----------------------------------------------------------------
+    // Pre-flight HEAD/branch check (task #850)
+    //
+    // Step 3c refuses to merge when the main checkout is on any
+    // branch other than the merge target (incl. detached HEAD). This
+    // closes the wedge described in #850: while a task was being
+    // merged the user had `cd`'d the main checkout to a detached
+    // commit, so step 6 fast-forwarded the ref but step 6b's reset
+    // was silently skipped, and a later transient cleanup error
+    // flipped the worker's `Err` arm but couldn't update the task
+    // state, leaving it wedged in `merging`.
+    // -----------------------------------------------------------------
+
+    fn make_merging_task_with_branch(db: &TasksDb) -> i64 {
+        let task = db
+            .create_task(
+                "test-project",
+                "preflight",
+                None,
+                None,
+                None,
+                true,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Ready),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.assign_task(task.id, "s1").unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Approved),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Merging),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.set_branch(task.id, "task-merging").unwrap();
+        db.set_worktree_path(task.id, "/tmp/fake-wt").unwrap();
+        task.id
+    }
+
+    /// Run `merge_task_for_caller` against a mock server that emits the
+    /// canned responses listed in `responses` (one per request, in
+    /// order). Returns the resulting `MergeResult` plus the requests
+    /// the mock saw.
+    fn run_merge_with_mock(
+        db: &TasksDb,
+        task_id: i64,
+        responses: Vec<Response>,
+    ) -> (Vec<Request>, tau_agent_plugin::Result<MergeResult>) {
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(responses));
+        let r = responses.clone();
+        with_mock_server(
+            move |idx, _req| {
+                let mut guard = r.lock().unwrap();
+                if idx < guard.len() {
+                    std::mem::replace(&mut guard[idx], Response::Ok)
+                } else {
+                    Response::Error {
+                        message: format!("unexpected request idx {}", idx),
+                    }
+                }
+            },
+            |w, rd| merge_task_for_caller(db, task_id, "test-project", None, w, rd),
+        )
+    }
+
+    #[test]
+    fn test_preflight_refuses_when_head_is_detached() {
+        let db = TasksDb::open_memory().unwrap();
+        let task_id = make_merging_task_with_branch(&db);
+
+        let responses = vec![
+            // 1. CreateSession (log session)
+            Response::SessionCreated {
+                session_id: "log-1".into(),
+            },
+            // 2. Step 3b: working-tree diff check (no error)
+            Response::ToolExecuted {
+                content: String::new(),
+                is_error: false,
+            },
+            // 3. Step 3c: HEAD probe — returns "HEAD" for detached HEAD
+            Response::ToolExecuted {
+                content: "HEAD\n".into(),
+                is_error: false,
+            },
+            // 4. ArchiveSession on the early-return path
+            Response::Ok,
+        ];
+
+        let (seen, result) = run_merge_with_mock(&db, task_id, responses);
+        let result = result.expect("merge_task should not error");
+        assert!(
+            !result.success,
+            "pre-flight on detached HEAD must refuse the merge"
+        );
+        assert!(
+            result.log.contains("detached HEAD"),
+            "expected detached-HEAD diagnostic, got log:\n{}",
+            result.log
+        );
+        assert!(
+            result.log.contains("Refusing to merge"),
+            "expected 'Refusing to merge' guidance, got log:\n{}",
+            result.log
+        );
+        // Session created → step 3b probe → step 3c HEAD probe → archive.
+        assert_eq!(seen.len(), 4, "expected 4 requests, got {:?}", seen);
+    }
+
+    #[test]
+    fn test_preflight_refuses_when_head_is_other_branch() {
+        let db = TasksDb::open_memory().unwrap();
+        let task_id = make_merging_task_with_branch(&db);
+
+        let responses = vec![
+            Response::SessionCreated {
+                session_id: "log-1".into(),
+            },
+            Response::ToolExecuted {
+                content: String::new(),
+                is_error: false,
+            },
+            // HEAD is on "feature-x"
+            Response::ToolExecuted {
+                content: "feature-x\n".into(),
+                is_error: false,
+            },
+            Response::Ok,
+        ];
+
+        let (_, result) = run_merge_with_mock(&db, task_id, responses);
+        let result = result.expect("merge_task should not error");
+        assert!(!result.success);
+        assert!(
+            result.log.contains("branch 'feature-x'"),
+            "expected non-target branch diagnostic, got log:\n{}",
+            result.log
+        );
+        // The recovery hint must be self-contained and actionable.
+        assert!(
+            result.log.contains("checkout main"),
+            "expected actionable git checkout hint, got log:\n{}",
+            result.log
+        );
+    }
+
+    #[test]
+    fn test_preflight_passes_when_head_is_merge_target() {
+        // When HEAD is on the merge target the pre-flight passes; we
+        // assert this by feeding all the responses needed up to and
+        // including a rebase failure (so we don't have to mock the
+        // full success path). If pre-flight had refused we'd see
+        // "Refusing to merge" in the log; instead we should see
+        // "Rebase failed" because that's where we cut the test.
+        let db = TasksDb::open_memory().unwrap();
+        let task_id = make_merging_task_with_branch(&db);
+
+        let responses = vec![
+            Response::SessionCreated {
+                session_id: "log-1".into(),
+            },
+            // Step 3b (clean check)
+            Response::ToolExecuted {
+                content: String::new(),
+                is_error: false,
+            },
+            // Step 3c (HEAD probe) — on the merge target, all good
+            Response::ToolExecuted {
+                content: "main\n".into(),
+                is_error: false,
+            },
+            // Step 4 (rebase) — fail to short-circuit the test
+            Response::ToolExecuted {
+                content: "CONFLICT: synthetic".into(),
+                is_error: true,
+            },
+            // Aborted rebase
+            Response::ToolExecuted {
+                content: String::new(),
+                is_error: false,
+            },
+            // Archive log session on early return
+            Response::Ok,
+        ];
+
+        let (_, result) = run_merge_with_mock(&db, task_id, responses);
+        let result = result.expect("merge_task should not error");
+        assert!(!result.success);
+        assert!(
+            !result.log.contains("Refusing to merge"),
+            "pre-flight must NOT refuse when HEAD == merge_target, got log:\n{}",
+            result.log
+        );
+        assert!(
+            result.log.contains("Rebase failed"),
+            "expected to fall through to step 4 rebase; got log:\n{}",
+            result.log
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Post-FF cleanup hardening (task #850)
+    //
+    // After step 6's update-ref lands, no subsequent
+    // `execute_bash`/`server_request` error must propagate as `Err`
+    // — the merge has already landed, and bubbling out would cause
+    // the worker thread's error arm to revert the task to `Active`,
+    // leaving the file claim live and the ref orphaned. Instead
+    // each step logs into `MergeResult.log` and the result remains
+    // `success: true`.
+    //
+    // The test below feeds responses up through the FF and then
+    // injects an error during step 7b (branch delete). The merge
+    // must still report `success: true` with a warning in the log.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_post_ff_cleanup_error_does_not_fail_merge() {
+        let db = TasksDb::open_memory().unwrap();
+        let task_id = make_merging_task_with_branch(&db);
+
+        // Drive every request through pre-FF success and then inject
+        // a failure during step 7b's branch delete.
+        let responses = vec![
+            // 1. CreateSession
+            Response::SessionCreated {
+                session_id: "log-1".into(),
+            },
+            // 2. Step 3b: clean check
+            Response::ToolExecuted {
+                content: String::new(),
+                is_error: false,
+            },
+            // 3. Step 3c: HEAD probe — on merge target
+            Response::ToolExecuted {
+                content: "main\n".into(),
+                is_error: false,
+            },
+            // 4. Step 4: rebase succeeds
+            Response::ToolExecuted {
+                content: "rebased".into(),
+                is_error: false,
+            },
+            // 5. Step 6: update-ref (FF) succeeds — merge LANDED here
+            Response::ToolExecuted {
+                content: String::new(),
+                is_error: false,
+            },
+            // 6. Step 6b: post-FF main HEAD probe — not on target so
+            //    we skip the reset (returning a different branch keeps
+            //    the test simpler).
+            Response::ToolExecuted {
+                content: "feature-x\n".into(),
+                is_error: false,
+            },
+            // 7. Step 7a: worktree remove
+            Response::ToolExecuted {
+                content: "removed".into(),
+                is_error: false,
+            },
+            // 8. Step 7a': SetCwd for log_session
+            Response::Ok,
+            // 9. Step 7b: branch delete — INJECT TUNNEL ERROR.
+            //    With the post-FF hardening this MUST be downgraded
+            //    to a warning in `log` and the merge stays success.
+            Response::Error {
+                message: "simulated tunnel error during branch delete".into(),
+            },
+            // 10. Step 8: archive log session — also injected error to
+            //     verify *both* are downgraded to warnings.
+            Response::Error {
+                message: "simulated archive error".into(),
+            },
+        ];
+
+        let (_seen, result) = run_merge_with_mock(&db, task_id, responses);
+        let result = result.expect("merge_task must not error after FF lands");
+        assert!(
+            result.success,
+            "post-FF cleanup errors must not flip success to false; log:\n{}",
+            result.log
+        );
+        assert!(
+            result
+                .log
+                .contains("WARNING: post-merge: failed to delete branch"),
+            "expected branch-delete warning in log:\n{}",
+            result.log
+        );
+        assert!(
+            result
+                .log
+                .contains("WARNING: failed to archive log session"),
+            "expected archive-log warning in log:\n{}",
+            result.log
+        );
+        assert!(
+            result.log.contains("=== Merge complete ==="),
+            "expected the success epilogue, got log:\n{}",
+            result.log
+        );
     }
 }

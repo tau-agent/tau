@@ -3009,6 +3009,18 @@ pub fn run_tasks_plugin() {
             run_stale_ready_watchdog_pass(&db, &mut followup_events, &mut writer, &mut chan_reader);
         for w in stale_warnings {
             eprintln!("tasks startup stale-ready watchdog: {}", w);
+
+            // Stuck-merging watchdog (task #850).
+            let stuck_merging_warnings = run_stuck_merging_watchdog_pass(
+                &db,
+                &resolver,
+                &mut followup_events,
+                &mut writer,
+                &mut chan_reader,
+            );
+            for w in stuck_merging_warnings {
+                eprintln!("tasks startup stuck-merging watchdog: {}", w);
+            }
         }
         // Drain the follow-up events synchronously so recovered
         // tasks are dispatched before we start servicing tool
@@ -3452,6 +3464,20 @@ fn drain_scheduler_events(
         writer,
         reader,
     ));
+
+    // Stuck-merging watchdog (task #850): tasks wedged in `merging`
+    // hold their file claims indefinitely, blocking downstream
+    // tasks. Reconcile to `merged` (success) or `failed` based on
+    // git state, and queue a follow-up `ScheduleNeeded` so the
+    // unblocked tasks dispatch this drain cycle.
+    warnings.extend(run_stuck_merging_watchdog_pass(
+        db,
+        resolver,
+        &mut followup_events,
+        writer,
+        reader,
+    ));
+
     for ev in std::mem::take(&mut followup_events) {
         if let SchedulerEvent::ScheduleNeeded(project_name, sid) = ev {
             warnings.extend(run_schedule_pass(
@@ -4101,6 +4127,370 @@ fn run_stale_ready_watchdog_pass(
         warnings.push(msg);
     }
     warnings
+}
+
+// ---------------------------------------------------------------------------
+// Stuck-merging watchdog (task #850)
+// ---------------------------------------------------------------------------
+//
+// Tasks in `merging` are mid-merge: the worker has flipped the state
+// from `Approved → Merging`, run the rebase + checklist + fast-forward,
+// and is in the middle of cleanup. A healthy run takes seconds. If a
+// task lingers in `merging` (e.g. a transient tunnel error during
+// post-FF cleanup that bubbled out as `Err`, or a non-cooperative
+// main checkout the worker refused), its file claim stays live and
+// downstream tasks get a `[scheduler-skip] file conflict` from the
+// scheduler indefinitely. See task #842 for the production wedge.
+//
+// This watchdog is the safety net: scan `merging` tasks older than
+// `STUCK_MERGING_THRESHOLD_MS`, inspect git to determine whether the
+// merge actually landed on the target branch, and reconcile the task
+// state to `Merged` (success) or `Failed` (could-not-verify) so the
+// scheduler can release the file claim and move on.
+
+/// Tasks in `merging` for longer than this are treated as wedged by
+/// the watchdog. A normal merge transitions through `merging` in
+/// seconds; 60 s is a generous threshold that stays well clear of any
+/// legitimately slow checklist run while reacting to wedges within a
+/// minute (the production wedge in #842 sat for hours before manual
+/// intervention).
+const STUCK_MERGING_THRESHOLD_MS: i64 = 60_000;
+
+/// Sentinel string appended to the watchdog's task-message after
+/// every reconciliation attempt. Used as the attempt counter —
+/// [`count_stuck_merging_attempts`] greps messages for this marker.
+const STUCK_MERGING_WATCHDOG_MARKER: &str = "[stuck-merging-watchdog]";
+
+/// Count how many times the stuck-merging watchdog has previously
+/// fired for this task. Returns 0 on any DB error.
+fn count_stuck_merging_attempts(db: &TasksDb, task_id: i64) -> usize {
+    match db.get_messages(task_id) {
+        Ok(msgs) => msgs
+            .iter()
+            .filter(|m| m.content.contains(STUCK_MERGING_WATCHDOG_MARKER))
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// Inspect git state to decide whether a stuck-merging task's branch
+/// has actually landed on the merge target.
+///
+/// Returns:
+/// - `Some(true)` — the merge succeeded (branch reachable from target,
+///   or branch already deleted by post-merge cleanup).
+/// - `Some(false)` — the branch ref still exists AND is NOT reachable
+///   from the merge target, so the merge did not land.
+/// - `None` — unable to verify (git error, no project dir, missing
+///   branch metadata). Treated as "don't touch this task" by the
+///   watchdog.
+///
+/// Heuristic note: "branch ref no longer exists" is taken as a
+/// success signal because the only path that deletes the branch in
+/// the current code is step 7b of `merge_task_for_caller`, which runs
+/// after `git update-ref` lands. If that ordering changes, this
+/// heuristic must be revisited.
+fn merge_landed_for_stuck_task(project_dir: &str, task: &crate::tasks_db::Task) -> Option<bool> {
+    let branch = task.branch.as_ref()?;
+    let merge_target = task.merge_target.clone().unwrap_or_else(|| "main".into());
+
+    // Sanity-check that we can talk to git at all in this project_dir,
+    // otherwise we'd misread "git failed" as "branch deleted". The
+    // merge target must exist for the task to ever have been mergable;
+    // if it doesn't resolve, we can't decide and must return None.
+    let target_exists = std::process::Command::new("git")
+        .args([
+            "-C",
+            project_dir,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", merge_target),
+        ])
+        .output()
+        .ok()?;
+    if !target_exists.status.success() {
+        // Either project_dir isn't a git repo, or the merge target
+        // ref is missing. Either way we can't make a safe call.
+        return None;
+    }
+
+    // Does the branch ref still exist?
+    let exists = std::process::Command::new("git")
+        .args([
+            "-C",
+            project_dir,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", branch),
+        ])
+        .output()
+        .ok()?;
+    if !exists.status.success() {
+        // Branch ref is gone but the target exists — cleanup ran,
+        // which only happens on the success path. Treat as merged.
+        return Some(true);
+    }
+
+    // Branch still exists; check whether it is an ancestor of (or
+    // equal to) the merge target.
+    let anc = std::process::Command::new("git")
+        .args([
+            "-C",
+            project_dir,
+            "merge-base",
+            "--is-ancestor",
+            branch,
+            &merge_target,
+        ])
+        .output()
+        .ok()?;
+    Some(anc.status.success())
+}
+
+/// Scan for tasks stuck in `merging` and reconcile them by inspecting
+/// the git state of their branch vs. the merge target.
+///
+/// Recovery rules:
+///
+/// - If git shows the branch landed on the target (reachable, or
+///   already deleted by cleanup) → transition to `Merged` and push a
+///   `ScheduleNeeded` so any blocked downstream tasks get a fresh
+///   pass.
+/// - If git can verify the merge did NOT land → transition to
+///   `Failed` with a loud message asking a human to investigate.
+/// - If git cannot answer (project path resolution failed, branch
+///   metadata missing, subprocess errored) → leave the task alone
+///   and try again on the next pass, up to `MAX_WATCHDOG_ATTEMPTS`.
+///
+/// Each fire records a `STUCK_MERGING_WATCHDOG_MARKER` message so the
+/// attempt counter is durable. After `MAX_WATCHDOG_ATTEMPTS` fires
+/// the watchdog gives up and transitions the task to `Failed`
+/// regardless, with a message pointing the user at manual recovery.
+///
+/// Pushes a `ScheduleNeeded` event for every reconciled task so
+/// downstream file-claim conflicts unblock immediately.
+fn run_stuck_merging_watchdog_pass(
+    db: &TasksDb,
+    resolver: &ProjectResolver,
+    pending_events: &mut Vec<SchedulerEvent>,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Vec<String> {
+    let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+    let stuck = match db.get_stuck_merging_tasks(now_ms, STUCK_MERGING_THRESHOLD_MS) {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!(
+                "tasks stuck-merging watchdog: failed to query stuck tasks: {}",
+                e
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut warnings = Vec::new();
+    for task in stuck {
+        let prior_attempts = count_stuck_merging_attempts(db, task.id);
+
+        if prior_attempts >= MAX_WATCHDOG_ATTEMPTS {
+            // Give up — transition to `Failed` so a human notices.
+            let msg = format!(
+                "⚠️ Stuck-merging watchdog giving up on task {} ({}) after {} reconciliation \
+                 attempts. Task has been in `merging` for too long; transitioning to \
+                 `failed` so a human can verify git state and choose the right outcome.",
+                task.id, task.title, prior_attempts
+            );
+            eprintln!("tasks stuck-merging watchdog: {}", msg);
+            let _ = db.add_message(task.id, &msg, Some("system"));
+            warnings.push(msg);
+            if let Err(e) = db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some(TaskState::Failed),
+                    ..Default::default()
+                },
+                None,
+            ) {
+                // Most likely cause: another path raced us to a
+                // terminal transition. Log and move on.
+                eprintln!(
+                    "tasks stuck-merging watchdog: failed to transition task {} to failed: {}",
+                    task.id, e
+                );
+            } else {
+                if let Ok(Some(t)) = db.get_task(task.id) {
+                    crate::tasks_notify::notify_state_change(
+                        db,
+                        &t,
+                        TaskState::Merging,
+                        Some("stuck-merging watchdog gave up after max attempts"),
+                        writer,
+                        reader,
+                    );
+                }
+                queue_schedule_event(pending_events, &task.project_name);
+            }
+            continue;
+        }
+
+        let project_dir = match resolver.resolve(&task.project_name) {
+            Ok(p) => p,
+            Err(e) => {
+                let warn = format!(
+                    "⚠️ Stuck-merging watchdog: task {} ({}) cannot resolve project '{}': {}",
+                    task.id, task.title, task.project_name, e
+                );
+                eprintln!("tasks stuck-merging watchdog: {}", warn);
+                let _ = db.add_message(task.id, &warn, Some("system"));
+                warnings.push(warn);
+                continue;
+            }
+        };
+
+        let attempt_num = prior_attempts + 1;
+        let attempt_msg = format!(
+            "{} Stuck-merging watchdog detected task {} ({}) in `merging` for >={}s; \
+             attempt {}/{} to reconcile via git inspection.",
+            STUCK_MERGING_WATCHDOG_MARKER,
+            task.id,
+            task.title,
+            STUCK_MERGING_THRESHOLD_MS / 1000,
+            attempt_num,
+            MAX_WATCHDOG_ATTEMPTS,
+        );
+        eprintln!("tasks stuck-merging watchdog: {}", attempt_msg);
+        let _ = db.add_message(task.id, &attempt_msg, Some("system"));
+
+        match merge_landed_for_stuck_task(&project_dir, &task) {
+            Some(true) => {
+                let ctx = crate::tasks_scheduler::extract_merge_commit(&project_dir, &task);
+                let summary = format!(
+                    "✅ Stuck-merging watchdog reconciled task {} ({}) to `merged`: \
+                     branch verified as landed on '{}'.{}",
+                    task.id,
+                    task.title,
+                    task.merge_target.as_deref().unwrap_or("main"),
+                    ctx.as_deref()
+                        .map(|c| format!(" Merge target now at {}.", c))
+                        .unwrap_or_default(),
+                );
+                eprintln!("tasks stuck-merging watchdog: {}", summary);
+                let _ = db.add_message(task.id, &summary, Some("system"));
+
+                if let Err(e) = db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some(TaskState::Merged),
+                        ..Default::default()
+                    },
+                    None,
+                ) {
+                    // Race: another path got there first. Treat as
+                    // benign — log and move on, no retry.
+                    let warn = format!(
+                        "⚠️ Stuck-merging watchdog: task {} state-transition to merged failed \
+                         (likely raced another path): {}",
+                        task.id, e
+                    );
+                    eprintln!("tasks stuck-merging watchdog: {}", warn);
+                    let _ = db.add_message(task.id, &warn, Some("system"));
+                    warnings.push(warn);
+                    continue;
+                }
+
+                if let Ok(Some(t)) = db.get_task(task.id) {
+                    crate::tasks_notify::notify_state_change(
+                        db,
+                        &t,
+                        TaskState::Merging,
+                        ctx.as_deref(),
+                        writer,
+                        reader,
+                    );
+                }
+                queue_schedule_event(pending_events, &task.project_name);
+                warnings.push(summary);
+            }
+            Some(false) => {
+                let summary = format!(
+                    "⚠️ Stuck-merging watchdog: task {} ({}) branch '{}' is NOT reachable from \
+                     '{}' — the merge did not land. Transitioning to `failed` so a human can \
+                     investigate; check `git -C '{}' log {}` for clues.",
+                    task.id,
+                    task.title,
+                    task.branch.as_deref().unwrap_or("<unset>"),
+                    task.merge_target.as_deref().unwrap_or("main"),
+                    project_dir,
+                    task.branch.as_deref().unwrap_or("<unset>"),
+                );
+                eprintln!("tasks stuck-merging watchdog: {}", summary);
+                let _ = db.add_message(task.id, &summary, Some("system"));
+
+                if let Err(e) = db.update_task(
+                    task.id,
+                    &TaskUpdate {
+                        state: Some(TaskState::Failed),
+                        ..Default::default()
+                    },
+                    None,
+                ) {
+                    let warn = format!(
+                        "⚠️ Stuck-merging watchdog: task {} state-transition to failed failed: {}",
+                        task.id, e
+                    );
+                    eprintln!("tasks stuck-merging watchdog: {}", warn);
+                    let _ = db.add_message(task.id, &warn, Some("system"));
+                    warnings.push(warn);
+                    continue;
+                }
+
+                if let Ok(Some(t)) = db.get_task(task.id) {
+                    crate::tasks_notify::notify_state_change(
+                        db,
+                        &t,
+                        TaskState::Merging,
+                        Some("stuck-merging watchdog: merge did not land"),
+                        writer,
+                        reader,
+                    );
+                }
+                queue_schedule_event(pending_events, &task.project_name);
+                warnings.push(summary);
+            }
+            None => {
+                let warn = format!(
+                    "⚠️ Stuck-merging watchdog: task {} ({}) cannot determine git state \
+                     (branch metadata missing or git subprocess failed); leaving task alone, \
+                     attempt {}/{}.",
+                    task.id, task.title, attempt_num, MAX_WATCHDOG_ATTEMPTS
+                );
+                eprintln!("tasks stuck-merging watchdog: {}", warn);
+                let _ = db.add_message(task.id, &warn, Some("system"));
+                warnings.push(warn);
+            }
+        }
+    }
+
+    warnings
+}
+
+/// Push a `ScheduleNeeded` event for `project_name`, deduping against
+/// any event already queued for the same project.
+fn queue_schedule_event(pending_events: &mut Vec<SchedulerEvent>, project_name: &str) {
+    let already_queued = pending_events.iter().any(|e| {
+        matches!(
+            e,
+            SchedulerEvent::ScheduleNeeded(p, _) if p == project_name
+        )
+    });
+    if !already_queued {
+        pending_events.push(SchedulerEvent::ScheduleNeeded(
+            project_name.to_string(),
+            None,
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -13903,5 +14293,320 @@ mod tests {
                 .any(|e| matches!(e, SchedulerEvent::ScheduleNeeded(..))),
             "re-holding must not trigger a schedule pass"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Stuck-merging watchdog (task #850)
+    // ---------------------------------------------------------------
+
+    /// Initialise a real git repo with two branches: `main` (the merge
+    /// target) and `task-N`. The caller chooses whether `task-N` is
+    /// reachable from `main`.
+    fn init_repo_with_task_branch(merged: bool, delete_task_branch: bool) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let path = dir.path();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .expect("git command")
+        };
+        run(&["init", "-b", "main"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "test"]);
+        std::fs::write(path.join("README.md"), "# test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+
+        // Create task-N branch with one commit.
+        run(&["checkout", "-b", "task-merging"]);
+        std::fs::write(path.join("feature.txt"), "feature\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "feature"]);
+
+        if merged {
+            // Fast-forward main onto task-merging so it is reachable.
+            run(&["update-ref", "refs/heads/main", "refs/heads/task-merging"]);
+        }
+
+        // Move HEAD off the task branch so it can be safely deleted.
+        run(&["checkout", "main"]);
+
+        if delete_task_branch {
+            // Use -D so we can delete a branch even when not reachable
+            // (mirrors the production cleanup which uses build_branch_delete_command).
+            run(&["branch", "-D", "task-merging"]);
+        }
+
+        dir
+    }
+
+    /// Build a stuck `merging` task pointing at the given project path.
+    fn make_stuck_merging_task(db: &TasksDb, title: &str, age_ms: i64) -> crate::tasks_db::Task {
+        let task = db
+            .create_task(
+                "test-project",
+                title,
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .expect("create task");
+        db.set_branch(task.id, "task-merging").expect("set_branch");
+        db.set_worktree_path(task.id, "/tmp/fake-wt")
+            .expect("set_worktree_path");
+        // Walk the state machine to merging via the legal path:
+        // Ready → Active → Review → Approved → Merging.
+        for s in [
+            TaskState::Active,
+            TaskState::Review,
+            TaskState::Approved,
+            TaskState::Merging,
+        ] {
+            db.update_task(
+                task.id,
+                &TaskUpdate {
+                    state: Some(s),
+                    ..Default::default()
+                },
+                None,
+            )
+            .expect("state transition");
+        }
+
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        let backdated = now_ms.saturating_sub(age_ms);
+        db.conn
+            .execute(
+                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![backdated, task.id],
+            )
+            .expect("backdate updated_at");
+
+        db.get_task(task.id).expect("get").expect("task exists")
+    }
+
+    #[test]
+    fn test_get_stuck_merging_tasks_threshold() {
+        // Only tasks older than the threshold should be returned, and
+        // only those in `merging`.
+        let db = TasksDb::open_memory().unwrap();
+        let fresh = make_stuck_merging_task(&db, "fresh", 5_000);
+        let old = make_stuck_merging_task(&db, "old", 120_000);
+
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        let stuck = db
+            .get_stuck_merging_tasks(now_ms, STUCK_MERGING_THRESHOLD_MS)
+            .expect("query stuck merging");
+        let ids: Vec<i64> = stuck.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&old.id), "old task should be returned");
+        assert!(
+            !ids.contains(&fresh.id),
+            "fresh task should NOT be returned"
+        );
+    }
+
+    #[test]
+    fn test_get_stuck_merging_tasks_filters_other_states() {
+        let db = TasksDb::open_memory().unwrap();
+        // Stuck merging task counts.
+        let merging = make_stuck_merging_task(&db, "merging", 120_000);
+        // An active task with the same age should NOT be returned.
+        let active = make_stuck_active_task(&db, "active", 120_000);
+
+        let now_ms = tau_agent_plugin::timestamp_ms() as i64;
+        let stuck = db
+            .get_stuck_merging_tasks(now_ms, STUCK_MERGING_THRESHOLD_MS)
+            .expect("query");
+        let ids: Vec<i64> = stuck.iter().map(|t| t.id).collect();
+        assert!(ids.contains(&merging.id));
+        assert!(
+            !ids.contains(&active.id),
+            "active tasks must not be returned by get_stuck_merging_tasks"
+        );
+    }
+
+    #[test]
+    fn test_stuck_merging_watchdog_skips_fresh_tasks() {
+        // A merging task that just transitioned must not be touched.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let _fresh = make_stuck_merging_task(&db, "fresh", 5_000);
+
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let warnings =
+            run_stuck_merging_watchdog_pass(&db, &resolver, &mut events, &mut writer, &mut reader);
+        assert!(
+            warnings.is_empty(),
+            "watchdog must not touch fresh merging tasks, got {:?}",
+            warnings
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_stuck_merging_watchdog_reconciles_to_merged_when_branch_reachable() {
+        // Real git repo where the task branch is fast-forwarded onto main.
+        let repo = init_repo_with_task_branch(true, false);
+        let db = TasksDb::open_memory().unwrap();
+        let resolver =
+            ProjectResolver::test(&[("test-project", repo.path().to_str().expect("path utf8"))]);
+        let (mut writer, mut reader) = mock_io();
+
+        let task = make_stuck_merging_task(&db, "merged-on-target", 120_000);
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let warnings =
+            run_stuck_merging_watchdog_pass(&db, &resolver, &mut events, &mut writer, &mut reader);
+        assert!(
+            warnings.iter().any(|w| w.contains("reconciled")),
+            "expected reconciliation warning, got {:?}",
+            warnings
+        );
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(updated.state, TaskState::Merged);
+
+        // Watchdog should queue a ScheduleNeeded so downstream tasks unblock.
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project"
+            )),
+            "expected ScheduleNeeded event, got {:?}",
+            events
+        );
+    }
+
+    #[test]
+    fn test_stuck_merging_watchdog_reconciles_to_merged_when_branch_already_deleted() {
+        // Production cleanup deletes the branch only after the FF lands.
+        // The watchdog therefore treats a missing branch as a success signal.
+        let repo = init_repo_with_task_branch(true, true);
+        let db = TasksDb::open_memory().unwrap();
+        let resolver =
+            ProjectResolver::test(&[("test-project", repo.path().to_str().expect("path utf8"))]);
+        let (mut writer, mut reader) = mock_io();
+
+        let task = make_stuck_merging_task(&db, "branch-deleted", 120_000);
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let _ =
+            run_stuck_merging_watchdog_pass(&db, &resolver, &mut events, &mut writer, &mut reader);
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated.state,
+            TaskState::Merged,
+            "missing branch ref should be treated as a successful merge"
+        );
+    }
+
+    #[test]
+    fn test_stuck_merging_watchdog_transitions_to_failed_when_branch_not_reachable() {
+        // Branch exists but is NOT reachable from main: the merge did NOT land.
+        let repo = init_repo_with_task_branch(false, false);
+        let db = TasksDb::open_memory().unwrap();
+        let resolver =
+            ProjectResolver::test(&[("test-project", repo.path().to_str().expect("path utf8"))]);
+        let (mut writer, mut reader) = mock_io();
+
+        let task = make_stuck_merging_task(&db, "unreachable", 120_000);
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let warnings =
+            run_stuck_merging_watchdog_pass(&db, &resolver, &mut events, &mut writer, &mut reader);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("NOT reachable") || w.contains("did not land")),
+            "expected unreachable-branch warning, got {:?}",
+            warnings
+        );
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(updated.state, TaskState::Failed);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SchedulerEvent::ScheduleNeeded(p, _) if p == "test-project"
+            )),
+            "expected ScheduleNeeded event even on failed reconciliation"
+        );
+    }
+
+    #[test]
+    fn test_stuck_merging_watchdog_gives_up_after_max_attempts() {
+        // Pre-populate the task with MAX_WATCHDOG_ATTEMPTS markers and
+        // confirm the next pass transitions to Failed.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = make_stuck_merging_task(&db, "persistent", 120_000);
+        for i in 0..MAX_WATCHDOG_ATTEMPTS {
+            db.add_message(
+                task.id,
+                &format!("{} attempt {}", STUCK_MERGING_WATCHDOG_MARKER, i + 1),
+                Some("system"),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            count_stuck_merging_attempts(&db, task.id),
+            MAX_WATCHDOG_ATTEMPTS
+        );
+
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let warnings =
+            run_stuck_merging_watchdog_pass(&db, &resolver, &mut events, &mut writer, &mut reader);
+        assert!(
+            warnings.iter().any(|w| w.contains("giving up")),
+            "expected give-up warning, got {:?}",
+            warnings
+        );
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(updated.state, TaskState::Failed);
+    }
+
+    #[test]
+    fn test_stuck_merging_watchdog_leaves_task_alone_when_git_unreadable() {
+        // No real git repo at the resolved path — the heuristic must
+        // refuse to touch the task. Subsequent passes will retry until
+        // MAX_WATCHDOG_ATTEMPTS and then transition to Failed.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver(); // resolves to /test/project (does not exist).
+        let (mut writer, mut reader) = mock_io();
+
+        let task = make_stuck_merging_task(&db, "git-unreadable", 120_000);
+        let mut events: Vec<SchedulerEvent> = Vec::new();
+        let warnings =
+            run_stuck_merging_watchdog_pass(&db, &resolver, &mut events, &mut writer, &mut reader);
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated.state,
+            TaskState::Merging,
+            "task must remain in merging when git can't answer; got {:?} warnings={:?}",
+            updated.state,
+            warnings
+        );
+        // Must not push a ScheduleNeeded if it didn't reconcile.
+        assert!(
+            events.is_empty(),
+            "no schedule event when nothing was reconciled"
+        );
+        // But must still record an attempt marker so the give-up
+        // counter ticks up across passes.
+        assert_eq!(count_stuck_merging_attempts(&db, task.id), 1);
     }
 }

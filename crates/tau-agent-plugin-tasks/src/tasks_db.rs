@@ -2106,6 +2106,47 @@ impl TasksDb {
         Ok(tasks)
     }
 
+    /// Find tasks stuck in `merging` for longer than `max_age_ms`.
+    ///
+    /// A healthy merge transitions through `merging` in seconds (the
+    /// merge worker flips `Approved → Merging`, runs the merge, then
+    /// flips `Merging → Merged`). A task that lingers here is a strong
+    /// signal that something went wrong post-rebase — the file claim
+    /// is still held but no more progress will happen on its own.
+    ///
+    /// Unlike [`get_stuck_active_tasks`], we do NOT filter on
+    /// `session_id IS NULL`: the merge worker doesn't touch
+    /// `task.session_id`, so a stuck merging task may have any value
+    /// there (typically the worker session id from when the task was
+    /// in `active`).
+    ///
+    /// See task #850.
+    pub fn get_stuck_merging_tasks(
+        &self,
+        now_ms: i64,
+        max_age_ms: i64,
+    ) -> tau_agent_plugin::Result<Vec<Task>> {
+        let cutoff = now_ms.saturating_sub(max_age_ms);
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {} FROM tasks
+                 WHERE state = 'merging' AND updated_at <= ?1",
+                TASK_COLUMNS
+            ))
+            .map_err(plugin_io_err("prepare stuck merging query"))?;
+
+        let rows = stmt
+            .query_map(params![cutoff], row_to_task)
+            .map_err(plugin_io_err("query stuck merging"))?;
+
+        let mut tasks = Vec::new();
+        for row in rows {
+            tasks.push(row.map_err(plugin_io_err("read stuck merging task"))?);
+        }
+        Ok(tasks)
+    }
+
     /// Find tasks in terminal states (merged/closed/failed) that still have a worktree_path set.
     /// Used for startup cleanup of stale worktrees.
     pub fn get_stale_worktree_tasks(&self) -> tau_agent_plugin::Result<Vec<Task>> {
