@@ -61,6 +61,11 @@ pub struct ToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Always `true` for tau — we stream tool-call argument deltas through
+    /// `StreamEvent::ToolcallDelta`, so we always opt into eager tool input
+    /// streaming. Replaces the deprecated fine-grained tool-streaming beta
+    /// header.
+    pub eager_input_streaming: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
 }

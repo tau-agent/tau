@@ -104,16 +104,18 @@ fn run_stream(
     if is_oauth {
         oauth_auth = format!("Bearer {}", ctx.api_key);
         extra_headers.push(("authorization", oauth_auth.as_str()));
-        extra_headers.push((
-            "anthropic-beta",
-            "claude-code-20250219,oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14",
-        ));
+        // NOTE: if/when more beta features are added, only push this header
+        // when the comma-list is non-empty — sending `anthropic-beta: ""`
+        // causes HTTP 400 on models with no other betas enabled.
+        extra_headers.push(("anthropic-beta", "claude-code-20250219,oauth-2025-04-20"));
         extra_headers.push(("user-agent", "claude-cli/2.1.75"));
         extra_headers.push(("x-app", "cli"));
         extra_headers.push(("anthropic-dangerous-direct-browser-access", "true"));
     } else {
         extra_headers.push(("x-api-key", ctx.api_key));
-        extra_headers.push(("anthropic-beta", "fine-grained-tool-streaming-2025-05-14"));
+        // No `anthropic-beta` header: we have no beta features to send on the
+        // API-key path. Eager tool-input streaming is now opted into per-tool
+        // via `eager_input_streaming: true` on each ToolDef.
     }
 
     let PreparedStream {
@@ -531,6 +533,7 @@ fn build_request_body(
                 name: t.name.clone(),
                 description: t.description.clone(),
                 input_schema: t.parameters.clone(),
+                eager_input_streaming: true,
                 cache_control: None,
             })
             .collect();
@@ -1105,6 +1108,49 @@ mod tests {
         assert!(tools[0].get("cache_control").is_none());
         assert!(tools[1].get("cache_control").is_none());
         assert_eq!(tools[2]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn every_tool_has_eager_input_streaming_true() {
+        // Replaces the deprecated fine-grained tool-streaming beta header:
+        // every tool we send must opt in per-tool.
+        let ctx = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage::text("hi"))],
+            tools: vec![
+                Tool {
+                    name: "first".into(),
+                    description: "first tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                Tool {
+                    name: "second".into(),
+                    description: "second tool".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            ],
+        };
+
+        // Default model (claude-opus-4-7) via the `build` helper.
+        let body = build(&ctx, &StreamOptions::default());
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        for tool in tools {
+            assert_eq!(
+                tool["eager_input_streaming"], true,
+                "every tool must serialize eager_input_streaming: true, got {tool}"
+            );
+        }
+
+        // Same expectation for a non-adaptive model (claude-haiku-4-5).
+        let haiku = model_by_id("claude-haiku-4-5");
+        let req = build_request_body(&haiku, &ctx, &StreamOptions::default())
+            .expect("build_request_body");
+        let body = serde_json::to_value(req).expect("serialize");
+        let tools = body["tools"].as_array().expect("tools array");
+        for tool in tools {
+            assert_eq!(tool["eager_input_streaming"], true);
+        }
     }
 
     #[test]
