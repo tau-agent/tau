@@ -141,9 +141,39 @@ pub fn discover_project(start: &Path) -> Option<(String, PathBuf)> {
     loop {
         let config_path = dir.join(".tau").join("project.toml");
         if config_path.is_file() {
-            let contents = std::fs::read_to_string(&config_path).ok()?;
-            let config: ProjectConfig = toml::from_str(&contents).ok()?;
-            let canonical = dir.canonicalize().ok()?;
+            let contents = match std::fs::read_to_string(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        error = %e,
+                        "discover_project: failed to read project.toml",
+                    );
+                    return None;
+                }
+            };
+            let config: ProjectConfig = match toml::from_str(&contents) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        error = %e,
+                        "discover_project: malformed project.toml",
+                    );
+                    return None;
+                }
+            };
+            let canonical = match dir.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "discover_project: failed to canonicalize project root",
+                    );
+                    return None;
+                }
+            };
             return Some((config.name, canonical));
         }
         if !dir.pop() {
@@ -365,6 +395,82 @@ mod tests {
     fn discover_returns_none_when_missing() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         assert!(discover_project(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn discover_with_trailing_slash() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path();
+        let tau_dir = root.join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join("project.toml"), "name = \"trailing\"\n").unwrap();
+
+        // Append a trailing slash to the path.
+        let mut with_slash = root.to_string_lossy().into_owned();
+        with_slash.push('/');
+        let p = std::path::Path::new(&with_slash);
+
+        let (name, found) = discover_project(p).expect("should discover");
+        assert_eq!(name, "trailing");
+        assert_eq!(found, root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn discover_with_dot_dot_in_path() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path();
+        let tau_dir = root.join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join("project.toml"), "name = \"dotdot\"\n").unwrap();
+
+        // Build a path of the form `<root>/sub/..` that resolves to root.
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let weird = sub.join("..");
+
+        let (name, found) = discover_project(&weird).expect("should discover via .. path");
+        assert_eq!(name, "dotdot");
+        // Canonicalisation collapses `..` so the discovered root matches the real one.
+        assert_eq!(found, root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn discover_nonexistent_path_returns_none() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let bogus = tmp.path().join("does").join("not").join("exist");
+        // Must not panic and must return None.
+        assert!(discover_project(&bogus).is_none());
+    }
+
+    #[test]
+    fn discover_malformed_toml_returns_none() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path();
+        let tau_dir = root.join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        // Not valid TOML (missing quotes / value).
+        std::fs::write(tau_dir.join("project.toml"), "name = \n").unwrap();
+
+        assert!(discover_project(root).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_via_symlink_to_project_root() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path().join("real");
+        std::fs::create_dir_all(&root).unwrap();
+        let tau_dir = root.join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join("project.toml"), "name = \"sym\"\n").unwrap();
+
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+
+        let (name, found) = discover_project(&link).expect("should discover via symlink");
+        assert_eq!(name, "sym");
+        // Canonicalised path resolves through the symlink to the real dir.
+        assert_eq!(found, root.canonicalize().unwrap());
     }
 
     // -- init_project ---------------------------------------------------------

@@ -78,35 +78,55 @@ pub(super) fn create_session_impl(
         .and_then(|pid| st.db.get_session(pid).ok().flatten());
 
     // Derive cwd before model resolution: project aliases need it.
-    let cwd = cwd
-        .clone()
-        .or_else(|| parent.as_ref().and_then(|p| p.cwd.clone()));
+    let requested_cwd = cwd.clone();
+    let parent_cwd = parent.as_ref().and_then(|p| p.cwd.clone());
+    let cwd = requested_cwd.clone().or_else(|| parent_cwd.clone());
+    tracing::debug!(
+        requested_cwd = ?requested_cwd,
+        parent_cwd = ?parent_cwd,
+        resolved_cwd = ?cwd,
+        "create_session: cwd resolution",
+    );
 
     // Resolve project name: explicit > discovery > parent inheritance.
-    let project_name = project_name
-        .clone()
-        .or_else(|| {
-            cwd.as_deref().and_then(|c| {
-                let path = std::path::Path::new(c);
-                crate::project::discover_project(path).map(|(name, root)| {
-                    // Upsert: register the project in DB if not already present.
-                    let root_str = root.to_string_lossy();
-                    if st
-                        .db
-                        .get_project_by_path(&root_str)
-                        .ok()
-                        .flatten()
-                        .is_none()
-                    {
-                        let _ = st.db.create_project(&name, &root_str);
-                    } else {
-                        let _ = st.db.update_project_last_seen(&name);
-                    }
-                    name
-                })
-            })
+    let explicit_project_name = project_name.clone();
+    let discovery_result: Option<String> = cwd.as_deref().and_then(|c| {
+        let path = std::path::Path::new(c);
+        crate::project::discover_project(path).map(|(name, root)| {
+            tracing::debug!(
+                cwd = %c,
+                name = %name,
+                root = %root.display(),
+                "create_session: discovery succeeded",
+            );
+            // Upsert: register the project in DB if not already present.
+            let root_str = root.to_string_lossy();
+            if st
+                .db
+                .get_project_by_path(&root_str)
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                let _ = st.db.create_project(&name, &root_str);
+            } else {
+                let _ = st.db.update_project_last_seen(&name);
+            }
+            name
         })
-        .or_else(|| parent.as_ref().and_then(|p| p.project_name.clone()));
+    });
+    let parent_project = parent.as_ref().and_then(|p| p.project_name.clone());
+    let project_name = explicit_project_name
+        .clone()
+        .or_else(|| discovery_result.clone())
+        .or_else(|| parent_project.clone());
+    tracing::debug!(
+        explicit = ?explicit_project_name,
+        discovery_result = ?discovery_result,
+        parent_project = ?parent_project,
+        final_resolved = ?project_name,
+        "create_session: project_name resolution",
+    );
 
     // Resolve the model. When the request supplies an explicit model_id we
     // run it through the alias resolver (operator → project → global →
@@ -208,6 +228,12 @@ pub(super) fn create_session_impl(
         notify_parent,
         project_name,
     };
+    tracing::debug!(
+        session_id = %id,
+        project_name = ?stored.project_name,
+        cwd = ?stored.cwd,
+        "create_session: about to persist",
+    );
     match st.db.create_session(&stored) {
         Ok(()) => Response::SessionCreated { session_id: id },
         Err(e) => Response::Error {
@@ -523,16 +549,20 @@ pub(super) async fn handle_client(
                     && system_prompt.is_none()
                 {
                     let id = session_id.clone();
-                    let cwd_resolved = {
+                    let (cwd_resolved, project_resolved) = {
                         let st = lock_state(&state);
-                        st.db.get_session(&id).ok().flatten().and_then(|s| s.cwd)
+                        let stored = st.db.get_session(&id).ok().flatten();
+                        (
+                            stored.as_ref().and_then(|s| s.cwd.clone()),
+                            stored.as_ref().and_then(|s| s.project_name.clone()),
+                        )
                     };
                     let cwd_str = cwd_resolved.as_deref().unwrap_or("/tmp");
                     let mut pm = plugins.lock().expect("plugins mutex poisoned");
                     match pm.ensure_session_plugins(
                         &id,
                         cwd_str,
-                        project_name.as_deref(),
+                        project_resolved.as_deref(),
                         sandbox_profile.as_deref(),
                     ) {
                         Ok(failures) => {
@@ -2570,5 +2600,99 @@ mod tests {
             )
             .await;
         });
+    }
+
+    /// Symptom B regression (task #888): when `create_session_impl` is
+    /// called with `project_name = None` and a `cwd` that points inside a
+    /// tau project, the persisted `StoredSession.project_name` must be the
+    /// discovered name. The dispatch loop then re-fetches that row and
+    /// passes the resolved value to `ensure_session_plugins`, ensuring the
+    /// plugin layer and the DB agree.
+    #[test]
+    fn create_session_resolves_project_name_from_cwd() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path();
+        let tau_dir = root.join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(tau_dir.join("project.toml"), "name = \"resolved-proj\"\n").unwrap();
+
+        let state = mk_state();
+        let cwd = Some(root.to_string_lossy().into_owned());
+        let resp = create_session_impl(
+            &state,
+            &None,
+            &None,
+            &Some("sp".into()), // bypass post-create plugin spawn path; we test resolution only
+            &cwd,
+            &None,
+            0,
+            &None,
+            false,
+            true,
+            &None, // <-- explicit project_name is None: discovery must populate
+        );
+        let id = match resp {
+            crate::protocol::Response::SessionCreated { session_id } => session_id,
+            other => panic!("expected SessionCreated, got {:?}", other),
+        };
+
+        // The persisted row must carry the discovered project name.
+        let stored = {
+            let st = lock_state(&state);
+            st.db
+                .get_session(&id)
+                .expect("db.get_session")
+                .expect("session row")
+        };
+        assert_eq!(
+            stored.project_name.as_deref(),
+            Some("resolved-proj"),
+            "discovery must populate project_name when explicit value is None",
+        );
+
+        // Mirror the dispatch loop's fetch-and-pass step: the value handed
+        // to the plugin layer is `stored.project_name`, not the (None) wire
+        // value that was originally requested. This is the contract the
+        // fix in dispatch.rs upholds.
+        let plugin_arg: Option<&str> = stored.project_name.as_deref();
+        assert_eq!(
+            plugin_arg,
+            Some("resolved-proj"),
+            "plugin spawn must receive the resolved project_name, not the request value",
+        );
+    }
+
+    /// Companion test: when a non-project cwd is passed, project_name stays
+    /// None and that's what the plugin layer sees.
+    #[test]
+    fn create_session_no_project_when_cwd_outside_project() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let state = mk_state();
+        let cwd = Some(tmp.path().to_string_lossy().into_owned());
+        let resp = create_session_impl(
+            &state,
+            &None,
+            &None,
+            &Some("sp".into()),
+            &cwd,
+            &None,
+            0,
+            &None,
+            false,
+            true,
+            &None,
+        );
+        let id = match resp {
+            crate::protocol::Response::SessionCreated { session_id } => session_id,
+            other => panic!("expected SessionCreated, got {:?}", other),
+        };
+        let stored = {
+            let st = lock_state(&state);
+            st.db
+                .get_session(&id)
+                .expect("db.get_session")
+                .expect("session row")
+        };
+        assert!(stored.project_name.is_none());
     }
 }

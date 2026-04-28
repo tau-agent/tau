@@ -18,6 +18,7 @@ thiserror.workspace = true
 futures.workspace = true
 toml.workspace = true
 myelin.workspace = true
+tracing.workspace = true
 
 [features]
 # `serde` is unconditionally pulled in as a hard dep above; the feature flag
