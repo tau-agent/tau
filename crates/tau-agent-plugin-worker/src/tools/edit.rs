@@ -38,7 +38,7 @@ pub fn tool_def() -> ToolDef {
         tool: Tool {
             name: "edit".into(),
             description:
-                "Edit a file by replacing exact text or by line-anchor. Each old_text must match exactly (including whitespace and newlines) and be unique in the file. Anchor edits use the `<hash>§` prefixes from the `read` tool's output and re-validate against current file contents. Supports single edit or multiple disjoint edits in one call across one or more files."
+                "Edit a file by replacing exact text or by line-anchor. Each old_text must match exactly (including whitespace and newlines) and be unique in the file. Anchor edits use the `<hash>§` prefixes from the `read` tool's output and re-validate against current file contents. When making multiple changes in one logical step, batch them into a single call: multiple edits per file, or multiple files in the `files` form. All edits validate before any write, so a batched call is atomic. Issuing one `edit` call per file when you could batch is wasteful."
                     .into(),
             // The schema accepts two mutually exclusive shapes — single-file
             // (`path` + `edits`) and multi-file (`files`) — but does NOT
@@ -57,7 +57,7 @@ pub fn tool_def() -> ToolDef {
                     },
                     "edits": {
                         "type": "array",
-                        "description": "Single-file form: one or more edits to apply in order to `path`. Each edit must be either a legacy `{old_text, new_text}` (old_text unique in the file) or an anchor edit `{edit_type, anchor, end_anchor?, text}` (anchor copied from the read tool's `<hash>§` prefix). Edits must not overlap. Mutually exclusive with `files`.",
+                        "description": "Single-file form: one or more edits to apply in order to `path`. Each edit must be either a legacy `{old_text, new_text}` (old_text unique in the file) or an anchor edit `{edit_type, anchor, end_anchor?, text}` (anchor copied from the read tool's `<hash>§` prefix). Edits must not overlap. Mutually exclusive with `files`. If your edits span multiple files, use the `files` form instead — same atomicity, one round-trip.",
                         "minItems": 1,
                         "items": EDIT_ITEM_SCHEMA.clone()
                     },
