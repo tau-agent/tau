@@ -55,6 +55,25 @@ impl ToolOutput {
         }
     }
 
+    /// Build a ToolOutput whose sole content block is an image (base64 + mime).
+    pub fn image(data: String, mime_type: String) -> Self {
+        Self {
+            content: vec![ToolResultContent::Image(ImageContent { data, mime_type })],
+            is_error: false,
+            summary: None,
+        }
+    }
+
+    /// Append an image block to an existing multi-part output. Used by the
+    /// `read` tool when a single call mixes text and image files so the
+    /// resulting `ToolOutput.content` interleaves text and image blocks in
+    /// request order.
+    pub fn with_image(mut self, data: String, mime_type: String) -> Self {
+        self.content
+            .push(ToolResultContent::Image(ImageContent { data, mime_type }));
+        self
+    }
+
     pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
         self.summary = Some(summary.into());
         self

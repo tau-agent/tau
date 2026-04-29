@@ -2621,6 +2621,7 @@ name = "tau-agent-plugin-worker"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
  "futures",
  "nix 0.30.1",

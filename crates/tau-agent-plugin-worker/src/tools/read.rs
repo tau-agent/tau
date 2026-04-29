@@ -33,7 +33,8 @@
 //! probably expected.
 
 use super::{ToolDef, ToolOutput};
-use tau_agent_plugin::Tool;
+use base64::Engine;
+use tau_agent_plugin::{ImageContent, TextContent, Tool, ToolResultContent};
 
 /// Maximum number of paths accepted in a single `read` call. Prevents the
 /// model from accidentally enumerating a whole tree.
@@ -44,12 +45,56 @@ pub const MAX_PATHS: usize = 20;
 /// dropped with a truncation marker rather than ballooning the response.
 pub const MAX_TOTAL_BYTES: usize = 256 * 1024;
 
+/// Per-image raw-bytes cap. Anthropic documents 5 MB / image; we mirror that
+/// limit and reject larger files with an inline error so other paths in the
+/// same multi-path call still succeed.
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Per-call total budget for base64-encoded image payload, tracked
+/// independently from [`MAX_TOTAL_BYTES`]. Charging images against the much
+/// smaller text cap would make even a single ~1 MB image starve the whole
+/// call; charging text against the image cap would make text responses
+/// arbitrarily large. Sized so a full 5 MB image (~6.7 MB base64) plus a
+/// few text files fit comfortably.
+pub const MAX_TOTAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// Map a path extension to an Anthropic-supported image mime, or `None` for
+/// non-image extensions (which fall through to the text path). Detection is
+/// extension-based on purpose: deterministic, cheap, and matches the user
+/// intuition that `foo.png` is an image. Files renamed to a known image
+/// extension but containing non-image bytes will be sent to the model as a
+/// malformed image; the spec accepts that trade-off.
+fn image_mime_from_path(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())?;
+    match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Short label rendered in the per-file image summary line (e.g. `PNG`).
+fn mime_label(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "PNG",
+        "image/jpeg" => "JPEG",
+        "image/gif" => "GIF",
+        "image/webp" => "WEBP",
+        _ => "image",
+    }
+}
+
 pub fn tool_def() -> ToolDef {
     ToolDef {
         tool: Tool {
             name: "read".into(),
             description:
-                "Read the contents of one or more files. Supports offset/limit for large files (applied per file). Each line in the body is prefixed with `<hash>§` — a stable per-line anchor (FNV-1a 8 hex; `.n` suffix for duplicate lines) you can use with the `edit` tool's anchor shape. Prefer `get_file_skeleton` to outline a file's structure cheaply, or `get_function` to pull a specific function body, when you don't need the whole file."
+                "Read the contents of one or more files. Supports offset/limit for large files (applied per file). Each line in the body is prefixed with `<hash>§` — a stable per-line anchor (FNV-1a 8 hex; `.n` suffix for duplicate lines) you can use with the `edit` tool's anchor shape. For paths ending in `.png`, `.jpg`/`.jpeg`, `.gif`, `.webp` the file is returned as a base64 image block instead of text; `offset` and `limit` are ignored for images. Prefer `get_file_skeleton` to outline a file's structure cheaply, or `get_function` to pull a specific function body, when you don't need the whole file."
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -111,21 +156,39 @@ fn prepare_arguments(mut args: serde_json::Value) -> serde_json::Value {
     args
 }
 
-/// Per-file outcome — either a rendered body + summary fragment, or an
-/// inline error string to render in the file's section.
+/// Per-file outcome rendered into the multi-block tool output.
+enum FileBody {
+    /// Successful text read (existing path).
+    Text(String),
+    /// Successful image read: base64 payload + mime + raw byte count for
+    /// the human-readable summary. Base64 is computed once in `read_one`.
+    Image {
+        data_b64: String,
+        mime: &'static str,
+        raw_bytes: usize,
+        /// `true` when the caller passed non-default `offset` / `limit`,
+        /// which we silently ignored. Surfaced as a per-file note.
+        args_ignored: bool,
+    },
+    /// Inline error to render as `error: …` in this file's section.
+    Error(String),
+}
+
 struct FileRead {
     /// Path string as the caller requested it (echoed back verbatim).
     path_str: String,
-    /// On success: rendered body (joined lines + optional continuation hint).
-    /// On failure: `Err(message)` rendered as an inline `error: …` line.
-    body: Result<String, String>,
+    /// Body / outcome for this file.
+    body: FileBody,
     /// Total lines in the file (used for the multi-file summary). Zero on
-    /// error.
+    /// error or for image entries.
     total_lines: usize,
-    /// Bytes the body contributes to the global byte cap. Zero on error.
+    /// Bytes the body contributes to whichever budget is relevant: text
+    /// length for [`FileBody::Text`], base64 length for [`FileBody::Image`],
+    /// zero for errors.
     bytes: usize,
-    /// `Some((start1, end))` when offset/limit selected a sub-range; used
-    /// for the single-file summary path. `None` for full reads or errors.
+    /// `Some((start1, end))` when offset/limit selected a sub-range of a
+    /// text file; used for the single-file summary path. `None` for full
+    /// reads, errors, or images.
     range: Option<(usize, usize)>,
 }
 
@@ -137,12 +200,85 @@ fn read_one(
     remaining_bytes: usize,
 ) -> FileRead {
     let path = super::resolve_path(cwd, path_str);
+
+    // Image branch: extension-based detection. We metadata-stat first so an
+    // oversize image is rejected without slurping its bytes into memory.
+    if let Some(mime) = image_mime_from_path(path_str) {
+        let args_ignored = offset != 1 || limit.is_some();
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                return FileRead {
+                    path_str: path_str.to_string(),
+                    body: FileBody::Error(format!("failed to read {}: {}", path.display(), e)),
+                    total_lines: 0,
+                    bytes: 0,
+                    range: None,
+                };
+            }
+        };
+        let raw_bytes = meta.len() as usize;
+        if raw_bytes > MAX_IMAGE_BYTES {
+            return FileRead {
+                path_str: path_str.to_string(),
+                body: FileBody::Error(format!(
+                    "image {} is {} bytes, exceeds per-image cap of {} bytes",
+                    path.display(),
+                    raw_bytes,
+                    MAX_IMAGE_BYTES,
+                )),
+                total_lines: 0,
+                bytes: 0,
+                range: None,
+            };
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                return FileRead {
+                    path_str: path_str.to_string(),
+                    body: FileBody::Error(format!("failed to read {}: {}", path.display(), e)),
+                    total_lines: 0,
+                    bytes: 0,
+                    range: None,
+                };
+            }
+        };
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let charge = data_b64.len();
+        if charge > remaining_bytes {
+            return FileRead {
+                path_str: path_str.to_string(),
+                body: FileBody::Error(format!(
+                    "image {} ({} bytes base64) exceeds remaining image budget for this call",
+                    path.display(),
+                    charge,
+                )),
+                total_lines: 0,
+                bytes: 0,
+                range: None,
+            };
+        }
+        return FileRead {
+            path_str: path_str.to_string(),
+            body: FileBody::Image {
+                data_b64,
+                mime,
+                raw_bytes,
+                args_ignored,
+            },
+            total_lines: 0,
+            bytes: charge,
+            range: None,
+        };
+    }
+
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(e) => {
             return FileRead {
                 path_str: path_str.to_string(),
-                body: Err(format!("failed to read {}: {}", path.display(), e)),
+                body: FileBody::Error(format!("failed to read {}: {}", path.display(), e)),
                 total_lines: 0,
                 bytes: 0,
                 range: None,
@@ -200,7 +336,7 @@ fn read_one(
 
     FileRead {
         path_str: path_str.to_string(),
-        body: Ok(body),
+        body: FileBody::Text(body),
         total_lines: total,
         bytes,
         range,
@@ -249,7 +385,9 @@ fn execute(
 
     let n_paths = paths.len();
     let mut results: Vec<FileRead> = Vec::with_capacity(n_paths);
-    let mut used_bytes: usize = 0;
+    // Two independent budgets — see the constants' doc comments.
+    let mut used_text_bytes: usize = 0;
+    let mut used_image_bytes: usize = 0;
     let mut cap_reached = false;
     let mut skipped_after_cap: usize = 0;
 
@@ -258,21 +396,42 @@ fn execute(
             skipped_after_cap += 1;
             continue;
         }
-        let remaining = MAX_TOTAL_BYTES.saturating_sub(used_bytes);
+        // Pick the relevant budget based on extension before calling
+        // `read_one`. This keeps `read_one` agnostic to which budget it's
+        // charging against; the caller decides.
+        let is_image = image_mime_from_path(path_str).is_some();
+        let remaining = if is_image {
+            MAX_TOTAL_IMAGE_BYTES.saturating_sub(used_image_bytes)
+        } else {
+            MAX_TOTAL_BYTES.saturating_sub(used_text_bytes)
+        };
         let fr = read_one(cwd, path_str, offset, limit, remaining);
-        used_bytes = used_bytes.saturating_add(fr.bytes);
-        if used_bytes >= MAX_TOTAL_BYTES {
-            cap_reached = true;
+        match &fr.body {
+            FileBody::Image { .. } => {
+                used_image_bytes = used_image_bytes.saturating_add(fr.bytes);
+                if used_image_bytes >= MAX_TOTAL_IMAGE_BYTES {
+                    cap_reached = true;
+                }
+            }
+            FileBody::Text(_) => {
+                used_text_bytes = used_text_bytes.saturating_add(fr.bytes);
+                if used_text_bytes >= MAX_TOTAL_BYTES {
+                    cap_reached = true;
+                }
+            }
+            FileBody::Error(_) => { /* errors don't charge either budget */ }
         }
         results.push(fr);
     }
 
-    // Render output. Single-path calls get the legacy format byte-for-byte.
+    // Render output. Single-path calls get the legacy format byte-for-byte
+    // for text; the image path is single-block too (one Image content) but
+    // with an image-flavoured summary.
     if n_paths == 1 {
         // Safe: we just pushed exactly one entry above.
         let fr = results.into_iter().next().expect("one result for one path");
         match fr.body {
-            Ok(body) => {
+            FileBody::Text(body) => {
                 let summary = match fr.range {
                     None => format!("read: {} ({} lines)", fr.path_str, fr.total_lines),
                     Some((s, e)) => format!(
@@ -282,55 +441,130 @@ fn execute(
                 };
                 ToolOutput::text(body).with_summary(summary)
             }
-            Err(msg) => ToolOutput::error(msg),
+            FileBody::Image {
+                data_b64,
+                mime,
+                raw_bytes,
+                args_ignored,
+            } => {
+                let summary = format!(
+                    "image: {} ({}, {} KB)",
+                    fr.path_str,
+                    mime_label(mime),
+                    raw_bytes / 1024
+                );
+                let mut out = ToolOutput::image(data_b64, mime.into()).with_summary(summary);
+                if args_ignored {
+                    // Prepend a one-line text note so the model can see the
+                    // ignored-args explanation alongside the image block.
+                    out.content.insert(
+                        0,
+                        ToolResultContent::Text(TextContent {
+                            text: "[note: offset/limit ignored for image inputs]".into(),
+                            text_signature: None,
+                        }),
+                    );
+                }
+                out
+            }
+            FileBody::Error(msg) => ToolOutput::error(msg),
         }
     } else {
-        let mut out = String::new();
+        // Multi-path: build an interleaved Vec<ToolResultContent>. Adjacent
+        // text fragments collapse into one Text block; image entries flush
+        // the buffer and emit an Image block at the right position so the
+        // final content sequence matches the request order.
+        let mut content: Vec<ToolResultContent> = Vec::new();
+        let mut buf = String::new();
+        let flush = |buf: &mut String, content: &mut Vec<ToolResultContent>| {
+            if !buf.is_empty() {
+                content.push(ToolResultContent::Text(TextContent {
+                    text: std::mem::take(buf),
+                    text_signature: None,
+                }));
+            }
+        };
+
         let mut total_lines = 0usize;
         let mut errors = 0usize;
         let mut successes = 0usize;
+        let mut images = 0usize;
         for (i, fr) in results.iter().enumerate() {
             if i > 0 {
-                out.push_str("\n\n");
+                buf.push_str("\n\n");
             }
-            out.push_str(&format!("===== {} =====\n", fr.path_str));
+            buf.push_str(&format!("===== {} =====\n", fr.path_str));
             match &fr.body {
-                Ok(body) => {
-                    out.push_str(body);
+                FileBody::Text(body) => {
+                    buf.push_str(body);
                     total_lines += fr.total_lines;
                     successes += 1;
                 }
-                Err(msg) => {
-                    out.push_str("error: ");
-                    out.push_str(msg);
+                FileBody::Image {
+                    data_b64,
+                    mime,
+                    raw_bytes,
+                    args_ignored,
+                } => {
+                    buf.push_str(&format!(
+                        "image: {} ({}, {} KB)\n",
+                        fr.path_str,
+                        mime_label(mime),
+                        raw_bytes / 1024
+                    ));
+                    if *args_ignored {
+                        buf.push_str("[note: offset/limit ignored for image inputs]\n");
+                    }
+                    flush(&mut buf, &mut content);
+                    content.push(ToolResultContent::Image(ImageContent {
+                        data: data_b64.clone(),
+                        mime_type: (*mime).into(),
+                    }));
+                    successes += 1;
+                    images += 1;
+                }
+                FileBody::Error(msg) => {
+                    buf.push_str("error: ");
+                    buf.push_str(msg);
                     errors += 1;
                 }
             }
         }
         if cap_reached && skipped_after_cap > 0 {
-            out.push_str(&format!(
+            buf.push_str(&format!(
                 "\n\n[truncated: byte cap reached, {} file(s) not read]",
                 skipped_after_cap
             ));
         }
+        flush(&mut buf, &mut content);
 
-        let summary = if errors == 0 {
-            format!("read: {} files ({} total lines)", n_paths, total_lines)
-        } else {
-            format!(
-                "read: {} files ({} total lines, {} error{})",
-                n_paths,
-                total_lines,
+        // Summary: keep the existing text-only format when no images are
+        // involved; otherwise append an image count so transcripts are
+        // unambiguous.
+        let mut summary = format!("read: {} files ({} total lines", n_paths, total_lines);
+        if images > 0 {
+            summary.push_str(&format!(
+                ", {} image{}",
+                images,
+                if images == 1 { "" } else { "s" }
+            ));
+        }
+        if errors > 0 {
+            summary.push_str(&format!(
+                ", {} error{}",
                 errors,
                 if errors == 1 { "" } else { "s" }
-            )
-        };
+            ));
+        }
+        summary.push(')');
 
-        let mut output = ToolOutput::text(out).with_summary(summary);
-        // Partial success is not an error; only flag the call as errored
-        // when *every* path failed.
-        output.is_error = successes == 0;
-        output
+        ToolOutput {
+            content,
+            // Partial success is not an error; only flag when *every* path
+            // failed.
+            is_error: successes == 0,
+            summary: Some(summary),
+        }
     }
 }
 
@@ -704,5 +938,236 @@ mod tests {
         let text = result.content[0].text().to_string();
         let h_foo = super::super::line_hash::fnv1a_8hex("foo");
         assert_eq!(text, format!("{h_foo}.2§foo\n{h_foo}.3§foo"));
+    }
+
+    // --- image branch ------------------------------------------------------
+
+    /// Smallest valid PNG: a 1×1 transparent pixel. Used as fixture data
+    /// for the image tests so the bytes are real PNG bytes (would survive
+    /// future content-sniffing without test churn).
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn write_bytes(dir: &std::path::Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, content).expect("write test file");
+        p
+    }
+
+    #[test]
+    fn read_image_returns_image_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = write_bytes(dir.path(), "foo.png", PNG_1X1);
+        let p_str = p.to_str().expect("path");
+        let result = execute(
+            serde_json::json!({"paths": [p_str]}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        assert_eq!(
+            result.content.len(),
+            1,
+            "expected single image block, got {:?}",
+            result.content
+        );
+        match &result.content[0] {
+            ToolResultContent::Image(img) => {
+                assert_eq!(img.mime_type, "image/png");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&img.data)
+                    .expect("valid base64");
+                assert_eq!(decoded, PNG_1X1);
+            }
+            other => panic!("expected Image, got {:?}", other),
+        }
+        let summary = result.summary.expect("summary");
+        assert!(
+            summary.starts_with("image: ") && summary.contains("PNG"),
+            "got: {summary}"
+        );
+    }
+
+    #[test]
+    fn read_oversize_image_returns_error_not_panic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = write_bytes(dir.path(), "big.png", &vec![0u8; 6 * 1024 * 1024]);
+        let ok_text = write_file(dir.path(), "ok.txt", "hello\n");
+        let big_str = big.to_str().expect("big");
+        let ok_str = ok_text.to_str().expect("ok");
+        let result = execute(
+            serde_json::json!({"paths": [big_str, ok_str]}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        // Partial success: text file still readable, oversize image surfaces
+        // as an inline error in its slot.
+        assert!(!result.is_error, "partial success should not be flagged");
+        // No image block should have been emitted.
+        let has_image = result
+            .content
+            .iter()
+            .any(|c| matches!(c, ToolResultContent::Image(_)));
+        assert!(!has_image, "oversize image should not produce Image block");
+        let combined: String = result
+            .content
+            .iter()
+            .map(|c| c.text())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            combined.contains("exceeds per-image cap"),
+            "missing image cap error in: {combined}"
+        );
+        assert!(combined.contains("hello"), "text file body missing");
+        let summary = result.summary.expect("summary");
+        assert!(summary.contains("1 error"), "got: {summary}");
+    }
+
+    #[test]
+    fn read_mixed_text_and_image() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = write_file(dir.path(), "a.txt", "hello\n");
+        let b = write_bytes(dir.path(), "b.png", PNG_1X1);
+        let a_str = a.to_str().expect("a");
+        let b_str = b.to_str().expect("b");
+        let result = execute(
+            serde_json::json!({"paths": [a_str, b_str]}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        // Expect the content sequence to be [Text(headers+body+image-summary), Image]
+        // because adjacent text fragments collapse and the image block flushes
+        // the text buffer in front of it.
+        assert_eq!(result.content.len(), 2, "got: {:?}", result.content);
+        match &result.content[0] {
+            ToolResultContent::Text(t) => {
+                assert!(
+                    t.text.contains(&format!("===== {} =====", a_str)),
+                    "missing a header in: {}",
+                    t.text
+                );
+                assert!(
+                    t.text.contains(&format!("===== {} =====", b_str)),
+                    "missing b header in: {}",
+                    t.text
+                );
+                assert!(t.text.contains("hello"), "missing text body: {}", t.text);
+                assert!(
+                    t.text.contains("image: ") && t.text.contains("PNG"),
+                    "missing image summary line in: {}",
+                    t.text
+                );
+            }
+            other => panic!("expected Text, got {:?}", other),
+        }
+        match &result.content[1] {
+            ToolResultContent::Image(img) => {
+                assert_eq!(img.mime_type, "image/png");
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&img.data)
+                    .expect("valid base64");
+                assert_eq!(decoded, PNG_1X1);
+            }
+            other => panic!("expected Image, got {:?}", other),
+        }
+        let summary = result.summary.expect("summary");
+        assert!(summary.contains("1 image"), "got: {summary}");
+    }
+
+    #[test]
+    fn read_image_with_offset_limit_ignored_with_note() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = write_bytes(dir.path(), "foo.png", PNG_1X1);
+        let other = write_file(dir.path(), "a.txt", "hello\n");
+        let p_str = p.to_str().expect("png");
+        let other_str = other.to_str().expect("txt");
+
+        // Multi-path: assert the per-file note appears next to the image
+        // header and the image block is still emitted.
+        let result = execute(
+            serde_json::json!({"paths": [other_str, p_str], "offset": 5, "limit": 3}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error, "got: {:?}", result.content);
+        let text_blob: String = result
+            .content
+            .iter()
+            .map(|c| c.text())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            text_blob.contains("offset/limit ignored"),
+            "missing ignored-args note in: {text_blob}"
+        );
+        let has_image = result
+            .content
+            .iter()
+            .any(|c| matches!(c, ToolResultContent::Image(_)));
+        assert!(has_image, "image block should still be emitted");
+
+        // Single-path: note rendered as a leading text block alongside the
+        // image content.
+        let result = execute(
+            serde_json::json!({"paths": [p_str], "offset": 5, "limit": 3}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 2, "got: {:?}", result.content);
+        match &result.content[0] {
+            ToolResultContent::Text(t) => assert!(
+                t.text.contains("offset/limit ignored"),
+                "missing note in: {}",
+                t.text
+            ),
+            other => panic!("expected Text first, got {:?}", other),
+        }
+        assert!(matches!(&result.content[1], ToolResultContent::Image(_)));
+    }
+
+    #[test]
+    fn read_unknown_extension_falls_back_to_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Invalid UTF-8 bytes so `read_to_string` fails on the text path.
+        let p = write_bytes(dir.path(), "weird.bmp", &[0xFF, 0xFE, 0xFD, 0xFC]);
+        let p_str = p.to_str().expect("path");
+        let result = execute(
+            serde_json::json!({"paths": [p_str]}),
+            "/tmp",
+            &tau_agent_plugin::CancelToken::new(),
+        );
+        // Unknown extension → text path → invalid UTF-8 → inline failure.
+        // Single-path call returns is_error=true (text path's failure
+        // semantics).
+        assert!(
+            result.is_error,
+            "unknown ext should not be treated as image"
+        );
+        let has_image = result
+            .content
+            .iter()
+            .any(|c| matches!(c, ToolResultContent::Image(_)));
+        assert!(
+            !has_image,
+            "unknown extension must not produce an Image block"
+        );
+        let msg: String = result
+            .content
+            .iter()
+            .map(|c| c.text())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            msg.contains("failed to read"),
+            "expected text-read error, got: {msg}"
+        );
     }
 }
