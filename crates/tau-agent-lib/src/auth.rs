@@ -7,6 +7,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -277,8 +278,21 @@ fn do_refresh(refresh_tok: &str) -> crate::Result<OAuthCredentials> {
 // ---------------------------------------------------------------------------
 
 /// Persistent credential store backed by a JSON file.
+///
+/// Concurrency model:
+/// - The `flock` on the file (shared/exclusive) provides cross-process
+///   exclusion against other `tau` invocations (e.g. `tau login` while a
+///   daemon is running).
+/// - Within a single process, `flock(2)` semantics are ambiguous when
+///   multiple threads use distinct fds for the same file (the kernel
+///   may convert an existing lock rather than block).  To get reliable
+///   in-process serialisation we hold an additional `Mutex<()>` around
+///   every read/write/refresh.  The mutex is taken *before* the flock,
+///   so contention between same-process threads serialises here and the
+///   flock effectively only sees one fd per process at a time.
 pub struct AuthStorage {
     path: PathBuf,
+    in_process_lock: Arc<Mutex<()>>,
 }
 
 /// What's stored in auth.json per provider.
@@ -298,7 +312,10 @@ impl AuthStorage {
     }
 
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            in_process_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn open_default() -> Self {
@@ -307,6 +324,19 @@ impl AuthStorage {
 
     /// Read all credentials (under shared lock).
     fn read_locked(&self) -> crate::Result<AuthData> {
+        // Serialise same-process readers/writers before touching the fd
+        // to avoid relying on flock's ambiguous in-process semantics.
+        let _in_proc = self
+            .in_process_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        self.read_locked_inner()
+    }
+
+    /// Inner read: assumes the in-process mutex is already held by the
+    /// caller.  Used by `set` / `remove` to make the read-modify-write
+    /// cycle atomic against same-process writers.
+    fn read_locked_inner(&self) -> crate::Result<AuthData> {
         if !self.path.exists() {
             tracing::warn!(
                 path = %self.path.display(),
@@ -346,17 +376,34 @@ impl AuthStorage {
         Ok(data)
     }
 
-    /// Write all credentials (under exclusive lock).
-    fn write_locked(&self, data: &AuthData) -> crate::Result<()> {
+    /// Inner write: assumes the in-process mutex is already held by the
+    /// caller.  Used by `set` / `remove` to make the read-modify-write
+    /// cycle atomic against same-process writers.
+    fn write_locked_inner(&self, data: &AuthData) -> crate::Result<()> {
         ensure_parent(&self.path)?;
+        // Open WITHOUT truncating: `OpenOptions::truncate(true)` would
+        // truncate as a side-effect of `open()`, before any lock is held,
+        // exposing a window in which a concurrent reader sees a 0-byte
+        // file and fails to parse.  We truncate *after* taking the
+        // exclusive lock instead.
         let file = fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&self.path)
             .map_err(|e| crate::Error::Io(e.to_string()))?;
         file.lock_exclusive()
             .map_err(|e| crate::Error::Io(format!("lock {}: {}", self.path.display(), e)))?;
+        // Now under the exclusive lock — truncate and rewrite.  This is
+        // atomic with respect to concurrent `read_locked` callers, who
+        // will block on `lock_shared` until we release.
+        file.set_len(0)
+            .map_err(|e| crate::Error::Io(e.to_string()))?;
+        use std::io::Seek;
+        (&file)
+            .seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| crate::Error::Io(e.to_string()))?;
         serde_json::to_writer_pretty(&file, data)
             .map_err(|e| crate::Error::Parse(e.to_string()))?;
         file.unlock().map_err(|e| crate::Error::Io(e.to_string()))?;
@@ -374,16 +421,27 @@ impl AuthStorage {
 
     /// Store a credential for a provider.
     pub fn set(&self, provider: &str, cred: AuthCredential) -> crate::Result<()> {
-        let mut data = self.read_locked().unwrap_or_default();
+        // Hold the in-process mutex across the entire read-modify-write
+        // cycle so two same-process callers writing disjoint providers
+        // both survive (no last-writer-wins from interleaved RMW).
+        let _in_proc = self
+            .in_process_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut data = self.read_locked_inner().unwrap_or_default();
         data.insert(provider.to_string(), cred);
-        self.write_locked(&data)
+        self.write_locked_inner(&data)
     }
 
     /// Remove a credential.
     pub fn remove(&self, provider: &str) -> crate::Result<()> {
-        let mut data = self.read_locked().unwrap_or_default();
+        let _in_proc = self
+            .in_process_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut data = self.read_locked_inner().unwrap_or_default();
         data.remove(provider);
-        self.write_locked(&data)
+        self.write_locked_inner(&data)
     }
 
     /// Get credential for a provider.
@@ -521,9 +579,13 @@ impl AuthStorage {
                         provider,
                         file_len,
                         err = %e,
-                        "auth refresh_locked: parse failed under exclusive lock — falling back to empty AuthData (existing creds may be lost!)"
+                        "auth refresh_locked: parse failed under exclusive lock; refusing to overwrite"
                     );
-                    AuthData::default()
+                    file.unlock().ok();
+                    return Err(crate::Error::Parse(format!(
+                        "auth.json malformed (refresh path): {}. Re-authenticate with `tau login {}` to repair.",
+                        e, provider
+                    )));
                 }
             }
         } else {
@@ -998,6 +1060,166 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "lagging session must not trigger a second refresh",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Concurrency hardening (task 889)
+    // ---------------------------------------------------------------------
+
+    /// `write_locked` truncates under the exclusive lock now, so a
+    /// concurrent `read_locked` should never observe a 0-byte file and
+    /// fail to parse.  Previously, `OpenOptions::truncate(true)` opened
+    /// the file 0-byte before the flock was taken; a reader could slip
+    /// in during that window and see EOF.
+    #[test]
+    fn concurrent_read_during_write_never_parse_errors() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        // Seed with a non-trivial value so reads have something to parse.
+        storage
+            .set("anthropic", AuthCredential::ApiKey { key: "K0".into() })
+            .expect("seed");
+
+        let storage = Arc::new(storage);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Writer: rewrite the file in a tight loop.
+        let writer = {
+            let s = storage.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    let cred = AuthCredential::ApiKey {
+                        key: format!("K{}", i),
+                    };
+                    s.set("anthropic", cred).expect("set");
+                    i += 1;
+                }
+            })
+        };
+
+        // Readers: hammer reads for a fixed iteration count.  Any
+        // `Parse` error is a regression.
+        let n_readers = 4;
+        let iters_per_reader = 200;
+        let mut readers = Vec::new();
+        for _ in 0..n_readers {
+            let s = storage.clone();
+            readers.push(std::thread::spawn(move || {
+                for _ in 0..iters_per_reader {
+                    match s.get("anthropic") {
+                        Ok(_) => {}
+                        Err(crate::Error::Parse(msg)) => {
+                            panic!("concurrent read produced Parse error (regression): {}", msg);
+                        }
+                        Err(e) => panic!("unexpected error: {:?}", e),
+                    }
+                }
+            }));
+        }
+
+        for r in readers {
+            r.join().expect("reader join");
+        }
+        stop.store(true, Ordering::SeqCst);
+        writer.join().expect("writer join");
+    }
+
+    /// A non-empty but malformed auth.json must produce a clear
+    /// user-actionable Parse error from `refresh_locked`, not a silent
+    /// `unwrap_or_default()` that drops every other provider's creds.
+    #[test]
+    fn refresh_locked_malformed_file_errors_loudly() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        // Hand-write garbage into auth.json.
+        std::fs::write(&storage.path, b"corrupt!").expect("write garbage");
+
+        // The hook would only run *after* parsing succeeded; if we ever
+        // reach it, the test is broken.
+        let _h = install_refresh_hook(|_| {
+            panic!("do_refresh must not be called when the auth file is malformed");
+        });
+
+        let err = storage
+            .refresh_locked("anthropic", "R0")
+            .expect_err("refresh on malformed file must error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("malformed"),
+            "error message must contain 'malformed': {}",
+            msg
+        );
+        assert!(
+            msg.contains("tau login"),
+            "error message must point user at `tau login`: {}",
+            msg
+        );
+
+        // The on-disk file must NOT have been overwritten with a
+        // partial AuthData (the bug we are fixing).
+        let on_disk = std::fs::read(&storage.path).expect("reread");
+        assert_eq!(
+            on_disk, b"corrupt!",
+            "refresh_locked must not rewrite a malformed file"
+        );
+    }
+
+    /// Two concurrent in-process writers each adding a *different*
+    /// provider must both survive in the final file.  With only flock
+    /// (and same-process fds) this could degenerate to last-writer-wins;
+    /// the in-process mutex pins the read-modify-write cycle.
+    #[test]
+    fn in_process_mutex_serialises_disjoint_writes() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        let storage = Arc::new(storage);
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let s1 = storage.clone();
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            for i in 0..50 {
+                s1.set(
+                    "providerA",
+                    AuthCredential::ApiKey {
+                        key: format!("A{}", i),
+                    },
+                )
+                .expect("set A");
+            }
+        });
+        let s2 = storage.clone();
+        let b2 = barrier.clone();
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            for i in 0..50 {
+                s2.set(
+                    "providerB",
+                    AuthCredential::ApiKey {
+                        key: format!("B{}", i),
+                    },
+                )
+                .expect("set B");
+            }
+        });
+
+        t1.join().expect("t1");
+        t2.join().expect("t2");
+
+        // Both providers' final entries must be present.
+        let data = storage.read_locked().expect("read final");
+        assert!(
+            data.contains_key("providerA"),
+            "providerA missing after concurrent writes (last-writer-wins regression)"
+        );
+        assert!(
+            data.contains_key("providerB"),
+            "providerB missing after concurrent writes (last-writer-wins regression)"
         );
     }
 }
