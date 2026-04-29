@@ -4,42 +4,147 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use tau_agent_lib::protocol::{Request, Response, SessionInfo};
 use tau_agent_lib::providers::mock::{MockProvider, MockResponse, mock_model};
 
+/// Default per-operation socket timeout in seconds. The previous 30s
+/// constant was tight enough that under heavy parallel `cargo test` load
+/// (many concurrent test servers, each with its own smol runtime + sqlite
+/// db) the read would frequently return `WouldBlock` and panic, which
+/// surfaced as flaky `WouldBlock` failures attributed to seemingly-random
+/// tests. 120s gives plenty of headroom; CI can dial it up further via
+/// `TAU_TEST_TIMEOUT_SECS`.
+const DEFAULT_TEST_TIMEOUT_SECS: u64 = 120;
+
+/// Resolve the test socket timeout, honouring `TAU_TEST_TIMEOUT_SECS`.
+/// Falls back to [`DEFAULT_TEST_TIMEOUT_SECS`] for any malformed or
+/// missing value.
+fn test_socket_timeout() -> Duration {
+    let secs = std::env::var("TAU_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TEST_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Short, human-readable kind of a [`Request`] (the `type` tag from the
+/// wire format), used in panic messages so a failure points at the
+/// specific operation that timed out instead of just `WouldBlock`.
+fn request_kind(req: &Request) -> &'static str {
+    match req {
+        Request::Chat { .. } => "Chat",
+        Request::CreateSession { .. } => "CreateSession",
+        Request::Shutdown { .. } => "Shutdown",
+        // Fallback: the Debug impl is verbose but at least identifies
+        // the variant. Tests that hit this branch will still get a
+        // clearer error than a bare WouldBlock panic.
+        _ => "Request",
+    }
+}
+
+/// Set the `TAU_SHUTDOWN_DRAIN_SECS=2` override exactly once across all
+/// concurrently-running tests in the same process. Concurrent
+/// `std::env::set_var` from multiple threads is undefined behaviour on
+/// the 2024 edition, so the previous per-`start*` `unsafe { set_var }`
+/// call was a real soundness hazard — even if it had not yet been
+/// observed to misbehave.
+fn ensure_shutdown_drain_env() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        // SAFETY: the OnceLock guarantees this runs exactly once across
+        // all threads, so no other thread can be reading or writing the
+        // process environment concurrently from within this harness.
+        // We still race against the rest of the program in principle,
+        // but tests don't read this var elsewhere.
+        unsafe {
+            std::env::set_var("TAU_SHUTDOWN_DRAIN_SECS", "2");
+        }
+    });
+}
+
+/// Wrap a socket I/O failure in a panic message that names the
+/// operation, the request kind, and hints at the most likely cause
+/// (server overload under parallel test load).
+fn socket_panic(op: &str, req: &Request, err: &dyn std::fmt::Display) -> ! {
+    panic!(
+        "test harness: {op} for {kind} request failed: {err}. \
+         This is usually the test server being slow under parallel load \
+         (TAU_TEST_TIMEOUT_SECS={timeout}s). Re-run with --test-threads=1 \
+         or raise TAU_TEST_TIMEOUT_SECS to confirm.",
+        op = op,
+        kind = request_kind(req),
+        err = err,
+        timeout = test_socket_timeout().as_secs(),
+    )
+}
+
 /// Send a request and read one response line.
 pub fn send_recv(stream: &UnixStream, req: &Request) -> Response {
-    let mut stream = stream.try_clone().unwrap();
-    let mut line = serde_json::to_string(req).unwrap();
+    let mut stream = stream
+        .try_clone()
+        .unwrap_or_else(|e| socket_panic("clone stream", req, &e));
+    let mut line = serde_json::to_string(req).expect("serialize request");
     line.push('\n');
-    stream.write_all(line.as_bytes()).unwrap();
-    stream.flush().unwrap();
+    if let Err(e) = stream.write_all(line.as_bytes()) {
+        socket_panic("write", req, &e);
+    }
+    if let Err(e) = stream.flush() {
+        socket_panic("flush", req, &e);
+    }
 
     let mut reader = BufReader::new(stream);
     let mut resp_line = String::new();
-    reader.read_line(&mut resp_line).unwrap();
-    serde_json::from_str(&resp_line).unwrap()
+    if let Err(e) = reader.read_line(&mut resp_line) {
+        socket_panic("read response", req, &e);
+    }
+    serde_json::from_str(&resp_line).unwrap_or_else(|e| {
+        panic!(
+            "test harness: failed to parse response for {kind}: {err}. \
+             Raw line: {raw:?}",
+            kind = request_kind(req),
+            err = e,
+            raw = resp_line,
+        )
+    })
 }
 
 /// Read all response lines until a terminal one.
 pub fn send_recv_all(stream: &UnixStream, req: &Request) -> Vec<Response> {
-    let mut stream = stream.try_clone().unwrap();
-    let mut line = serde_json::to_string(req).unwrap();
+    let mut stream = stream
+        .try_clone()
+        .unwrap_or_else(|e| socket_panic("clone stream", req, &e));
+    let mut line = serde_json::to_string(req).expect("serialize request");
     line.push('\n');
-    stream.write_all(line.as_bytes()).unwrap();
-    stream.flush().unwrap();
+    if let Err(e) = stream.write_all(line.as_bytes()) {
+        socket_panic("write", req, &e);
+    }
+    if let Err(e) = stream.flush() {
+        socket_panic("flush", req, &e);
+    }
 
     let mut reader = BufReader::new(stream);
     let mut responses = Vec::new();
     loop {
         let mut resp_line = String::new();
-        reader.read_line(&mut resp_line).unwrap();
+        if let Err(e) = reader.read_line(&mut resp_line) {
+            socket_panic("read response", req, &e);
+        }
         if resp_line.trim().is_empty() {
             continue;
         }
-        let resp: Response = serde_json::from_str(&resp_line).unwrap();
+        let resp: Response = serde_json::from_str(&resp_line).unwrap_or_else(|e| {
+            panic!(
+                "test harness: failed to parse response for {kind}: {err}. \
+                 Raw line: {raw:?}",
+                kind = request_kind(req),
+                err = e,
+                raw = resp_line,
+            )
+        });
         let is_terminal = matches!(
             &resp,
             Response::SessionCreated { .. }
@@ -67,58 +172,16 @@ pub fn send_recv_all(stream: &UnixStream, req: &Request) -> Vec<Response> {
 
 pub struct TestServer {
     pub sock_path: PathBuf,
+    /// Handle to the background thread running `run_with_config`. Drained
+    /// by `Drop` so we can join it before the tempdir disappears.
+    server_thread: Option<JoinHandle<()>>,
     _dir: tempfile::TempDir,
 }
 
 impl TestServer {
     /// Start a test server with mock provider in a background thread.
     pub fn start(mock_responses: Vec<MockResponse>) -> Self {
-        // Keep shutdown snappy in tests; production defaults to 180s.
-        // SAFETY: integration tests each run in their own process.
-        unsafe {
-            std::env::set_var("TAU_SHUTDOWN_DRAIN_SECS", "2");
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("tau-test.sock");
-        let db_path = dir.path().join("test.db");
-        let sock_clone = sock_path.clone();
-
-        let model = mock_model();
-        let mut registry = tau_agent_lib::provider::ProviderRegistry::new();
-        registry.register(MockProvider::new(mock_responses));
-
-        let config = tau_agent_lib::server::TestServerConfig {
-            registry,
-            models: vec![model],
-            socket_path: sock_clone,
-            db_path,
-            tool_executor_factory: None,
-            mock_tools: vec![],
-            plugins_config: None,
-            aliases: std::collections::HashMap::new(),
-        };
-
-        std::thread::spawn(move || {
-            smol::block_on(async {
-                if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
-                    eprintln!("test server error: {}", e);
-                }
-            });
-        });
-
-        // Wait for socket to appear
-        for _ in 0..50 {
-            if sock_path.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(sock_path.exists(), "server socket did not appear");
-
-        TestServer {
-            sock_path,
-            _dir: dir,
-        }
+        Self::start_with_config(mock_responses, |c| c)
     }
 
     /// Start a test server with custom config modifications.
@@ -128,12 +191,9 @@ impl TestServer {
             tau_agent_lib::server::TestServerConfig,
         ) -> tau_agent_lib::server::TestServerConfig,
     {
-        // Keep shutdown snappy in tests; production defaults to 180s.
-        // SAFETY: integration tests each run in their own process.
-        unsafe {
-            std::env::set_var("TAU_SHUTDOWN_DRAIN_SECS", "2");
-        }
-        let dir = tempfile::tempdir().unwrap();
+        ensure_shutdown_drain_env();
+
+        let dir = tempfile::tempdir().expect("create tempdir for test server");
         let sock_path = dir.path().join("tau-test.sock");
         let db_path = dir.path().join("test.db");
         let sock_clone = sock_path.clone();
@@ -154,14 +214,19 @@ impl TestServer {
         };
         let config = configure(base_config);
 
-        std::thread::spawn(move || {
+        let server_thread = std::thread::spawn(move || {
             smol::block_on(async {
                 if let Err(e) = tau_agent_lib::server::run_with_config(config).await {
-                    eprintln!("test server error: {}", e);
+                    // Surface server-side errors as a panic on the
+                    // server thread so cargo records them. Previously
+                    // these were eprintln'd and discarded, leaving
+                    // clients to see only a downstream `WouldBlock`.
+                    panic!("test server crashed: {e}");
                 }
             });
         });
 
+        // Wait for socket to appear
         for _ in 0..50 {
             if sock_path.exists() {
                 break;
@@ -172,6 +237,7 @@ impl TestServer {
 
         TestServer {
             sock_path,
+            server_thread: Some(server_thread),
             _dir: dir,
         }
     }
@@ -228,15 +294,38 @@ impl TestServer {
     }
 
     pub fn connect(&self) -> UnixStream {
-        let conn = UnixStream::connect(&self.sock_path).unwrap();
-        conn.set_read_timeout(Some(Duration::from_secs(30)))
-            .unwrap();
+        let conn = UnixStream::connect(&self.sock_path)
+            .unwrap_or_else(|e| panic!("connect to {:?}: {e}", self.sock_path));
+        let timeout = test_socket_timeout();
+        conn.set_read_timeout(Some(timeout))
+            .expect("set_read_timeout");
+        conn.set_write_timeout(Some(timeout))
+            .expect("set_write_timeout");
         conn
     }
 
     pub fn shutdown(&self) {
-        let conn = self.connect();
-        send_recv(&conn, &Request::Shutdown { restart: false });
+        // Best-effort shutdown — the server may already be gone if a
+        // previous test triggered an explicit shutdown. We connect
+        // directly (rather than through `send_recv`) to keep this
+        // tolerant of a partially-torn-down server.
+        let Ok(mut conn) = UnixStream::connect(&self.sock_path) else {
+            return;
+        };
+        let timeout = test_socket_timeout();
+        let _ = conn.set_read_timeout(Some(timeout));
+        let _ = conn.set_write_timeout(Some(timeout));
+        let req = match serde_json::to_string(&Request::Shutdown { restart: false }) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let _ = conn.write_all(format!("{}\n", req).as_bytes());
+        let _ = conn.flush();
+        // Drain one response line so the server has a chance to ack
+        // before we drop the socket. We deliberately ignore the result.
+        let mut reader = BufReader::new(conn);
+        let mut buf = String::new();
+        let _ = reader.read_line(&mut buf);
     }
 }
 
@@ -535,6 +624,7 @@ mod builder_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         TestServer {
             sock_path: dir.path().join("unused.sock"),
+            server_thread: None,
             _dir: dir,
         }
     }
@@ -663,10 +753,49 @@ mod builder_tests {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
+        // Best-effort: ask the server to shut down, then join the
+        // background thread so its sqlite handles and accept-loop are
+        // fully torn down before the tempdir disappears. Without this
+        // step the previous harness leaked fds across hundreds of
+        // tests in one binary, which contributed to the parallel-load
+        // `WouldBlock` flakes this fix targets.
         if let Ok(mut conn) = UnixStream::connect(&self.sock_path) {
-            let req = serde_json::to_string(&Request::Shutdown { restart: false }).unwrap();
-            let _ = conn.write_all(format!("{}\n", req).as_bytes());
-            let _ = conn.flush();
+            // Apply our timeout so a wedged server can't pin Drop forever.
+            let timeout = test_socket_timeout();
+            let _ = conn.set_read_timeout(Some(timeout));
+            let _ = conn.set_write_timeout(Some(timeout));
+            if let Ok(req) = serde_json::to_string(&Request::Shutdown { restart: false }) {
+                let _ = conn.write_all(format!("{}\n", req).as_bytes());
+                let _ = conn.flush();
+                // Drain one response line so the server has a chance
+                // to ack — ignore everything that comes back.
+                let mut reader = BufReader::new(conn);
+                let mut buf = String::new();
+                let _ = reader.read_line(&mut buf);
+            }
+        }
+
+        // Bounded-wait join: the server thread should exit promptly
+        // after the Shutdown above, but we don't want a stuck server
+        // to wedge an entire test binary's teardown. Poll for up to
+        // 5s, then move on and let the thread leak (the process is
+        // about to exit anyway when the last TestServer drops).
+        if let Some(handle) = self.server_thread.take() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            // `JoinHandle` doesn't expose a timed join, so poll
+            // `is_finished` and join once it reports done.
+            loop {
+                if handle.is_finished() {
+                    let _ = handle.join();
+                    break;
+                }
+                if Instant::now() > deadline {
+                    // Leak the handle — the OS will reap on process
+                    // exit. Better than blocking every other test.
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 }
