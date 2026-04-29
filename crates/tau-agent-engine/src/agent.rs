@@ -108,10 +108,27 @@ pub fn needs_continuation(messages: &[Message]) -> bool {
 /// Repair a message history that was corrupted by a crash or kill.
 ///
 /// Two cases:
-/// 1. Last message is Assistant with StopReason::ToolUse but no ToolResult
-///    messages follow (daemon killed before any tool executed).
-/// 2. Last message is ToolResult but the preceding Assistant had more tool_use
-///    blocks than there are ToolResult messages (partial execution).
+/// 1. Daemon killed right after persisting an Assistant with StopReason::ToolUse,
+///    leaving no ToolResult messages (no tools executed before the kill).
+/// 2. Daemon killed mid-tool-execution: some tool_results landed but at least
+///    one is missing.
+///
+/// We synthesize error ToolResult stubs for the missing ids and return them
+/// to the caller. The caller is expected to append them to the history.
+///
+/// During the walk-back we skip messages that are *not sent to the LLM*:
+/// `Info` messages (display-only, e.g. the "Resumed after server restart."
+/// banner injected before this function runs) and `Assistant` messages with
+/// `StopReason::Error` (empty content; the provider builders skip them).
+/// Without that, the post-crash auto-resume path — which queues an Info
+/// message *before* invoking repair — would mask the orphan tool_use, and
+/// the next API call would fail with HTTP 400 "`tool_use` ids were found
+/// without `tool_result` blocks immediately after".
+///
+/// We do NOT skip `User` or `CompactionSummary` messages: a fresh user turn
+/// or a compaction boundary closes the recovery window. (If a repair didn't
+/// happen at the expected moment and the user has already re-prompted, the
+/// history is no longer auto-repairable here; it has to be fixed out of band.)
 ///
 /// Returns the stub messages that were synthesized (caller should persist them).
 /// Returns an empty vec if no repair was needed.
@@ -120,16 +137,23 @@ pub fn repair_messages(messages: &[Message]) -> Vec<Message> {
         return Vec::new();
     }
 
-    // Find the last Assistant message and collect any trailing ToolResults
+    // Walk back from the end, skipping messages that don't end the recovery
+    // window. ToolResults are valid pre-crash output; Info messages are
+    // display-only (notably the "Resumed after server restart." banner queued
+    // by the auto-resume path before this function runs); Error-stop
+    // assistants are empty placeholders that the provider builders skip.
     let mut last_assistant_idx = None;
     for (i, msg) in messages.iter().enumerate().rev() {
         match msg {
-            Message::ToolResult(_) => continue,
+            Message::ToolResult(_) | Message::Info(_) => continue,
+            Message::Assistant(a) if a.stop_reason == StopReason::Error => continue,
             Message::Assistant(_) => {
                 last_assistant_idx = Some(i);
                 break;
             }
-            _ => break, // User or CompactionSummary — no repair needed
+            // User or CompactionSummary — a fresh turn / compaction boundary
+            // closes the recovery window.
+            _ => break,
         }
     }
 
@@ -2100,6 +2124,96 @@ mod tests {
     }
 
     #[test]
+    fn repair_skips_trailing_info_to_find_orphan_tooluse() {
+        // Reproduces the post-OOM auto-resume bug: the auto-resume path queues
+        // an Info message ("Resumed after server restart.") *before* invoking
+        // repair. Without skipping Info during the walk-back, the trailing
+        // Info hides the orphan tool_use, no stub is generated, and the next
+        // API call fails with HTTP 400.
+        let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
+        a.stop_reason = StopReason::ToolUse;
+        a.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        }));
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(a),
+            Message::Info(tau_agent_base::types::InfoMessage {
+                text: "Resumed after server restart.".into(),
+                timestamp: 0,
+            }),
+        ];
+        let stubs = repair_messages(&messages);
+        assert_eq!(
+            stubs.len(),
+            1,
+            "trailing Info must not mask orphan tool_use"
+        );
+        let Message::ToolResult(tr) = &stubs[0] else {
+            panic!("expected ToolResult stub");
+        };
+        assert_eq!(tr.tool_call_id, "tc1");
+        assert!(tr.is_error);
+    }
+
+    #[test]
+    fn repair_skips_trailing_error_assistant_to_find_orphan_tooluse() {
+        // After the first failed auto-resume, an Assistant with
+        // StopReason::Error (empty content) lands at the tail — it's the
+        // HTTP 400 the provider returned because of the still-broken history.
+        // The provider builders skip empty assistants, so we must skip them
+        // during the walk-back too, otherwise the second resume attempt
+        // also fails to repair and HTTP 400s again.
+        let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
+        a.stop_reason = StopReason::ToolUse;
+        a.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        }));
+        let mut error_a = AssistantMessage::empty("mock", "mock", "mock-model");
+        error_a.stop_reason = StopReason::Error;
+        error_a.error_message = Some("HTTP 400: tool_use without tool_result".into());
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::Assistant(a),
+            Message::Info(tau_agent_base::types::InfoMessage {
+                text: "Resumed after server restart.".into(),
+                timestamp: 0,
+            }),
+            Message::Assistant(error_a),
+        ];
+        let stubs = repair_messages(&messages);
+        assert_eq!(stubs.len(), 1);
+        let Message::ToolResult(tr) = &stubs[0] else {
+            panic!("expected ToolResult stub");
+        };
+        assert_eq!(tr.tool_call_id, "tc1");
+    }
+
+    #[test]
+    fn repair_does_not_cross_user_reprompt() {
+        // If the user already re-prompted after the broken history, the
+        // recovery window is closed: a fresh user turn is a normal
+        // continuation request and we shouldn't auto-stub past it.
+        let mut a = AssistantMessage::empty("mock", "mock", "mock-model");
+        a.stop_reason = StopReason::ToolUse;
+        a.content.push(AssistantContent::ToolCall(ToolCall {
+            id: "tc1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({}),
+        }));
+        let messages = vec![
+            Message::Assistant(a),
+            Message::User(UserMessage::text("please continue")),
+        ];
+        assert!(repair_messages(&messages).is_empty());
+    }
+
+    #[test]
+
     fn repair_ignores_non_tooluse_assistant() {
         // Assistant with StopReason::Stop should not trigger repair
         let a = AssistantMessage::empty("mock", "mock", "mock-model");
