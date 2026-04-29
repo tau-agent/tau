@@ -554,6 +554,16 @@ impl AuthStorage {
     /// Refresh token under exclusive file lock, re-reading first in case
     /// another process already refreshed.
     fn refresh_locked(&self, provider: &str, stale_refresh: &str) -> crate::Result<Option<String>> {
+        // Serialise in-process callers before flock.  Held across the
+        // entire refresh — including the network call to the OAuth
+        // endpoint — so a concurrent same-process `set` cannot interleave
+        // its read-modify-write with ours and clobber the credential we
+        // are about to write.  flock alone is unreliable within a single
+        // process when distinct fds are used.
+        let _in_proc = self
+            .in_process_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         tracing::debug!(provider, "auth refresh_locked: entry");
         ensure_parent(&self.path)?;
 
@@ -1221,5 +1231,110 @@ mod tests {
             data.contains_key("providerB"),
             "providerB missing after concurrent writes (last-writer-wins regression)"
         );
+    }
+
+    /// A long-running `refresh_locked` call (with the OAuth endpoint
+    /// blocked on a barrier so we can guarantee interleaving) must
+    /// serialise against a concurrent `set` for a *different* provider.
+    /// Without holding the in-process mutex across the refresh, the
+    /// refresh's eventual write would clobber the `set`'s entry — the
+    /// exact "new credential silently disappears" failure pattern this
+    /// task hardens against.
+    #[test]
+    fn refresh_locked_serialises_against_concurrent_set() {
+        let _g = test_lock();
+        let (storage, _tmp) = tmp_storage();
+        // Pre-populate an EXPIRED OAuth credential so get_api_key_excluding
+        // takes the refresh branch.
+        set_oauth(&storage, "anthropic", "A0", "R0", past_expiry());
+
+        let storage = Arc::new(storage);
+
+        // Coordination:
+        // - `refresh_started`: signalled by the refresh hook once it has
+        //   entered the OAuth endpoint stub.  This guarantees the refresh
+        //   thread is *inside* refresh_locked's critical section.
+        // - `let_refresh_finish`: the writer thread releases this *after*
+        //   it attempts its `set`.  If the in-process mutex is held by
+        //   the refresh, the `set` will be blocked and we know it
+        //   couldn't have raced; if the mutex is NOT held, the `set` will
+        //   complete first, then the refresh's later write will clobber
+        //   it.
+        let refresh_started = Arc::new(Barrier::new(2));
+        let let_refresh_finish = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let rs = refresh_started.clone();
+        let lrf = let_refresh_finish.clone();
+        let _h = install_refresh_hook(move |_| {
+            rs.wait();
+            // Spin until the writer thread has had a chance to attempt
+            // its `set`.  With the in-process mutex held, the writer is
+            // blocked here; without it, the writer races ahead.
+            while !lrf.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(OAuthCredentials {
+                refresh: "R1".into(),
+                access: "A1".into(),
+                expires: future_expiry(),
+            })
+        });
+
+        // Thread 1: trigger the refresh.
+        let s1 = storage.clone();
+        let t_refresh = std::thread::spawn(move || {
+            s1.get_api_key_excluding("anthropic", Some("A0"))
+                .expect("refresh")
+        });
+
+        // Wait until the refresh is genuinely inside its critical
+        // section before we start the writer.
+        refresh_started.wait();
+
+        // Thread 2: write a credential for a DIFFERENT provider while
+        // the refresh is mid-flight.  This must not be lost.
+        let s2 = storage.clone();
+        let t_writer = std::thread::spawn(move || {
+            s2.set(
+                "openai",
+                AuthCredential::ApiKey {
+                    key: "OPENAI_KEY".into(),
+                },
+            )
+            .expect("set openai");
+        });
+
+        // Give the writer a beat to actually attempt acquiring the
+        // in-process mutex (it should now be blocked behind the refresh).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Now release the refresh hook so refresh_locked can complete.
+        let_refresh_finish.store(true, Ordering::SeqCst);
+
+        let refreshed_key = t_refresh.join().expect("refresh join");
+        t_writer.join().expect("writer join");
+
+        assert_eq!(refreshed_key.as_deref(), Some("A1"));
+
+        // Both providers must be present in the final file.  If the
+        // mutex were not held across the refresh, the refresh would have
+        // written its data (read before the `set`) on top of the
+        // `set`'s update, dropping the openai entry.
+        let data = storage.read_locked().expect("read final");
+        assert!(
+            data.contains_key("anthropic"),
+            "anthropic missing after concurrent refresh+set"
+        );
+        assert!(
+            data.contains_key("openai"),
+            "openai missing - refresh_locked clobbered concurrent set (regression)"
+        );
+        // And specifically the openai entry must be the one the writer
+        // produced, not some stale variant.
+        match data.get("openai").expect("openai entry") {
+            AuthCredential::ApiKey { key } => {
+                assert_eq!(key, "OPENAI_KEY", "openai entry was overwritten");
+            }
+            other => panic!("unexpected openai credential variant: {:?}", other),
+        }
     }
 }
