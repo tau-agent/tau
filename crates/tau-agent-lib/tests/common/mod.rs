@@ -34,16 +34,17 @@ fn test_socket_timeout() -> Duration {
 /// Short, human-readable kind of a [`Request`] (the `type` tag from the
 /// wire format), used in panic messages so a failure points at the
 /// specific operation that timed out instead of just `WouldBlock`.
-fn request_kind(req: &Request) -> &'static str {
-    match req {
-        Request::Chat { .. } => "Chat",
-        Request::CreateSession { .. } => "CreateSession",
-        Request::Shutdown { .. } => "Shutdown",
-        // Fallback: the Debug impl is verbose but at least identifies
-        // the variant. Tests that hit this branch will still get a
-        // clearer error than a bare WouldBlock panic.
-        _ => "Request",
-    }
+fn request_kind(req: &Request) -> String {
+    // `Request` is `#[serde(tag = "type", rename_all = "snake_case")]`,
+    // so the serialised form always carries a top-level `"type"` string
+    // identifying the variant. Extracting it through serde keeps this
+    // helper correct as the protocol grows new variants — every
+    // `Request::*` the tests send will surface its real name in panic
+    // messages, instead of falling back to a generic placeholder.
+    serde_json::to_value(req)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "<unknown>".to_owned())
 }
 
 /// Set the `TAU_SHUTDOWN_DRAIN_SECS=2` override exactly once across all
