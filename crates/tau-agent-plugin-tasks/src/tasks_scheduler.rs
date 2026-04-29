@@ -893,6 +893,7 @@ fn send_initial_chat(
     let chat_req = tau_agent_plugin::Request::Chat {
         session_id: session_id.to_string(),
         text,
+        attachments: Vec::new(),
     };
     match server_request(writer, reader, chat_req) {
         Ok(tau_agent_plugin::Response::Ok) => Ok(()),

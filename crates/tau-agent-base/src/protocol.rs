@@ -13,7 +13,14 @@ use crate::types::StreamEvent;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     /// Send a chat message in a session.
-    Chat { session_id: String, text: String },
+    Chat {
+        session_id: String,
+        text: String,
+        /// Optional attachments (images for now). Empty by default for
+        /// backward compatibility with older clients/payloads.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ChatAttachment>,
+    },
     /// Create a new session.
     CreateSession {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -317,6 +324,38 @@ pub enum Request {
         #[serde(default)]
         restart: bool,
     },
+}
+
+/// Attachments to a `Request::Chat` message.
+///
+/// Today only images are supported; the structure is an open enum so we can
+/// add more attachment kinds without bumping the protocol shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatAttachment {
+    /// An image. `data` is base64-encoded image bytes; `mime_type` is one
+    /// of the MIME types accepted by the validator (`image/png`, `image/jpeg`,
+    /// `image/gif`, `image/webp`). The server validates both fields before
+    /// building the `UserMessage` and rejects oversized or malformed payloads
+    /// with a `Response::Error` rather than panicking.
+    Image { data: String, mime_type: String },
+}
+
+impl ChatAttachment {
+    /// Convert this attachment into an engine `UserContent` block.
+    ///
+    /// Pure structural mapping; callers that need validation (decoded byte
+    /// length, allowed MIME, etc.) should run that *before* calling this.
+    pub fn to_user_content(&self) -> crate::types::UserContent {
+        match self {
+            ChatAttachment::Image { data, mime_type } => {
+                crate::types::UserContent::Image(crate::types::ImageContent {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                })
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,5 +1335,86 @@ mod tests {
         assert!(is_shutting_down_error(SHUTTING_DOWN_ERROR));
         assert!(is_shutting_down_error("server is shutting down"));
         assert!(!is_shutting_down_error("some other error"));
+    }
+
+    #[test]
+    fn chat_serialises_without_attachments_when_empty() {
+        let req = Request::Chat {
+            session_id: "s1".into(),
+            text: "hi".into(),
+            attachments: Vec::new(),
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(
+            !json.contains("attachments"),
+            "empty attachments should be omitted from JSON, got: {json}"
+        );
+        let parsed: Request = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            Request::Chat {
+                session_id,
+                text,
+                attachments,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(text, "hi");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn chat_with_image_roundtrips() {
+        let req = Request::Chat {
+            session_id: "s1".into(),
+            text: "describe".into(),
+            attachments: vec![ChatAttachment::Image {
+                data: "AAAA".into(),
+                mime_type: "image/png".into(),
+            }],
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"attachments\""), "got: {json}");
+        assert!(json.contains("\"type\":\"image\""), "got: {json}");
+        assert!(json.contains("\"mime_type\":\"image/png\""), "got: {json}");
+        let parsed: Request = serde_json::from_str(&json).expect("deserialize");
+        match parsed {
+            Request::Chat {
+                session_id,
+                text,
+                attachments,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(text, "describe");
+                assert_eq!(attachments.len(), 1);
+                match &attachments[0] {
+                    ChatAttachment::Image { data, mime_type } => {
+                        assert_eq!(data, "AAAA");
+                        assert_eq!(mime_type, "image/png");
+                    }
+                }
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn legacy_chat_payload_deserialises() {
+        // Old client payloads omit the `attachments` field entirely.
+        let json = r#"{"type":"chat","session_id":"s","text":"hi"}"#;
+        let parsed: Request = serde_json::from_str(json).expect("deserialize legacy");
+        match parsed {
+            Request::Chat {
+                session_id,
+                text,
+                attachments,
+            } => {
+                assert_eq!(session_id, "s");
+                assert_eq!(text, "hi");
+                assert!(attachments.is_empty());
+            }
+            other => panic!("unexpected variant: {:?}", other),
+        }
     }
 }

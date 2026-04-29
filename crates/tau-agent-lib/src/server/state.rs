@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::auth::AuthStorage;
 use crate::config;
 use crate::db::Db;
-use crate::protocol::Response;
+use crate::protocol::{ChatAttachment, Response};
 use crate::provider::ProviderRegistry;
 use crate::types::Model;
 
@@ -95,6 +95,19 @@ pub(super) fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, State
 pub(super) type SessionLocks = Arc<Mutex<HashMap<String, Arc<smol::lock::Mutex<()>>>>>;
 
 /// Get or create an async lock for a session.
+/// Element type for the chat-spawn channel that drives `run_child_chat`.
+///
+/// Carries the original chat-request payload (text + optional image
+/// attachments) from a tool/plugin caller through to the agent runner.
+/// Defined here rather than as a tuple so the field meanings stay obvious
+/// at the call sites.
+#[derive(Debug, Clone)]
+pub(crate) struct ChatSpawn {
+    pub session_id: String,
+    pub text: String,
+    pub attachments: Vec<ChatAttachment>,
+}
+
 pub(super) fn session_lock(locks: &SessionLocks, session_id: &str) -> Arc<smol::lock::Mutex<()>> {
     let mut map = locks.lock().expect("session locks mutex poisoned");
     map.entry(session_id.to_string())

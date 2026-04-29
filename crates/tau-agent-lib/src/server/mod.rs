@@ -3,6 +3,7 @@
 mod agent_runner;
 mod bg_jobs;
 mod bg_tasks;
+pub mod chat_attachments;
 mod dispatch;
 mod notifications;
 mod post_idle;

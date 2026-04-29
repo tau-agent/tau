@@ -314,7 +314,7 @@ pub(super) async fn write_plugin_request(
 }
 
 /// Create a chat-spawn channel with a receiver task that fires off
-/// `run_child_chat` for each `(session_id, text)` pair.
+/// `run_child_chat` for each `ChatSpawn` message.
 ///
 /// Used by `spawn_global_plugin_background_tasks` so that background
 /// `ServerRequest::Chat` calls can spawn agent turns.
@@ -324,10 +324,10 @@ pub(super) fn spawn_bg_chat_receiver(
     shutdown: ShutdownHandle,
     session_locks: SessionLocks,
     throttle: crate::throttle::ProviderThrottle,
-) -> smol::channel::Sender<(String, String)> {
-    let (tx, rx) = smol::channel::unbounded::<(String, String)>();
+) -> smol::channel::Sender<super::state::ChatSpawn> {
+    let (tx, rx) = smol::channel::unbounded::<super::state::ChatSpawn>();
     smol::spawn(async move {
-        while let Ok((child_session_id, text)) = rx.recv().await {
+        while let Ok(spawn) = rx.recv().await {
             let s = state.clone();
             let p = plugins.clone();
             let sh = shutdown.clone();
@@ -335,8 +335,15 @@ pub(super) fn spawn_bg_chat_receiver(
             let th = throttle.clone();
             let ov: SharedTestOverrides = Arc::new(TestOverrides::default());
             smol::spawn(async move {
-                let sid = child_session_id;
-                if let Err(e) = run_child_chat(s, p, sh, sl, th, sid.clone(), text, ov).await {
+                let super::state::ChatSpawn {
+                    session_id,
+                    text,
+                    attachments,
+                } = spawn;
+                let sid = session_id;
+                if let Err(e) =
+                    run_child_chat(s, p, sh, sl, th, sid.clone(), text, attachments, ov).await
+                {
                     tracing::warn!(session_id = %sid, %e, "bg child chat error");
                 }
             })
@@ -368,7 +375,7 @@ pub(super) fn spawn_global_plugin_background_tasks(
     session_locks: &SessionLocks,
     shutdown: &ShutdownHandle,
     throttle: &crate::throttle::ProviderThrottle,
-    chat_spawn_tx: &smol::channel::Sender<(String, String)>,
+    chat_spawn_tx: &smol::channel::Sender<super::state::ChatSpawn>,
     test_overrides: &SharedTestOverrides,
 ) {
     let io_pairs = {

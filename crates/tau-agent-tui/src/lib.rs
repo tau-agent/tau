@@ -401,11 +401,12 @@ async fn run_inner(
         if let Some(action) = action {
             let sid = app.session_id.clone();
             match action {
-                Action::SendChat(text) => {
+                Action::SendChat { text, attachments } => {
                     // Fire-and-forget: responses arrive via Subscribe connection
                     send_fire_and_forget(Request::Chat {
                         session_id: sid,
                         text,
+                        attachments,
                     })
                     .await?;
                 }

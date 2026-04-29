@@ -163,6 +163,7 @@ fn cancel_chat_kills_bash_subprocess_through_worker_plugin() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "please run the command".into(),
+            attachments: Vec::new(),
         },
     );
 

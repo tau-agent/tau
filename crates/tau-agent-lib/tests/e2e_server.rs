@@ -259,6 +259,7 @@ fn server_chat_simple_text() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -319,6 +320,7 @@ fn phase_events_carry_turn_started_at_ms() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hi".into(),
+            attachments: Vec::new(),
         },
     );
     let after_ms = timestamp_ms();
@@ -425,6 +427,7 @@ fn phase_events_carry_phase_started_at_ms() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hi".into(),
+            attachments: Vec::new(),
         },
     );
     let after_ms = timestamp_ms();
@@ -500,6 +503,7 @@ fn server_chat_tool_call_loop() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "run something".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -574,6 +578,7 @@ fn server_chat_error_preserves_partial_messages() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "do something".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -677,6 +682,7 @@ fn server_session_resume_after_restart() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -854,6 +860,7 @@ fn steer_queues_message_for_idle_session() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
     let has_done = responses.iter().any(|r| matches!(r, Response::AgentDone));
@@ -1023,6 +1030,7 @@ fn server_chat_with_mock_tool_success() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "read /tmp/test.txt".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -1148,6 +1156,7 @@ fn server_chat_with_mock_tool_error() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "read /etc/shadow".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -1260,6 +1269,7 @@ fn server_chat_multi_tool_calls() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "read a.txt and list /tmp".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -1378,6 +1388,7 @@ fn server_chat_multi_turn_tool_loop() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "summarize the project".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -1501,6 +1512,7 @@ fn server_chat_tool_schemas_in_context() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -1614,6 +1626,7 @@ fn session_dump_and_replay() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "run echo hello world".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -2197,6 +2210,7 @@ done
         &Request::Chat {
             session_id: sid.clone(),
             text: "test".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(
@@ -2555,6 +2569,7 @@ fn server_log_provider_chat_returns_immediately() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -2687,6 +2702,7 @@ fn chat_to_log_session_emits_note_and_no_agent_loop() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hi there".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -3157,6 +3173,7 @@ fn session_info_is_live_false_when_idle() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -3241,6 +3258,7 @@ fn session_info_is_live_false_after_restart_with_stale_phase() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(resps.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -3378,6 +3396,7 @@ fn clean_shutdown_resets_phases_to_idle() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(resps.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -3555,6 +3574,7 @@ fn server_restart_clears_stale_phases() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(resps.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -3650,6 +3670,7 @@ fn server_restart_clears_stale_phases() {
         &Request::Chat {
             session_id: sid.clone(),
             text: "hello again".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(
@@ -4346,6 +4367,7 @@ fn seamless_restart_rejects_new_chat_during_drain() {
             &Request::Chat {
                 session_id: chat_sid,
                 text: "go".into(),
+                attachments: Vec::new(),
             },
         );
     });
@@ -4374,6 +4396,7 @@ fn seamless_restart_rejects_new_chat_during_drain() {
         let chat = serde_json::to_string(&Request::Chat {
             session_id: sid.clone(),
             text: "hi".into(),
+            attachments: Vec::new(),
         })
         .unwrap();
         let _ = conn2.write_all(format!("{}\n", chat).as_bytes());
@@ -4448,6 +4471,7 @@ fn chat_no_api_key_emits_error_and_agent_done_in_order() {
         &Request::Chat {
             session_id: sid,
             text: "hi".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -4564,6 +4588,7 @@ fn subscriber_sees_error_then_agent_done_on_no_api_key() {
         &Request::Chat {
             session_id: sid,
             text: "hi".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -4903,6 +4928,218 @@ fn server_compact_with_keep_hint_round_trips() {
         )),
         "expected at least one Status event from the subscriber, got: {:?}",
         events
+    );
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Image attachment plumbing (task 904)
+// ---------------------------------------------------------------------------
+
+/// Smallest possible PNG: 1x1 transparent.
+fn tiny_png_bytes() -> Vec<u8> {
+    vec![
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H', b'D',
+        b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, b'I', b'D', b'A', b'T', 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, b'I',
+        b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+    ]
+}
+
+fn b64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[test]
+fn server_chat_with_image_attachment_persisted_to_message_store() {
+    use tau_agent_lib::protocol::ChatAttachment;
+    use tau_agent_lib::types::{Message, UserContent};
+
+    let server = TestServer::start(vec![MockResponse::Text("looks like a single pixel".into())]);
+
+    let sid = match CreateSessionBuilder::new(&server)
+        .system_prompt("vision test")
+        .cwd("/tmp")
+        .send_raw()
+    {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn = server.connect();
+    let responses = send_recv_all(
+        &conn,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "describe".into(),
+            attachments: vec![ChatAttachment::Image {
+                data: b64_encode(&tiny_png_bytes()),
+                mime_type: "image/png".into(),
+            }],
+        },
+    );
+    assert!(
+        responses.iter().any(|r| matches!(r, Response::AgentDone)),
+        "expected AgentDone, got: {:?}",
+        responses
+    );
+
+    let conn2 = server.connect();
+    let resp = send_recv(
+        &conn2,
+        &Request::GetMessages {
+            session_id: sid.clone(),
+        },
+    );
+    let messages = match resp {
+        Response::Messages { messages } => messages,
+        other => panic!("expected Messages, got {:?}", other),
+    };
+    let user = messages
+        .iter()
+        .find_map(|m| match m {
+            Message::User(u) => Some(u),
+            _ => None,
+        })
+        .expect("at least one user message");
+    assert_eq!(user.content.len(), 2, "expected [Text, Image] content");
+    match &user.content[0] {
+        UserContent::Text(t) => assert_eq!(t.text, "describe"),
+        other => panic!("expected text first, got {:?}", other),
+    }
+    match &user.content[1] {
+        UserContent::Image(img) => {
+            assert_eq!(img.mime_type, "image/png");
+            assert_eq!(img.data, b64_encode(&tiny_png_bytes()));
+        }
+        other => panic!("expected image second, got {:?}", other),
+    }
+    server.shutdown();
+}
+
+#[test]
+fn server_chat_with_oversized_image_returns_error() {
+    use tau_agent_lib::protocol::ChatAttachment;
+
+    let server = TestServer::start(vec![MockResponse::Text("nope".into())]);
+
+    let sid = match CreateSessionBuilder::new(&server)
+        .system_prompt("oversized test")
+        .cwd("/tmp")
+        .send_raw()
+    {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    // 6 MiB of zeroes — well over the 5 MiB cap.
+    let big = vec![0u8; 6 * 1024 * 1024];
+    let conn = server.connect();
+    let responses = send_recv_all(
+        &conn,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "see this big image".into(),
+            attachments: vec![ChatAttachment::Image {
+                data: b64_encode(&big),
+                mime_type: "image/png".into(),
+            }],
+        },
+    );
+    let saw_error = responses.iter().any(|r| {
+        matches!(
+            r,
+            Response::Error { message } if message.contains("invalid chat attachments")
+        )
+    });
+    assert!(
+        saw_error,
+        "expected a Response::Error mentioning attachments, got: {:?}",
+        responses
+    );
+    server.shutdown();
+}
+
+#[test]
+fn server_chat_with_unsupported_mime_returns_error() {
+    use tau_agent_lib::protocol::ChatAttachment;
+
+    let server = TestServer::start(vec![MockResponse::Text("nope".into())]);
+
+    let sid = match CreateSessionBuilder::new(&server)
+        .system_prompt("bad-mime test")
+        .cwd("/tmp")
+        .send_raw()
+    {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn = server.connect();
+    let responses = send_recv_all(
+        &conn,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "weird format".into(),
+            attachments: vec![ChatAttachment::Image {
+                data: b64_encode(&tiny_png_bytes()),
+                mime_type: "image/bmp".into(),
+            }],
+        },
+    );
+    let saw_error = responses.iter().any(|r| {
+        matches!(
+            r,
+            Response::Error { message } if message.contains("unsupported image mime type")
+        )
+    });
+    assert!(
+        saw_error,
+        "expected a Response::Error mentioning unsupported MIME, got: {:?}",
+        responses
+    );
+    server.shutdown();
+}
+
+#[test]
+fn server_chat_with_bad_base64_returns_error() {
+    use tau_agent_lib::protocol::ChatAttachment;
+
+    let server = TestServer::start(vec![MockResponse::Text("nope".into())]);
+
+    let sid = match CreateSessionBuilder::new(&server)
+        .system_prompt("bad-b64 test")
+        .cwd("/tmp")
+        .send_raw()
+    {
+        Response::SessionCreated { session_id } => session_id,
+        other => panic!("{:?}", other),
+    };
+
+    let conn = server.connect();
+    let responses = send_recv_all(
+        &conn,
+        &Request::Chat {
+            session_id: sid.clone(),
+            text: "bad bytes".into(),
+            attachments: vec![ChatAttachment::Image {
+                data: "not valid base64!!!".into(),
+                mime_type: "image/png".into(),
+            }],
+        },
+    );
+    let saw_error = responses.iter().any(|r| {
+        matches!(
+            r,
+            Response::Error { message } if message.contains("base64")
+        )
+    });
+    assert!(
+        saw_error,
+        "expected a Response::Error mentioning base64, got: {:?}",
+        responses
     );
     server.shutdown();
 }

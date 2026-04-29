@@ -2655,6 +2655,7 @@ dependencies = [
  "serde_json",
  "smol",
  "tau-agent-lib",
+ "tempfile",
  "toml",
  "unicode-width",
 ]

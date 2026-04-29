@@ -467,7 +467,7 @@ pub(super) async fn handle_client(
     session_locks: SessionLocks,
     throttle: crate::throttle::ProviderThrottle,
     test_overrides: SharedTestOverrides,
-    bg_chat_spawn_tx: smol::channel::Sender<(String, String)>,
+    bg_chat_spawn_tx: smol::channel::Sender<super::state::ChatSpawn>,
 ) -> crate::Result<()> {
     // Register for shutdown notifications
     let shutdown_rx = shutdown.register_client();
@@ -595,7 +595,11 @@ pub(super) async fn handle_client(
                 let resp = get_session_ancestors_impl(&state, &session_id);
                 send(&mut writer, &resp).await?;
             }
-            crate::protocol::Request::Chat { session_id, text } => {
+            crate::protocol::Request::Chat {
+                session_id,
+                text,
+                attachments,
+            } => {
                 if shutdown.is_shutting_down() {
                     // Emit the terminal pair (Error, AgentDone) even on
                     // shutdown so any subscribed TUI transitions out of
@@ -794,8 +798,25 @@ pub(super) async fn handle_client(
                         }
                     }
 
-                    // Append user message (persisted to DB)
-                    let user_msg = Message::User(UserMessage::text(&text));
+                    // Append user message (persisted to DB).
+                    // Build the engine-side message using the shared helper
+                    // so attachments are validated and image blocks are
+                    // appended after the text block (or alone if text is
+                    // empty). Validation failures bail out cleanly via
+                    // the surrounding async block's error path so the
+                    // terminal-broadcast logic still fires.
+                    let user_msg = match super::chat_attachments::build_user_message_for_request(
+                        &text,
+                        &attachments,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Err(crate::Error::Io(format!(
+                                "invalid chat attachments: {}",
+                                e
+                            )));
+                        }
+                    };
                     {
                         let st = lock_state(&state);
                         st.db.append_message(&session_id, &user_msg)?;
@@ -2500,7 +2521,8 @@ mod tests {
             let throttle = crate::throttle::ProviderThrottle::new();
             let test_overrides: SharedTestOverrides =
                 Arc::new(super::super::TestOverrides::default());
-            let (bg_chat_tx, _bg_chat_rx) = smol::channel::unbounded::<(String, String)>();
+            let (bg_chat_tx, _bg_chat_rx) =
+                smol::channel::unbounded::<crate::server::state::ChatSpawn>();
 
             let (client_std, server_std) =
                 std::os::unix::net::UnixStream::pair().expect("socketpair");

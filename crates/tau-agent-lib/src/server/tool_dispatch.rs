@@ -26,7 +26,7 @@ pub(super) async fn execute_tool_impl(
     session_id: &str,
     tool_name: &str,
     arguments: serde_json::Value,
-    chat_spawn_tx: &smol::channel::Sender<(String, String)>,
+    chat_spawn_tx: &smol::channel::Sender<super::state::ChatSpawn>,
 ) -> crate::protocol::Response {
     use crate::protocol::Response;
     use crate::types::*;
@@ -190,7 +190,7 @@ pub(super) async fn handle_server_request(
     plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
     shutdown: &ShutdownHandle,
     throttle: &crate::throttle::ProviderThrottle,
-    chat_spawn_tx: &smol::channel::Sender<(String, String)>,
+    chat_spawn_tx: &smol::channel::Sender<super::state::ChatSpawn>,
     test_overrides: &SharedTestOverrides,
     req: &crate::protocol::Request,
     session_id: &str,
@@ -240,8 +240,26 @@ pub(super) async fn handle_server_request(
             session_locks,
             caller_session_id.as_deref(),
         ),
-        Request::Chat { session_id, text } => {
-            match chat_spawn_tx.send((session_id.clone(), text.clone())).await {
+        Request::Chat {
+            session_id,
+            text,
+            attachments,
+        } => {
+            // Validate attachments here so a bad payload from a plugin
+            // surfaces synchronously instead of crashing the spawn task.
+            for (i, att) in attachments.iter().enumerate() {
+                if let Err(msg) = super::chat_attachments::validate_attachment(att) {
+                    return Response::Error {
+                        message: format!("attachment #{}: {}", i, msg),
+                    };
+                }
+            }
+            let spawn = super::state::ChatSpawn {
+                session_id: session_id.clone(),
+                text: text.clone(),
+                attachments: attachments.clone(),
+            };
+            match chat_spawn_tx.send(spawn).await {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error {
                     message: format!("failed to queue chat: {}", e),

@@ -19,9 +19,11 @@ pub(super) struct PluginExecutor {
     pub(super) plugins: Arc<Mutex<crate::plugin::PluginManager>>,
     pub(super) state: SharedState,
     pub(super) session_locks: SessionLocks,
-    /// Channel for spawning child Chat requests (session_id, text).
+    /// Channel for spawning child Chat requests. Carries the full chat
+    /// payload (text + attachments) so children inherit images attached
+    /// by the parent's orchestration tool.
     /// Received by the server to spawn async agent turns.
-    pub(super) chat_spawn_tx: smol::channel::Sender<(String, String)>,
+    pub(super) chat_spawn_tx: smol::channel::Sender<super::state::ChatSpawn>,
     pub(super) shutdown: ShutdownHandle,
     pub(super) throttle: crate::throttle::ProviderThrottle,
     pub(super) session_id: String,
@@ -477,7 +479,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
 
     // Channel for child Chat requests spawned by orchestration tools.
     // The receiver task spawns async agent turns for each queued chat.
-    let (chat_spawn_tx, chat_spawn_rx) = smol::channel::unbounded::<(String, String)>();
+    let (chat_spawn_tx, chat_spawn_rx) = smol::channel::unbounded::<super::state::ChatSpawn>();
 
     // Spawn a task that processes queued child chats.
     let spawn_state = state.clone();
@@ -487,7 +489,7 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     let spawn_throttle = throttle.clone();
     let spawn_overrides = test_overrides.clone();
     smol::spawn(async move {
-        while let Ok((child_session_id, text)) = chat_spawn_rx.recv().await {
+        while let Ok(spawn) = chat_spawn_rx.recv().await {
             // Each child chat gets its own async task (fire-and-forget).
             let s = spawn_state.clone();
             let p = spawn_plugins.clone();
@@ -496,8 +498,15 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             let th = spawn_throttle.clone();
             let ov = spawn_overrides.clone();
             smol::spawn(async move {
-                let sid = child_session_id;
-                if let Err(e) = run_child_chat(s, p, sh, sl, th, sid.clone(), text, ov).await {
+                let super::state::ChatSpawn {
+                    session_id,
+                    text,
+                    attachments,
+                } = spawn;
+                let sid = session_id;
+                if let Err(e) =
+                    run_child_chat(s, p, sh, sl, th, sid.clone(), text, attachments, ov).await
+                {
                     tracing::warn!(session_id = %sid, %e, "child chat error");
                 }
             })
@@ -645,6 +654,7 @@ pub(super) async fn run_child_chat(
     throttle: crate::throttle::ProviderThrottle,
     session_id: String,
     text: String,
+    attachments: Vec<crate::protocol::ChatAttachment>,
     test_overrides: SharedTestOverrides,
 ) -> crate::Result<()> {
     if shutdown.is_shutting_down() {
@@ -718,8 +728,15 @@ pub(super) async fn run_child_chat(
             ))
         });
 
-        // Append user message
-        let user_msg = Message::User(UserMessage::text(&text));
+        // Append user message — use the shared chat-attachment builder so
+        // images attached upstream survive the trip into engine context.
+        let user_msg =
+            match super::chat_attachments::build_user_message_for_request(&text, &attachments) {
+                Ok(m) => m,
+                Err(e) => {
+                    return Err(crate::Error::Io(format!("invalid chat attachments: {}", e)));
+                }
+            };
         {
             let st = lock_state(&state);
             st.db.append_message(&session_id, &user_msg)?;

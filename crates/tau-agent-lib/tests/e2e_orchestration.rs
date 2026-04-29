@@ -444,6 +444,7 @@ fn spawn_child_chat_produces_messages() {
         &Request::Chat {
             session_id: child_id.clone(),
             text: "do work".into(),
+            attachments: Vec::new(),
         },
     );
 
@@ -541,6 +542,7 @@ fn spawn_multiple_children_wait_all() {
         let req = Request::Chat {
             session_id: cid.clone(),
             text: format!("task {}", i),
+            attachments: Vec::new(),
         };
         let mut line = serde_json::to_string(&req).unwrap();
         line.push('\n');
@@ -739,6 +741,7 @@ fn spawn_delete_parent_cascades() {
         &Request::Chat {
             session_id: child_id.clone(),
             text: "work".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -841,6 +844,7 @@ fn wait_sessions_returns_summary() {
         &Request::Chat {
             session_id: child_id.clone(),
             text: "what is the meaning of life?".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));
@@ -966,6 +970,7 @@ fn wait_any_sessions_returns_only_completed() {
         &Request::Chat {
             session_id: fast_id.clone(),
             text: "go fast".into(),
+            attachments: Vec::new(),
         },
     );
     assert!(responses.iter().any(|r| matches!(r, Response::AgentDone)));

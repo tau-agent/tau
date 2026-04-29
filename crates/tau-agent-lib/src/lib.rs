@@ -12,6 +12,11 @@ pub mod server;
 pub mod shutdown;
 pub mod worker;
 
+/// Re-export of the server's chat-attachment helpers so CLI/TUI clients
+/// can validate and encode attachments without depending on the server
+/// crate's internals.
+pub use server::chat_attachments;
+
 // Re-export from tau-agent-base for backward compatibility
 pub use tau_agent_base::config_chain;
 pub use tau_agent_base::model_resolve;

@@ -29,6 +29,11 @@ enum Commands {
         /// Max child sessions this session can spawn (0 = no children)
         #[arg(long, default_value = "16")]
         child_budget: u32,
+        /// Attach an image file to the next message (PNG/JPEG/GIF/WEBP, ≤5 MiB).
+        /// Repeat to attach multiple. Only sent on the first send in this
+        /// invocation; subsequent prompts in interactive mode are text-only.
+        #[arg(long = "attach", value_name = "PATH")]
+        attach: Vec<std::path::PathBuf>,
     },
     /// Log in to an LLM provider (OAuth)
     Login {
@@ -574,11 +579,12 @@ async fn run(cli: Cli) -> tau_agent_lib::Result<()> {
             model,
             no_tui,
             child_budget,
+            attach,
         } => {
             maybe_auto_init();
             // Resolve model: CLI flag > saved setting > hardcoded default
             let model = model.unwrap_or_else(tau_agent_tui::settings::default_model);
-            cmd_chat(message, session, &model, no_tui, child_budget).await?;
+            cmd_chat(message, session, &model, no_tui, child_budget, attach).await?;
         }
         Commands::Worker => {
             tau_agent_lib::worker::run();
@@ -951,6 +957,7 @@ async fn cmd_chat(
     model: &str,
     no_tui: bool,
     child_budget: u32,
+    attach: Vec<std::path::PathBuf>,
 ) -> tau_agent_lib::Result<()> {
     // Install chat-mode signal handler for the non-TUI variants.  The
     // TUI installs its own (different) handler from inside its run loop
@@ -959,6 +966,19 @@ async fn cmd_chat(
         install_chat_signal_handler();
     }
     let mut client = tau_agent_lib::client::Client::connect_or_start().await?;
+
+    // Pre-flight encode any --attach files so we fail fast (and once) on
+    // bad paths/MIMEs before opening a session, rather than mid-stream.
+    let attachments: Vec<tau_agent_lib::protocol::ChatAttachment> = {
+        let mut out = Vec::with_capacity(attach.len());
+        for p in &attach {
+            match tau_agent_lib::chat_attachments::encode_file_attachment(p) {
+                Ok(att) => out.push(att),
+                Err(e) => return Err(tau_agent_lib::Error::Io(e)),
+            }
+        }
+        out
+    };
 
     // Parse "provider/model" syntax
     let (provider, model_id) = if let Some(idx) = model.find('/') {
@@ -1016,7 +1036,7 @@ async fn cmd_chat(
             totals.cost = info.stats.cost;
             totals.context_tokens = info.stats.context_tokens;
         }
-        send_and_print(&mut client, &session_id, &text, &mut totals).await?;
+        send_and_print(&mut client, &session_id, &text, &mut totals, attachments).await?;
     } else if no_tui {
         // Interactive but no TUI: use rustyline
         let mut totals = UsageTotals::default();
@@ -1030,9 +1050,19 @@ async fn cmd_chat(
             totals.cost = info.stats.cost;
             totals.context_tokens = info.stats.context_tokens;
         }
-        interactive_loop(&mut client, session_id, &mut totals, child_budget).await?;
+        interactive_loop(
+            &mut client,
+            session_id,
+            &mut totals,
+            child_budget,
+            attachments,
+        )
+        .await?;
     } else {
         // TUI mode
+        if !attachments.is_empty() {
+            eprintln!("warning: --attach is ignored in TUI mode; use the /attach slash command");
+        }
         tau_agent_tui::run(
             session_id,
             info_model,
@@ -1101,11 +1131,13 @@ async fn send_and_print(
     session_id: &str,
     text: &str,
     totals: &mut UsageTotals,
+    attachments: Vec<tau_agent_lib::protocol::ChatAttachment>,
 ) -> tau_agent_lib::Result<()> {
     client
         .send(&tau_agent_lib::protocol::Request::Chat {
             session_id: session_id.to_string(),
             text: text.to_string(),
+            attachments,
         })
         .await?;
 
@@ -1331,6 +1363,7 @@ async fn interactive_loop(
     mut session_id: String,
     totals: &mut UsageTotals,
     child_budget: u32,
+    initial_attachments: Vec<tau_agent_lib::protocol::ChatAttachment>,
 ) -> tau_agent_lib::Result<()> {
     let hist = history_path();
     if let Some(parent) = hist.parent() {
@@ -1341,6 +1374,7 @@ async fn interactive_loop(
         .map_err(|e| tau_agent_lib::Error::Io(format!("readline init: {}", e)))?;
     let _ = rl.load_history(&hist);
 
+    let mut pending_attachments = initial_attachments;
     loop {
         let line = match rl.readline("tau> ") {
             Ok(line) => line,
@@ -1372,12 +1406,22 @@ async fn interactive_loop(
             }
         }
 
-        match send_and_print(client, &session_id, line, totals).await {
+        match send_and_print(
+            client,
+            &session_id,
+            line,
+            totals,
+            std::mem::take(&mut pending_attachments),
+        )
+        .await
+        {
             Ok(()) => {}
             Err(e) => {
                 if try_reconnect(client, &e).await {
                     // Retry the message after reconnecting
-                    if let Err(e) = send_and_print(client, &session_id, line, totals).await {
+                    if let Err(e) =
+                        send_and_print(client, &session_id, line, totals, Vec::new()).await
+                    {
                         eprintln!("error: {}", e);
                     }
                 } else {
@@ -1640,7 +1684,7 @@ async fn handle_slash_command(
                     client.recv_streaming(|_| {}).await?;
                     // Notify the model about the cwd change
                     let notice = format!("[Working directory changed to: {}]", new_cwd);
-                    send_and_print(client, session_id, &notice, totals).await?;
+                    send_and_print(client, session_id, &notice, totals, Vec::new()).await?;
                     eprintln!("cwd: {}", new_cwd);
                 }
             }

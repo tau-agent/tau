@@ -5,8 +5,8 @@ use ratatui_textarea::TextArea;
 
 use tau_agent_lib::auth::SubscriptionUsage;
 use tau_agent_lib::protocol::{
-    ProjectStatsInfo, Response, SessionInfo, TaskHistoryInfo, TaskInfo, TaskMessageInfo,
-    TaskRelationInfo, TaskSessionInfo,
+    ChatAttachment, ProjectStatsInfo, Response, SessionInfo, TaskHistoryInfo, TaskInfo,
+    TaskMessageInfo, TaskRelationInfo, TaskSessionInfo,
 };
 use tau_agent_lib::types::{
     AgentPhase, AssistantContent, Message, StopReason, StreamEvent, ToolResultMessage, UserContent,
@@ -308,6 +308,25 @@ pub struct App {
     /// Local input history for arrow-key scrollback.
     /// Includes both regular chat messages and slash commands.
     pub input_history: Vec<String>,
+
+    /// Image attachments queued via `/attach <path>` (or by intercepting
+    /// a bracketed-paste of an image file path). Drained on the next
+    /// `Action::SendChat` so they ride along with the user's message.
+    /// Cleared explicitly by `/clear-attach`.
+    pub pending_attachments: Vec<PendingAttachment>,
+}
+
+/// One pending image attachment in the TUI.
+///
+/// `display_name` is the basename used for the `📎 foo.png` chip in the
+/// input area; `attachment` is the wire-ready payload that ships with the
+/// next `Request::Chat`. Decoded byte length is cached so we can render
+/// `(12 KiB)` without re-decoding.
+#[derive(Debug, Clone)]
+pub struct PendingAttachment {
+    pub display_name: String,
+    pub attachment: ChatAttachment,
+    pub decoded_bytes: usize,
 }
 
 /// Saved state when navigating to a child session.
@@ -333,6 +352,47 @@ pub struct NavEntry {
     /// `navigate_back` so the per-phase elapsed counter resumes from
     /// the correct moment.
     pub phase_anchor: Option<std::time::Instant>,
+}
+
+/// Render a byte count as a compact human-readable string
+/// (`1023 B`, `12 KiB`, `4.7 MiB`).
+///
+/// Used by the attachment chip line; deliberately lo-fi so we don't pull
+/// in another formatting dep.
+pub fn format_byte_size(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * 1024;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Cheap heuristic: does this pasted text look like a single existing
+/// image file path? Used to divert bracketed-paste of file paths into
+/// the `/attach` flow.
+///
+/// Conservative on purpose: only one line, short, an image extension,
+/// and the file must actually exist. Anything else falls through to the
+/// normal text-insertion path so we never silently swallow a paste.
+fn paste_as_image_path(text: &str) -> Option<String> {
+    if text.lines().count() != 1 || text.len() > 4096 {
+        return None;
+    }
+    let trimmed = text.trim().trim_matches('\'').trim_matches('"');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(trimmed);
+    let mime = tau_agent_lib::chat_attachments::sniff_image_mime(path)?;
+    let _ = mime; // sniff_image_mime guarantees a known extension
+    if !path.exists() || !path.is_file() {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 impl App {
@@ -408,6 +468,7 @@ impl App {
             pending_steer: None,
             all_tools_expanded: false,
             input_history: Vec::new(),
+            pending_attachments: Vec::new(),
         }
     }
 
@@ -628,8 +689,16 @@ impl App {
     }
 
     fn handle_terminal_event(&mut self, event: CtEvent) -> Option<Action> {
-        // Handle bracketed paste: insert full text into textarea
+        // Handle bracketed paste: insert full text into textarea, except
+        // when the paste looks like a single image path (e.g. dragged
+        // from a file manager). In that case, treat it as `/attach <path>`
+        // — most terminals don't forward image bytes through bracketed
+        // paste so this is the only realistic image-paste flow.
         if let CtEvent::Paste(text) = &event {
+            if let Some(path) = paste_as_image_path(text) {
+                self.handle_attach_command(&path);
+                return None;
+            }
             self.textarea.insert_str(text);
             return None;
         }
@@ -687,7 +756,12 @@ impl App {
                 self.scroll_to_bottom();
                 self.mode = AppMode::Streaming;
                 self.history_index = None;
-                Some(Action::SendChat(text))
+                let attachments: Vec<ChatAttachment> = self
+                    .pending_attachments
+                    .drain(..)
+                    .map(|p| p.attachment)
+                    .collect();
+                Some(Action::SendChat { text, attachments })
             }
             // Alt+Enter while idle: send immediately (same as plain Enter)
             (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
@@ -711,7 +785,12 @@ impl App {
                 self.scroll_to_bottom();
                 self.mode = AppMode::Streaming;
                 self.history_index = None;
-                Some(Action::SendChat(text))
+                let attachments: Vec<ChatAttachment> = self
+                    .pending_attachments
+                    .drain(..)
+                    .map(|p| p.attachment)
+                    .collect();
+                Some(Action::SendChat { text, attachments })
             }
             // Shift+Enter: insert newline
             (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) => {
@@ -2358,6 +2437,21 @@ impl App {
             }
             "/task" | "/tasks" => self.handle_task_slash_command(args),
             "/project" | "/projects" => self.handle_project_slash_command(args),
+            "/attach" => self.handle_attach_command(args),
+            "/clear-attach" | "/clear-attachments" => {
+                if self.pending_attachments.is_empty() {
+                    self.messages.push(MessageItem::Status {
+                        text: "no pending attachments".into(),
+                    });
+                } else {
+                    let n = self.pending_attachments.len();
+                    self.pending_attachments.clear();
+                    self.messages.push(MessageItem::Status {
+                        text: format!("cleared {} attachment(s)", n),
+                    });
+                }
+                None
+            }
             _ => {
                 self.messages.push(MessageItem::Error {
                     text: format!("unknown command: {}. Type /help", cmd),
@@ -2365,6 +2459,67 @@ impl App {
                 None
             }
         }
+    }
+
+    /// Implement `/attach <path>`: read an image file, validate it, queue it
+    /// for the next chat send.
+    ///
+    /// On success, pushes a status line with the chip name + decoded byte
+    /// count and stays in Input mode (returns `None`). Errors are surfaced
+    /// as `MessageItem::Error` and do not change `pending_attachments`.
+    fn handle_attach_command(&mut self, args: &str) -> Option<Action> {
+        let path_str = args.trim();
+        if path_str.is_empty() {
+            self.messages.push(MessageItem::Error {
+                text: "usage: /attach <path-to-image>".into(),
+            });
+            return None;
+        }
+        // Expand ~ to $HOME for ergonomics.
+        let expanded: std::path::PathBuf = if let Some(stripped) = path_str.strip_prefix("~/") {
+            if let Some(home) = std::env::var_os("HOME") {
+                let mut p = std::path::PathBuf::from(home);
+                p.push(stripped);
+                p
+            } else {
+                std::path::PathBuf::from(path_str)
+            }
+        } else {
+            std::path::PathBuf::from(path_str)
+        };
+        match tau_agent_lib::chat_attachments::encode_file_attachment(&expanded) {
+            Ok(att) => {
+                let display_name = expanded
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| expanded.display().to_string());
+                let decoded_bytes = match tau_agent_lib::chat_attachments::validate_attachment(&att)
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.messages.push(MessageItem::Error { text: e });
+                        return None;
+                    }
+                };
+                self.pending_attachments.push(PendingAttachment {
+                    display_name: display_name.clone(),
+                    attachment: att,
+                    decoded_bytes,
+                });
+                self.messages.push(MessageItem::Status {
+                    text: format!(
+                        "\u{1F4CE} attached {} ({})",
+                        display_name,
+                        format_byte_size(decoded_bytes)
+                    ),
+                });
+            }
+            Err(e) => {
+                self.messages.push(MessageItem::Error { text: e });
+            }
+        }
+        None
     }
 
     /// Dispatch `/project <subcommand>` in the TUI.  Currently supports
@@ -3640,7 +3795,10 @@ impl App {
 /// Actions the event loop should perform after handling an event.
 #[derive(Debug)]
 pub enum Action {
-    SendChat(String),
+    SendChat {
+        text: String,
+        attachments: Vec<ChatAttachment>,
+    },
     CancelChat,
     ListModels,
     SetModel(String),
@@ -5573,7 +5731,11 @@ mod tests {
 
         // Should produce a SendChat action, not None
         assert!(
-            matches!(action, Some(Action::SendChat(ref t)) if t == "hello from idle"),
+            matches!(
+                action,
+                Some(Action::SendChat { ref text, ref attachments })
+                    if text == "hello from idle" && attachments.is_empty()
+            ),
             "Alt+Enter in Input mode should send immediately, got {action:?}"
         );
         // Mode should transition to Streaming
@@ -7091,5 +7253,131 @@ mod tests {
             app.has_active_tool(),
             "a ToolActive anywhere in the list should be detected"
         );
+    }
+
+    // ---- /attach + pending_attachments tests ----
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        // Smallest possible PNG, identical to the one used by the lib's
+        // chat_attachments tests — 1x1 transparent.
+        vec![
+            0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, b'I', b'H',
+            b'D', b'R', 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, b'I', b'D', b'A', b'T', 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    #[test]
+    fn attach_command_queues_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tiny.png");
+        std::fs::write(&path, tiny_png_bytes()).expect("write");
+        let mut app = make_app();
+        let cmd = format!("/attach {}", path.display());
+        let action = app.handle_slash_command(&cmd);
+        assert!(action.is_none(), "/attach stays in input mode");
+        assert_eq!(app.pending_attachments.len(), 1, "one attachment queued");
+        assert_eq!(app.pending_attachments[0].display_name, "tiny.png");
+        // A Status message about the attach should have been pushed.
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::Status { text } if text.contains("attached"))),
+            "expected attach status message, got {:?}",
+            app.messages
+        );
+    }
+
+    #[test]
+    fn send_clears_pending_attachments() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tiny.png");
+        std::fs::write(&path, tiny_png_bytes()).expect("write");
+        let mut app = make_app();
+        let cmd = format!("/attach {}", path.display());
+        app.handle_slash_command(&cmd);
+        assert_eq!(app.pending_attachments.len(), 1);
+
+        app.mode = AppMode::Input;
+        app.textarea.insert_str("hi");
+        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let action = app.handle_input_key(&key);
+
+        match action {
+            Some(Action::SendChat {
+                ref text,
+                ref attachments,
+            }) => {
+                assert_eq!(text, "hi");
+                assert_eq!(attachments.len(), 1, "attachment moved into action");
+            }
+            other => panic!("expected SendChat, got {:?}", other),
+        }
+        assert!(
+            app.pending_attachments.is_empty(),
+            "pending should be drained after send"
+        );
+    }
+
+    #[test]
+    fn clear_attach_drains_pending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tiny.png");
+        std::fs::write(&path, tiny_png_bytes()).expect("write");
+        let mut app = make_app();
+        app.handle_slash_command(&format!("/attach {}", path.display()));
+        assert_eq!(app.pending_attachments.len(), 1);
+        app.handle_slash_command("/clear-attach");
+        assert!(app.pending_attachments.is_empty());
+    }
+
+    #[test]
+    fn attach_rejects_unsupported_extension() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("foo.bmp");
+        std::fs::write(&path, b"x").expect("write");
+        let mut app = make_app();
+        app.handle_slash_command(&format!("/attach {}", path.display()));
+        assert!(app.pending_attachments.is_empty());
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::Error { text } if text.contains("unsupported"))),
+            "expected error message about unsupported extension"
+        );
+    }
+
+    #[test]
+    fn paste_image_path_is_intercepted_into_attach() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tiny.png");
+        std::fs::write(&path, tiny_png_bytes()).expect("write");
+        let mut app = make_app();
+        // Simulate a bracketed-paste of the file path.
+        let event = CtEvent::Paste(path.display().to_string());
+        let action = app.handle_terminal_event(event);
+        assert!(action.is_none());
+        assert_eq!(
+            app.pending_attachments.len(),
+            1,
+            "image path paste should attach"
+        );
+        assert!(
+            app.textarea.lines().iter().all(|l: &String| l.is_empty()),
+            "textarea should remain empty when the paste is intercepted"
+        );
+    }
+
+    #[test]
+    fn paste_non_image_text_falls_through_to_textarea() {
+        let mut app = make_app();
+        let event = CtEvent::Paste("some pasted prose".to_string());
+        let action = app.handle_terminal_event(event);
+        assert!(action.is_none());
+        assert!(app.pending_attachments.is_empty());
+        let s = app.textarea.lines().join("\n");
+        assert!(s.contains("some pasted prose"));
     }
 }

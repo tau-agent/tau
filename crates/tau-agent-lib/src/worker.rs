@@ -904,6 +904,7 @@ async fn handle_session_tool(
                 let chat_req = crate::protocol::Request::Chat {
                     session_id: child_id.clone(),
                     text: task.to_string(),
+                    attachments: Vec::new(),
                 };
                 match server_request(msg_tx, pending, chat_req).await {
                     Ok(crate::protocol::Response::Ok) => {}
