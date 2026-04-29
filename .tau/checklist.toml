@@ -1,53 +1,11 @@
 [[check]]
 name = "just fmt"
-command = """
-cargo_works() {
-  command -v cargo >/dev/null 2>&1 \\
-    && cargo fmt --version >/dev/null 2>&1
-}
-if ! cargo_works; then
-  for d in "$HOME/.cargo/bin" "$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"; do
-    if [ -x "$d/cargo" ] && [ -x "$d/cargo-fmt" ]; then
-      PATH="$d:$PATH"; export PATH
-      cargo_works && break
-    fi
-  done
-fi
-exec just fmt
-"""
+command = "just fmt"
 
 [[check]]
 name = "just build"
-command = """
-cargo_works() {
-  command -v cargo >/dev/null 2>&1 \\
-    && cargo --version >/dev/null 2>&1
-}
-if ! cargo_works; then
-  for d in "$HOME/.cargo/bin" "$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"; do
-    if [ -x "$d/cargo" ]; then
-      PATH="$d:$PATH"; export PATH
-      cargo_works && break
-    fi
-  done
-fi
-exec just build
-"""
+command = "just build"
 
 [[check]]
 name = "just test"
-command = """
-cargo_works() {
-  command -v cargo >/dev/null 2>&1 \\
-    && cargo --version >/dev/null 2>&1
-}
-if ! cargo_works; then
-  for d in "$HOME/.cargo/bin" "$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"; do
-    if [ -x "$d/cargo" ]; then
-      PATH="$d:$PATH"; export PATH
-      cargo_works && break
-    fi
-  done
-fi
-exec just test
-"""
+command = "just test"
