@@ -865,7 +865,7 @@ impl TaskPhase {
         task: &Task,
         project_instructions: &str,
         merge_target: &str,
-        checklist: &[crate::tasks_merge::CheckItem],
+        checklist: &[crate::tasks_merge::ResolvedCheckItem],
     ) -> String {
         match self {
             Self::Worker => {
@@ -1819,7 +1819,7 @@ fn build_initial_message(
     task: &Task,
     merge_target: &str,
     project_instructions: &str,
-    checklist: &[crate::tasks_merge::CheckItem],
+    checklist: &[crate::tasks_merge::ResolvedCheckItem],
 ) -> String {
     let review_instruction = if task.skip_review {
         format!(
@@ -3238,13 +3238,15 @@ mod tests {
         task.branch = Some("task-1-21".into());
         task.worktree_path = Some("/tmp/wt-21".into());
         let checklist = vec![
-            crate::tasks_merge::CheckItem {
+            crate::tasks_merge::ResolvedCheckItem {
                 name: "format".into(),
                 command: "cargo fmt --check".into(),
+                timeout_secs: crate::tasks_merge::CHECKLIST_DEFAULT_TIMEOUT_SECS,
             },
-            crate::tasks_merge::CheckItem {
+            crate::tasks_merge::ResolvedCheckItem {
                 name: "lint".into(),
                 command: "cargo clippy --all-targets".into(),
+                timeout_secs: crate::tasks_merge::CHECKLIST_DEFAULT_TIMEOUT_SECS,
             },
         ];
         let msg = build_initial_message(&task, "main", "", &checklist);

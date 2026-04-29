@@ -76,8 +76,23 @@ pub fn sessions_to_archive(sessions: &[TaskSession]) -> (Vec<&TaskSession>, Vec<
 // Checklist
 // ---------------------------------------------------------------------------
 
+/// Hard-coded fallback timeout for checklist commands, used when neither
+/// the per-check `timeout_secs` nor the file-level `timeout_secs` is set.
+/// Generous enough to cover `just test` on a moderately-sized workspace;
+/// per-project configs can override.
+///
+/// The bash tool's own default is 120s; we override here because
+/// checklist commands are typically `cargo test`-class and routinely
+/// exceed that budget on larger codebases.
+pub const CHECKLIST_DEFAULT_TIMEOUT_SECS: u64 = 300;
+
 #[derive(Debug, Deserialize)]
 pub struct Checklist {
+    /// File-level default timeout for every check in this file. Items
+    /// that don't set their own `timeout_secs` inherit this value. If
+    /// unset here too, [`CHECKLIST_DEFAULT_TIMEOUT_SECS`] applies.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
     #[serde(default)]
     pub check: Vec<CheckItem>,
 }
@@ -86,14 +101,35 @@ pub struct Checklist {
 pub struct CheckItem {
     pub name: String,
     pub command: String,
+    /// Per-check override. Wins over the file-level `timeout_secs` and
+    /// the hard-coded fallback.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// A checklist item with its timeout already resolved per the rules in
+/// [`load_checklist`]: per-check override → file-level default →
+/// [`CHECKLIST_DEFAULT_TIMEOUT_SECS`] fallback.
+#[derive(Debug, Clone)]
+pub struct ResolvedCheckItem {
+    pub name: String,
+    pub command: String,
+    pub timeout_secs: u64,
 }
 
 /// Load the project checklist from up to three config tiers (operator >
 /// project > global).  Checklist items from higher tiers are prepended:
 /// operator items run first, then project, then global.
 ///
+/// Each item is annotated with its resolved timeout. Resolution order,
+/// for each item:
+///   1. `CheckItem.timeout_secs` (per-check override),
+///   2. the `Checklist.timeout_secs` of the file the item came from
+///      (per-project / global default),
+///   3. [`CHECKLIST_DEFAULT_TIMEOUT_SECS`].
+///
 /// Returns an empty vec if no tier has a checklist file.
-pub fn load_checklist(project_dir: &str, project_name: Option<&str>) -> Vec<CheckItem> {
+pub fn load_checklist(project_dir: &str, project_name: Option<&str>) -> Vec<ResolvedCheckItem> {
     let configs: Vec<(_, Checklist)> = tau_agent_base::config_chain::load_all(
         project_name,
         Some(project_dir),
@@ -103,7 +139,18 @@ pub fn load_checklist(project_dir: &str, project_name: Option<&str>) -> Vec<Chec
 
     let mut items = Vec::new();
     for (_path, checklist) in configs {
-        items.extend(checklist.check);
+        let file_default = checklist.timeout_secs;
+        for item in checklist.check {
+            let timeout_secs = item
+                .timeout_secs
+                .or(file_default)
+                .unwrap_or(CHECKLIST_DEFAULT_TIMEOUT_SECS);
+            items.push(ResolvedCheckItem {
+                name: item.name,
+                command: item.command,
+                timeout_secs,
+            });
+        }
     }
     items
 }
@@ -139,19 +186,30 @@ fn server_request(
 
 /// Run a bash command via ExecuteTool on the given session.
 /// Returns (stdout text, is_error).
+///
+/// `timeout_secs` is forwarded to the bash tool's `timeout` argument when
+/// `Some(_)`. When `None`, the bash tool falls back to its built-in
+/// default (120s as of writing). Checklist invocations always pass an
+/// explicit timeout via [`load_checklist`]; fast git plumbing commands
+/// (rebase, branch delete, `merge-base`, …) pass `None`.
 fn execute_bash(
     writer: &mut impl Write,
     reader: &mut impl BufRead,
     session_id: &str,
     command: &str,
+    timeout_secs: Option<u64>,
 ) -> tau_agent_plugin::Result<(String, bool)> {
+    let mut arguments = json!({ "command": command });
+    if let Some(t) = timeout_secs {
+        arguments["timeout"] = json!(t);
+    }
     let resp = server_request(
         writer,
         reader,
         Request::ExecuteTool {
             session_id: session_id.to_string(),
             tool_name: "bash".into(),
-            arguments: json!({ "command": command }),
+            arguments,
         },
     )?;
 
@@ -282,6 +340,7 @@ pub fn merge_task_for_caller(
             "git -C '{}' diff --quiet HEAD && git -C '{}' diff --cached --quiet HEAD",
             project_dir, project_dir
         ),
+        None,
     )?;
     if is_error {
         if let Err(e) = archive_session(writer, reader, &log_session) {
@@ -316,6 +375,7 @@ pub fn merge_task_for_caller(
         reader,
         &log_session,
         &format!("git -C '{}' rev-parse --abbrev-ref HEAD", project_dir),
+        None,
     )?;
     let head_branch = main_head_preflight.trim();
     if head_err || head_branch.is_empty() || head_branch != merge_target {
@@ -354,13 +414,13 @@ pub fn merge_task_for_caller(
          git -c advice.resolveConflict=false rebase {}",
         merge_target,
     );
-    let (output, is_error) = execute_bash(writer, reader, &log_session, &rebase_cmd)?;
+    let (output, is_error) = execute_bash(writer, reader, &log_session, &rebase_cmd, None)?;
     log.push_str(&output);
     log.push('\n');
 
     if is_error {
         // Abort the rebase so we leave a clean state
-        let _ = execute_bash(writer, reader, &log_session, "git rebase --abort");
+        let _ = execute_bash(writer, reader, &log_session, "git rebase --abort", None);
         if let Err(e) = archive_session(writer, reader, &log_session) {
             eprintln!(
                 "tasks: warning: failed to archive log session {}: {}",
@@ -377,7 +437,13 @@ pub fn merge_task_for_caller(
     let checklist = load_checklist(project_dir, None);
     for item in &checklist {
         log.push_str(&format!("=== Check: {} ===\n", item.name));
-        let (output, is_error) = execute_bash(writer, reader, &log_session, &item.command)?;
+        let (output, is_error) = execute_bash(
+            writer,
+            reader,
+            &log_session,
+            &item.command,
+            Some(item.timeout_secs),
+        )?;
         log.push_str(&output);
         log.push('\n');
 
@@ -411,6 +477,7 @@ pub fn merge_task_for_caller(
             "git merge-base --is-ancestor {} {} && git update-ref refs/heads/{} $(git rev-parse {})",
             merge_target, branch, merge_target, branch
         ),
+        None,
     )?;
     log.push_str(&output);
     log.push('\n');
@@ -455,6 +522,7 @@ pub fn merge_task_for_caller(
         reader,
         &log_session,
         &format!("git -C '{}' rev-parse --abbrev-ref HEAD", project_dir),
+        None,
     ) {
         Ok((output, _is_error)) => output,
         Err(e) => {
@@ -472,6 +540,7 @@ pub fn merge_task_for_caller(
             reader,
             &log_session,
             &format!("git -C '{}' reset --hard HEAD", project_dir),
+            None,
         ) {
             Ok((output, _)) => {
                 log.push_str(&output);
@@ -509,6 +578,7 @@ pub fn merge_task_for_caller(
                 "cd $(git rev-parse --show-toplevel) && git worktree remove --force {}",
                 worktree_path
             ),
+            None,
         ) {
             Ok((output, wt_err)) => {
                 log.push_str(&output);
@@ -577,7 +647,7 @@ pub fn merge_task_for_caller(
     // but the explicit `-C` here is what makes this step robust
     // against any future cwd weirdness.
     let br_cmd = build_branch_delete_command(project_dir, branch);
-    match execute_bash(writer, reader, &log_session, &br_cmd) {
+    match execute_bash(writer, reader, &log_session, &br_cmd, None) {
         Ok((output, br_err)) => {
             log.push_str(&output);
             if br_err {
@@ -1214,6 +1284,174 @@ command = "cargo test"
         assert_eq!(items[0].name, "operator-fmt");
         assert_eq!(items[1].name, "project-test");
         assert_eq!(items[2].name, "global-lint");
+
+        // Items inherit the fallback timeout when no file-level or per-check
+        // override is set anywhere in the tier chain.
+        for item in &items {
+            assert_eq!(
+                item.timeout_secs, CHECKLIST_DEFAULT_TIMEOUT_SECS,
+                "item {} should fall back to default",
+                item.name
+            );
+        }
+    }
+
+    // ----- timeout resolution -----
+
+    #[test]
+    fn test_load_checklist_with_file_level_timeout() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_cfg, _xdg) = isolate_config();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(
+            tau_dir.join("checklist.toml"),
+            r#"
+timeout_secs = 600
+
+[[check]]
+name = "fmt"
+command = "just fmt"
+
+[[check]]
+name = "build"
+command = "just build"
+"#,
+        )
+        .unwrap();
+
+        let items = load_checklist(dir.path().to_str().unwrap(), None);
+        assert_eq!(items.len(), 2);
+        // Both items inherit the file-level default of 600.
+        assert_eq!(items[0].timeout_secs, 600);
+        assert_eq!(items[1].timeout_secs, 600);
+    }
+
+    #[test]
+    fn test_load_checklist_with_per_item_timeout_override() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_cfg, _xdg) = isolate_config();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(
+            tau_dir.join("checklist.toml"),
+            r#"
+timeout_secs = 600
+
+[[check]]
+name = "fmt"
+command = "just fmt"
+
+[[check]]
+name = "test"
+command = "just test"
+timeout_secs = 900
+"#,
+        )
+        .unwrap();
+
+        let items = load_checklist(dir.path().to_str().unwrap(), None);
+        assert_eq!(items.len(), 2);
+        // First item: no override, inherits file-level 600.
+        assert_eq!(items[0].name, "fmt");
+        assert_eq!(items[0].timeout_secs, 600);
+        // Second item: per-check override wins.
+        assert_eq!(items[1].name, "test");
+        assert_eq!(items[1].timeout_secs, 900);
+    }
+
+    #[test]
+    fn test_load_checklist_no_timeout_uses_fallback() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_cfg, _xdg) = isolate_config();
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let tau_dir = dir.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(
+            tau_dir.join("checklist.toml"),
+            r#"
+[[check]]
+name = "fmt"
+command = "just fmt"
+"#,
+        )
+        .unwrap();
+
+        let items = load_checklist(dir.path().to_str().unwrap(), None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].timeout_secs, CHECKLIST_DEFAULT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn test_three_tier_timeout_resolution() {
+        let _g = CHECKLIST_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (config_tmp, _xdg) = isolate_config();
+
+        // Global checklist: timeout_secs = 200.
+        let global_dir = config_tmp.path().join("tau");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(
+            global_dir.join("checklist.toml"),
+            r#"
+timeout_secs = 200
+
+[[check]]
+name = "global-lint"
+command = "lint-global"
+"#,
+        )
+        .unwrap();
+
+        // Project checklist: timeout_secs = 400.
+        let project_tmp = tempfile::TempDir::new().unwrap();
+        let tau_dir = project_tmp.path().join(".tau");
+        std::fs::create_dir_all(&tau_dir).unwrap();
+        std::fs::write(
+            tau_dir.join("checklist.toml"),
+            r#"
+timeout_secs = 400
+
+[[check]]
+name = "project-test"
+command = "test-project"
+"#,
+        )
+        .unwrap();
+
+        // Operator checklist: no file-level timeout, no per-check override.
+        let operator_dir = global_dir.join("projects").join("myproj");
+        std::fs::create_dir_all(&operator_dir).unwrap();
+        std::fs::write(
+            operator_dir.join("checklist.toml"),
+            r#"
+[[check]]
+name = "operator-fmt"
+command = "fmt-operator"
+"#,
+        )
+        .unwrap();
+
+        let items = load_checklist(project_tmp.path().to_str().unwrap(), Some("myproj"));
+
+        assert_eq!(items.len(), 3);
+        // Existing operator-first ordering is preserved.
+        assert_eq!(items[0].name, "operator-fmt");
+        assert_eq!(items[1].name, "project-test");
+        assert_eq!(items[2].name, "global-lint");
+        // Each item gets the timeout from its own file (or the fallback when
+        // its file declares none) — the tier chain does NOT propagate
+        // timeouts across files.
+        assert_eq!(
+            items[0].timeout_secs, CHECKLIST_DEFAULT_TIMEOUT_SECS,
+            "operator file has no timeout_secs, item should fall back"
+        );
+        assert_eq!(items[1].timeout_secs, 400, "project tier sets 400");
+        assert_eq!(items[2].timeout_secs, 200, "global tier sets 200");
     }
 
     // ----- merge state validation -----

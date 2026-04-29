@@ -1,3 +1,13 @@
+# Merge-step checklist run by the task system after a successful rebase.
+# Each entry is a shell command; a non-zero exit fails the merge.
+#
+# Optional `timeout_secs` knobs control how long each command may run:
+#   - top-level `timeout_secs`: file-wide default for every check below
+#   - per-check `timeout_secs`: override for a single slow check
+# When neither is set, the worker uses its hard-coded fallback (300s).
+# Resolution order (highest-precedence first):
+#   per-check override → file-level default → built-in fallback (300s)
+
 [[check]]
 name = "just fmt"
 command = "just fmt"
@@ -9,3 +19,6 @@ command = "just build"
 [[check]]
 name = "just test"
 command = "just test"
+# `just test` is the slow one; bump well past the 300s fallback so a
+# normal-but-thorough run never trips the timeout.
+timeout_secs = 600
