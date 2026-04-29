@@ -326,6 +326,8 @@ impl AuthStorage {
     fn read_locked(&self) -> crate::Result<AuthData> {
         // Serialise same-process readers/writers before touching the fd
         // to avoid relying on flock's ambiguous in-process semantics.
+        // INFALLIBLE: `in_process_lock` guards a `Mutex<()>` with no protected state,
+        // so recovering from `PoisonError` cannot observe a torn invariant.
         let _in_proc = self
             .in_process_lock
             .lock()
@@ -424,6 +426,7 @@ impl AuthStorage {
         // Hold the in-process mutex across the entire read-modify-write
         // cycle so two same-process callers writing disjoint providers
         // both survive (no last-writer-wins from interleaved RMW).
+        // INFALLIBLE: `Mutex<()>` — no protected state, so poison recovery is safe.
         let _in_proc = self
             .in_process_lock
             .lock()
@@ -435,6 +438,7 @@ impl AuthStorage {
 
     /// Remove a credential.
     pub fn remove(&self, provider: &str) -> crate::Result<()> {
+        // INFALLIBLE: `Mutex<()>` — no protected state, so poison recovery is safe.
         let _in_proc = self
             .in_process_lock
             .lock()
@@ -560,6 +564,7 @@ impl AuthStorage {
         // its read-modify-write with ours and clobber the credential we
         // are about to write.  flock alone is unreliable within a single
         // process when distinct fds are used.
+        // INFALLIBLE: `Mutex<()>` — no protected state, so poison recovery is safe.
         let _in_proc = self
             .in_process_lock
             .lock()
