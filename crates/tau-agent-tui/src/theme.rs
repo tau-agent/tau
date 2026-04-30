@@ -220,8 +220,8 @@ pub fn dark() -> Theme {
 // Built-in themes (embedded at compile time)
 // ---------------------------------------------------------------------------
 
-const BUILTIN_DARK: &str = include_str!("../../../themes/dark.json");
-const BUILTIN_LIGHT: &str = include_str!("../../../themes/light.json");
+const BUILTIN_DARK: &str = include_str!("../themes/dark.json");
+const BUILTIN_LIGHT: &str = include_str!("../themes/light.json");
 
 /// Names of built-in themes.
 const BUILTIN_NAMES: &[&str] = &["dark", "light"];
