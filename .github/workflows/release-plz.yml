@@ -1,0 +1,75 @@
+# release-plz: open release PRs on push to main, publish on merge.
+#
+# Trusted publishing:
+#   - Configure crates.io trusted publishing for this repo + workflow:
+#       https://crates.io/docs/trusted-publishing
+#     Each crate must be claimed once on crates.io with the
+#     repository / workflow / environment values matching this file.
+#   - No CARGO_REGISTRY_TOKEN secret is needed; the action exchanges the
+#     workflow's OIDC token for a short-lived crates.io token at publish time.
+#
+# GITHUB_TOKEN is provided automatically by Actions and is used to open the
+# release PR and create GitHub releases.
+#
+# See https://release-plz.dev/docs/github for setup details.
+
+name: release-plz
+
+permissions:
+  pull-requests: write
+  contents: write
+  # Required for crates.io trusted publishing (OIDC token exchange).
+  id-token: write
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Publishes any crates whose version was bumped by a merged release-plz PR,
+  # and creates the corresponding GitHub releases / git tags.
+  release-plz-release:
+    name: release-plz release
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'tau-agent' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Opens or updates a single "release-plz PR" that bumps versions and updates
+  # CHANGELOGs for every workspace crate with unreleased changes.
+  release-plz-pr:
+    name: release-plz PR
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'tau-agent' }}
+    concurrency:
+      group: release-plz-pr
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Command-line interface for the tau LLM agent (binary: tau)"
+readme = "README.md"
 
 [[bin]]
 name = "tau"

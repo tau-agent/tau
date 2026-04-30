@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Task system plugin for the tau agent — manages tasks, scheduling, and merge queue"
+readme = "README.md"
 
 [dependencies]
 tau-agent-base.workspace = true

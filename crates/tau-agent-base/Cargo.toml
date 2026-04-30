@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Shared types, wire protocol, and utilities for the tau agent workspace"
+readme = "README.md"
 
 [dependencies]
 serde.workspace = true

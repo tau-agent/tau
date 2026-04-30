@@ -1,0 +1,113 @@
+# release-plz configuration
+# https://release-plz.dev/docs/config
+#
+# Workflow:
+# - On every push to `main`, the release-plz GitHub Action opens (or updates)
+#   a single "release-plz PR" that bumps versions and updates CHANGELOGs for
+#   every workspace crate that has unreleased changes.
+# - When that PR is merged, the same Action publishes the bumped crates to
+#   crates.io (in dependency order) and creates GitHub releases with the
+#   changelog excerpt.
+
+[workspace]
+# Bump dependent crates together — when a base crate's version changes, the
+# downstream crates' version constraints follow in the same release PR.
+dependencies_update = true
+
+# Maintain CHANGELOG.md per crate.
+changelog_update = true
+
+# Open the release PR against `main`.
+pr_branch_prefix = "release-plz/"
+pr_labels = ["release"]
+
+publish_timeout = "30m"
+
+# Conventional-commits style changelog. Commit prefixes like `feat:`, `fix:`,
+# `docs:` are grouped; everything else lands under "Other".
+[changelog]
+header = """# Changelog
+
+All notable changes to this project are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+body = """
+## [{{ version }}]{% if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}*({{ commit.scope }})* {% endif %}{{ commit.message | upper_first }}{% if commit.links %} ({% for link in commit.links %}[{{ link.text }}]({{ link.href }}){% if not loop.last %}, {% endif %}{% endfor %}){% endif %}
+{%- endfor %}
+{% endfor %}
+"""
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Changed" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^test", group = "Tests" },
+  { message = "^chore\\(deps\\)", group = "Dependencies" },
+  { message = "^chore", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^style", skip = true },
+]
+
+# Every workspace crate is publishable. Listed explicitly so we control
+# release/tag behaviour per crate if needed later.
+
+[[package]]
+name = "tau-agent-base"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "tau-agent-plugin"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "tau-agent-client"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "tau-agent-plugin-tasks"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "tau-agent-plugin-worker"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "tau-agent-engine"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "tau-agent-lib"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "tau-agent-tui"
+publish = true
+git_release_enable = true
+git_tag_enable = true
+
+[[package]]
+name = "tau-agent"
+publish = true
+git_release_enable = true
+git_tag_enable = true

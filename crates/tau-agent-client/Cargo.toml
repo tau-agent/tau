@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Unix-socket client library for connecting to the tau agent server"
+readme = "README.md"
 
 [dependencies]
 tau-agent-base.workspace = true

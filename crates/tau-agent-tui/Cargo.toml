@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Ratatui-based terminal UI for the tau LLM agent"
+readme = "README.md"
 
 [dependencies]
 tau-agent-lib.workspace = true

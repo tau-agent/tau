@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Plugin SDK for the tau agent — everything a plugin author needs in one crate"
+readme = "README.md"
 
 [dependencies]
 tau-agent-base.workspace = true

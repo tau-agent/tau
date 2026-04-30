@@ -10,6 +10,7 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Core agent loop and LLM providers for the tau agent"
+readme = "README.md"
 
 [dependencies]
 tau-agent-base.workspace = true
