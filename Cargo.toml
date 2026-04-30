@@ -10,7 +10,7 @@ license = "MIT"
 authors = ["Kaspar Schleiser <kaspar@schleiser.de>"]
 repository = "https://github.com/tau-agent/tau"
 homepage = "https://github.com/tau-agent/tau"
-keywords = ["llm", "agent", "ai", "command-line-utilities", "development-tools"]
+keywords = ["llm", "agent", "ai", "cli", "development-tools"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
