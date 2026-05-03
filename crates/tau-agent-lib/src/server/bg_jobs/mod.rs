@@ -6,3 +6,4 @@
 //! [`super::run`] / [`super::run_with_config`].
 
 pub(crate) mod gc_empty_sessions;
+pub(crate) mod refresh_subscription_usage;

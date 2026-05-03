@@ -381,6 +381,7 @@ pub async fn run_with_config(config: TestServerConfig) -> crate::Result<()> {
     let bg = bg_tasks::BgTaskScheduler::new(state.clone(), shutdown.clone());
     lock_state(&state).bg_scheduler = Some(bg.clone());
     bg_jobs::gc_empty_sessions::register_all(&bg).await;
+    bg_jobs::refresh_subscription_usage::register_all(&bg).await;
     bg.run_startup().await;
 
     let shutdown_watcher = shutdown.clone();
@@ -584,6 +585,7 @@ pub async fn run() -> crate::Result<()> {
     let bg = bg_tasks::BgTaskScheduler::new(state.clone(), shutdown.clone());
     lock_state(&state).bg_scheduler = Some(bg.clone());
     bg_jobs::gc_empty_sessions::register_all(&bg).await;
+    bg_jobs::refresh_subscription_usage::register_all(&bg).await;
     bg.run_startup().await;
 
     // Install signal-driven graceful shutdown.  SIGTERM (e.g. systemd

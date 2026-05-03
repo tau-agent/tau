@@ -915,9 +915,16 @@ async fn run_inner(
         app.sync_streaming_timer();
         event_loop.set_ticking(app.mode == AppMode::Streaming || app.has_active_tool());
 
-        // Periodic subscription usage refresh (every 60s)
+        // Fallback subscription-usage poll.
+        //
+        // The server-side `refresh_subscription_usage` bg job fires
+        // every 60s and pushes the result over the Subscribe channel,
+        // so under normal operation the status line refreshes without
+        // any client polling.  Keep a long-interval fallback (5min) in
+        // case the push channel is broken — e.g. mid-reconnect, or a
+        // bug we haven't spotted yet.
         if app.totals.is_subscription
-            && app.last_usage_fetch.elapsed() >= std::time::Duration::from_secs(60)
+            && app.last_usage_fetch.elapsed() >= std::time::Duration::from_secs(5 * 60)
         {
             app.last_usage_fetch = std::time::Instant::now();
             send_request_and_recv(Request::GetSubscriptionUsage, server_tx.clone()).await?;

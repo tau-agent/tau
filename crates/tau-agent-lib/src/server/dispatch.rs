@@ -25,7 +25,16 @@ use crate::protocol::Response;
 use crate::truncate_str;
 use crate::types::*;
 
-const USAGE_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
+/// TTL for the in-memory subscription-usage cache.
+///
+/// The primary refresher is now
+/// [`super::bg_jobs::refresh_subscription_usage`], which fires every
+/// 60s and pushes the new value to all connected TUIs. This TTL only
+/// gates the on-demand path (`Request::GetSubscriptionUsage` from a
+/// just-reconnected client), so 30s is plenty: in the worst case the
+/// client sees data slightly older than the next bg tick will
+/// produce, then catches up via the push.
+const USAGE_CACHE_TTL_MS: u64 = 30 * 1000;
 
 /// Create a session (pure DB logic, no plugin setup).
 #[allow(clippy::too_many_arguments)]
