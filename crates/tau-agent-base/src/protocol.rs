@@ -593,6 +593,19 @@ pub fn is_shutting_down_error(err: &str) -> bool {
     err == SHUTTING_DOWN_ERROR || err.contains("server is shutting down")
 }
 
+/// Returns true if `err` looks like a failure surfaced by the
+/// Anthropic subscription-usage poll path (`/v1/messages/usage` /
+/// `/api/oauth/usage`). Used by clients as defence-in-depth: the
+/// server-side handler in #940 no longer sends `Response::Error` for
+/// these failures — it falls back to a cached or default
+/// [`Response::SubscriptionUsage`] — but if a future code path were to
+/// regress and emit such an error over the wire, clients can
+/// recognize it as out-of-band and refrain from tearing down
+/// streaming UI state (in-flight tool calls, agent phase, etc.).
+pub fn is_subscription_usage_error(err: &str) -> bool {
+    err.contains("usage API")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,

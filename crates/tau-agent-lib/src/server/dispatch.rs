@@ -29,12 +29,14 @@ use crate::types::*;
 ///
 /// The primary refresher is now
 /// [`super::bg_jobs::refresh_subscription_usage`], which fires every
-/// 60s and pushes the new value to all connected TUIs. This TTL only
+/// 5 minutes and pushes the new value to all connected TUIs. This TTL
 /// gates the on-demand path (`Request::GetSubscriptionUsage` from a
-/// just-reconnected client), so 30s is plenty: in the worst case the
-/// client sees data slightly older than the next bg tick will
-/// produce, then catches up via the push.
-const USAGE_CACHE_TTL_MS: u64 = 30 * 1000;
+/// just-reconnected client) and intentionally matches the bg job's
+/// interval: in steady state the bg job is the *only* thing hitting
+/// Anthropic's `/usage` endpoint, and reconnecting clients ride the
+/// cache. Holding ourselves to ~5 minute granularity here is what
+/// kept us inside Anthropic's account-scoped rate limit (#940).
+const USAGE_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 
 /// Validate that `successor_id` (when `Some`) is a sensible link target
 /// for `session_id`. Returns `Ok(())` on success or a human-readable
@@ -88,6 +90,80 @@ pub(super) fn validate_successor_link(
         ));
     }
     Ok(())
+}
+
+/// Resolve a `Request::GetSubscriptionUsage` into a `SubscriptionUsage`
+/// payload, with the on-demand caching and graceful-degradation logic
+/// the inline handler used to carry. Lifted out so it can be unit-
+/// tested without standing up a full request socket.
+///
+/// Strategy:
+/// * If the cache is fresh (within [`USAGE_CACHE_TTL_MS`]), serve it.
+/// * Otherwise, try `fetch` outside the state lock.
+/// * On fetch error, serve the (possibly stale) cache if any, else
+///   `SubscriptionUsage::default()`. Anthropic rate-limits `/usage`
+///   aggressively (#940) and the previous behaviour — surfacing the
+///   raw error as a `Response::Error` — caused the TUI to render a
+///   red banner *and* visually interrupt unrelated in-flight tool
+///   calls. Returning a usage payload (even an empty one) means no
+///   fallback path on the wire ever looks like a session error.
+///
+/// The `fetch` argument is a closure rather than a direct call to
+/// [`crate::auth::fetch_subscription_usage`] so tests can inject a
+/// canned `Result` without spinning up the network stack. Production
+/// callers pass `|tok| smol::unblock(move || fetch_subscription_usage(&tok))`.
+async fn resolve_subscription_usage<F, Fut>(
+    state: &SharedState,
+    fetch: F,
+) -> crate::auth::SubscriptionUsage
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = crate::Result<crate::auth::SubscriptionUsage>>,
+{
+    let (cache_snapshot, fresh_within_ttl) = {
+        let st = lock_state(state);
+        let now = crate::types::timestamp_ms();
+        match st.usage_cache.as_ref() {
+            Some((usage, fetched_at)) => {
+                let fresh = now.saturating_sub(*fetched_at) < USAGE_CACHE_TTL_MS;
+                (Some(usage.clone()), fresh)
+            }
+            None => (None, false),
+        }
+    };
+
+    if fresh_within_ttl {
+        return cache_snapshot.expect("fresh_within_ttl implies cache present");
+    }
+
+    // Cache empty or stale — attempt a fetch, but never propagate the
+    // error to the caller. Falls back to the cached value (if any) or
+    // a default-constructed payload.
+    let token = {
+        let st = lock_state(state);
+        st.auth.get_api_key("anthropic")
+    };
+    let fetched = match token {
+        Ok(Some(tok)) if crate::auth::is_oauth_token(&tok) => fetch(tok).await,
+        _ => Err(crate::Error::NoApiKey(
+            "subscription usage requires OAuth login".into(),
+        )),
+    };
+    match fetched {
+        Ok(usage) => {
+            let mut st = lock_state(state);
+            st.usage_cache = Some((usage.clone(), crate::types::timestamp_ms()));
+            usage
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                had_cache = cache_snapshot.is_some(),
+                "GetSubscriptionUsage: fetch failed; serving cached or default"
+            );
+            cache_snapshot.unwrap_or_default()
+        }
+    }
 }
 
 /// Atomically create a successor session inheriting the predecessor's
@@ -2076,58 +2152,11 @@ pub(super) async fn handle_client(
                 send(&mut writer, &Response::AuthStatus { providers }).await?;
             }
             crate::protocol::Request::GetSubscriptionUsage => {
-                // Check cache, fetch if stale
-                let cache_result = {
-                    let st = lock_state(&state);
-                    let now = crate::types::timestamp_ms();
-                    if let Some((ref usage, fetched_at)) = st.usage_cache {
-                        if now.saturating_sub(fetched_at) < USAGE_CACHE_TTL_MS {
-                            Some(Ok(usage.clone()))
-                        } else {
-                            None // stale
-                        }
-                    } else {
-                        None // not yet fetched
-                    }
-                };
-
-                let result = if let Some(cached) = cache_result {
-                    cached
-                } else {
-                    // Fetch outside the lock
-                    let token = {
-                        let st = lock_state(&state);
-                        st.auth.get_api_key("anthropic")
-                    };
-                    match token {
-                        Ok(Some(tok)) if crate::auth::is_oauth_token(&tok) => {
-                            smol::unblock(move || crate::auth::fetch_subscription_usage(&tok)).await
-                        }
-                        _ => Err(crate::Error::NoApiKey(
-                            "subscription usage requires OAuth login".into(),
-                        )),
-                    }
-                };
-
-                match result {
-                    Ok(usage) => {
-                        // Update cache
-                        {
-                            let mut st = lock_state(&state);
-                            st.usage_cache = Some((usage.clone(), crate::types::timestamp_ms()));
-                        }
-                        send(&mut writer, &Response::SubscriptionUsage { usage }).await?;
-                    }
-                    Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                let usage = resolve_subscription_usage(&state, |tok| {
+                    smol::unblock(move || crate::auth::fetch_subscription_usage(&tok))
+                })
+                .await;
+                send(&mut writer, &Response::SubscriptionUsage { usage }).await?;
             }
             crate::protocol::Request::WaitSessions {
                 session_ids,
@@ -2868,6 +2897,51 @@ mod tests {
         }))
     }
 
+    /// Build a `State` with an isolated, tempdir-backed `AuthStorage`
+    /// pre-loaded with a fake Anthropic OAuth credential. Used by
+    /// `resolve_subscription_usage` tests so the OAuth-token branch
+    /// runs (and hits our injected fetcher) without depending on the
+    /// real `~/.config/tau/auth.json`.
+    fn mk_state_with_oauth() -> (SharedState, tempfile::TempDir) {
+        let db = Db::open_memory().expect("open memory db");
+        let auth_dir = tempfile::tempdir().expect("tempdir for auth");
+        let auth = crate::auth::AuthStorage::new(auth_dir.path().join("auth.json"));
+        auth.set(
+            "anthropic",
+            AuthCredential::Oauth(crate::auth::OAuthCredentials {
+                refresh: "refresh-stub".into(),
+                access: "sk-ant-oat-test-token".into(),
+                // 1 hour in the future so `get_api_key` returns the
+                // stored token without trying to refresh it.
+                expires: crate::types::timestamp_ms() + 60 * 60 * 1000,
+            }),
+        )
+        .expect("install anthropic oauth credential");
+        let state = Arc::new(Mutex::new(State {
+            db,
+            registry: ProviderRegistry::new(),
+            auth,
+            config: crate::config::Config::default(),
+            global_aliases: HashMap::new(),
+            default_model: mk_model(),
+            all_models: vec![mk_model()],
+            usage_cache: None,
+            cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
+            has_queued: HashMap::new(),
+            subscribers: HashMap::new(),
+            phases: HashMap::new(),
+            live_sessions: HashSet::new(),
+            waited_sessions: HashSet::new(),
+            session_done_waiters: Vec::new(),
+            reply_waiters: HashMap::new(),
+            next_msg_id: 0,
+            bg_after_idle: HashMap::new(),
+            bg_scheduler: None,
+        }));
+        (state, auth_dir)
+    }
+
     /// Subscribing then dropping the client socket without any broadcast
     /// must clean up the subscriber entry within a bounded window. This
     /// is the disconnect-EOF race: previously the forwarding loop could
@@ -3388,5 +3462,160 @@ mod tests {
                  catch-all `request not supported in plugin context` error"
             ),
         }
+    }
+
+    /// Helper: a usage payload with a marker utilization so equality
+    /// asserts read clearly in test failure output.
+    fn usage_with(value: f64) -> crate::auth::SubscriptionUsage {
+        crate::auth::SubscriptionUsage {
+            five_hour: Some(crate::auth::UsageBucket {
+                utilization: Some(value),
+                resets_at: Some("2026-01-01T00:00:00Z".into()),
+            }),
+            seven_day: None,
+            seven_day_sonnet: None,
+            seven_day_opus: None,
+            extra_usage: None,
+        }
+    }
+
+    /// Regression for #940: a fetch error must NOT be propagated to
+    /// the caller. With a populated cache we serve the cached value
+    /// and pretend nothing went wrong.
+    #[test]
+    fn resolve_subscription_usage_falls_back_to_stale_cache_on_error() {
+        smol::block_on(async {
+            let (state, _auth_dir) = mk_state_with_oauth();
+
+            // Pre-populate the cache with a known value, then time-
+            // shift the fetched_at far enough into the past that the
+            // TTL has expired and the helper will try to refetch.
+            let stale = usage_with(7.0);
+            {
+                let mut st = lock_state(&state);
+                let stale_ts =
+                    crate::types::timestamp_ms().saturating_sub(USAGE_CACHE_TTL_MS + 60_000);
+                st.usage_cache = Some((stale.clone(), stale_ts));
+            }
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_clone = calls.clone();
+            let result = resolve_subscription_usage(&state, |_tok| {
+                let c = calls_clone.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(crate::Error::HttpStatus {
+                        status: 429,
+                        message: "rate limited".into(),
+                        retry_after: None,
+                    })
+                }
+            })
+            .await;
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "fetcher must be invoked when cache is stale"
+            );
+            assert_eq!(
+                result.five_hour.as_ref().and_then(|b| b.utilization),
+                Some(7.0),
+                "stale cache value must be returned on fetch error \
+                 instead of propagating the 429"
+            );
+        });
+    }
+
+    /// Regression for #940: with NO cache and a fetch error, return a
+    /// `default()` payload (empty buckets). The TUI renders nothing
+    /// instead of a red banner.
+    #[test]
+    fn resolve_subscription_usage_returns_default_when_no_cache_and_error() {
+        smol::block_on(async {
+            let (state, _auth_dir) = mk_state_with_oauth();
+            // Cache stays at None.
+
+            let result = resolve_subscription_usage(&state, |_tok| async {
+                Err(crate::Error::HttpStatus {
+                    status: 429,
+                    message: "rate limited".into(),
+                    retry_after: Some(60),
+                })
+            })
+            .await;
+
+            // Default = all buckets `None`.
+            assert!(
+                result.five_hour.is_none()
+                    && result.seven_day.is_none()
+                    && result.seven_day_sonnet.is_none()
+                    && result.seven_day_opus.is_none()
+                    && result.extra_usage.is_none(),
+                "empty cache + fetch error must yield SubscriptionUsage::default(), \
+                 got {result:?}"
+            );
+        });
+    }
+
+    /// Fresh cache short-circuits: the fetcher must not be called.
+    #[test]
+    fn resolve_subscription_usage_skips_fetch_when_cache_fresh() {
+        smol::block_on(async {
+            let (state, _auth_dir) = mk_state_with_oauth();
+            let fresh = usage_with(42.0);
+            {
+                let mut st = lock_state(&state);
+                st.usage_cache = Some((fresh.clone(), crate::types::timestamp_ms()));
+            }
+
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_clone = calls.clone();
+            let result = resolve_subscription_usage(&state, |_tok| {
+                let c = calls_clone.clone();
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(usage_with(0.0))
+                }
+            })
+            .await;
+
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "fresh cache must short-circuit the fetcher"
+            );
+            assert_eq!(
+                result.five_hour.as_ref().and_then(|b| b.utilization),
+                Some(42.0),
+                "fresh cache value must be returned verbatim"
+            );
+        });
+    }
+
+    /// On a successful fetch the helper updates the cache for next
+    /// time. (The bg job is the canonical updater, but on-demand
+    /// fetches that succeed must not let the cache stay stale.)
+    #[test]
+    fn resolve_subscription_usage_updates_cache_on_success() {
+        smol::block_on(async {
+            let (state, _auth_dir) = mk_state_with_oauth();
+            // Cache starts empty.
+
+            let result =
+                resolve_subscription_usage(&state, |_tok| async { Ok(usage_with(13.5)) }).await;
+
+            assert_eq!(
+                result.five_hour.as_ref().and_then(|b| b.utilization),
+                Some(13.5)
+            );
+            let st = lock_state(&state);
+            let (cached, _ts) = st.usage_cache.as_ref().expect("cache populated");
+            assert_eq!(
+                cached.five_hour.as_ref().and_then(|b| b.utilization),
+                Some(13.5),
+                "successful fetch must populate the cache"
+            );
+        });
     }
 }

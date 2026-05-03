@@ -3235,6 +3235,18 @@ impl App {
                     self.phase = AgentPhase::Idle;
                     self.set_mode(AppMode::Input);
                     self.pending_steer = None;
+                } else if tau_agent_lib::protocol::is_subscription_usage_error(&message) {
+                    // Defence-in-depth for #940: the subscription-usage
+                    // fetch is an unrelated background poll. A failure
+                    // there must not interrupt an in-flight tool call,
+                    // flip the agent phase, or surface a red error to
+                    // the user. The server already swallows these
+                    // failures (returns a cached/default payload) but
+                    // we guard the TUI explicitly so a future
+                    // regression on either side can't reproduce the
+                    // original bug (active tool rendered as
+                    // `[interrupted]`, session presumed crashed).
+                    let _ = message;
                 } else {
                     self.finalize_in_flight();
                     self.messages.push(MessageItem::Error { text: message });
@@ -7564,5 +7576,62 @@ mod tests {
         assert!(app.pending_attachments.is_empty());
         let s = app.textarea.lines().join("\n");
         assert!(s.contains("some pasted prose"));
+    }
+
+    /// Regression for #940: a `Response::Error` carrying a
+    /// subscription-usage failure (e.g. an Anthropic 429 from
+    /// `/usage`) is delivered out-of-band by an unrelated request
+    /// connection and must not interrupt an in-flight tool call.
+    /// Before the fix the TUI would (a) finalize the active tool to
+    /// `[interrupted]`, (b) flip the agent phase to Idle, and (c)
+    /// switch the input mode — leading users to believe their session
+    /// had crashed when the agent loop was actually still running.
+    #[test]
+    fn subscription_usage_error_does_not_interrupt_active_tool() {
+        let mut app = make_app();
+        // Simulate an in-flight tool call: phase is ToolExec, mode is
+        // Streaming, and a `MessageItem::ToolActive` is in scrollback.
+        app.phase = AgentPhase::ToolExec;
+        app.set_mode(AppMode::Streaming);
+        let started_at = std::time::Instant::now();
+        app.messages.push(MessageItem::ToolActive {
+            tool_call_id: "toolu_test".to_string(),
+            name: "bash".to_string(),
+            args: serde_json::json!({"command": "sleep 60"}),
+            output_lines: Vec::new(),
+            started_at,
+        });
+
+        // Inject the wire-level error the bg poll used to surface.
+        app.handle_server_response(Response::Error {
+            message: "HTTP error: usage API: http status: 429".to_string(),
+        });
+
+        // The active tool must still be active. The previous bug
+        // would have replaced it with a `MessageItem::ToolComplete`
+        // marked `is_error: true` and labelled `[interrupted]`.
+        let still_active = app.messages.iter().any(
+            |m| matches!(m, MessageItem::ToolActive { tool_call_id: id, .. } if id == "toolu_test"),
+        );
+        assert!(
+            still_active,
+            "out-of-band /usage 429 must not finalize an in-flight tool call"
+        );
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| matches!(m, MessageItem::Error { .. })),
+            "out-of-band /usage 429 must not push a red error row"
+        );
+        assert_eq!(
+            app.phase,
+            AgentPhase::ToolExec,
+            "out-of-band /usage 429 must not flip the agent phase"
+        );
+        assert_eq!(
+            app.mode,
+            AppMode::Streaming,
+            "out-of-band /usage 429 must not switch the input mode"
+        );
     }
 }

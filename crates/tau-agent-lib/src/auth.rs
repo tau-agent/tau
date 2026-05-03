@@ -780,13 +780,40 @@ struct UsageApiResponse {
 
 /// Fetch subscription usage from the Anthropic API.
 /// `token` must be a valid OAuth access token.
+///
+/// Non-2xx responses are surfaced as [`crate::Error::HttpStatus`] so the
+/// caller can distinguish 429s (and read `Retry-After`) from generic
+/// transport failures. Transport-level failures (DNS, TLS, connection
+/// reset, …) still surface as [`crate::Error::Http`].
 pub fn fetch_subscription_usage(token: &str) -> crate::Result<SubscriptionUsage> {
-    let resp: UsageApiResponse = ureq::get(USAGE_URL)
+    let mut resp = ureq::get(USAGE_URL)
         .header("authorization", &format!("Bearer {}", token))
         .header("anthropic-beta", "oauth-2025-04-20")
         .header("content-type", "application/json")
+        .config()
+        .http_status_as_error(false)
+        .build()
         .call()
-        .map_err(|e| crate::Error::Http(format!("usage API: {}", e)))?
+        .map_err(|e| crate::Error::Http(format!("usage API: {}", e)))?;
+
+    let status = resp.status().as_u16();
+    if status >= 400 {
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        use std::io::Read;
+        let mut body_text = String::new();
+        let _ = resp.body_mut().as_reader().read_to_string(&mut body_text);
+        return Err(crate::Error::HttpStatus {
+            status,
+            message: format!("usage API: {}", body_text),
+            retry_after,
+        });
+    }
+
+    let resp: UsageApiResponse = resp
         .body_mut()
         .read_json()
         .map_err(|e| crate::Error::Parse(format!("usage response: {}", e)))?;
