@@ -1298,7 +1298,7 @@ async fn send_and_print(
                     tau_agent_lib::StreamEvent::ToolcallEnd { tool_call, .. } => {
                         let args_str = tool_call.arguments.to_string();
                         let preview = if args_str.len() > 100 {
-                            format!("{}...", &args_str[..100])
+                            format!("{}...", tau_agent_lib::truncate_str(&args_str, 100))
                         } else {
                             args_str
                         };
@@ -1320,7 +1320,7 @@ async fn send_and_print(
                             let p: String =
                                 content.split_whitespace().collect::<Vec<_>>().join(" ");
                             if p.len() > 100 {
-                                format!("{}...", &p[..100])
+                                format!("{}...", tau_agent_lib::truncate_str(&p, 100))
                             } else {
                                 p
                             }
@@ -3126,7 +3126,7 @@ fn print_slow_events(rows: &[tau_agent_lib::profile::SlowEvent]) {
             detail
         };
         let detail = if detail.len() > 160 {
-            format!("{}…", &detail[..160])
+            format!("{}…", tau_agent_lib::truncate_str(&detail, 160))
         } else {
             detail
         };

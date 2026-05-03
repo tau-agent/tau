@@ -558,25 +558,12 @@ const LOOP_REVIEW_MESSAGE_COUNT: usize = 6;
 
 /// Run an inline LLM call to review whether the session is stuck.
 /// Returns `true` if the session appears stuck.
-async fn run_loop_review(
-    registry: &ProviderRegistry,
-    review_model: &Model,
-    messages: &[Message],
-    options: &StreamOptions,
-    config: &AgentConfig,
-    event_tx: &EventSender,
-) -> bool {
-    let _ = event_tx.try_send(StreamEvent::Phase {
-        phase: tau_agent_base::types::AgentPhase::Compacting,
-        turn_started_at_ms: None,
-        phase_started_at_ms: None,
-    });
-
-    // Extract the last N messages for review.
-    let start = messages.len().saturating_sub(LOOP_REVIEW_MESSAGE_COUNT);
-    let recent: Vec<Message> = messages[start..].to_vec();
-
-    // Format them as a single user message for the reviewer.
+/// Build the user-message text used for a loop-review LLM call from the
+/// supplied (already-trimmed) messages.
+///
+/// Tool-result content is byte-truncated to 1000 bytes, rounded down to a
+/// UTF-8 char boundary so multi-byte characters near the limit don't panic.
+fn build_loop_review_text(recent: &[Message]) -> String {
     let mut review_text = String::from("Here are the last messages from the session:\n\n");
     for (i, msg) in recent.iter().enumerate() {
         review_text.push_str(&format!("--- Message {} ---\n", i + 1));
@@ -619,7 +606,7 @@ async fn run_loop_review(
                     .join("\n");
                 // Truncate long tool results for the review.
                 if content.len() > 1000 {
-                    review_text.push_str(&content[..1000]);
+                    review_text.push_str(tau_agent_base::truncate_str(&content, 1000));
                     review_text.push_str("\n[...truncated...]\n");
                 } else {
                     review_text.push_str(&content);
@@ -638,6 +625,29 @@ async fn run_loop_review(
         review_text.push('\n');
     }
     review_text.push_str("Is this session making PROGRESS or is it STUCK?");
+    review_text
+}
+
+async fn run_loop_review(
+    registry: &ProviderRegistry,
+    review_model: &Model,
+    messages: &[Message],
+    options: &StreamOptions,
+    config: &AgentConfig,
+    event_tx: &EventSender,
+) -> bool {
+    let _ = event_tx.try_send(StreamEvent::Phase {
+        phase: tau_agent_base::types::AgentPhase::Compacting,
+        turn_started_at_ms: None,
+        phase_started_at_ms: None,
+    });
+
+    // Extract the last N messages for review.
+    let start = messages.len().saturating_sub(LOOP_REVIEW_MESSAGE_COUNT);
+    let recent: Vec<Message> = messages[start..].to_vec();
+
+    // Format them as a single user message for the reviewer.
+    let review_text = build_loop_review_text(&recent);
 
     let review_context = Context {
         system_prompt: Some(LOOP_REVIEW_SYSTEM_PROMPT.into()),
@@ -2975,5 +2985,46 @@ mod tests {
                 "tracked PGIDs should be empty after cancel"
             );
         });
+    }
+
+    /// Regression test for task 952: `&content[..1000]` would panic when the
+    /// 1000th byte fell inside a multi-byte UTF-8 character (e.g. the
+    /// box-drawing char `─`, U+2500, 3 bytes). After the fix the loop-review
+    /// text builder uses `truncate_str`, which rounds down to the nearest
+    /// char boundary instead of panicking.
+    #[test]
+    fn build_loop_review_text_does_not_panic_on_utf8_boundary() {
+        // 998 ASCII bytes followed by 5 box-drawing chars (3 bytes each).
+        // Boundaries land at 998, 1001, 1004, 1007, 1010, 1013 — so byte
+        // index 1000 is inside the first ─ and the old `&content[..1000]`
+        // would panic here.
+        let mut content = "a".repeat(998);
+        content.push_str("─────");
+        assert_eq!(content.len(), 998 + 15);
+
+        let tr = ToolResultMessage::success("tc1", "bash", content);
+        let messages = vec![Message::ToolResult(tr)];
+
+        let text = build_loop_review_text(&messages);
+
+        // Must contain the 998 "a"s and the truncation marker.
+        assert!(text.contains(&"a".repeat(998)));
+        assert!(text.contains("[...truncated...]"));
+        // Must not include the full ASCII run + all box-drawing chars
+        // (i.e. truncation actually happened).
+        assert!(!text.contains("─────"));
+    }
+
+    /// Sanity: short tool-result content takes the non-truncating path
+    /// and is included verbatim.
+    #[test]
+    fn build_loop_review_text_short_content_not_truncated() {
+        let tr = ToolResultMessage::success("tc1", "bash", "hello ─ world");
+        let messages = vec![Message::ToolResult(tr)];
+
+        let text = build_loop_review_text(&messages);
+
+        assert!(text.contains("hello ─ world"));
+        assert!(!text.contains("[...truncated...]"));
     }
 }
