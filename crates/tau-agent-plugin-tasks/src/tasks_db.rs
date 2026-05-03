@@ -349,8 +349,9 @@ impl TasksDb {
         Ok(Self { conn })
     }
 
-    /// Open an in-memory database (for tests).
-    #[cfg(test)]
+    /// Open an in-memory database. Primarily useful for tests across
+    /// crates that depend on `tau-agent-plugin-tasks`.
+    #[doc(hidden)]
     pub fn open_memory() -> tau_agent_plugin::Result<Self> {
         let conn =
             Connection::open_in_memory().map_err(plugin_io_err("open in-memory tasks db"))?;
@@ -1696,6 +1697,67 @@ impl TasksDb {
         let mut out = Vec::new();
         for row in rows {
             out.push(row.map_err(plugin_io_err("read project task session row"))?);
+        }
+        Ok(out)
+    }
+
+    /// Return `(task_id, session_id, role)` for every row in
+    /// `task_sessions`. Optionally restrict to a single project. Ordered by
+    /// `created_at` ascending so callers that only want the first
+    /// (task, session) pair can dedupe deterministically.
+    ///
+    /// Used by `tau profile tokens` to attribute per-session token usage
+    /// to a role and task without doing N+1 lookups via
+    /// [`TasksDb::get_sessions`].
+    pub fn list_task_session_roles(
+        &self,
+        project_name: Option<&str>,
+    ) -> tau_agent_plugin::Result<Vec<(i64, String, String)>> {
+        let mut out = Vec::new();
+        if let Some(p) = project_name {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT ts.task_id, ts.session_id, ts.role \
+                     FROM task_sessions ts \
+                     INNER JOIN tasks t ON t.id = ts.task_id \
+                     WHERE t.project_name = ?1 \
+                     ORDER BY ts.created_at",
+                )
+                .map_err(plugin_io_err("prepare list_task_session_roles"))?;
+            let rows = stmt
+                .query_map(params![p], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(plugin_io_err("list_task_session_roles"))?;
+            for row in rows {
+                out.push(row.map_err(plugin_io_err("read task_session role row"))?);
+            }
+        } else {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT task_id, session_id, role \
+                     FROM task_sessions \
+                     ORDER BY created_at",
+                )
+                .map_err(plugin_io_err("prepare list_task_session_roles"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(plugin_io_err("list_task_session_roles"))?;
+            for row in rows {
+                out.push(row.map_err(plugin_io_err("read task_session role row"))?);
+            }
         }
         Ok(out)
     }

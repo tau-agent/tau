@@ -752,6 +752,426 @@ pub fn session_cost_total(db: &Db, session_id: &str) -> crate::Result<f64> {
     Ok(total.unwrap_or(0.0))
 }
 
+// ---------------------------------------------------------------------------
+// `tau profile tokens` — token / cost rollups.
+// ---------------------------------------------------------------------------
+
+/// Token + cost totals over an arbitrary scope (a session, a role, a task).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost_usd: f64,
+}
+
+impl TokenUsage {
+    /// Sum of all four token counters. Cheap; called per row at print time.
+    pub fn total_tokens(&self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_write)
+    }
+}
+
+/// One row of the [`token_leaderboard`] / [`task_token_breakdown`] output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenRow {
+    /// Group key — session id, role name, or stringified task id.
+    pub group: String,
+    /// Number of distinct sessions folded into this row. `1` when grouping
+    /// by session.
+    pub sessions: u64,
+    pub tokens: TokenUsage,
+    /// Distinct model identifiers seen in the group, sorted ascending.
+    /// Empty when none of the contributing sessions had a recognisable
+    /// `model_json.id`.
+    pub models: Vec<String>,
+}
+
+/// Grouping axis for [`token_leaderboard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenGroupBy {
+    /// One row per session.
+    Session,
+    /// One row per `task_sessions.role` (worker / reviewer / planner / …).
+    /// Requires a `tasks_db` so the join can find the role of each session.
+    /// Sessions that have no `task_sessions` row are skipped.
+    Role,
+    /// One row per task. Requires a `tasks_db`. Sessions that have no
+    /// `task_sessions` row are skipped.
+    Task,
+}
+
+/// Sort axis for the leaderboard. Default in the CLI is `Cost`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSort {
+    Cost,
+    Tokens,
+    Input,
+    Output,
+}
+
+impl Default for TokenSort {
+    fn default() -> Self {
+        TokenSort::Cost
+    }
+}
+
+/// Per-session token totals pulled from `messages.message_json` under the
+/// current `ProfileFilter`. Cheap shared helper for the three public
+/// entry points below.
+struct SessionTotals {
+    session_id: String,
+    tokens: TokenUsage,
+    /// `model_json.id` from `sessions`, or empty string when missing.
+    model_id: String,
+    /// `sessions.project_name` (used only by callers that want to filter
+    /// further; the SQL already restricts on it when the filter sets it).
+    #[allow(dead_code)]
+    project_name: Option<String>,
+}
+
+/// Inner SQL for the per-session aggregate. Returns one row per session
+/// matching the project / since / until filters. The four token counters
+/// and the cost sum come from `json_extract` over the assistant `usage`
+/// blob. Messages without a `$.usage` (user, tool_result, info, …) are
+/// transparently skipped — `json_extract` returns NULL and `SUM` ignores
+/// NULLs.
+fn collect_session_totals(db: &Db, filter: &ProfileFilter) -> crate::Result<Vec<SessionTotals>> {
+    let conn = db.conn();
+
+    let mut sql = String::from(
+        "SELECT s.id, \
+                COALESCE(SUM(json_extract(m.message_json,'$.usage.input')),       0) AS in_t, \
+                COALESCE(SUM(json_extract(m.message_json,'$.usage.output')),      0) AS out_t, \
+                COALESCE(SUM(json_extract(m.message_json,'$.usage.cache_read')),  0) AS cr_t, \
+                COALESCE(SUM(json_extract(m.message_json,'$.usage.cache_write')), 0) AS cw_t, \
+                COALESCE(SUM(json_extract(m.message_json,'$.usage.cost.total')),  0.0) AS cost, \
+                json_extract(s.model_json,'$.id') AS model_id, \
+                s.project_name \
+         FROM sessions s \
+         LEFT JOIN messages m \
+             ON m.session_id = s.id \
+            AND json_extract(m.message_json,'$.usage') IS NOT NULL",
+    );
+    let mut clauses: Vec<String> = Vec::new();
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(s) = &filter.session_id {
+        clauses.push("s.id = ?".into());
+        args.push(rusqlite::types::Value::Text(s.clone()));
+    }
+    if let Some(p) = &filter.project {
+        clauses.push("s.project_name = ?".into());
+        args.push(rusqlite::types::Value::Text(p.clone()));
+    }
+    // The since/until window is on message timestamps, not session
+    // creation — this matches `buckets()` semantics and lets a long-lived
+    // session contribute partial usage. The clause is wrapped so that
+    // sessions with no matching messages still appear (they'll have
+    // zeroed totals).
+    if let Some(t) = filter.since_ms {
+        clauses
+            .push("(json_extract(m.message_json,'$.timestamp') IS NULL OR json_extract(m.message_json,'$.timestamp') >= ?)".into());
+        args.push(rusqlite::types::Value::Integer(t));
+    }
+    if let Some(t) = filter.until_ms {
+        clauses
+            .push("(json_extract(m.message_json,'$.timestamp') IS NULL OR json_extract(m.message_json,'$.timestamp') <= ?)".into());
+        args.push(rusqlite::types::Value::Integer(t));
+    }
+    if !clauses.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&clauses.join(" AND "));
+    }
+    sql.push_str(" GROUP BY s.id");
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| crate::Error::Io(format!("prepare token totals: {}", e)))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            let sid: String = row.get(0)?;
+            let in_t: i64 = row.get(1)?;
+            let out_t: i64 = row.get(2)?;
+            let cr_t: i64 = row.get(3)?;
+            let cw_t: i64 = row.get(4)?;
+            let cost: f64 = row.get(5)?;
+            let model_id: Option<String> = row.get(6)?;
+            let project_name: Option<String> = row.get(7)?;
+            Ok(SessionTotals {
+                session_id: sid,
+                tokens: TokenUsage {
+                    input: in_t.max(0) as u64,
+                    output: out_t.max(0) as u64,
+                    cache_read: cr_t.max(0) as u64,
+                    cache_write: cw_t.max(0) as u64,
+                    cost_usd: cost,
+                },
+                model_id: model_id.unwrap_or_default(),
+                project_name,
+            })
+        })
+        .map_err(|e| crate::Error::Io(format!("query token totals: {}", e)))?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| crate::Error::Io(format!("row token totals: {}", e)))?);
+    }
+    Ok(out)
+}
+
+/// Sort a vec of [`TokenRow`] in place by the requested axis, descending.
+fn sort_token_rows(rows: &mut [TokenRow], sort: TokenSort) {
+    match sort {
+        TokenSort::Cost => rows.sort_by(|a, b| {
+            b.tokens
+                .cost_usd
+                .partial_cmp(&a.tokens.cost_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        TokenSort::Tokens => {
+            rows.sort_by(|a, b| b.tokens.total_tokens().cmp(&a.tokens.total_tokens()))
+        }
+        TokenSort::Input => rows.sort_by(|a, b| b.tokens.input.cmp(&a.tokens.input)),
+        TokenSort::Output => rows.sort_by(|a, b| b.tokens.output.cmp(&a.tokens.output)),
+    }
+}
+
+/// Helper: fold a [`TokenUsage`] delta into an accumulator.
+fn fold_usage(acc: &mut TokenUsage, delta: &TokenUsage) {
+    acc.input = acc.input.saturating_add(delta.input);
+    acc.output = acc.output.saturating_add(delta.output);
+    acc.cache_read = acc.cache_read.saturating_add(delta.cache_read);
+    acc.cache_write = acc.cache_write.saturating_add(delta.cache_write);
+    acc.cost_usd += delta.cost_usd;
+}
+
+/// Token leaderboard across all sessions matching `filter`, grouped by
+/// `group_by`.
+///
+/// - `TokenGroupBy::Session` is pure sessions-DB and ignores `tasks_db`.
+/// - `TokenGroupBy::Role` and `TokenGroupBy::Task` join on
+///   `task_sessions` from `tasks_db`. Sessions that have no
+///   `task_sessions` row are skipped (orchestrator / interactive
+///   sessions usually fall here unless they were promoted to a task).
+///
+/// `role_filter` restricts Role/Task rollups to one role (e.g.
+/// `"worker"`). Ignored for `TokenGroupBy::Session`.
+///
+/// Sort order is descending by `sort`. The CLI defaults to
+/// [`TokenSort::Cost`].
+pub fn token_leaderboard(
+    db: &Db,
+    filter: &ProfileFilter,
+    group_by: TokenGroupBy,
+    role_filter: Option<&str>,
+    sort: TokenSort,
+    tasks_db: Option<&tau_agent_plugin_tasks::tasks_db::TasksDb>,
+) -> crate::Result<Vec<TokenRow>> {
+    let totals = collect_session_totals(db, filter)?;
+
+    match group_by {
+        TokenGroupBy::Session => {
+            let mut rows: Vec<TokenRow> = totals
+                .into_iter()
+                .map(|t| {
+                    let models = if t.model_id.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![t.model_id]
+                    };
+                    TokenRow {
+                        group: t.session_id,
+                        sessions: 1,
+                        tokens: t.tokens,
+                        models,
+                    }
+                })
+                .collect();
+            sort_token_rows(&mut rows, sort);
+            Ok(rows)
+        }
+        TokenGroupBy::Role | TokenGroupBy::Task => {
+            let tasks_db = tasks_db.ok_or_else(|| {
+                crate::Error::Parse(
+                    "token_leaderboard with Role/Task grouping requires a TasksDb".into(),
+                )
+            })?;
+            // Build session_id -> (task_id, role) map. Use the project
+            // filter when present to avoid pulling unrelated tasks.
+            let session_map = load_task_session_map(tasks_db, filter.project.as_deref())?;
+            let mut groups: std::collections::BTreeMap<
+                String,
+                (u64, TokenUsage, std::collections::BTreeSet<String>),
+            > = std::collections::BTreeMap::new();
+            // Track per-group seen sessions so a session counted under a
+            // (task, role) is only folded once.
+            let mut seen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+                std::collections::BTreeMap::new();
+            for st in totals {
+                let Some(meta) = session_map.get(&st.session_id) else {
+                    continue;
+                };
+                if let Some(rf) = role_filter {
+                    if meta.role != rf {
+                        continue;
+                    }
+                }
+                let key = match group_by {
+                    TokenGroupBy::Role => meta.role.clone(),
+                    TokenGroupBy::Task => meta.task_id.to_string(),
+                    TokenGroupBy::Session => unreachable!(),
+                };
+                let group_seen = seen.entry(key.clone()).or_default();
+                if !group_seen.insert(st.session_id.clone()) {
+                    // Already folded this session into this group (a session
+                    // can have multiple task_sessions rows for the same
+                    // task+role; record_session is idempotent on (task,
+                    // session) but a session could in principle appear under
+                    // multiple tasks — that's intentional under Role and
+                    // distinguished under Task).
+                    continue;
+                }
+                let entry = groups.entry(key).or_insert_with(|| {
+                    (
+                        0u64,
+                        TokenUsage::default(),
+                        std::collections::BTreeSet::new(),
+                    )
+                });
+                entry.0 += 1;
+                fold_usage(&mut entry.1, &st.tokens);
+                if !st.model_id.is_empty() {
+                    entry.2.insert(st.model_id.clone());
+                }
+            }
+            let mut rows: Vec<TokenRow> = groups
+                .into_iter()
+                .map(|(k, (n, tokens, models))| TokenRow {
+                    group: k,
+                    sessions: n,
+                    tokens,
+                    models: models.into_iter().collect(),
+                })
+                .collect();
+            sort_token_rows(&mut rows, sort);
+            Ok(rows)
+        }
+    }
+}
+
+/// Sum the per-message `usage.{input,output,cache_read,cache_write}` and
+/// `usage.cost.total` over all messages in `session_id`. Mirror of
+/// [`session_cost_total`] but covering the four token counters too.
+pub fn session_token_breakdown(db: &Db, session_id: &str) -> crate::Result<TokenUsage> {
+    let conn = db.conn();
+    let row = conn
+        .query_row(
+            "SELECT COALESCE(SUM(json_extract(message_json,'$.usage.input')),       0), \
+                    COALESCE(SUM(json_extract(message_json,'$.usage.output')),      0), \
+                    COALESCE(SUM(json_extract(message_json,'$.usage.cache_read')),  0), \
+                    COALESCE(SUM(json_extract(message_json,'$.usage.cache_write')), 0), \
+                    COALESCE(SUM(json_extract(message_json,'$.usage.cost.total')),  0.0) \
+             FROM messages \
+             WHERE session_id = ?1 \
+               AND json_extract(message_json,'$.usage') IS NOT NULL",
+            params![session_id],
+            |row| {
+                let in_t: i64 = row.get(0)?;
+                let out_t: i64 = row.get(1)?;
+                let cr_t: i64 = row.get(2)?;
+                let cw_t: i64 = row.get(3)?;
+                let cost: f64 = row.get(4)?;
+                Ok(TokenUsage {
+                    input: in_t.max(0) as u64,
+                    output: out_t.max(0) as u64,
+                    cache_read: cr_t.max(0) as u64,
+                    cache_write: cw_t.max(0) as u64,
+                    cost_usd: cost,
+                })
+            },
+        )
+        .map_err(|e| crate::Error::Io(format!("sum session tokens: {}", e)))?;
+    Ok(row)
+}
+
+/// Per-task token rollup: returns one [`TokenRow`] per
+/// `(task_session.role, task_session.session_id)` entry for `task_id`,
+/// sorted by cost descending. The `group` field is the role (e.g.
+/// `"worker"`); `sessions` is always `1`.
+///
+/// Multiple sessions sharing the same role on the same task each get
+/// their own row — useful when a task was retried (two `worker` sessions)
+/// or had a planner + a refiner.
+pub fn task_token_breakdown(
+    sessions_db: &Db,
+    tasks_db: &tau_agent_plugin_tasks::tasks_db::TasksDb,
+    task_id: i64,
+) -> crate::Result<Vec<TokenRow>> {
+    let task_sessions = tasks_db
+        .get_sessions(task_id)
+        .map_err(|e| crate::Error::Io(format!("load task_sessions for task {}: {}", task_id, e)))?;
+
+    let mut rows: Vec<TokenRow> = Vec::with_capacity(task_sessions.len());
+    for ts in task_sessions {
+        let tokens = session_token_breakdown(sessions_db, &ts.session_id)?;
+        // Pull the model id from the session row for the `models` column.
+        let model_id: Option<String> = sessions_db
+            .conn()
+            .query_row(
+                "SELECT json_extract(model_json,'$.id') FROM sessions WHERE id = ?1",
+                params![&ts.session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(|e| crate::Error::Io(format!("load session model: {}", e)))?;
+        let models = match model_id {
+            Some(s) if !s.is_empty() => vec![s],
+            _ => Vec::new(),
+        };
+        rows.push(TokenRow {
+            group: ts.role,
+            sessions: 1,
+            tokens,
+            models,
+        });
+    }
+    sort_token_rows(&mut rows, TokenSort::Cost);
+    Ok(rows)
+}
+
+/// Per-session metadata pulled from `task_sessions`. Used to enrich the
+/// per-session totals with role / task information.
+struct TaskSessionMeta {
+    task_id: i64,
+    role: String,
+}
+
+/// Build a `session_id -> (task_id, role)` map from `task_sessions`.
+///
+/// When a session is referenced by multiple `task_sessions` rows (rare —
+/// a session is typically owned by one task) we keep the first one. The
+/// callers are aggregations, not point lookups, so collisions just
+/// affect which group a session contributes to, not correctness of
+/// totals.
+fn load_task_session_map(
+    tasks_db: &tau_agent_plugin_tasks::tasks_db::TasksDb,
+    project: Option<&str>,
+) -> crate::Result<std::collections::HashMap<String, TaskSessionMeta>> {
+    let rows = tasks_db
+        .list_task_session_roles(project)
+        .map_err(|e| crate::Error::Io(format!("list task_sessions: {}", e)))?;
+    let mut out: std::collections::HashMap<String, TaskSessionMeta> =
+        std::collections::HashMap::new();
+    for (task_id, session_id, role) in rows {
+        out.entry(session_id)
+            .or_insert(TaskSessionMeta { task_id, role });
+    }
+    Ok(out)
+}
+
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1451,5 +1871,298 @@ mod tests {
                 s.bucket
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // `tau profile tokens` — token / cost rollup tests.
+    // ---------------------------------------------------------------
+
+    use tau_agent_plugin_tasks::tasks_db::TasksDb;
+
+    /// Build an assistant `Message` with a fully-populated `Usage`.
+    fn assistant_with_usage(
+        ts: u64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        cost: f64,
+    ) -> Message {
+        let usage = Usage {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            total_tokens: input + output + cache_read + cache_write,
+            cost: crate::types::Cost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: cost,
+            },
+        };
+        Message::Assistant(AssistantMessage {
+            content: vec![],
+            api: "anthropic".into(),
+            provider: "anthropic".into(),
+            model: "claude-test".into(),
+            response_id: None,
+            usage,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: ts,
+        })
+    }
+
+    /// Make an in-memory tasks DB and seed `(task_id, role)` rows so the
+    /// joins in `token_leaderboard` / `task_token_breakdown` find the
+    /// caller's sessions.
+    fn seed_tasks(
+        rows: &[(i64, &str, &str, &str)], // (nominal task_id, project, role, session_id)
+    ) -> (TasksDb, std::collections::HashMap<i64, i64>) {
+        let tasks = TasksDb::open_memory().expect("open tasks mem");
+        let mut id_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for (nominal, project, _role, _sid) in rows {
+            if id_map.contains_key(nominal) {
+                continue;
+            }
+            let title = format!("task-{}", nominal);
+            let task = tasks
+                .create_task(
+                    project,
+                    &title,
+                    None,
+                    None,
+                    None,
+                    false,
+                    "ready",
+                    false,
+                    None,
+                    None,
+                    false,
+                    None,
+                    false,
+                    tau_agent_plugin_tasks::tasks_db::FiledBy::default(),
+                )
+                .expect("create task");
+            id_map.insert(*nominal, task.id);
+        }
+        for (nominal, _project, role, sid) in rows {
+            let real = id_map.get(nominal).copied().expect("id mapped");
+            tasks
+                .record_session(real, sid, role)
+                .expect("record_session");
+        }
+        (tasks, id_map)
+    }
+
+    #[test]
+    fn token_leaderboard_groups_by_role() {
+        // Three sessions, two `worker`, one `reviewer`. The role rollup
+        // should sum the two workers and report the reviewer separately.
+        let db = Db::open_memory().expect("open mem");
+        for sid in ["s-w1", "s-w2", "s-rv"] {
+            make_session(&db, sid, Some("proj"));
+        }
+        // Each session contributes a single assistant message.
+        db.append_message("s-w1", &assistant_with_usage(1_000, 100, 50, 10, 5, 0.10))
+            .expect("w1");
+        db.append_message("s-w2", &assistant_with_usage(1_000, 200, 80, 20, 0, 0.20))
+            .expect("w2");
+        db.append_message("s-rv", &assistant_with_usage(1_000, 50, 25, 0, 0, 0.05))
+            .expect("rv");
+
+        let (tasks, _ids) = seed_tasks(&[
+            (1, "proj", "worker", "s-w1"),
+            (2, "proj", "worker", "s-w2"),
+            (1, "proj", "reviewer", "s-rv"),
+        ]);
+
+        let rows = token_leaderboard(
+            &db,
+            &ProfileFilter::default(),
+            TokenGroupBy::Role,
+            None,
+            TokenSort::Cost,
+            Some(&tasks),
+        )
+        .expect("leaderboard");
+
+        assert_eq!(rows.len(), 2, "one row per role");
+        let worker = rows
+            .iter()
+            .find(|r| r.group == "worker")
+            .expect("worker row");
+        assert_eq!(worker.sessions, 2);
+        assert_eq!(worker.tokens.input, 300);
+        assert_eq!(worker.tokens.output, 130);
+        assert_eq!(worker.tokens.cache_read, 30);
+        assert_eq!(worker.tokens.cache_write, 5);
+        assert!((worker.tokens.cost_usd - 0.30).abs() < 1e-9);
+
+        let reviewer = rows
+            .iter()
+            .find(|r| r.group == "reviewer")
+            .expect("reviewer row");
+        assert_eq!(reviewer.sessions, 1);
+        assert_eq!(reviewer.tokens.input, 50);
+
+        // Cost-desc default: worker > reviewer.
+        assert_eq!(rows[0].group, "worker");
+    }
+
+    #[test]
+    fn token_leaderboard_project_filter() {
+        let db = Db::open_memory().expect("open mem");
+        make_session(&db, "a1", Some("alpha"));
+        make_session(&db, "b1", Some("beta"));
+        db.append_message("a1", &assistant_with_usage(0, 100, 0, 0, 0, 1.0))
+            .expect("a1");
+        db.append_message("b1", &assistant_with_usage(0, 999, 0, 0, 0, 9.99))
+            .expect("b1");
+
+        let rows = token_leaderboard(
+            &db,
+            &ProfileFilter {
+                project: Some("alpha".into()),
+                ..Default::default()
+            },
+            TokenGroupBy::Session,
+            None,
+            TokenSort::Cost,
+            None,
+        )
+        .expect("leaderboard");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group, "a1");
+        assert_eq!(rows[0].tokens.input, 100);
+        assert!((rows[0].tokens.cost_usd - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_token_breakdown_sums_usage_fields() {
+        let db = Db::open_memory().expect("open mem");
+        make_session(&db, "s1", None);
+        // Three assistant messages plus one user (which has no usage and
+        // must not poison the SUM).
+        db.append_message("s1", &user_at(500, "hi")).expect("user");
+        db.append_message("s1", &assistant_with_usage(1_000, 10, 5, 1, 2, 0.05))
+            .expect("a1");
+        db.append_message("s1", &assistant_with_usage(2_000, 20, 8, 3, 0, 0.10))
+            .expect("a2");
+        db.append_message("s1", &assistant_with_usage(3_000, 30, 12, 0, 4, 0.15))
+            .expect("a3");
+
+        let usage = session_token_breakdown(&db, "s1").expect("breakdown");
+        assert_eq!(usage.input, 60);
+        assert_eq!(usage.output, 25);
+        assert_eq!(usage.cache_read, 4);
+        assert_eq!(usage.cache_write, 6);
+        assert!((usage.cost_usd - 0.30).abs() < 1e-9);
+        assert_eq!(usage.total_tokens(), 60 + 25 + 4 + 6);
+    }
+
+    #[test]
+    fn task_token_breakdown_lists_one_row_per_role() {
+        let db = Db::open_memory().expect("open mem");
+        make_session(&db, "sw", Some("proj"));
+        make_session(&db, "sr", Some("proj"));
+        // Worker spends more than reviewer.
+        db.append_message("sw", &assistant_with_usage(0, 1_000, 500, 0, 0, 5.00))
+            .expect("sw");
+        db.append_message("sr", &assistant_with_usage(0, 100, 50, 0, 0, 0.50))
+            .expect("sr");
+
+        let (tasks, ids) =
+            seed_tasks(&[(42, "proj", "worker", "sw"), (42, "proj", "reviewer", "sr")]);
+        let real_id = ids[&42];
+
+        let rows = task_token_breakdown(&db, &tasks, real_id).expect("task breakdown");
+        assert_eq!(rows.len(), 2);
+        // Cost-desc.
+        assert_eq!(rows[0].group, "worker");
+        assert_eq!(rows[1].group, "reviewer");
+        assert_eq!(rows[0].sessions, 1);
+        assert!((rows[0].tokens.cost_usd - 5.00).abs() < 1e-9);
+        assert!((rows[1].tokens.cost_usd - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn token_leaderboard_distinct_models_per_group() {
+        // Two sessions with different model ids, both rolled up into the
+        // same role. The `models` vec must list both, sorted, deduped.
+        let db = Db::open_memory().expect("open mem");
+        let mut m1 = test_model();
+        m1.id = "claude-3-opus".into();
+        let mut m2 = test_model();
+        m2.id = "claude-3-sonnet".into();
+        make_session_with_model(&db, "s-opus", m1);
+        make_session_with_model(&db, "s-sonnet", m2);
+        db.append_message("s-opus", &assistant_with_usage(0, 10, 1, 0, 0, 0.01))
+            .expect("opus");
+        db.append_message("s-sonnet", &assistant_with_usage(0, 10, 1, 0, 0, 0.01))
+            .expect("sonnet");
+
+        let (tasks, _ids) =
+            seed_tasks(&[(1, "", "worker", "s-opus"), (2, "", "worker", "s-sonnet")]);
+
+        let rows = token_leaderboard(
+            &db,
+            &ProfileFilter::default(),
+            TokenGroupBy::Role,
+            None,
+            TokenSort::Cost,
+            Some(&tasks),
+        )
+        .expect("leaderboard");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.group, "worker");
+        assert_eq!(row.sessions, 2);
+        assert_eq!(row.models, vec!["claude-3-opus", "claude-3-sonnet"]);
+    }
+
+    #[test]
+    fn token_leaderboard_ignores_messages_without_usage() {
+        // User and tool_result messages have no `$.usage` blob — the
+        // SUM must skip them via the `IS NOT NULL` join filter so the
+        // assistant totals are reported untouched. Regression for an
+        // earlier draft that joined unconditionally and tripped over
+        // SQLite's behaviour of folding NULLs into 0.
+        let db = Db::open_memory().expect("open mem");
+        make_session(&db, "s", None);
+        db.append_message("s", &user_at(0, "hi")).expect("u1");
+        db.append_message(
+            "s",
+            &assistant_with_usage(
+                1_000, /*in*/ 100, /*out*/ 50, /*cr*/ 10, /*cw*/ 5, 0.42,
+            ),
+        )
+        .expect("a");
+        db.append_message("s", &tool_result_at(2_000, "call-1", "bash", "ok"))
+            .expect("tr");
+        db.append_message("s", &user_at(3_000, "thanks"))
+            .expect("u2");
+
+        let usage = session_token_breakdown(&db, "s").expect("breakdown");
+        assert_eq!(usage.input, 100);
+        assert_eq!(usage.output, 50);
+        assert_eq!(usage.cache_read, 10);
+        assert_eq!(usage.cache_write, 5);
+        assert!((usage.cost_usd - 0.42).abs() < 1e-9);
+
+        let rows = token_leaderboard(
+            &db,
+            &ProfileFilter::default(),
+            TokenGroupBy::Session,
+            None,
+            TokenSort::Cost,
+            None,
+        )
+        .expect("leaderboard");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tokens.input, 100);
+        assert_eq!(rows[0].tokens.output, 50);
     }
 }
