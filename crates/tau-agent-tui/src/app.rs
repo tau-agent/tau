@@ -4863,6 +4863,7 @@ mod tests {
             last_exit_status: None,
             is_live: true,
             project_name: None,
+            successor_id: None,
             turn_started_at_ms: Some(started_30s_ago),
             phase_started_at_ms: Some(started_30s_ago),
         };
@@ -6243,6 +6244,7 @@ mod tests {
             last_exit_status: None,
             is_live: true,
             project_name: None,
+            successor_id: None,
             turn_started_at_ms: None,
             phase_started_at_ms: None,
         };

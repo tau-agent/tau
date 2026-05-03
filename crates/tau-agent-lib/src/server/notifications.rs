@@ -28,6 +28,23 @@
 //! `.await`: it clones the subscriber senders out of the map, drops the
 //! state lock, and then awaits each send. This avoids a slow subscriber
 //! blocking unrelated session traffic.
+//!
+//! # Successor resolution (task 914)
+//!
+//! `queue_message_to_session`, `queue_and_maybe_resume`, and
+//! `notify_parent_of_child_completion` resolve the target session through
+//! [`crate::db::Db::resolve_successor`] **before** persisting the queued
+//! message and flagging `has_queued`. The resolve + write happens inside
+//! a single `lock_state` acquisition so there's no window where a
+//! `Request::SetSessionSuccessor` can land between the resolve and the
+//! insert.
+//!
+//! The broadcast paths (`broadcast_to_subscribers`,
+//! `broadcast_to_subscribers_and_wait`) intentionally do **not** resolve.
+//! Those carry in-flight `TextDelta` / `ThinkingDelta` / `Phase` / `Status`
+//! events for the session that's actually running its turn; subscribers
+//! attached to a predecessor that is mid-turn must keep receiving its
+//! traffic until the turn completes.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +58,12 @@ use crate::types::*;
 
 /// Queue a message for delivery to a target session.
 /// Persists immediately and sets the has_queued flag for in-flight agent loops.
+///
+/// The target id is resolved through the successor chain (see
+/// [`crate::db::Db::resolve_successor`]) so messages aimed at a retired
+/// session land on the live tip. Resolution happens under the same lock
+/// as the persist + flag, so there's no race against a concurrent
+/// `SetSessionSuccessor` request.
 pub(super) fn queue_message_to_session(
     state: &SharedState,
     target: &str,
@@ -48,9 +71,10 @@ pub(super) fn queue_message_to_session(
     sender_info: &str,
 ) {
     let mut st = lock_state(state);
-    st.db.queue_message(target, content, sender_info).ok();
+    let resolved = st.db.resolve_successor(target);
+    st.db.queue_message(&resolved, content, sender_info).ok();
     st.has_queued
-        .entry(target.to_string())
+        .entry(resolved)
         .or_insert_with(|| Arc::new(AtomicBool::new(false)))
         .store(true, Ordering::Release);
 }
@@ -117,6 +141,12 @@ pub(super) fn record_message_to_log_session(state: &SharedState, target: &str, c
 
 /// Queue a message and, if the target session is idle, spawn a resume task so
 /// the message is processed without waiting for the next user interaction.
+///
+/// The target is resolved through the successor chain so retired sessions
+/// forward to their live tip (task 914). Resolution + queue happen under
+/// the same lock; the resolved id is then reused for the `session_lock`
+/// check and the spawned `resume_child_session` so we resume the live
+/// session rather than the retired predecessor.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn queue_and_maybe_resume(
     state: &SharedState,
@@ -129,10 +159,21 @@ pub(super) fn queue_and_maybe_resume(
     sender_info: &str,
     test_overrides: &SharedTestOverrides,
 ) {
-    queue_message_to_session(state, target, content, sender_info);
-    // If the target session is idle (lock is free), spawn a resume task.
+    // Resolve + persist + flag under one lock so a concurrent
+    // SetSessionSuccessor can't slip between resolve and write.
+    let resolved = {
+        let mut st = lock_state(state);
+        let resolved = st.db.resolve_successor(target);
+        st.db.queue_message(&resolved, content, sender_info).ok();
+        st.has_queued
+            .entry(resolved.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .store(true, Ordering::Release);
+        resolved
+    };
+    // If the (resolved) target session is idle (lock is free), spawn a resume task.
     let needs_resume = {
-        let lock = session_lock(session_locks, target);
+        let lock = session_lock(session_locks, &resolved);
         lock.try_lock().is_some()
     };
     if needs_resume {
@@ -142,7 +183,7 @@ pub(super) fn queue_and_maybe_resume(
         let sl = session_locks.clone();
         let th = throttle.clone();
         let ov = test_overrides.clone();
-        let sid = target.to_string();
+        let sid = resolved;
         smol::spawn(async move {
             if let Err(e) = resume_child_session(s, p, sh, sl, th, sid.clone(), ov).await {
                 tracing::warn!(session_id = %sid, %e, "resume session after queued message failed");
@@ -179,7 +220,13 @@ pub(super) fn notify_parent_of_child_completion(
         {
             return;
         }
-        let parent = child.and_then(|s| s.parent_id);
+        // Resolve the parent through the successor chain (task 914) so a
+        // retired parent forwards the completion notice to its live tip.
+        // Resolution happens under the same lock that read `child` so a
+        // concurrent SetSessionSuccessor can't slip in.
+        let parent = child
+            .and_then(|s| s.parent_id)
+            .map(|pid| st.db.resolve_successor(&pid));
         let summary = st
             .db
             .get_messages(child_session_id)
@@ -543,6 +590,32 @@ mod tests {
         }))
     }
 
+    /// Insert a minimal session into the in-memory db.  Used by the
+    /// successor-resolution tests below.
+    fn insert_session(state: &SharedState, id: &str) {
+        let st = lock_state(state);
+        st.db
+            .create_session(&crate::db::StoredSession {
+                id: id.into(),
+                model: mk_model(),
+                system_prompt: None,
+                cwd: None,
+                is_subscription: false,
+                created_at: 1000,
+                parent_id: None,
+                child_budget: 0,
+                tagline: None,
+                archived: false,
+                last_exit_status: None,
+                last_phase: None,
+                auto_archive: false,
+                notify_parent: true,
+                project_name: None,
+                successor_id: None,
+            })
+            .expect("create session");
+    }
+
     /// A bounded-buffer subscriber should backpressure `broadcast_to_subscribers_and_wait`
     /// until its receiver reads. This guards the ordering guarantee that
     /// motivated this module (TUI must observe `AgentDone` before idleness).
@@ -770,5 +843,125 @@ mod tests {
         assert!(matches!(entry.0, crate::types::AgentPhase::Idle));
         assert_eq!(entry.1, None);
         assert_eq!(entry.2, None);
+    }
+
+    // -----------------------------------------------------------------
+    // Task 914: successor resolution tests
+    // -----------------------------------------------------------------
+
+    /// `queue_message_to_session` targeting a retired session must land
+    /// the message on the live successor and flag *its* `has_queued`.
+    #[test]
+    fn queue_message_lands_on_successor() {
+        let state = mk_state();
+        insert_session(&state, "s_old");
+        insert_session(&state, "s_new");
+        {
+            let st = lock_state(&state);
+            st.db.set_successor("s_old", Some("s_new")).expect("set");
+        }
+        queue_message_to_session(&state, "s_old", "hello", "sender");
+
+        let st = lock_state(&state);
+        let drained = st
+            .db
+            .drain_queued_messages("s_new")
+            .expect("drain successor");
+        assert_eq!(drained.len(), 1, "message landed on the successor");
+        let drained_old = st
+            .db
+            .drain_queued_messages("s_old")
+            .expect("drain predecessor");
+        assert!(
+            drained_old.is_empty(),
+            "predecessor must not receive the message"
+        );
+        // has_queued flag must point at the successor, not the predecessor.
+        assert!(
+            st.has_queued
+                .get("s_new")
+                .map(|f| f.load(Ordering::Acquire))
+                .unwrap_or(false),
+            "has_queued must be flagged on the successor"
+        );
+        assert!(
+            !st.has_queued
+                .get("s_old")
+                .map(|f| f.load(Ordering::Acquire))
+                .unwrap_or(false),
+            "has_queued must NOT be flagged on the predecessor"
+        );
+    }
+
+    /// A self-cycle in the successor chain short-circuits without
+    /// looping forever; the message lands on the last reachable session.
+    #[test]
+    fn queue_message_cycle_short_circuits() {
+        let state = mk_state();
+        insert_session(&state, "s_a");
+        insert_session(&state, "s_b");
+        {
+            let st = lock_state(&state);
+            st.db.set_successor("s_a", Some("s_b")).expect("set");
+            st.db.set_successor("s_b", Some("s_a")).expect("set");
+        }
+        queue_message_to_session(&state, "s_a", "hi", "sender");
+        // Resolver from s_a walks: s_a -> s_b (visit), would-revisit s_a -> stop at s_b.
+        let st = lock_state(&state);
+        let drained = st.db.drain_queued_messages("s_b").expect("drain");
+        assert_eq!(drained.len(), 1);
+    }
+
+    /// An archived successor falls back to the predecessor (last live link).
+    #[test]
+    fn queue_message_archived_successor_falls_back() {
+        let state = mk_state();
+        insert_session(&state, "s_old");
+        insert_session(&state, "s_new");
+        {
+            let st = lock_state(&state);
+            st.db.set_successor("s_old", Some("s_new")).expect("set");
+            st.db.archive_session_tree("s_new").expect("archive");
+        }
+        queue_message_to_session(&state, "s_old", "hi", "sender");
+        let st = lock_state(&state);
+        let drained = st.db.drain_queued_messages("s_old").expect("drain");
+        assert_eq!(
+            drained.len(),
+            1,
+            "archived successor falls back to predecessor"
+        );
+    }
+
+    /// Broadcast paths must NOT resolve through the successor chain;
+    /// in-flight delta traffic for a predecessor's running turn belongs
+    /// on subscribers attached to the predecessor.
+    #[test]
+    fn broadcasts_do_not_follow_successor() {
+        let state = mk_state();
+        insert_session(&state, "s_old");
+        insert_session(&state, "s_new");
+        {
+            let st = lock_state(&state);
+            st.db.set_successor("s_old", Some("s_new")).expect("set");
+        }
+        // Subscribe on the predecessor only.  A broadcast targeted at the
+        // predecessor should still land on the predecessor's subscriber
+        // queue, not be silently redirected to the successor.
+        let (tx, rx) = smol::channel::bounded::<Response>(4);
+        {
+            let mut st = lock_state(&state);
+            st.subscribers.insert("s_old".into(), vec![tx]);
+        }
+        broadcast_to_subscribers(&state, "s_old", &Response::AgentDone);
+        // The subscriber on the predecessor sees the event.
+        assert!(matches!(rx.try_recv(), Ok(Response::AgentDone)));
+        // No subscriber registered for s_new, so no delivery happens there
+        // (and crucially, this test does not register one to receive).
+        let st = lock_state(&state);
+        assert!(
+            !st.subscribers.contains_key("s_new"),
+            "broadcast must not register or redirect to the successor"
+        );
     }
 }

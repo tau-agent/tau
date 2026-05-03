@@ -164,6 +164,11 @@ fn format_message(task: &Task, from: TaskState, context: Option<&str>) -> String
 ///   parent-task session (first available anchor wins).
 ///
 /// Archived sessions are skipped (via per-session `GetSessionInfo`).
+/// Each candidate id is run through [`resolve_successor_via_server`]
+/// before being inserted into the dedupe set, so retired sessions
+/// forward to their live tip and old + new ids that resolve to the same
+/// tip collapse into a single delivery (task 914).
+
 fn collect_recipients(
     db: &TasksDb,
     task: &Task,
@@ -174,13 +179,13 @@ fn collect_recipients(
 
     // 1. Task's own session_id (may or may not be in task_sessions).
     if let Some(ref sid) = task.session_id {
-        set.insert(sid.clone());
+        set.insert(resolve_successor_via_server(sid, writer, reader));
     }
 
     // 2. Every recorded task_sessions row.
     if let Ok(sessions) = db.get_sessions(task.id) {
         for ts in sessions {
-            set.insert(ts.session_id);
+            set.insert(resolve_successor_via_server(&ts.session_id, writer, reader));
         }
     }
 
@@ -189,7 +194,7 @@ fn collect_recipients(
         if let Ok(parent_sessions) = db.get_sessions(parent_id) {
             for ts in parent_sessions {
                 if ts.role == "creator" || ts.role == "interactive" {
-                    set.insert(ts.session_id);
+                    set.insert(resolve_successor_via_server(&ts.session_id, writer, reader));
                 }
             }
         }
@@ -206,13 +211,34 @@ fn collect_recipients(
     //    task's session subtree and accumulates a timeline of the task's
     //    life; it receives every legitimate state transition.
     if let Some(ref sid) = task.placeholder_session_id {
-        set.insert(sid.clone());
+        set.insert(resolve_successor_via_server(sid, writer, reader));
     }
 
     // 6. Filter archived sessions.
     set.into_iter()
         .filter(|sid| !is_session_archived(sid, writer, reader))
         .collect()
+}
+
+/// Resolve `id` through the successor chain via the server.  Returns
+/// the resolved tip on success, or `id` unchanged on RPC failure (we'd
+/// rather deliver to the predecessor than swallow the message).  See
+/// task 914 for context.
+fn resolve_successor_via_server(
+    id: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> String {
+    match server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::ResolveSuccessor {
+            session_id: id.to_string(),
+        },
+    ) {
+        Ok(tau_agent_plugin::Response::ResolvedSuccessor { session_id }) => session_id,
+        _ => id.to_string(),
+    }
 }
 
 /// Find the session recorded with role `"creator"` on the task, if any.
@@ -794,6 +820,9 @@ mod tests {
         read_buf: Vec<u8>,
         archived_sessions: HashSet<String>,
         ancestors: HashMap<String, Vec<SessionInfo>>,
+        /// Map of session_id -> resolved tip for ResolveSuccessor RPC.
+        /// A session id missing from the map resolves to itself.
+        successors: HashMap<String, String>,
         /// Captured (target_session_id, text) pairs from QueueInfo.
         queue_info_calls: Vec<(String, String)>,
         /// Captured (target, content, sender_info, await_reply) tuples
@@ -810,6 +839,7 @@ mod tests {
                 read_buf: Vec::new(),
                 archived_sessions: HashSet::new(),
                 ancestors: HashMap::new(),
+                successors: HashMap::new(),
                 queue_info_calls: Vec::new(),
                 queue_message_calls: Vec::new(),
                 set_tagline_calls: Vec::new(),
@@ -896,6 +926,22 @@ mod tests {
                     });
                     Response::SessionAncestors { sessions }
                 }
+                Request::ResolveSuccessor { session_id } => {
+                    // Walk the test successor map (with cycle protection)
+                    // so test scenarios can express longer chains.
+                    let mut visited: HashSet<String> = HashSet::new();
+                    visited.insert(session_id.clone());
+                    let mut current = session_id.clone();
+                    while let Some(next) = self.successors.get(&current) {
+                        if !visited.insert(next.clone()) || self.archived_sessions.contains(next) {
+                            break;
+                        }
+                        current = next.clone();
+                    }
+                    Response::ResolvedSuccessor {
+                        session_id: current,
+                    }
+                }
                 _ => Response::Ok,
             }
         }
@@ -922,6 +968,7 @@ mod tests {
             turn_started_at_ms: None,
             phase_started_at_ms: None,
             project_name: None,
+            successor_id: None,
         }
     }
 
@@ -1212,6 +1259,75 @@ mod tests {
         let calls = captured_sorted(&shared);
         assert_eq!(calls.len(), 1, "expected one dedup'd call, got {:?}", calls);
         assert_eq!(calls[0].0, "s-one");
+    }
+
+    /// Task 914: a recorded recipient session that has been retired
+    /// (`successor_id` set on the server side) must have its successor
+    /// receive the notification — not the predecessor.
+    #[test]
+    fn notify_follows_successor_for_recorded_recipient() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "Succ", None, "ready");
+        db.record_session(task.id, "s-old", "worker").expect("rec");
+        task.state = TaskState::Active;
+
+        let (shared, mut w, mut r) = make_io();
+        // Configure the mock so the server reports s-old -> s-new.
+        shared
+            .lock()
+            .expect("mock shared lock")
+            .successors
+            .insert("s-old".into(), "s-new".into());
+
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
+
+        let calls = captured_sorted(&shared);
+        let sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(
+            sids.contains(&"s-new"),
+            "successor must receive the notification: {:?}",
+            sids
+        );
+        assert!(
+            !sids.contains(&"s-old"),
+            "retired predecessor must NOT receive the notification: {:?}",
+            sids
+        );
+    }
+
+    /// Task 914: when the same session id appears via two different
+    /// anchors (e.g. as the task's own session_id *and* via a recorded
+    /// `task_sessions` row) and both resolve through the successor chain
+    /// to the same tip, the dedupe set collapses them into a single
+    /// delivery.
+    #[test]
+    fn notify_dedupe_collapses_old_and_new_via_successor() {
+        let db = TasksDb::open_memory().expect("db");
+        let mut task = create_task(&db, "DedupSucc", None, "ready");
+        // Anchor 1: task.session_id = s-old (will resolve to s-new).
+        db.set_session_id(task.id, "s-old").expect("sid");
+        task.session_id = Some("s-old".into());
+        // Anchor 2: recorded as a worker row directly under s-new.
+        db.record_session(task.id, "s-new", "worker").expect("rec");
+        task.state = TaskState::Active;
+
+        let (shared, mut w, mut r) = make_io();
+        shared
+            .lock()
+            .expect("mock shared lock")
+            .successors
+            .insert("s-old".into(), "s-new".into());
+
+        notify_state_change(&db, &task, TaskState::Ready, None, &mut w, &mut r);
+
+        let calls = captured_sorted(&shared);
+        let sids: Vec<&str> = calls.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(
+            sids,
+            vec!["s-new"],
+            "old + new must collapse to a single delivery on s-new: {:?}",
+            sids
+        );
     }
 
     #[test]

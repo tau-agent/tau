@@ -707,7 +707,24 @@ pub fn find_root_session(
     if last.archived {
         return None;
     }
-    Some(last.id.clone())
+    // Task 914: if the root has been retired (`successor_id` set), follow
+    // the chain to the live tip via the dedicated `ResolveSuccessor` RPC
+    // so new task-dispatched children get parented under the *current*
+    // root rather than the retired one.  We resolve here (and not inside
+    // `GetSessionAncestors`) because the ancestor walk is intentionally a
+    // literal parent-chain query for the agent-facing `session_ancestors`
+    // tool, the picker, and the e2e tests.
+    let resolved = match server_request(
+        writer,
+        reader,
+        tau_agent_plugin::Request::ResolveSuccessor {
+            session_id: last.id.clone(),
+        },
+    ) {
+        Ok(tau_agent_plugin::Response::ResolvedSuccessor { session_id }) => session_id,
+        _ => last.id.clone(),
+    };
+    Some(resolved)
 }
 
 // ---------------------------------------------------------------------------
@@ -5359,16 +5376,52 @@ mod tests {
             turn_started_at_ms: None,
             phase_started_at_ms: None,
             project_name: None,
+            successor_id: None,
         }
     }
 
-    struct FindRootMock {
+    /// Run `find_root_session` against a canned `SessionAncestors` response.
+    fn run_find_root(
+        session_id: &str,
+        ancestors: Vec<tau_agent_plugin::SessionInfo>,
+    ) -> Option<String> {
+        run_find_root_with_successors(session_id, ancestors, std::collections::HashMap::new())
+    }
+
+    /// Run `find_root_session` against canned `SessionAncestors` and a
+    /// successor map for the `ResolveSuccessor` round-trip.  Sessions
+    /// missing from the map resolve to themselves.
+    fn run_find_root_with_successors(
+        session_id: &str,
+        ancestors: Vec<tau_agent_plugin::SessionInfo>,
+        successors: std::collections::HashMap<String, String>,
+    ) -> Option<String> {
+        use std::io::BufReader;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(SuccessorAwareFindRootMock {
+            write_buf: Vec::new(),
+            read_buf: Vec::new(),
+            ancestors,
+            successors,
+        }));
+        let mut writer = MockSuccessorAwareFindRootWriter {
+            shared: shared.clone(),
+        };
+        let reader = MockSuccessorAwareFindRootReader {
+            shared: shared.clone(),
+        };
+        let mut reader_buf = BufReader::new(reader);
+        super::find_root_session(session_id, &mut writer, &mut reader_buf)
+    }
+
+    /// Variant of [`FindRootMock`] that also responds to `ResolveSuccessor`.
+    struct SuccessorAwareFindRootMock {
         write_buf: Vec<u8>,
         read_buf: Vec<u8>,
         ancestors: Vec<tau_agent_plugin::SessionInfo>,
+        successors: std::collections::HashMap<String, String>,
     }
 
-    impl FindRootMock {
+    impl SuccessorAwareFindRootMock {
         fn process(&mut self) {
             use tau_agent_base::plugin_protocol::{PluginMessage, PluginRequest};
             let buf = std::mem::take(&mut self.write_buf);
@@ -5377,28 +5430,49 @@ mod tests {
                 if line.trim().is_empty() {
                     continue;
                 }
-                if let Ok(PluginMessage::ServerRequest { request_id, .. }) =
-                    serde_json::from_str::<PluginMessage>(line)
-                {
-                    let resp = PluginRequest::ServerResponse {
-                        request_id,
-                        response: tau_agent_plugin::Response::SessionAncestors {
-                            sessions: self.ancestors.clone(),
-                        },
-                    };
-                    if let Ok(mut json) = serde_json::to_string(&resp) {
-                        json.push('\n');
-                        self.read_buf.extend_from_slice(json.as_bytes());
+                let Ok(PluginMessage::ServerRequest {
+                    request_id,
+                    request,
+                }) = serde_json::from_str::<PluginMessage>(line)
+                else {
+                    continue;
+                };
+                let response = match request {
+                    tau_agent_plugin::Request::ResolveSuccessor { session_id } => {
+                        let mut visited: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        visited.insert(session_id.clone());
+                        let mut current = session_id;
+                        while let Some(next) = self.successors.get(&current) {
+                            if !visited.insert(next.clone()) {
+                                break;
+                            }
+                            current = next.clone();
+                        }
+                        tau_agent_plugin::Response::ResolvedSuccessor {
+                            session_id: current,
+                        }
                     }
+                    _ => tau_agent_plugin::Response::SessionAncestors {
+                        sessions: self.ancestors.clone(),
+                    },
+                };
+                let resp = PluginRequest::ServerResponse {
+                    request_id,
+                    response,
+                };
+                if let Ok(mut json) = serde_json::to_string(&resp) {
+                    json.push('\n');
+                    self.read_buf.extend_from_slice(json.as_bytes());
                 }
             }
         }
     }
 
-    struct MockFindRootWriter {
-        shared: std::sync::Arc<std::sync::Mutex<FindRootMock>>,
+    struct MockSuccessorAwareFindRootWriter {
+        shared: std::sync::Arc<std::sync::Mutex<SuccessorAwareFindRootMock>>,
     }
-    impl std::io::Write for MockFindRootWriter {
+    impl std::io::Write for MockSuccessorAwareFindRootWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.shared.lock().unwrap().write_buf.extend_from_slice(buf);
             Ok(buf.len())
@@ -5408,10 +5482,10 @@ mod tests {
         }
     }
 
-    struct MockFindRootReader {
-        shared: std::sync::Arc<std::sync::Mutex<FindRootMock>>,
+    struct MockSuccessorAwareFindRootReader {
+        shared: std::sync::Arc<std::sync::Mutex<SuccessorAwareFindRootMock>>,
     }
-    impl std::io::Read for MockFindRootReader {
+    impl std::io::Read for MockSuccessorAwareFindRootReader {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let mut shared = self.shared.lock().unwrap();
             shared.process();
@@ -5426,27 +5500,6 @@ mod tests {
             shared.read_buf.drain(..n);
             Ok(n)
         }
-    }
-
-    /// Run `find_root_session` against a canned `SessionAncestors` response.
-    fn run_find_root(
-        session_id: &str,
-        ancestors: Vec<tau_agent_plugin::SessionInfo>,
-    ) -> Option<String> {
-        use std::io::BufReader;
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(FindRootMock {
-            write_buf: Vec::new(),
-            read_buf: Vec::new(),
-            ancestors,
-        }));
-        let mut writer = MockFindRootWriter {
-            shared: shared.clone(),
-        };
-        let reader = MockFindRootReader {
-            shared: shared.clone(),
-        };
-        let mut reader_buf = BufReader::new(reader);
-        super::find_root_session(session_id, &mut writer, &mut reader_buf)
     }
 
     /// Mock for `GetSessionInfo` round-trips (used by `get_session_model`
@@ -5585,6 +5638,37 @@ mod tests {
         let leaf = session_info("leaf", Some("a"), false);
         let a = session_info("a", Some("b-unreachable"), false);
         assert_eq!(run_find_root("leaf", vec![leaf, a]), None);
+    }
+
+    /// Task 914: when the resolved root has a successor set, the
+    /// successor's id is returned so new task-dispatched children attach
+    /// to the *current* root rather than the retired predecessor.
+    #[test]
+    fn test_find_root_session_follows_successor() {
+        let child = session_info("child", Some("old_root"), false);
+        let old_root = session_info("old_root", None, false);
+        let mut succ = std::collections::HashMap::new();
+        succ.insert("old_root".to_string(), "new_root".to_string());
+        assert_eq!(
+            run_find_root_with_successors("child", vec![child, old_root], succ),
+            Some("new_root".to_string()),
+        );
+    }
+
+    /// When no successor is set, the resolver returns the input id and
+    /// behaviour matches the pre-task-914 baseline.
+    #[test]
+    fn test_find_root_session_no_successor_unchanged() {
+        let child = session_info("child", Some("root"), false);
+        let root = session_info("root", None, false);
+        assert_eq!(
+            run_find_root_with_successors(
+                "child",
+                vec![child, root],
+                std::collections::HashMap::new()
+            ),
+            Some("root".to_string()),
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -6152,7 +6236,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     mod phase_mock_io {
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
         use std::io::{BufReader, Read, Write};
         use std::sync::{Arc, Mutex};
         use tau_agent_plugin::{PluginMessage, PluginRequest, Request, Response};
@@ -6166,6 +6250,11 @@ mod tests {
             /// Parent id returned for every `GetSessionInfo` response
             /// (the tests that care set this explicitly).
             pub session_parent_id: Option<String>,
+            /// Optional successor map for `ResolveSuccessor` responses.
+            /// Sessions absent from the map resolve to themselves.  Used
+            /// to simulate retired root sessions in `find_root_session`
+            /// tests (task 914).
+            pub successors: HashMap<String, String>,
         }
 
         impl PhaseMockShared {
@@ -6177,6 +6266,7 @@ mod tests {
                     archived_sessions: HashSet::new(),
                     written_lines: Vec::new(),
                     session_parent_id: None,
+                    successors: HashMap::new(),
                 }
             }
 
@@ -6229,6 +6319,7 @@ mod tests {
                                     turn_started_at_ms: None,
                                     phase_started_at_ms: None,
                                     project_name: None,
+                                    successor_id: None,
                                 },
                             }
                         }
@@ -6253,8 +6344,25 @@ mod tests {
                                 turn_started_at_ms: None,
                                 phase_started_at_ms: None,
                                 project_name: None,
+                                successor_id: None,
                             }],
                         },
+                        Request::ResolveSuccessor { session_id } => {
+                            let mut visited: HashSet<String> = HashSet::new();
+                            visited.insert(session_id.clone());
+                            let mut current = session_id.clone();
+                            while let Some(next) = self.successors.get(&current) {
+                                if !visited.insert(next.clone())
+                                    || self.archived_sessions.contains(next)
+                                {
+                                    break;
+                                }
+                                current = next.clone();
+                            }
+                            Response::ResolvedSuccessor {
+                                session_id: current,
+                            }
+                        }
                         _ => Response::Ok,
                     };
                     let reply = PluginRequest::ServerResponse {

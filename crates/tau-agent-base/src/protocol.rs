@@ -124,6 +124,29 @@ pub enum Request {
         old_parent_id: String,
         new_parent_id: String,
     },
+    /// Mark `session_id` as superseded by `successor_id`. Future
+    /// notifications / queued messages / new-child-parent-anchor lookups
+    /// targeted at `session_id` are forwarded to the resolved tip of the
+    /// successor chain.  `successor_id == None` clears the link (un-retire).
+    ///
+    /// The predecessor stays in the DB — message history is preserved
+    /// and remains readable — but it will not receive new wakeups while
+    /// a successor is set.  See task 914.
+    SetSessionSuccessor {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        successor_id: Option<String>,
+        /// Session id of the caller when invoked via an orchestration tool.
+        /// `None` when invoked by the TUI/CLI/external API.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+    },
+    /// Resolve the live tip of `session_id`'s successor chain.
+    ///
+    /// Returns [`Response::ResolvedSuccessor`].  Used by plugins (notably
+    /// the tasks plugin) to redirect notifications away from retired
+    /// sessions.  See task 914.
+    ResolveSuccessor { session_id: String },
     /// Start OAuth login for a provider.
     Login { provider: String },
     /// Query authentication status.
@@ -498,6 +521,11 @@ pub enum Response {
     /// not treated as an error response so callers can match on "unknown
     /// project" cleanly.
     ProjectInfo { project: Option<ProjectInfoEntry> },
+    /// Resolved tip of a session's successor chain (response to
+    /// `Request::ResolveSuccessor`).  Returns the input session id
+    /// unchanged when no successor is set or the chain dead-ends at an
+    /// archived / missing successor.  See task 914.
+    ResolvedSuccessor { session_id: String },
     /// Error.
     Error { message: String },
 }
@@ -554,6 +582,11 @@ pub struct SessionInfo {
     /// Project name this session belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_name: Option<String>,
+    /// Optional successor session id.  When `Some`, this session has
+    /// been retired and notifications targeted at it are forwarded to
+    /// the resolved tip of the successor chain.  See task 914.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_id: Option<String>,
     /// Last exit status: null (never ran), "completed", "error", "cancelled", "max_turns".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit_status: Option<String>,
@@ -1241,6 +1274,19 @@ mod tests {
             Request::GetProjectInfo {
                 project_name: "tau".into(),
             },
+            Request::SetSessionSuccessor {
+                session_id: "s1".into(),
+                successor_id: Some("s2".into()),
+                caller_session_id: None,
+            },
+            Request::SetSessionSuccessor {
+                session_id: "s1".into(),
+                successor_id: None,
+                caller_session_id: Some("caller".into()),
+            },
+            Request::ResolveSuccessor {
+                session_id: "s1".into(),
+            },
         ];
         for req in &requests {
             let json = serde_json::to_string(req).expect("serialize request");
@@ -1311,6 +1357,9 @@ mod tests {
                 }),
             },
             Response::ProjectInfo { project: None },
+            Response::ResolvedSuccessor {
+                session_id: "s1".into(),
+            },
         ];
         for resp in &responses {
             let json = serde_json::to_string(resp).expect("serialize response");

@@ -36,6 +36,60 @@ use crate::types::*;
 /// produce, then catches up via the push.
 const USAGE_CACHE_TTL_MS: u64 = 30 * 1000;
 
+/// Validate that `successor_id` (when `Some`) is a sensible link target
+/// for `session_id`. Returns `Ok(())` on success or a human-readable
+/// error message otherwise.
+///
+/// Validation rules (all must hold for the link to be accepted):
+/// * `session_id` exists.
+/// * If `successor_id.is_some()`:
+///   * the successor session id is not equal to `session_id` (no self-link),
+///   * the successor session exists,
+///   * the successor is not archived,
+///   * the successor belongs to the same project as the predecessor
+///     (cross-project successors are rejected per task 914 spec),
+///   * the resulting chain does not loop back to `session_id`
+///     (see [`crate::db::Db::would_create_successor_cycle`]).
+///
+/// Caller must hold the state lock so that the read-validate-write
+/// sequence is atomic with respect to other writers.
+pub(super) fn validate_successor_link(
+    db: &crate::db::Db,
+    session_id: &str,
+    successor_id: Option<&str>,
+) -> Result<(), String> {
+    let pred = db
+        .get_session(session_id)
+        .map_err(|e| format!("lookup predecessor: {e}"))?
+        .ok_or_else(|| format!("session not found: {session_id}"))?;
+    let Some(succ_id) = successor_id else {
+        // Clearing the link only requires the predecessor exists.
+        return Ok(());
+    };
+    if succ_id == session_id {
+        return Err("successor must differ from session_id".to_string());
+    }
+    let succ = db
+        .get_session(succ_id)
+        .map_err(|e| format!("lookup successor: {e}"))?
+        .ok_or_else(|| format!("successor session not found: {succ_id}"))?;
+    if succ.archived {
+        return Err(format!("successor session is archived: {succ_id}"));
+    }
+    if pred.project_name != succ.project_name {
+        return Err(format!(
+            "successor must be in the same project (predecessor: {:?}, successor: {:?})",
+            pred.project_name, succ.project_name
+        ));
+    }
+    if db.would_create_successor_cycle(session_id, succ_id) {
+        return Err(format!(
+            "successor link would create a cycle ({session_id} -> {succ_id} -> ... -> {session_id})"
+        ));
+    }
+    Ok(())
+}
+
 /// Create a session (pure DB logic, no plugin setup).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_session_impl(
@@ -236,6 +290,7 @@ pub(super) fn create_session_impl(
         auto_archive,
         notify_parent,
         project_name,
+        successor_id: None,
     };
     tracing::debug!(
         session_id = %id,
@@ -1599,6 +1654,63 @@ pub(super) async fn handle_client(
                     }
                 }
             }
+            crate::protocol::Request::SetSessionSuccessor {
+                session_id,
+                successor_id,
+                caller_session_id,
+            } => {
+                // Validate + write under a single lock acquisition. The state
+                // mutex is the global single-writer for `Db`, so doing the
+                // cycle check + UPDATE under one lock is sufficient — no
+                // explicit SQLite transaction needed.
+                let result: Result<Option<String>, String> = {
+                    let st = lock_state(&state);
+                    match validate_successor_link(&st.db, &session_id, successor_id.as_deref()) {
+                        Ok(()) => match st.db.set_successor(&session_id, successor_id.as_deref()) {
+                            Ok(()) => Ok(successor_id.clone()),
+                            Err(e) => Err(e.to_string()),
+                        },
+                        Err(msg) => Err(msg),
+                    }
+                };
+                match result {
+                    Ok(new_succ) => {
+                        let info = match (&new_succ, caller_session_id.as_deref()) {
+                            (Some(s), Some(caller)) => format!(
+                                "Session retired by {caller}; future notifications forwarded to {s}."
+                            ),
+                            (Some(s), None) => {
+                                format!("Session retired; future notifications forwarded to {s}.")
+                            }
+                            (None, Some(caller)) => format!(
+                                "Successor link cleared by {caller}; session is no longer retired."
+                            ),
+                            (None, None) => {
+                                "Successor link cleared; session is no longer retired.".to_string()
+                            }
+                        };
+                        queue_info_to_session(&state, &session_id, &info);
+                        send(&mut writer, &Response::Ok).await?;
+                    }
+                    Err(message) => {
+                        send(&mut writer, &Response::Error { message }).await?;
+                    }
+                }
+            }
+            crate::protocol::Request::ResolveSuccessor { session_id } => {
+                let resolved = {
+                    let st = lock_state(&state);
+                    st.db.resolve_successor(&session_id)
+                };
+                send(
+                    &mut writer,
+                    &Response::ResolvedSuccessor {
+                        session_id: resolved,
+                    },
+                )
+                .await?;
+            }
+
             crate::protocol::Request::SetModel {
                 session_id,
                 model_id,
@@ -2725,5 +2837,97 @@ mod tests {
                 .expect("session row")
         };
         assert!(stored.project_name.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Task 914: validate_successor_link
+    // -----------------------------------------------------------------
+
+    /// Insert a minimal session into the test db with a controlled
+    /// `project_name` and `archived` flag so the validator's checks can
+    /// be exercised directly.
+    fn make_link_session(state: &SharedState, id: &str, project: Option<&str>, archived: bool) {
+        let st = lock_state(state);
+        st.db
+            .create_session(&crate::db::StoredSession {
+                id: id.into(),
+                model: mk_model(),
+                system_prompt: None,
+                cwd: None,
+                is_subscription: false,
+                created_at: 1000,
+                parent_id: None,
+                child_budget: 0,
+                tagline: None,
+                archived,
+                last_exit_status: None,
+                last_phase: None,
+                auto_archive: false,
+                notify_parent: true,
+                project_name: project.map(str::to_string),
+                successor_id: None,
+            })
+            .expect("create session");
+    }
+
+    #[test]
+    fn validate_successor_link_clears_when_predecessor_exists() {
+        let state = mk_state();
+        make_link_session(&state, "s_pred", Some("p"), false);
+        let st = lock_state(&state);
+        // Clearing the link is allowed when the predecessor exists.
+        assert!(validate_successor_link(&st.db, "s_pred", None).is_ok());
+        // Clearing on a missing predecessor is rejected.
+        assert!(validate_successor_link(&st.db, "s_missing", None).is_err());
+    }
+
+    #[test]
+    fn validate_successor_link_rejects_self_archived_and_cross_project() {
+        let state = mk_state();
+        make_link_session(&state, "s_pred", Some("alpha"), false);
+        make_link_session(&state, "s_succ", Some("alpha"), false);
+        make_link_session(&state, "s_succ_archived", Some("alpha"), true);
+        make_link_session(&state, "s_succ_other_proj", Some("beta"), false);
+
+        let st = lock_state(&state);
+        // Happy path.
+        assert!(validate_successor_link(&st.db, "s_pred", Some("s_succ")).is_ok());
+        // Self-link rejected.
+        let err = validate_successor_link(&st.db, "s_pred", Some("s_pred"))
+            .expect_err("self-link must be rejected");
+        assert!(err.contains("differ"));
+        // Archived successor rejected.
+        let err = validate_successor_link(&st.db, "s_pred", Some("s_succ_archived"))
+            .expect_err("archived successor must be rejected");
+        assert!(err.contains("archived"));
+        // Cross-project rejected.
+        let err = validate_successor_link(&st.db, "s_pred", Some("s_succ_other_proj"))
+            .expect_err("cross-project successor must be rejected");
+        assert!(err.contains("same project"));
+        // Missing predecessor rejected.
+        let err = validate_successor_link(&st.db, "s_missing", Some("s_succ"))
+            .expect_err("missing predecessor must be rejected");
+        assert!(err.contains("session not found"));
+        // Missing successor rejected.
+        let err = validate_successor_link(&st.db, "s_pred", Some("s_missing"))
+            .expect_err("missing successor must be rejected");
+        assert!(err.contains("successor session not found"));
+    }
+
+    #[test]
+    fn validate_successor_link_rejects_cycle() {
+        let state = mk_state();
+        make_link_session(&state, "s_a", Some("p"), false);
+        make_link_session(&state, "s_b", Some("p"), false);
+        // Establish s_b -> s_a.
+        {
+            let st = lock_state(&state);
+            st.db.set_successor("s_b", Some("s_a")).expect("set");
+        }
+        // Now attempting s_a -> s_b would close the loop.
+        let st = lock_state(&state);
+        let err = validate_successor_link(&st.db, "s_a", Some("s_b"))
+            .expect_err("cycle must be rejected");
+        assert!(err.contains("cycle"));
     }
 }

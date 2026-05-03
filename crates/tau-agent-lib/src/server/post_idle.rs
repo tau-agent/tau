@@ -280,6 +280,7 @@ mod tests {
                 auto_archive: false,
                 notify_parent: true,
                 project_name: None,
+                successor_id: None,
             })
             .expect("create session");
     }

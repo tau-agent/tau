@@ -109,6 +109,7 @@ pub(super) fn session_info(
         last_exit_status: stored.last_exit_status.clone(),
         is_live,
         project_name: stored.project_name.clone(),
+        successor_id: stored.successor_id.clone(),
         turn_started_at_ms,
         phase_started_at_ms,
     }
@@ -176,6 +177,7 @@ pub(super) fn session_info_from_db_stats(
         last_exit_status: stored.last_exit_status.clone(),
         is_live,
         project_name: stored.project_name.clone(),
+        successor_id: stored.successor_id.clone(),
         turn_started_at_ms,
         phase_started_at_ms,
     }

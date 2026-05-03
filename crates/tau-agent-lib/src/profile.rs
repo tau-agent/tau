@@ -1217,6 +1217,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: project.map(|s| s.to_string()),
+            successor_id: None,
         };
         db.create_session(&s).expect("create session");
     }
@@ -1263,6 +1264,7 @@ mod tests {
             auto_archive: false,
             notify_parent: true,
             project_name: None,
+            successor_id: None,
         };
         db.create_session(&s).expect("create session");
     }

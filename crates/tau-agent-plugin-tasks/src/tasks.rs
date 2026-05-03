@@ -4697,6 +4697,7 @@ mod tests {
                                     turn_started_at_ms: None,
                                     phase_started_at_ms: None,
                                     project_name: None,
+                                    successor_id: None,
                                 },
                             }
                         }
@@ -4729,6 +4730,7 @@ mod tests {
                                         turn_started_at_ms: None,
                                         phase_started_at_ms: None,
                                         project_name: None,
+                                        successor_id: None,
                                     }]
                                 });
                             tau_agent_plugin::Response::SessionAncestors { sessions }
@@ -9154,6 +9156,7 @@ mod tests {
             turn_started_at_ms: None,
             phase_started_at_ms: None,
             project_name: None,
+            successor_id: None,
         }
     }
 
