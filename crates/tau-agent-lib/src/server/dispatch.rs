@@ -1908,6 +1908,44 @@ pub(super) async fn handle_client(
                 .await?;
             }
 
+            crate::protocol::Request::GetTaskSessionRole { session_id } => {
+                // Open the tasks DB best-effort — a setup without the
+                // tasks plugin should not 500 here.  When the DB can't be
+                // opened we report "no task linkage" and let the caller
+                // proceed.
+                let resp = match crate::tasks_db::TasksDb::open_default() {
+                    Ok(db) => match db.find_active_task_role_for_session(&session_id) {
+                        Ok(Some((task_id, role))) => Response::TaskSessionRole {
+                            is_worker: role == "worker",
+                            task_id: Some(task_id),
+                            role: Some(role),
+                        },
+                        Ok(None) => Response::TaskSessionRole {
+                            is_worker: false,
+                            task_id: None,
+                            role: None,
+                        },
+                        Err(e) => {
+                            tracing::warn!(%e, %session_id, "GetTaskSessionRole DB query failed");
+                            Response::TaskSessionRole {
+                                is_worker: false,
+                                task_id: None,
+                                role: None,
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        tracing::debug!(%e, "GetTaskSessionRole: tasks DB unavailable");
+                        Response::TaskSessionRole {
+                            is_worker: false,
+                            task_id: None,
+                            role: None,
+                        }
+                    }
+                };
+                send(&mut writer, &resp).await?;
+            }
+
             crate::protocol::Request::SetModel {
                 session_id,
                 model_id,

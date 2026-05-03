@@ -157,6 +157,16 @@ pub enum Request {
     /// tree.  Returns [`Response::SessionCreated`] with the successor id
     /// on success and broadcasts [`Response::SessionSucceeded`] on the
     /// predecessor's subscriber channel.  See task 915.
+    /// Look up whether `session_id` is recorded as a session of any
+    /// non-terminal task and, if so, return the `(task_id, role)` it
+    /// plays.  Used by orchestration tools (today: `session_succeed`)
+    /// that must refuse to disturb a task-managed session lifecycle.
+    ///
+    /// Returns [`Response::TaskWorkerSession`] always — a non-task
+    /// session yields `is_worker = false` with `task_id` / `role` set
+    /// to `None`.  See task 915.
+    GetTaskSessionRole { session_id: String },
+
     SucceedSession {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -550,6 +560,18 @@ pub enum Response {
     /// (e.g. the TUI) typically react by switching their view to the
     /// successor.  See task 915.
     SessionSucceeded { successor_id: String },
+    /// Response to [`Request::GetTaskSessionRole`].  When `is_worker`
+    /// is true the session is currently bound to a non-terminal task in
+    /// the role identified by `role` (typically `"worker"`); `task_id`
+    /// names the task.  When `is_worker` is false (no task linkage),
+    /// `task_id` and `role` are `None`.  See task 915.
+    TaskSessionRole {
+        is_worker: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+    },
     /// Error.
     Error { message: String },
 }
@@ -1321,6 +1343,9 @@ mod tests {
                 tagline: None,
                 caller_session_id: None,
             },
+            Request::GetTaskSessionRole {
+                session_id: "s1".into(),
+            },
         ];
         for req in &requests {
             let json = serde_json::to_string(req).expect("serialize request");
@@ -1396,6 +1421,16 @@ mod tests {
             },
             Response::SessionSucceeded {
                 successor_id: "s2".into(),
+            },
+            Response::TaskSessionRole {
+                is_worker: true,
+                task_id: Some(42),
+                role: Some("worker".into()),
+            },
+            Response::TaskSessionRole {
+                is_worker: false,
+                task_id: None,
+                role: None,
             },
         ];
         for resp in &responses {

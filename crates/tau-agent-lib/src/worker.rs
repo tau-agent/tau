@@ -817,6 +817,45 @@ fn format_bash_output(
     }
 }
 
+/// Format the rejection message for a `session_succeed` call invoked
+/// from inside a task-managed session.  See task 915 edge case 2.
+///
+/// Extracted as a free function so the message format is unit-testable
+/// without spinning up the full plugin protocol.
+fn format_task_session_rejection(role: Option<&str>, task_id: Option<i64>) -> String {
+    let role_label = role.unwrap_or("worker");
+    let task_label = task_id
+        .map(|id| format!(" (task #{id})"))
+        .unwrap_or_default();
+    format!(
+        "session_succeed is forbidden inside a task {role_label} session{task_label}; \
+         the task scheduler controls this session's lifecycle."
+    )
+}
+
+/// Compose the handoff message that `session_succeed` queues on the
+/// successor session.  The summary is prepended verbatim; if any
+/// `carry_files` are supplied, a footer lists them so the successor
+/// knows which paths to re-read with a clean prompt cache.
+///
+/// Extracted as a free function so the composition rules are
+/// unit-testable.
+fn compose_succeed_handoff(summary: &str, carry_files: &[String]) -> String {
+    if carry_files.is_empty() {
+        summary.to_string()
+    } else {
+        let mut buf = String::with_capacity(summary.len() + 64);
+        buf.push_str(summary);
+        buf.push_str("\n\nFiles referenced in handoff:\n");
+        for path in carry_files {
+            buf.push_str("- ");
+            buf.push_str(path);
+            buf.push('\n');
+        }
+        buf
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session orchestration tools (async)
 // ---------------------------------------------------------------------------
@@ -1471,6 +1510,54 @@ async fn handle_session_tool(
                 }
             };
 
+            // Pre-flight (edge case 2 from task 915): refuse if this
+            // session is the worker for an in-flight task.  The task
+            // scheduler owns the worker session's lifecycle (worker →
+            // review → merge); succeeding out from under it would leave
+            // the scheduler holding a stale session pointer and confuse
+            // the merge / archive paths.  Other roles (planning,
+            // refining, reviewer, log) are already short-lived or
+            // non-critical and we don't gate them.
+            let role_req = crate::protocol::Request::GetTaskSessionRole {
+                session_id: caller_sid.clone(),
+            };
+            match server_request(msg_tx, pending, role_req).await {
+                Ok(crate::protocol::Response::TaskSessionRole {
+                    is_worker,
+                    task_id,
+                    role,
+                }) => {
+                    if is_worker {
+                        return ToolResultMessage::error(
+                            tcid,
+                            "",
+                            &format_task_session_rejection(role.as_deref(), task_id),
+                        );
+                    }
+                }
+                Ok(crate::protocol::Response::Error { message }) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("session_succeed pre-flight (task role) failed: {message}"),
+                    );
+                }
+                Ok(other) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("unexpected response: {:?}", other),
+                    );
+                }
+                Err(e) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("session_succeed pre-flight (task role) failed: {e}"),
+                    );
+                }
+            }
+
             // Pre-flight: refuse if this session is already retired.
             // The server enforces this too — we mirror it client-side so
             // the agent gets a fast, descriptive error.
@@ -1548,19 +1635,7 @@ async fn handle_session_tool(
             // The successor's agent loop is NOT woken — the message lands
             // in the queued_messages table and will be drained on the
             // user's next prompt (or the next forwarded notification).
-            let composed = if carry_files.is_empty() {
-                summary.to_string()
-            } else {
-                let mut buf = String::with_capacity(summary.len() + 64);
-                buf.push_str(summary);
-                buf.push_str("\n\nFiles referenced in handoff:\n");
-                for path in &carry_files {
-                    buf.push_str("- ");
-                    buf.push_str(path);
-                    buf.push('\n');
-                }
-                buf
-            };
+            let composed = compose_succeed_handoff(summary, &carry_files);
             let queue_req = crate::protocol::Request::QueueMessage {
                 target_session_id: new_id.clone(),
                 content: composed,
@@ -1669,6 +1744,69 @@ async fn handle_session_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Task 915: session_succeed helpers
+    // -----------------------------------------------------------------
+
+    /// Worker-session rejection message names the role and the task id
+    /// when both are known, falling back gracefully when they're not.
+    /// This is what the agent sees when it tries to succeed out from
+    /// under an active task.
+    #[test]
+    fn format_task_session_rejection_includes_role_and_task_id() {
+        let msg = format_task_session_rejection(Some("worker"), Some(42));
+        assert!(
+            msg.contains("worker") && msg.contains("#42"),
+            "expected role + task id in message, got: {msg}"
+        );
+        assert!(
+            msg.contains("forbidden"),
+            "message should explain rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("task scheduler controls"),
+            "message should explain why, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_task_session_rejection_falls_back_when_role_missing() {
+        let msg = format_task_session_rejection(None, None);
+        // Defaults to "worker" role label when unknown.
+        assert!(msg.contains("worker"), "default role label, got: {msg}");
+        // No `(task #...)` fragment when task id is unknown.
+        assert!(
+            !msg.contains("task #"),
+            "no task id fragment expected, got: {msg}"
+        );
+    }
+
+    /// Empty `carry_files` means the handoff is the summary verbatim, no
+    /// file footer.  Important: a successor sees this as the first user
+    /// message, so we must not append empty sections.
+    #[test]
+    fn compose_succeed_handoff_no_files_returns_summary_verbatim() {
+        let composed = compose_succeed_handoff("do the thing", &[]);
+        assert_eq!(composed, "do the thing");
+    }
+
+    /// With `carry_files`, a footer lists each path verbatim.  Paths
+    /// with spaces / odd characters are passed through unmodified — we
+    /// don't escape, the successor will pass them straight to the
+    /// `read` tool.
+    #[test]
+    fn compose_succeed_handoff_with_files_appends_footer() {
+        let files = vec![
+            "src/lib.rs".to_string(),
+            "path with spaces/foo.rs".to_string(),
+        ];
+        let composed = compose_succeed_handoff("continue refactor", &files);
+        assert!(composed.starts_with("continue refactor\n\n"));
+        assert!(composed.contains("Files referenced in handoff:\n"));
+        assert!(composed.contains("- src/lib.rs\n"));
+        assert!(composed.contains("- path with spaces/foo.rs\n"));
+    }
 
     #[test]
     fn classify_cwd_ok_for_existing_dir() {

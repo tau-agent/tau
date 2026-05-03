@@ -1081,6 +1081,12 @@ async fn succeed_session(
         .send(&Request::SucceedSession {
             session_id: session_id.to_string(),
             tagline,
+            // The TUI process has no agent-loop session id of its own to
+            // record as the caller (it acts on behalf of the human user),
+            // so the audit info-message in the predecessor reads "Session
+            // retired" rather than "Session retired by <id>". The
+            // agent-tool path (worker.rs::session_succeed) does pass
+            // its own session id here.
             caller_session_id: None,
         })
         .await?;

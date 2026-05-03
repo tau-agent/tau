@@ -1370,7 +1370,6 @@ mod tests {
         });
     }
 
-    #[test]
     /// `PostPersistAction::StopAgentLoop` flips a flag whose `should_stop`
     /// callback returns true, so the agent loop exits after persisting the
     /// tool result without consulting the LLM for another turn.  This is
@@ -1458,6 +1457,8 @@ mod tests {
             );
         });
     }
+
+    #[test]
 
     fn loop_review_progress_continues() {
         // review_interval=3: 3 tool-call turns, then review says PROGRESS,

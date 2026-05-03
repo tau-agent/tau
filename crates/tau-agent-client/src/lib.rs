@@ -112,6 +112,7 @@ impl Client {
                 | Response::ProjectStats { .. }
                 | Response::ProjectInfo { .. }
                 | Response::ResolvedSuccessor { .. }
+                | Response::TaskSessionRole { .. }
                 | Response::ServerShutdown { .. } => true,
             };
             on_response(&resp);

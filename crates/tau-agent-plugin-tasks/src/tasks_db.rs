@@ -1809,6 +1809,41 @@ impl TasksDb {
         Ok(out)
     }
 
+    /// If `session_id` is recorded as a session of any non-terminal task,
+    /// return `Some((task_id, role))`.  Used by orchestration tools that
+    /// need to refuse to disturb a task-managed session (e.g.
+    /// `session_succeed`, which would confuse the task scheduler if a
+    /// worker session retired itself out from under an active task).
+    ///
+    /// Returns the first match by `task_sessions.created_at`; in practice
+    /// a session belongs to at most one non-terminal task at a time so
+    /// this is unambiguous.
+    pub fn find_active_task_role_for_session(
+        &self,
+        session_id: &str,
+    ) -> tau_agent_plugin::Result<Option<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ts.task_id, ts.role FROM task_sessions ts \
+                 INNER JOIN tasks t ON t.id = ts.task_id \
+                 WHERE ts.session_id = ?1 \
+                   AND t.state NOT IN ('merged', 'closed', 'failed') \
+                 ORDER BY ts.created_at \
+                 LIMIT 1",
+            )
+            .map_err(plugin_io_err("prepare find_active_task_role_for_session"))?;
+        let mut rows = stmt
+            .query_map(params![session_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(plugin_io_err("find_active_task_role_for_session"))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(plugin_io_err("read task_session row"))?)),
+            None => Ok(None),
+        }
+    }
+
     /// Get all sessions for a task.
     pub fn get_sessions(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<TaskSession>> {
         let mut stmt = self
@@ -3895,6 +3930,92 @@ mod tests {
     }
 
     #[test]
+    /// `find_active_task_role_for_session` returns `Some((task_id, role))`
+    /// only when the session is recorded against a non-terminal task.
+    /// Sessions tied to merged / closed / failed tasks must come back as
+    /// `None` so `session_succeed` doesn't pointlessly refuse a long-since-
+    /// retired worker.
+    #[test]
+    fn find_active_task_role_for_session_filters_by_state() {
+        let db = TasksDb::open_memory().unwrap();
+        let set_state = |id: i64, state: &str| {
+            db.conn
+                .execute(
+                    "UPDATE tasks SET state = ?1 WHERE id = ?2",
+                    params![state, id],
+                )
+                .unwrap();
+        };
+
+        let active = db
+            .create_task(
+                "p",
+                "active",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.record_session(active.id, "s-worker-active", "worker")
+            .unwrap();
+        db.record_session(active.id, "s-reviewer-active", "reviewer")
+            .unwrap();
+
+        let merged = db
+            .create_task(
+                "p",
+                "merged",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.record_session(merged.id, "s-worker-merged", "worker")
+            .unwrap();
+        set_state(merged.id, "merged");
+
+        // Worker on the active task: returned with role=worker.
+        let row = db
+            .find_active_task_role_for_session("s-worker-active")
+            .unwrap();
+        assert_eq!(row, Some((active.id, "worker".to_string())));
+
+        // Reviewer on the active task: returned with role=reviewer
+        // (caller decides whether to gate on it).
+        let row = db
+            .find_active_task_role_for_session("s-reviewer-active")
+            .unwrap();
+        assert_eq!(row, Some((active.id, "reviewer".to_string())));
+
+        // Worker on a merged task: filtered out (no longer protected).
+        let row = db
+            .find_active_task_role_for_session("s-worker-merged")
+            .unwrap();
+        assert_eq!(row, None);
+
+        // Unknown session id: None.
+        let row = db.find_active_task_role_for_session("s-nobody").unwrap();
+        assert_eq!(row, None);
+    }
+
     fn test_list_protected_session_ids() {
         use std::collections::HashSet;
 
