@@ -1029,6 +1029,7 @@ fn task_state_style(state: &str, theme: &Theme) -> (&'static str, Style) {
         "approved" => ("✓", theme.bold_fg(theme.success)),
         "merging" => ("⟳", theme.fg(theme.accent)),
         "merged" => ("✔", theme.fg(theme.dim)),
+        "done" => ("✔", theme.fg(theme.success)),
         "failed" => ("✗", theme.fg(theme.error)),
         "closed" => ("✕", theme.fg(theme.dim)),
         _ => ("?", theme.fg(theme.dim)),
@@ -1437,7 +1438,7 @@ fn render_task_row(
         title_text.push_str(&format!("  {} ago", age.trim_end_matches(" ago")));
     }
 
-    let title_style = if matches!(task.state.as_str(), "merged" | "closed") {
+    let title_style = if matches!(task.state.as_str(), "merged" | "done" | "closed") {
         theme.italic_fg(theme.dim)
     } else if is_selected {
         theme.fg(theme.text)
@@ -2035,6 +2036,7 @@ mod tests {
             "approved",
             "merging",
             "merged",
+            "done",
             "failed",
             "closed",
         ];
@@ -2077,6 +2079,7 @@ mod tests {
             filed_by_session_id: None,
             created_at: 0,
             updated_at: 0,
+            no_merge: false,
         };
         let (g, _) = live_indicator(&make(true), &theme);
         assert!(g.starts_with('\u{25CF}'), "expected live dot, got {:?}", g);
@@ -2154,6 +2157,8 @@ mod tests {
             has_live_session: false,
             filed_by_project: None,
             filed_by_session_id: None,
+            no_merge: false,
+
             created_at: 0,
             updated_at: 0,
         }

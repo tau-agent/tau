@@ -1945,6 +1945,7 @@ mod tests {
                     false,
                     None,
                     false,
+                    false,
                     tau_agent_plugin_tasks::tasks_db::FiledBy::default(),
                 )
                 .expect("create task");

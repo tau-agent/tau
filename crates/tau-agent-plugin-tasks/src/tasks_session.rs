@@ -114,6 +114,7 @@ mod tests {
             auto_downgraded_from_ready: false,
             filed_by_project: None,
             filed_by_session_id: None,
+            no_merge: false,
             created_at: 0,
             updated_at: 0,
         }

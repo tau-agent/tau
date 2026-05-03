@@ -36,6 +36,7 @@ pub enum TaskState {
     Merging,
     Failed,
     Merged,
+    Done,
     Closed,
 }
 
@@ -70,6 +71,7 @@ impl TaskState {
         TaskState::Merging,
         TaskState::Failed,
         TaskState::Merged,
+        TaskState::Done,
         TaskState::Closed,
     ];
 
@@ -87,6 +89,7 @@ impl TaskState {
             TaskState::Merging => "merging",
             TaskState::Failed => "failed",
             TaskState::Merged => "merged",
+            TaskState::Done => "done",
             TaskState::Closed => "closed",
         }
     }
@@ -105,6 +108,7 @@ impl TaskState {
             "merging" => Ok(TaskState::Merging),
             "failed" => Ok(TaskState::Failed),
             "merged" => Ok(TaskState::Merged),
+            "done" => Ok(TaskState::Done),
             "closed" => Ok(TaskState::Closed),
             other => Err(InvalidTaskState(other.to_string())),
         }
@@ -116,7 +120,7 @@ impl TaskState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            TaskState::Merged | TaskState::Closed | TaskState::Failed
+            TaskState::Merged | TaskState::Done | TaskState::Closed | TaskState::Failed
         )
     }
 
@@ -204,13 +208,14 @@ impl FromSql for TaskState {
 ///
 /// Terminal states:
 ///   merged — fully terminal, no transitions out
+///   done   — fully terminal (no_merge tasks), no transitions out
 ///   closed -> interactive     (reopen)
 ///   failed -> closed          (give up)
 pub fn validate_transition(from: TaskState, to: TaskState) -> bool {
     use TaskState::*;
 
-    // merged is fully terminal — no transitions out at all
-    if from == Merged {
+    // merged and done are fully terminal — no transitions out at all
+    if from == Merged || from == Done {
         return false;
     }
 
@@ -236,6 +241,7 @@ pub fn validate_transition(from: TaskState, to: TaskState) -> bool {
             | (Active, Approved)
             | (Review, Approved)
             | (Approved, Merging)
+            | (Approved, Done)
             | (Merging, Merged)
             // Backward transitions (error recovery)
             | (Active, Ready)
@@ -293,6 +299,7 @@ mod tests {
             (TaskState::Merging, "\"merging\""),
             (TaskState::Failed, "\"failed\""),
             (TaskState::Merged, "\"merged\""),
+            (TaskState::Done, "\"done\""),
             (TaskState::Closed, "\"closed\""),
         ];
         for (state, json) in expected {
@@ -355,6 +362,7 @@ mod tests {
             (Active, Approved),
             (Review, Approved),
             (Approved, Merging),
+            (Approved, Done),
             (Merging, Merged),
             // Backward / error recovery
             (Active, Ready),
@@ -422,6 +430,17 @@ mod tests {
     }
 
     #[test]
+    fn done_is_fully_terminal() {
+        for &to in TaskState::ALL {
+            assert!(
+                !validate_transition(TaskState::Done, to),
+                "done -> {:?} must be rejected",
+                to
+            );
+        }
+    }
+
+    #[test]
     fn clear_session_id_set_is_exact() {
         use TaskState::*;
         let want: &[(TaskState, TaskState)] =
@@ -439,7 +458,7 @@ mod tests {
     fn classifier_sets() {
         use TaskState::*;
         for &s in TaskState::ALL {
-            let t = matches!(s, Merged | Closed | Failed);
+            let t = matches!(s, Merged | Done | Closed | Failed);
             assert_eq!(s.is_terminal(), t, "terminal {:?}", s);
             let i = matches!(s, Active | Review | Merging | Refining);
             assert_eq!(s.is_inflight(), i, "inflight {:?}", s);

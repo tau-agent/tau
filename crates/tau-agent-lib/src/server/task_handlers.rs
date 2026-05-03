@@ -29,6 +29,7 @@ fn task_to_info(t: crate::tasks_db::Task) -> TaskInfo {
         has_live_session: false,
         filed_by_project: t.filed_by_project,
         filed_by_session_id: t.filed_by_session_id,
+        no_merge: t.no_merge,
         created_at: t.created_at,
         updated_at: t.updated_at,
     }
@@ -260,6 +261,7 @@ pub fn handle_task_create(
         false,
         None,
         false,
+        false,
         crate::tasks_db::FiledBy::default(),
     ) {
         Ok(task) => Response::TaskUpdated {
@@ -310,6 +312,7 @@ pub fn handle_task_update(
         sandbox_profile,
         held: None,
         project_name: None,
+        no_merge: None,
     };
     match db.update_task(id, &update, None) {
         Ok(task) => Response::TaskUpdated {

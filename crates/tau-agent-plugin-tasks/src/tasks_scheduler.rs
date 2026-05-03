@@ -488,6 +488,34 @@ fn prepare_task(
         "tasks scheduler: prepare_task starting for task {} (state={}, parent_id={:?})",
         task.id, task.state, task.parent_id
     );
+
+    // no_merge tasks: skip branch + worktree provisioning entirely. The
+    // task transitions to active in-place; the worker session will run
+    // in the project's main checkout (see `TaskPhase::cwd`). On
+    // approval the task transitions directly to `done` rather than
+    // through `merging` (handled by `merge_approved_for_caller`).
+    if task.no_merge {
+        let _ = repo_root;
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Active),
+                ..Default::default()
+            },
+            None,
+        )?;
+        eprintln!(
+            "tasks scheduler: prepare_task success for task {} (no_merge=true; skipped worktree)",
+            task.id
+        );
+        return Ok(ScheduledTask {
+            id: task.id,
+            title: task.title.clone(),
+            branch: String::new(),
+            worktree_path: String::new(),
+        });
+    }
+
     let branch = tasks_git::task_branch_name(task.id, task.parent_id);
 
     // Determine the base branch: merge target (explicit override, parent's
@@ -781,6 +809,12 @@ impl TaskPhase {
     ///   (reviewers read the diff — the worktree is the right place, but
     ///   they tolerate a missing worktree).
     fn cwd(&self, task: &Task, project_path: &str) -> Option<String> {
+        // no_merge tasks have no worktree by design — their worker session
+        // runs in the project root (where reads are valid; the task is
+        // not expected to write).
+        if task.no_merge {
+            return Some(project_path.to_string());
+        }
         match self {
             Self::Worker => task.worktree_path.clone(),
             Self::Planner | Self::Refiner => Some(project_path.to_string()),
@@ -1550,6 +1584,62 @@ pub fn merge_approved(
     merge_approved_for_caller(db, resolve_path, None, writer, reader)
 }
 
+/// Archive the worker/placeholder/role sessions of a no_merge task that
+/// just transitioned to `done`. Mirrors the archival side of
+/// [`crate::tasks_merge::merge_task`] but without the merge ceremony.
+pub(crate) fn archive_no_merge_task_sessions_pub(
+    db: &TasksDb,
+    task: &Task,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    archive_no_merge_task_sessions(db, task, writer, reader);
+}
+
+fn archive_no_merge_task_sessions(
+    db: &TasksDb,
+    task: &Task,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) {
+    let mut archived: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ref placeholder_sid) = task.placeholder_session_id {
+        let _ = server_request(
+            writer,
+            reader,
+            tau_agent_plugin::Request::ArchiveSession {
+                session_id: placeholder_sid.clone(),
+                require_ancestor: None,
+            },
+        );
+        archived.insert(placeholder_sid.clone());
+    } else if let Ok(sessions) = db.get_sessions(task.id) {
+        for ts in &sessions {
+            let _ = server_request(
+                writer,
+                reader,
+                tau_agent_plugin::Request::ArchiveSession {
+                    session_id: ts.session_id.clone(),
+                    require_ancestor: None,
+                },
+            );
+            archived.insert(ts.session_id.clone());
+        }
+    }
+    if let Some(ref sid) = task.session_id
+        && !archived.contains(sid)
+    {
+        let _ = server_request(
+            writer,
+            reader,
+            tau_agent_plugin::Request::ArchiveSession {
+                session_id: sid.clone(),
+                require_ancestor: None,
+            },
+        );
+    }
+}
+
 /// Variant of [`merge_approved`] that threads a caller session id through
 /// [`merge_one_task`] — the caller may be in the to-be-archived subtree
 /// of one of the approved tasks, in which case archival is deferred to
@@ -1566,18 +1656,72 @@ pub fn merge_approved_for_caller(
         return Ok(Vec::new());
     }
 
+    // Partition: no_merge tasks transition straight to `done` (no merge
+    // ceremony, no checklist run, no worktree cleanup needed). Code-merge
+    // tasks proceed through the normal merge_one_task path.
+    let (no_merge_tasks, code_tasks): (Vec<Task>, Vec<Task>) =
+        approved.into_iter().partition(|t| t.no_merge);
+
+    let mut attempts: Vec<MergeAttempt> = Vec::new();
+
+    for task in &no_merge_tasks {
+        let task_id = task.id;
+        let title = task.title.clone();
+        match db.update_task(
+            task_id,
+            &TaskUpdate {
+                state: Some(TaskState::Done),
+                ..Default::default()
+            },
+            None,
+        ) {
+            Ok(updated) => {
+                crate::tasks_notify::notify_state_change(
+                    db,
+                    &updated,
+                    TaskState::Approved,
+                    None,
+                    writer,
+                    reader,
+                );
+                // Archive worker / reviewer / placeholder sessions so the
+                // task's session subtree doesn't leak after completion.
+                // Mirrors the archival that `merge_task` performs for
+                // code-merge tasks.
+                archive_no_merge_task_sessions(db, &updated, writer, reader);
+                attempts.push(MergeAttempt {
+                    task_id,
+                    title,
+                    success: true,
+                    log: "no_merge task: skipped merge ceremony, transitioned to done".to_string(),
+                });
+            }
+            Err(e) => {
+                attempts.push(MergeAttempt {
+                    task_id,
+                    title,
+                    success: false,
+                    log: format!("no_merge task: failed to transition to done: {}", e),
+                });
+            }
+        }
+    }
+
+    if code_tasks.is_empty() {
+        attempts.sort_by_key(|a| a.task_id);
+        return Ok(attempts);
+    }
+
     // Group tasks by their merge target branch. Within each group, process
     // one at a time (serialized). Across groups we could parallelize, but
     // since we have a single writer/reader pair, we process sequentially.
     let mut by_target: HashMap<String, Vec<Task>> = HashMap::new();
-    for task in approved {
+    for task in code_tasks {
         let target = db
             .get_merge_target(task.id)
             .unwrap_or_else(|_| "main".into());
         by_target.entry(target).or_default().push(task);
     }
-
-    let mut attempts = Vec::new();
 
     for tasks in by_target.values() {
         for task in tasks {
@@ -2715,6 +2859,7 @@ fn task_to_info_with_live(
         held: t.held,
         filed_by_project: t.filed_by_project,
         filed_by_session_id: t.filed_by_session_id,
+        no_merge: t.no_merge,
         created_at: t.created_at,
         updated_at: t.updated_at,
     }
@@ -2782,6 +2927,11 @@ pub fn task_overview_response(
         .into_iter()
         .map(|t| task_to_info_with_live(t, live_task_ids))
         .collect();
+    let recently_done: Vec<TaskInfo> = db
+        .list_recent_by_state(project, "done", recent_limit)?
+        .into_iter()
+        .map(|t| task_to_info_with_live(t, live_task_ids))
+        .collect();
     let recently_closed: Vec<TaskInfo> = db
         .list_recent_by_state(project, "closed", recent_limit)?
         .into_iter()
@@ -2795,6 +2945,7 @@ pub fn task_overview_response(
         blocked,
         held,
         recently_merged,
+        recently_done,
         recently_closed,
         inflight_count: status.inflight_count,
         max_concurrent: status.max_concurrent,
@@ -2839,6 +2990,7 @@ mod tests {
             auto_downgraded_from_ready: false,
             filed_by_project: None,
             filed_by_session_id: None,
+            no_merge: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -3590,6 +3742,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -3776,6 +3929,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -3845,6 +3999,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -3904,6 +4059,222 @@ mod tests {
         assert!(json.contains("all good"));
     }
 
+    // ---- no_merge merge sweep tests (task #942) ----
+
+    #[test]
+    fn test_merge_approved_no_merge_transitions_to_done() {
+        let db = TasksDb::open_memory().unwrap();
+        // Create a no_merge task and march it to approved.
+        let task = db
+            .create_task(
+                "test-project",
+                "investigate X",
+                None,
+                None,
+                None,
+                true, // skip_review
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                true, // no_merge
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.update_task(
+            task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Approved),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let attempts = merge_approved(
+            &db,
+            &|_| Ok("/fake/path".to_string()),
+            &mut writer,
+            &mut reader,
+        )
+        .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].success, "no_merge merge attempt must succeed");
+        assert!(
+            attempts[0].log.contains("no_merge"),
+            "log should mention the no_merge skip path: {}",
+            attempts[0].log
+        );
+
+        let updated = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated.state,
+            TaskState::Done,
+            "no_merge approved task must transition to done"
+        );
+    }
+
+    #[test]
+    fn test_merge_approved_mixed_no_merge_and_code() {
+        // A code-merge task and a no_merge task both in approved. The
+        // no_merge task transitions to done; the code task fails the
+        // merge ceremony (no real repo) and is reverted to active.
+        let db = TasksDb::open_memory().unwrap();
+        let no_merge_task = db
+            .create_task(
+                "test-project",
+                "investigation",
+                None,
+                None,
+                None,
+                true,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                true,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.update_task(
+            no_merge_task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Approved),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let code_task = db
+            .create_task(
+                "test-project",
+                "code change",
+                None,
+                None,
+                None,
+                true,
+                "interactive",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.update_task(
+            code_task.id,
+            &TaskUpdate {
+                state: Some(TaskState::Approved),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        db.set_branch(code_task.id, "task-2").unwrap();
+        db.set_worktree_path(code_task.id, "/tmp/wt-2").unwrap();
+
+        let mut writer: Vec<u8> = Vec::new();
+        let mut reader = std::io::BufReader::new(std::io::Cursor::new(Vec::<u8>::new()));
+        let attempts = merge_approved(
+            &db,
+            &|_| Ok("/fake/path".to_string()),
+            &mut writer,
+            &mut reader,
+        )
+        .unwrap();
+        assert_eq!(attempts.len(), 2);
+
+        let no_merge_after = db.get_task(no_merge_task.id).unwrap().unwrap();
+        assert_eq!(no_merge_after.state, TaskState::Done);
+
+        // Code task is in some non-Done state (active or merging or
+        // failed depending on how the fake-resolver pipeline reacts);
+        // the assertion that matters is it never landed in Done.
+        let code_after = db.get_task(code_task.id).unwrap().unwrap();
+        assert_ne!(
+            code_after.state,
+            TaskState::Done,
+            "code-merge task must not transition to done"
+        );
+    }
+
+    #[test]
+    fn test_prepare_task_no_merge_skips_worktree() {
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "investigation",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                true, // no_merge
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        // Pass an obviously-bogus repo_root — prepare_task must not touch git.
+        let scheduled = prepare_task(&db, &task, "/this/path/does/not/exist").unwrap();
+        assert_eq!(scheduled.id, task.id);
+        assert!(scheduled.branch.is_empty(), "no_merge: no branch created");
+        assert!(scheduled.worktree_path.is_empty(), "no_merge: no worktree");
+        let after = db.get_task(task.id).unwrap().unwrap();
+        assert_eq!(after.state, TaskState::Active);
+        assert!(after.branch.is_none(), "no_merge task must have no branch");
+        assert!(
+            after.worktree_path.is_none(),
+            "no_merge task must have no worktree"
+        );
+    }
+
+    #[test]
+    fn test_task_phase_cwd_no_merge_uses_project_root() {
+        // For no_merge tasks the worker phase should fall back to the
+        // project root (since there's no worktree).
+        let db = TasksDb::open_memory().unwrap();
+        let task = db
+            .create_task(
+                "test-project",
+                "investigation",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                true,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        // task.worktree_path is None (we never set it).
+        let cwd = TaskPhase::Worker.cwd(&task, "/proj/root");
+        assert_eq!(cwd.as_deref(), Some("/proj/root"));
+    }
+
     #[test]
     fn test_dispatch_replaces_stale_session_from_previous_phase() {
         let db = TasksDb::open_memory().unwrap();
@@ -3924,6 +4295,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -3999,6 +4371,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4065,6 +4438,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4085,6 +4459,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4142,6 +4517,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4196,6 +4572,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4262,6 +4639,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4311,6 +4689,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4614,6 +4993,7 @@ mod tests {
                 false,
                 None,
                 true, // auto_downgraded_from_ready,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4785,6 +5165,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4802,6 +5183,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4832,6 +5214,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -4886,6 +5269,7 @@ mod tests {
                 true,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -4934,6 +5318,7 @@ mod tests {
                 None,
                 true,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -5033,6 +5418,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -5050,6 +5436,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -5706,6 +6093,7 @@ mod tests {
                 /* held */ true,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -5967,6 +6355,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .expect("create");
@@ -6060,6 +6449,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6463,6 +6853,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             false,
             crate::tasks_db::FiledBy::default(),
         )

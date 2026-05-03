@@ -78,6 +78,7 @@ pub struct PickerGroups {
     pub blocked: Vec<(usize, TaskInfo)>,
     pub held: Vec<(usize, TaskInfo)>,
     pub recently_merged: Vec<TaskInfo>,
+    pub recently_done: Vec<TaskInfo>,
     pub recently_closed: Vec<TaskInfo>,
     pub inflight_count: usize,
     pub max_concurrent: usize,
@@ -1471,7 +1472,12 @@ impl App {
         // Recently completed tail — flat, no tree indent, dim age hint.
         // Only emit the header if at least one row survives filtering.
         let mut recent_tmp: Vec<PickerRow> = Vec::new();
-        for t in g.recently_merged.iter().chain(g.recently_closed.iter()) {
+        for t in g
+            .recently_merged
+            .iter()
+            .chain(g.recently_done.iter())
+            .chain(g.recently_closed.iter())
+        {
             if let Some(n) = needle.as_deref() {
                 if !task_matches_filter(t, n) {
                     continue;
@@ -1491,7 +1497,8 @@ impl App {
             if !first_group {
                 rows.push(PickerRow::Spacer);
             }
-            let recent_total = g.recently_merged.len() + g.recently_closed.len();
+            let recent_total =
+                g.recently_merged.len() + g.recently_done.len() + g.recently_closed.len();
             rows.push(PickerRow::Header(format!(
                 "recently completed ({})",
                 recent_total
@@ -3362,6 +3369,7 @@ impl App {
                 blocked,
                 held,
                 recently_merged,
+                recently_done,
                 recently_closed,
                 inflight_count,
                 max_concurrent,
@@ -3399,6 +3407,7 @@ impl App {
                         blocked: compute_group_depths(blocked),
                         held: compute_group_depths(held),
                         recently_merged,
+                        recently_done,
                         recently_closed,
                         inflight_count,
                         max_concurrent,
@@ -5303,6 +5312,7 @@ mod tests {
             has_live_session: false,
             filed_by_project: None,
             filed_by_session_id: None,
+            no_merge: false,
             created_at: 0,
             updated_at: 0,
         }
@@ -5334,6 +5344,7 @@ mod tests {
             blocked: Vec::new(),
             held: Vec::new(),
             recently_merged: Vec::new(),
+            recently_done: Vec::new(),
             recently_closed: Vec::new(),
             inflight_count: 2,
             max_concurrent: 8,
@@ -6672,6 +6683,7 @@ mod tests {
             blocked: blocked.into_iter().map(|t| (0, t)).collect(),
             held: held.into_iter().map(|t| (0, t)).collect(),
             recently_merged,
+            recently_done: Vec::new(),
             recently_closed: Vec::new(),
             inflight_count: 0,
             max_concurrent: 8,
@@ -7017,6 +7029,7 @@ mod tests {
             blocked: Vec::new(),
             held: vec![make_task_info(3, "h", "ready")],
             recently_merged: vec![make_task_info(4, "m", "merged")],
+            recently_done: Vec::new(),
             recently_closed: Vec::new(),
             inflight_count: 1,
             max_concurrent: 8,

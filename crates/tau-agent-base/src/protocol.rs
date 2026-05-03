@@ -523,6 +523,10 @@ pub enum Response {
         /// Most recently merged tasks, newest first, capped at `recent_limit`
         /// (the request's per-bucket limit).
         recently_merged: Vec<TaskInfo>,
+        /// Most recently "done" tasks (no_merge tasks that completed without
+        /// producing a code change), newest first, capped at `recent_limit`.
+        #[serde(default)]
+        recently_done: Vec<TaskInfo>,
         /// Most recently closed tasks, newest first, capped at `recent_limit`
         /// (the request's per-bucket limit; merged and closed are independent).
         recently_closed: Vec<TaskInfo>,
@@ -756,6 +760,12 @@ pub struct TaskInfo {
     /// available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filed_by_session_id: Option<String>,
+    /// True when this task does not produce a code change (no_merge tasks).
+    /// The scheduler skips worktree creation and the merge ceremony; on
+    /// approval the task transitions directly to `done`. Defaults to
+    /// `false` for back-compat with older clients / serialised payloads.
+    #[serde(default)]
+    pub no_merge: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1259,6 +1269,7 @@ mod tests {
             has_live_session: false,
             filed_by_project: None,
             filed_by_session_id: None,
+            no_merge: false,
             created_at: 1000,
             updated_at: 2000,
         };
@@ -1388,6 +1399,7 @@ mod tests {
                 blocked: Vec::new(),
                 held: Vec::new(),
                 recently_merged: Vec::new(),
+                recently_done: Vec::new(),
                 recently_closed: Vec::new(),
                 inflight_count: 1,
                 max_concurrent: 8,

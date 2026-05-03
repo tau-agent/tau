@@ -131,7 +131,7 @@ fn broadcasts_to_root(to: TaskState) -> bool {
     // dropping this", not actionable.
     matches!(
         to,
-        TaskState::Merged | TaskState::Failed | TaskState::Interactive
+        TaskState::Merged | TaskState::Done | TaskState::Failed | TaskState::Interactive
     )
 }
 
@@ -144,6 +144,8 @@ fn format_message(task: &Task, from: TaskState, context: Option<&str>) -> String
     let title = capped_title(&task.title);
     let body = if task.state == TaskState::Merged {
         format!("[task #{}] {}: merged", task.id, title)
+    } else if task.state == TaskState::Done {
+        format!("[task #{}] {}: done", task.id, title)
     } else {
         format!("[task #{}] {}: {} → {}", task.id, title, from, task.state)
     };
@@ -497,6 +499,12 @@ fn format_terminal_llm_message(task: &Task, context: Option<&str>) -> String {
                 "{} #{} \"{}\" has been merged. If you were waiting on it, you can now proceed.",
                 noun, task.id, title
             ),
+        },
+        TaskState::Done => match context {
+            Some(c) if !c.is_empty() => {
+                format!("{} #{} \"{}\" is done ({}).", noun, task.id, title, c)
+            }
+            _ => format!("{} #{} \"{}\" is done.", noun, task.id, title),
         },
         TaskState::Closed => match context {
             Some(c) if !c.is_empty() => format!(
@@ -1047,6 +1055,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             false,
             crate::tasks_db::FiledBy::default(),
         )

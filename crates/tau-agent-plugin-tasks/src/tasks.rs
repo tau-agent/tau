@@ -255,6 +255,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                         "type": "boolean",
                         "description": "When true, the task is created but NOT scheduled for dispatch, even if initial_state='ready'. Release by calling task_update with hold=false. Useful for batch-seeding a task board before manually choosing dispatch order. Default: false."
                     },
+                    "no_merge": {
+                        "type": "boolean",
+                        "description": "When true, the task does not produce a code change. The scheduler skips worktree creation; on approval the task transitions directly to `done` (no merge ceremony, no checklist run). Use for investigations, audits, design discussions, coordination, etc. Default: false."
+                    },
                     "affected_files": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -277,6 +281,7 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                 "Pass hold=true to create a task without scheduling it. Useful for batch-seeding a backlog on a greenfield project: file N tasks at once, review, then release them in considered order via task_update(hold=false). Held tasks are visible in task_list/task_status with a held indicator but the scheduler skips them.".into(),
                 "When filing with initial_state=\"ready\", pass `affected_files` (the files the work will touch) so the scheduler can run your task in parallel with disjoint tasks. Omit it only if the file set is genuinely unpredictable — in which case the task is auto-routed through a focused planning phase that populates the list. Use `affected_files: [\"*\"]` as the explicit \"touches everything / unknowable\" marker; that bypasses planning but keeps the task serialised against all other work.".into(),
                 "Pass `project` to file a task in a different project from the calling session's. Use this for cross-repo workflows: file one task per repo from the same orchestrator session and link them with `task_relate` / `depends_on`. Defaults to the caller's project; the named project must be registered (run `tau project init` inside its repo first).".into(),
+                "Pass `no_merge=true` for tasks that complete without a code change (investigations, audits, design discussions, coordination). The scheduler skips worktree creation and the task transitions `approved → done` instead of through merging. Pair with empty `affected_files` (or omit it) so the task can run in parallel with code work.".into(),
             ],
         },
         PluginToolDef {
@@ -400,6 +405,10 @@ fn tasks_tools() -> Vec<PluginToolDef> {
                     "hold": {
                         "type": "boolean",
                         "description": "Hold (true) or release (false) a task from scheduler dispatch. A held task remains visible in lists and preserves its state but the scheduler will not dispatch it. See task_create for details."
+                    },
+                    "no_merge": {
+                        "type": "boolean",
+                        "description": "Set/clear the no_merge flag. Pre-dispatch only — rejected after a worktree has been created. See task_create for full semantics."
                     },
                     "project": {
                         "type": "string",
@@ -708,6 +717,10 @@ fn handle_task_create(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let hold = args.get("hold").and_then(|v| v.as_bool()).unwrap_or(false);
+    let no_merge = args
+        .get("no_merge")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let message = args.get("message").and_then(|v| v.as_str());
     let merge_target = args.get("merge_target").and_then(|v| v.as_str());
     let sandbox_profile = args.get("sandbox_profile").and_then(|v| v.as_str());
@@ -797,7 +810,13 @@ fn handle_task_create(
         affected_files_arg.as_ref(),
         Some(serde_json::Value::Array(arr)) if !arr.is_empty()
     ) && !star_marker;
-    let auto_downgrade = initial_state == "ready" && !has_concrete_files && !star_marker;
+    // no_merge tasks (task #942) intentionally have no `affected_files`
+    // — they don't write to the codebase. Skipping the auto-downgrade
+    // for them keeps the lifecycle simple: they go straight from `ready`
+    // to `active` without a planning detour to populate a file list
+    // that doesn't exist.
+    let auto_downgrade =
+        initial_state == "ready" && !has_concrete_files && !star_marker && !no_merge;
     if auto_downgrade {
         initial_state = "planning";
     }
@@ -816,8 +835,10 @@ fn handle_task_create(
         hold,
         affected_files_arg.as_ref(),
         auto_downgrade,
+        no_merge,
         // Provenance: record where the file-call came from. Always the
-        // *caller's* project (`ctx.project_name`), not the resolved
+        // *caller's* project (`ctx.project_name`),
+        // not the resolved
         // target project — same-project filing still gets recorded
         // (it's still useful provenance) and cross-project filing
         // reveals which project's session reached over the fence.
@@ -1686,6 +1707,7 @@ fn handle_task_update(
             .map(String::from),
         held: args.get("hold").and_then(|v| v.as_bool()),
         project_name: project_name_update,
+        no_merge: args.get("no_merge").and_then(|v| v.as_bool()),
     };
 
     // Track session as reviewer if it approves the task — the transition
@@ -1799,7 +1821,7 @@ fn handle_task_update(
                         session_id.map(String::from),
                     ));
                 }
-                TaskState::Merged | TaskState::Closed => {
+                TaskState::Merged | TaskState::Done | TaskState::Closed => {
                     // Dependents may have been blocked on this task — re-
                     // evaluate schedulability on the next scheduler pass.
                     eprintln!(
@@ -3239,6 +3261,7 @@ pub fn run_tasks_plugin() {
                             | TaskState::Merging
                             | TaskState::Failed
                             | TaskState::Merged
+                            | TaskState::Done
                             | TaskState::Closed => {}
                         }
                     }
@@ -4996,6 +5019,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -5013,6 +5037,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -5051,6 +5076,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6226,6 +6252,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6288,6 +6315,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6341,6 +6369,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6401,6 +6430,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6447,6 +6477,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6512,6 +6543,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6561,6 +6593,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6619,6 +6652,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6676,6 +6710,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6729,6 +6764,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -6800,6 +6836,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6866,6 +6903,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6915,6 +6953,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -6957,6 +6996,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7030,6 +7070,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7108,6 +7149,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7190,6 +7232,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7275,6 +7318,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7390,6 +7434,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7484,6 +7529,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7562,6 +7608,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7634,6 +7681,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -7714,6 +7762,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -7775,7 +7824,7 @@ mod tests {
             .map(|t| t.prompt_guidelines.len())
             .sum();
         assert!(
-            total < 21,
+            total < 22,
             "task_* prompt_guidelines total should stay small; got {}",
             total
         );
@@ -8012,6 +8061,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8061,6 +8111,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8092,6 +8143,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8109,6 +8161,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8140,6 +8193,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8157,6 +8211,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8198,6 +8253,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8215,6 +8271,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8251,6 +8308,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8308,6 +8366,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8342,6 +8401,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8359,6 +8419,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8394,6 +8455,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8411,6 +8473,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8447,6 +8510,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8464,6 +8528,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8502,6 +8567,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -8519,6 +8585,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -8895,6 +8962,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -9638,6 +9706,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -9697,6 +9766,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -9755,6 +9825,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -9828,6 +9899,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -9911,6 +9983,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -9954,6 +10027,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10053,6 +10127,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10073,6 +10148,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10149,6 +10225,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10297,6 +10374,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10352,6 +10430,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10419,6 +10498,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10524,6 +10604,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10605,6 +10686,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10673,6 +10755,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10743,6 +10826,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -10815,6 +10899,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -10882,6 +10967,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11006,6 +11092,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11125,6 +11212,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11142,6 +11230,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11255,6 +11344,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11272,6 +11362,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11385,6 +11476,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11402,6 +11494,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11524,6 +11617,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11541,6 +11635,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11601,6 +11696,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11618,6 +11714,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11695,6 +11792,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11712,6 +11810,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -11845,6 +11944,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -11947,6 +12047,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12039,6 +12140,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12248,6 +12350,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12265,6 +12368,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12347,6 +12451,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12364,6 +12469,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12576,6 +12682,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12593,6 +12700,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12678,6 +12786,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12695,6 +12804,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12853,6 +12963,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -12870,6 +12981,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -12996,6 +13108,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13096,6 +13209,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13172,6 +13286,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13189,6 +13304,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13282,6 +13398,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13341,6 +13458,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13426,6 +13544,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13443,6 +13562,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13491,6 +13611,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13553,6 +13674,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13570,6 +13692,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13630,6 +13753,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -13884,6 +14008,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -13996,6 +14121,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -14012,6 +14138,7 @@ mod tests {
             None,
             false,
             None,
+            false,
             false,
             crate::tasks_db::FiledBy::default(),
         )
@@ -14070,6 +14197,7 @@ mod tests {
                 false,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .expect("create task");
@@ -14116,6 +14244,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -14387,6 +14516,7 @@ mod tests {
                 true,
                 None,
                 false,
+                false,
                 crate::tasks_db::FiledBy::default(),
             )
             .unwrap();
@@ -14503,6 +14633,7 @@ mod tests {
                 None,
                 false,
                 None,
+                false,
                 false,
                 crate::tasks_db::FiledBy::default(),
             )
@@ -14806,5 +14937,180 @@ mod tests {
         // happened if the watchdog had been called once per
         // stale-ready warning).
         assert_eq!(count_stuck_merging_attempts(&db, task.id), 1);
+    }
+
+    // ---- no_merge handler tests (task #942) ----
+
+    #[test]
+    fn test_handle_task_create_with_no_merge() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let mut pending = Vec::new();
+
+        let result = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "investigate slow startup",
+                "initial_state": "ready",
+                "no_merge": true,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        assert!(
+            !result.is_error,
+            "task_create with no_merge=true should succeed"
+        );
+
+        let tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].no_merge, "no_merge flag should be persisted");
+        // Even without affected_files, no_merge tasks must NOT be
+        // auto-downgraded to planning — they have no files by design.
+        assert_eq!(tasks[0].state, TaskState::Ready);
+        assert!(!tasks[0].auto_downgraded_from_ready);
+    }
+
+    #[test]
+    fn test_handle_task_create_no_merge_skips_auto_downgrade() {
+        // Regression: ready-state filing without affected_files normally
+        // routes through planning. For no_merge tasks (no files by
+        // design) this should NOT happen.
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+        let mut pending = Vec::new();
+
+        let _ = handle_task_create(
+            &db,
+            &serde_json::json!({
+                "title": "audit auth module",
+                "initial_state": "ready",
+                "no_merge": true,
+            }),
+            &ToolCtx {
+                project_name: Some("test-project"),
+                session_id: Some("s1"),
+                tool_call_id: "tc",
+            },
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut pending,
+        );
+        let tasks = db
+            .list_tasks("test-project", None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            tasks[0].state,
+            TaskState::Ready,
+            "no auto-downgrade for no_merge"
+        );
+    }
+
+    #[test]
+    fn test_handle_task_update_sets_no_merge_pre_dispatch() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        // Create a planning task (no branch / worktree yet).
+        let task = db
+            .create_task(
+                "test-project",
+                "some task",
+                None,
+                None,
+                None,
+                false,
+                "planning",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "no_merge": true}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            !result.is_error,
+            "task_update no_merge=true pre-dispatch should succeed"
+        );
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(reloaded.no_merge);
+    }
+
+    #[test]
+    fn test_handle_task_update_no_merge_rejected_after_worktree() {
+        let db = TasksDb::open_memory().unwrap();
+        let resolver = test_resolver();
+        let (mut writer, mut reader) = mock_io();
+
+        let task = db
+            .create_task(
+                "test-project",
+                "task with worktree",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        db.set_branch(task.id, "task-99").unwrap();
+        db.set_worktree_path(task.id, "/tmp/wt-99").unwrap();
+
+        let result = handle_task_update(
+            &db,
+            &serde_json::json!({"id": task.id, "no_merge": true}),
+            Some("s1"),
+            "tc",
+            &resolver,
+            &mut writer,
+            &mut reader,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert!(
+            result.is_error,
+            "task_update no_merge=true after worktree must be rejected"
+        );
+        let reloaded = db.get_task(task.id).unwrap().unwrap();
+        assert!(
+            !reloaded.no_merge,
+            "flag must remain unchanged after rejection"
+        );
     }
 }
