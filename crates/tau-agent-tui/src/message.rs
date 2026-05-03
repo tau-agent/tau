@@ -70,6 +70,12 @@ use crate::theme::Theme;
 pub enum MessageItem {
     /// User message.
     User { text: String },
+    /// System-injected user message that was drained into the agent
+    /// loop's context (e.g. a queued steer, child-completion notice,
+    /// or task notification). Rendered with a steer-tinted prefix so
+    /// the user can tell where it landed in the conversation history
+    /// and distinguish it from messages they typed in `Input` mode.
+    Steer { text: String },
     /// Complete assistant message.
     Assistant { text: String },
     /// Streaming assistant text (still arriving).
@@ -131,6 +137,38 @@ impl MessageItem {
                 lines.push(Line::from(Span::styled(" ", bg_style))); // top padding
                 for l in wrap_text(text, usable) {
                     lines.push(Line::from(Span::styled(format!(" {}", l), text_style)));
+                }
+                lines.push(Line::from(Span::styled(" ", bg_style))); // bottom padding
+                fill_bg(&mut lines, bg_style, width);
+                Text::from(lines)
+            }
+            MessageItem::Steer { text } => {
+                let bg_style = theme.bg(theme.user_message_bg);
+                let text_style = bg_style.fg(theme.user_message_text.to_ratatui());
+                let prefix_style = bg_style
+                    .fg(theme.accent.to_ratatui())
+                    .add_modifier(ratatui::style::Modifier::BOLD);
+                let prefix = " \u{21AA} steer: ";
+                let prefix_width = unicode_width::UnicodeWidthStr::width(prefix);
+                let usable = (width as usize).saturating_sub(prefix_width);
+
+                let mut lines: Vec<Line<'static>> = Vec::new();
+                lines.push(Line::from(Span::styled(" ", bg_style))); // top padding
+                let wrapped = wrap_text(text, usable);
+                let pad = " ".repeat(prefix_width);
+                for (i, l) in wrapped.iter().enumerate() {
+                    let leading = if i == 0 {
+                        Span::styled(prefix, prefix_style)
+                    } else {
+                        Span::styled(pad.clone(), bg_style)
+                    };
+                    lines.push(Line::from(vec![
+                        leading,
+                        Span::styled(l.clone(), text_style),
+                    ]));
+                }
+                if wrapped.is_empty() {
+                    lines.push(Line::from(Span::styled(prefix, prefix_style)));
                 }
                 lines.push(Line::from(Span::styled(" ", bg_style))); // bottom padding
                 fill_bg(&mut lines, bg_style, width);

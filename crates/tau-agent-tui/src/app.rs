@@ -3582,8 +3582,30 @@ impl App {
                 // resetting this, but be defensive in case of
                 // event-ordering quirks.
                 self.turn_text_finalized = false;
-                // Clear the steer indicator — the session has acknowledged
-                // the steer by starting a new assistant turn.
+                // Note: pending_steer is NOT cleared here. The agent
+                // loop emits `StreamEvent::SteerMessage` when it drains
+                // a queued user message into context (immediately
+                // before the next LLM call), and that is the correct,
+                // direct signal that the steer has been consumed. See
+                // the `SteerMessage` arm below.
+            }
+            StreamEvent::SteerMessage { message } => {
+                // The agent loop just drained a queued user message into
+                // context (steer / forwarded notification / child
+                // completion notice). Render it in scrollback so the
+                // user can see exactly where it landed in the
+                // conversation history, and clear the pending-steer
+                // indicator now that the LLM is about to consume it.
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        UserContent::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.messages.push(MessageItem::Steer { text });
                 self.pending_steer = None;
             }
             StreamEvent::TextDelta { delta, .. } => {
@@ -5715,9 +5737,13 @@ mod tests {
         assert_eq!(app.pending_steer.as_deref(), Some("fix the bug"));
     }
 
-    /// StreamEvent::Start clears pending_steer (session acknowledged the steer).
+    /// StreamEvent::Start does NOT clear pending_steer. The correct
+    /// signal is `StreamEvent::SteerMessage` (see
+    /// `steer_message_event_clears_pending_steer`); `Start` is a
+    /// downstream proxy in the current loop ordering and clearing on
+    /// it tied us to that ordering.
     #[test]
-    fn stream_start_clears_pending_steer() {
+    fn stream_start_does_not_clear_pending_steer() {
         let mut app = make_app();
         app.mode = AppMode::Streaming;
         app.pending_steer = Some("steer text".into());
@@ -5726,9 +5752,50 @@ mod tests {
             partial: assistant_message("", StopReason::Stop, None),
         });
 
+        assert_eq!(
+            app.pending_steer.as_deref(),
+            Some("steer text"),
+            "Start should not clear pending_steer (SteerMessage does)"
+        );
+    }
+
+    /// `StreamEvent::SteerMessage` pushes the drained user message into
+    /// scrollback so the user can see exactly where the steer landed in
+    /// the conversation history.
+    #[test]
+    fn steer_message_event_pushes_to_scrollback() {
+        use tau_agent_lib::types::UserMessage;
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        let len_before = app.messages.len();
+
+        app.handle_stream_event(StreamEvent::SteerMessage {
+            message: UserMessage::text("fix the bug"),
+        });
+
+        assert_eq!(app.messages.len(), len_before + 1);
+        match app.messages.last() {
+            Some(MessageItem::Steer { text }) => assert_eq!(text, "fix the bug"),
+            other => panic!("expected Steer message, got {other:?}"),
+        }
+    }
+
+    /// `StreamEvent::SteerMessage` clears the pending-steer indicator
+    /// — the LLM is about to consume the queued message.
+    #[test]
+    fn steer_message_event_clears_pending_steer() {
+        use tau_agent_lib::types::UserMessage;
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        app.pending_steer = Some("steer text".into());
+
+        app.handle_stream_event(StreamEvent::SteerMessage {
+            message: UserMessage::text("steer text"),
+        });
+
         assert!(
             app.pending_steer.is_none(),
-            "Start should clear pending_steer"
+            "SteerMessage should clear pending_steer"
         );
     }
 
