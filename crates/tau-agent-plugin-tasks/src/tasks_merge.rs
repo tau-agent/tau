@@ -884,11 +884,17 @@ pub fn notify_parent_if_all_done(
     };
 
     // Check if all sibling subtasks are in a terminal state
+    // (merged / done / closed — not failed, since failed is the
+    // unhappy path and the parent shouldn't be told "all subtasks
+    // done" when one of them errored).
     let subtasks = db.get_subtasks(parent_id)?;
     let all_done = !subtasks.is_empty()
-        && subtasks
-            .iter()
-            .all(|t| t.state == TaskState::Merged || t.state == TaskState::Closed);
+        && subtasks.iter().all(|t| {
+            matches!(
+                t.state,
+                TaskState::Merged | TaskState::Done | TaskState::Closed
+            )
+        });
 
     if !all_done {
         return Ok(());

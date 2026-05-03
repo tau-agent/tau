@@ -279,9 +279,21 @@ fn run_one_job<W>(
                     writer,
                     reader,
                 );
-                crate::tasks_scheduler::archive_no_merge_task_sessions_pub(
+                crate::tasks_scheduler::archive_no_merge_task_sessions(
                     db, &updated, writer, reader,
                 );
+                // Parent-notification parity with the code-merge path:
+                // a no_merge subtask completing must wake its code
+                // (or no_merge) parent the same way a merge would.
+                crate::tasks_merge::notify_parent_of_subtask_done(db, job.task_id, writer, reader);
+                if let Err(e) =
+                    crate::tasks_merge::notify_parent_if_all_done(db, job.task_id, writer, reader)
+                {
+                    eprintln!(
+                        "tasks merge worker: notify_parent_if_all_done for no_merge task {}: {}",
+                        job.task_id, e
+                    );
+                }
             }
             Err(e) => {
                 eprintln!(

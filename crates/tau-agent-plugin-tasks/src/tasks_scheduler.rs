@@ -1587,16 +1587,7 @@ pub fn merge_approved(
 /// Archive the worker/placeholder/role sessions of a no_merge task that
 /// just transitioned to `done`. Mirrors the archival side of
 /// [`crate::tasks_merge::merge_task`] but without the merge ceremony.
-pub(crate) fn archive_no_merge_task_sessions_pub(
-    db: &TasksDb,
-    task: &Task,
-    writer: &mut impl Write,
-    reader: &mut impl BufRead,
-) {
-    archive_no_merge_task_sessions(db, task, writer, reader);
-}
-
-fn archive_no_merge_task_sessions(
+pub(crate) fn archive_no_merge_task_sessions(
     db: &TasksDb,
     task: &Task,
     writer: &mut impl Write,
@@ -1689,6 +1680,18 @@ pub fn merge_approved_for_caller(
                 // Mirrors the archival that `merge_task` performs for
                 // code-merge tasks.
                 archive_no_merge_task_sessions(db, &updated, writer, reader);
+                // Parent-notification parity with the code-merge path:
+                // a no_merge subtask completing must wake its code
+                // (or no_merge) parent the same way a merge would.
+                crate::tasks_merge::notify_parent_of_subtask_done(db, task_id, writer, reader);
+                if let Err(e) =
+                    crate::tasks_merge::notify_parent_if_all_done(db, task_id, writer, reader)
+                {
+                    eprintln!(
+                        "tasks scheduler: notify_parent_if_all_done for no_merge task {}: {}",
+                        task_id, e
+                    );
+                }
                 attempts.push(MergeAttempt {
                     task_id,
                     title,

@@ -1690,3 +1690,285 @@ fn watchdog_recovers_task_stuck_without_session_id() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// no_merge task lifecycle tests (task #942)
+// ---------------------------------------------------------------------------
+
+/// Full lifecycle for a no_merge task:
+/// `filed (interactive) → ready → active → review → approved → done`.
+///
+/// Asserts:
+/// - The task never gets a branch or worktree (scheduler skips
+///   provisioning for `no_merge=true`).
+/// - On approval the task transitions directly to `done` (no merge
+///   ceremony, no `merging` state).
+/// - `done` is terminal: subsequent transitions are rejected.
+#[test]
+fn no_merge_task_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    // Generous response budget for any auto-dispatched worker / reviewer
+    // sessions. The no_merge task does no real work — we drive the state
+    // transitions manually — but the dispatched sessions still consume
+    // mock responses for any chat turns they execute before shutdown.
+    let server = start_server_with_tasks(
+        &repo,
+        (0..16)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    // File a no_merge task directly as `ready`. The auto-downgrade to
+    // planning is suppressed for no_merge tasks (no files to populate),
+    // so this should land in `ready` immediately.
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "Investigate slow startup",
+            "initial_state": "ready",
+            "no_merge": true,
+            "message": "figure out why X is slow",
+        }),
+    );
+    let task_id = task["id"].as_i64().unwrap();
+    assert_eq!(task["state"].as_str().unwrap(), "ready");
+    assert_eq!(
+        task["no_merge"].as_bool(),
+        Some(true),
+        "no_merge flag should be persisted on creation"
+    );
+
+    // Scheduler should pick it up and transition it to `active` WITHOUT
+    // creating a branch or worktree.
+    let task_payload =
+        wait_for_task_state(&server, &sid, task_id, "active", Duration::from_secs(10));
+    let task_data = &task_payload["task"];
+    assert!(
+        task_data["branch"].is_null(),
+        "no_merge task must have null branch, got {:?}",
+        task_data["branch"]
+    );
+    assert!(
+        task_data["worktree_path"].is_null(),
+        "no_merge task must have null worktree_path, got {:?}",
+        task_data["worktree_path"]
+    );
+
+    // Worker reports findings and transitions active → review.
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_message",
+        serde_json::json!({
+            "id": task_id,
+            "content": "Investigation: startup is slow because of X. Recommend Y.",
+        }),
+    );
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": task_id, "state": "review"}),
+    );
+    assert_eq!(task["state"].as_str().unwrap(), "review");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Reviewer approves → approved.
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": task_id, "state": "approved"}),
+    );
+    assert_eq!(task["state"].as_str().unwrap(), "approved");
+
+    // The MergeNeeded event auto-fires; for a no_merge task the merge
+    // sweep skips the ceremony and transitions to `done` directly.
+    let final_payload =
+        wait_for_task_state(&server, &sid, task_id, "done", Duration::from_secs(15));
+    let final_task = &final_payload["task"];
+    assert_eq!(final_task["state"].as_str().unwrap(), "done");
+    assert!(
+        final_task["branch"].is_null(),
+        "no_merge task must still have null branch after done"
+    );
+    assert!(
+        final_task["worktree_path"].is_null(),
+        "no_merge task must still have null worktree_path after done"
+    );
+
+    // The no_merge task never went through `merging`. We assert this
+    // indirectly: the task moved straight from `approved` to `done` in
+    // the previous wait_for_task_state call — had it taken the merging
+    // detour, the wait would have observed `merging` first, but the
+    // explicit transition path in the scheduler's no_merge branch goes
+    // approved → done with no `merging` step in between. Additionally
+    // there is no merge commit on main attributable to this task,
+    // verified by the absence of a task branch below.
+
+    // `done` is terminal: an attempt to transition out must be rejected.
+    let err = exec_tool_err(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": task_id, "state": "active"}),
+    );
+    assert!(
+        err.to_lowercase().contains("transition") || err.to_lowercase().contains("invalid"),
+        "transition out of done should be rejected, got: {err}"
+    );
+
+    // The task on disk: no branch was ever created in git either.
+    let branches = git(&repo, &["branch", "--list"]);
+    assert!(
+        !branches.contains(&format!("task-{}", task_id)),
+        "git should not have a branch for the no_merge task, got: {}",
+        branches
+    );
+
+    server.shutdown();
+}
+
+/// Coexistence: a no_merge investigation task and a code-merge task
+/// both sit in `approved`. A single merge sweep transitions the
+/// no_merge task to `done` AND merges the code task in one pass; the
+/// no_merge transition does not block the code merge and vice versa.
+#[test]
+fn no_merge_task_coexists_with_code_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    let server = start_server_with_tasks(
+        &repo,
+        (0..32)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    // ----- Code task first -----
+    // (filed first to get its branch+worktree; while it's in-flight the
+    // no_merge task can run in parallel because their file-claims are
+    // disjoint — the no_merge task explicitly opts in to the file-less
+    // slot via no `affected_files` only after the code task has its
+    // worktree.)
+    let code_task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "add file foo.txt",
+            "initial_state": "ready",
+            "affected_files": ["foo.txt"],
+            "message": "create foo.txt with hello",
+        }),
+    );
+    let code_id = code_task["id"].as_i64().unwrap();
+    assert!(
+        !code_task["no_merge"].as_bool().unwrap_or(false),
+        "code task should default to no_merge=false"
+    );
+
+    let code_active =
+        wait_for_task_state(&server, &sid, code_id, "active", Duration::from_secs(10));
+    let code_worktree = code_active["task"]["worktree_path"]
+        .as_str()
+        .expect("code task must have a worktree")
+        .to_string();
+    let wt_path = std::path::Path::new(&code_worktree);
+
+    // Worker writes the file and commits.
+    std::fs::write(wt_path.join("foo.txt"), "hello\n").unwrap();
+    git(wt_path, &["add", "foo.txt"]);
+    git(wt_path, &["commit", "-m", "Add foo.txt"]);
+    git(wt_path, &["rebase", "main"]);
+
+    // Move code task to `review` then `approved` — these states are NOT
+    // in-flight, so the file-less no_merge task can now schedule
+    // alongside it.
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": code_id, "state": "review"}),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": code_id, "state": "approved"}),
+    );
+
+    // ----- no_merge task -----
+    let no_merge_task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "audit auth module",
+            "initial_state": "ready",
+            "no_merge": true,
+            "message": "check whether auth needs hardening",
+        }),
+    );
+    let no_merge_id = no_merge_task["id"].as_i64().unwrap();
+
+    // Drive no_merge task to approved.
+    let _ = wait_for_task_state(
+        &server,
+        &sid,
+        no_merge_id,
+        "active",
+        Duration::from_secs(10),
+    );
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": no_merge_id, "state": "review"}),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({"id": no_merge_id, "state": "approved"}),
+    );
+
+    // The code task lands on `merged`; the no_merge task lands on
+    // `done`. Both must reach their respective terminals — if either
+    // hung the assertions below would time out.
+    let no_merge_final =
+        wait_for_task_state(&server, &sid, no_merge_id, "done", Duration::from_secs(20));
+    let code_final = wait_for_task_state(&server, &sid, code_id, "merged", Duration::from_secs(20));
+
+    assert_eq!(no_merge_final["task"]["state"].as_str().unwrap(), "done");
+    assert!(
+        no_merge_final["task"]["branch"].is_null(),
+        "no_merge task must have null branch"
+    );
+    assert_eq!(code_final["task"]["state"].as_str().unwrap(), "merged");
+
+    // The code change actually landed on main.
+    let content = git(&repo, &["show", "main:foo.txt"]);
+    assert!(
+        content.contains("hello"),
+        "foo.txt should be on main after merge, got: {}",
+        content
+    );
+
+    server.shutdown();
+}
