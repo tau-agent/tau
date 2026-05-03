@@ -337,376 +337,376 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     // `&mut Context`, etc.  Safe here because callers drop both via
     // their own scopes on panic — we don't read post-panic state.
     let result = AssertUnwindSafe(async {
-    // Check provider throttle — sleep if rate limited
-    if let Some(remaining) = throttle.check(&model.provider) {
-        let human = crate::agent::format_duration_human(remaining.as_millis() as u64);
-        tracing::info!(provider = %model.provider, wait = %human, "provider throttled");
-        let msg = format!(
-            "provider '{}' rate limited, retrying in {}...",
-            model.provider, human
-        );
-        // Notify as a non-fatal status (not Error — Error would cause the TUI
-        // to switch out of Streaming mode prematurely).
-        let status_resp = Response::Stream {
-            event: Box::new(StreamEvent::Status {
-                message: msg.clone(),
-            }),
-        };
-        send(writer, &status_resp).await.ok();
-        broadcast_to_subscribers(state, session_id, &status_resp);
-        // Emit rate-limited phase
-        emit_phase(state, session_id, crate::types::AgentPhase::RateLimited);
-        // Sleep with periodic cancellation checks
-        let deadline = std::time::Instant::now() + remaining;
-        while std::time::Instant::now() < deadline {
-            if cancel_flag.load(Ordering::Relaxed) || shutdown.is_shutting_down() {
-                return Err(crate::Error::Cancelled);
+        // Check provider throttle — sleep if rate limited
+        if let Some(remaining) = throttle.check(&model.provider) {
+            let human = crate::agent::format_duration_human(remaining.as_millis() as u64);
+            tracing::info!(provider = %model.provider, wait = %human, "provider throttled");
+            let msg = format!(
+                "provider '{}' rate limited, retrying in {}...",
+                model.provider, human
+            );
+            // Notify as a non-fatal status (not Error — Error would cause the TUI
+            // to switch out of Streaming mode prematurely).
+            let status_resp = Response::Stream {
+                event: Box::new(StreamEvent::Status {
+                    message: msg.clone(),
+                }),
+            };
+            send(writer, &status_resp).await.ok();
+            broadcast_to_subscribers(state, session_id, &status_resp);
+            // Emit rate-limited phase
+            emit_phase(state, session_id, crate::types::AgentPhase::RateLimited);
+            // Sleep with periodic cancellation checks
+            let deadline = std::time::Instant::now() + remaining;
+            while std::time::Instant::now() < deadline {
+                if cancel_flag.load(Ordering::Relaxed) || shutdown.is_shutting_down() {
+                    return Err(crate::Error::Cancelled);
+                }
+                smol::Timer::after(std::time::Duration::from_secs(1)).await;
             }
-            smol::Timer::after(std::time::Duration::from_secs(1)).await;
         }
-    }
 
-    // Preflight: resolve API key unless the provider is a no-key provider
-    // (e.g. the `log` provider). This is the P1 safety net from task 582 —
-    // even if an agent loop somehow kicks off on a log-provider session we
-    // do NOT want to emit "no API key for provider: log".
-    let needs_key = {
-        let st = lock_state(state);
-        st.registry.needs_api_key(&model.api)
-    };
-    let api_key = if needs_key {
-        let api_key = {
+        // Preflight: resolve API key unless the provider is a no-key provider
+        // (e.g. the `log` provider). This is the P1 safety net from task 582 —
+        // even if an agent loop somehow kicks off on a log-provider session we
+        // do NOT want to emit "no API key for provider: log".
+        let needs_key = {
             let st = lock_state(state);
-            resolve_api_key(&st.auth, &st.config, &model.provider)?
+            st.registry.needs_api_key(&model.api)
         };
-        match api_key {
-            Some(key) => Some(key),
-            None => {
-                tracing::error!(
-                    session_id = %session_id,
-                    model = %model.id,
-                    provider = %model.provider,
-                    ts_ms = crate::types::timestamp_ms(),
-                    "agent_runner: NoApiKey early-return — see resolve_api_key warning above"
-                );
-                return Err(crate::Error::NoApiKey(model.provider.clone()));
+        let api_key = if needs_key {
+            let api_key = {
+                let st = lock_state(state);
+                resolve_api_key(&st.auth, &st.config, &model.provider)?
+            };
+            match api_key {
+                Some(key) => Some(key),
+                None => {
+                    tracing::error!(
+                        session_id = %session_id,
+                        model = %model.id,
+                        provider = %model.provider,
+                        ts_ms = crate::types::timestamp_ms(),
+                        "agent_runner: NoApiKey early-return — see resolve_api_key warning above"
+                    );
+                    return Err(crate::Error::NoApiKey(model.provider.clone()));
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
-    let options = StreamOptions {
-        api_key,
-        ..Default::default()
-    };
+        let options = StreamOptions {
+            api_key,
+            ..Default::default()
+        };
 
-    emit_phase(state, session_id, crate::types::AgentPhase::Connecting);
+        emit_phase(state, session_id, crate::types::AgentPhase::Connecting);
 
-    let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
+        let (event_tx, event_rx) = smol::channel::unbounded::<StreamEvent>();
 
-    // Set up has_queued flag for this session
-    let has_queued_flag = {
-        let mut st = lock_state(state);
-        st.has_queued
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone()
-    };
+        // Set up has_queued flag for this session
+        let has_queued_flag = {
+            let mut st = lock_state(state);
+            st.has_queued
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone()
+        };
 
-    // Per-session "stop after next tool result" flag — set by
-    // PostPersistAction::StopAgentLoop and read by `should_stop` so the
-    // agent loop exits cleanly without consulting the LLM again.  Reset
-    // here for each Chat turn (a previous turn that succeeded would have
-    // left the predecessor session retired, but a defensive reset keeps
-    // the flag honest if the row is somehow re-used in tests).
-    let stop_after_tool_flag: Arc<AtomicBool> = {
-        let mut st = lock_state(state);
-        let flag = st
-            .stop_after_tool_flags
-            .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone();
-        flag.store(false, Ordering::Relaxed);
-        flag
-    };
+        // Per-session "stop after next tool result" flag — set by
+        // PostPersistAction::StopAgentLoop and read by `should_stop` so the
+        // agent loop exits cleanly without consulting the LLM again.  Reset
+        // here for each Chat turn (a previous turn that succeeded would have
+        // left the predecessor session retired, but a defensive reset keeps
+        // the flag honest if the row is somehow re-used in tests).
+        let stop_after_tool_flag: Arc<AtomicBool> = {
+            let mut st = lock_state(state);
+            let flag = st
+                .stop_after_tool_flags
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .clone();
+            flag.store(false, Ordering::Relaxed);
+            flag
+        };
 
-    let shutdown_flag = shutdown.flag.clone();
-    let cancel_flag_clone = cancel_flag.clone();
-    let stop_after_tool_clone = stop_after_tool_flag.clone();
-    let state_clone_persist = state.clone();
-    let session_id_persist = session_id.to_string();
-    let state_clone_drain = state.clone();
-    let session_id_drain = session_id.to_string();
-    let has_queued_clone = has_queued_flag.clone();
-    let agent_config = crate::agent::AgentConfig {
-        should_stop: Some(Box::new(move || {
-            shutdown_flag.load(Ordering::Relaxed)
-                || cancel_flag_clone.load(Ordering::Relaxed)
-                || stop_after_tool_clone.load(Ordering::Relaxed)
-        })),
-        cancel_token: Some(tau_agent_base::types::CancelToken::from_flag(
-            cancel_flag.clone(),
-        )),
-        drain_queued: Some(Box::new(move || {
-            if has_queued_clone.swap(false, Ordering::Acquire) {
-                let st = state_clone_drain.lock().expect("state mutex poisoned");
-                st.db
-                    .drain_queued_messages(&session_id_drain)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        })),
-        on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
-            let st = state_clone_persist.lock().expect("state mutex poisoned");
-            if let Err(e) = st.db.append_message(&session_id_persist, msg) {
-                tracing::warn!(%e, "db error persisting agent message");
-            }
-        }))),
-        post_persist_callback: {
-            let state_clone_pp = state.clone();
-            Some(Box::new(
-                move |actions: &[tau_agent_base::types::PostPersistAction]| {
-                    for action in actions {
-                        match action {
-                            tau_agent_base::types::PostPersistAction::EmitInfoMessage {
-                                target_session_id,
-                                text,
-                            } => {
-                                super::notifications::queue_info_to_session(
-                                    &state_clone_pp,
+        let shutdown_flag = shutdown.flag.clone();
+        let cancel_flag_clone = cancel_flag.clone();
+        let stop_after_tool_clone = stop_after_tool_flag.clone();
+        let state_clone_persist = state.clone();
+        let session_id_persist = session_id.to_string();
+        let state_clone_drain = state.clone();
+        let session_id_drain = session_id.to_string();
+        let has_queued_clone = has_queued_flag.clone();
+        let agent_config = crate::agent::AgentConfig {
+            should_stop: Some(Box::new(move || {
+                shutdown_flag.load(Ordering::Relaxed)
+                    || cancel_flag_clone.load(Ordering::Relaxed)
+                    || stop_after_tool_clone.load(Ordering::Relaxed)
+            })),
+            cancel_token: Some(tau_agent_base::types::CancelToken::from_flag(
+                cancel_flag.clone(),
+            )),
+            drain_queued: Some(Box::new(move || {
+                if has_queued_clone.swap(false, Ordering::Acquire) {
+                    let st = state_clone_drain.lock().expect("state mutex poisoned");
+                    st.db
+                        .drain_queued_messages(&session_id_drain)
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            })),
+            on_message: Some(std::sync::Mutex::new(Box::new(move |msg: &Message| {
+                let st = state_clone_persist.lock().expect("state mutex poisoned");
+                if let Err(e) = st.db.append_message(&session_id_persist, msg) {
+                    tracing::warn!(%e, "db error persisting agent message");
+                }
+            }))),
+            post_persist_callback: {
+                let state_clone_pp = state.clone();
+                Some(Box::new(
+                    move |actions: &[tau_agent_base::types::PostPersistAction]| {
+                        for action in actions {
+                            match action {
+                                tau_agent_base::types::PostPersistAction::EmitInfoMessage {
                                     target_session_id,
                                     text,
-                                );
-                            }
-                            tau_agent_base::types::PostPersistAction::StopAgentLoop { reason } => {
-                                tracing::info!(
-                                    %reason,
-                                    "PostPersistAction::StopAgentLoop set; agent loop will exit after this tool result"
-                                );
-                                stop_after_tool_flag.store(true, Ordering::Relaxed);
+                                } => {
+                                    super::notifications::queue_info_to_session(
+                                        &state_clone_pp,
+                                        target_session_id,
+                                        text,
+                                    );
+                                }
+                                tau_agent_base::types::PostPersistAction::StopAgentLoop { reason } => {
+                                    tracing::info!(
+                                        %reason,
+                                        "PostPersistAction::StopAgentLoop set; agent loop will exit after this tool result"
+                                    );
+                                    stop_after_tool_flag.store(true, Ordering::Relaxed);
+                                }
                             }
                         }
+                    },
+                ))
+            },
+            refresh_api_key: {
+                let state_clone_refresh = state.clone();
+                let provider_name = model.provider.clone();
+                Some(Box::new(move |stale: Option<&str>| {
+                    let st = state_clone_refresh.lock().expect("state mutex poisoned");
+                    resolve_api_key_excluding(&st.auth, &st.config, &provider_name, stale)
+                        .ok()
+                        .flatten()
+                }))
+            },
+            idle_timeout_secs: std::env::var("TAU_STREAM_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(crate::agent::AgentConfig::default().idle_timeout_secs),
+            ..Default::default()
+        };
+
+        let registry_clone = {
+            let st = lock_state(state);
+            st.registry.clone()
+        };
+        let (child_budget, project_name) = {
+            let st = lock_state(state);
+            st.db
+                .get_session(session_id)
+                .ok()
+                .flatten()
+                .map(|s| (s.child_budget, s.project_name))
+                .unwrap_or((0, None))
+        };
+        let plugin_tools = if !test_overrides.mock_tools.is_empty() {
+            test_overrides.mock_tools.clone()
+        } else {
+            let pm = plugins.lock().expect("plugins mutex poisoned");
+            pm.tool_schemas(session_id, child_budget)
+        };
+
+        let model_clone = model.clone();
+        let options_clone = options;
+        let cwd_clone = cwd.to_string();
+        let mut context_clone = context.clone();
+
+        let plugins_clone = plugins.clone();
+        let state_clone_exec = state.clone();
+        let session_locks_clone = session_locks.clone();
+        let in_flight = shutdown.clone();
+        let shutdown_clone = shutdown.clone();
+        let throttle_clone = throttle.clone();
+        let session_id_for_executor = session_id.to_string();
+        let test_overrides_clone = test_overrides.clone();
+
+        // Channel for child Chat requests spawned by orchestration tools.
+        // The receiver task spawns async agent turns for each queued chat.
+        let (chat_spawn_tx, chat_spawn_rx) = smol::channel::unbounded::<super::state::ChatSpawn>();
+
+        // Spawn a task that processes queued child chats.
+        let spawn_state = state.clone();
+        let spawn_plugins = plugins.clone();
+        let spawn_shutdown = shutdown.clone();
+        let spawn_session_locks = session_locks.clone();
+        let spawn_throttle = throttle.clone();
+        let spawn_overrides = test_overrides.clone();
+        smol::spawn(async move {
+            while let Ok(spawn) = chat_spawn_rx.recv().await {
+                // Each child chat gets its own async task (fire-and-forget).
+                let s = spawn_state.clone();
+                let p = spawn_plugins.clone();
+                let sh = spawn_shutdown.clone();
+                let sl = spawn_session_locks.clone();
+                let th = spawn_throttle.clone();
+                let ov = spawn_overrides.clone();
+                smol::spawn(async move {
+                    let super::state::ChatSpawn {
+                        session_id,
+                        text,
+                        attachments,
+                    } = spawn;
+                    let sid = session_id;
+                    if let Err(e) =
+                        run_child_chat(s, p, sh, sl, th, sid.clone(), text, attachments, ov).await
+                    {
+                        tracing::warn!(session_id = %sid, %e, "child chat error");
                     }
-                },
-            ))
-        },
-        refresh_api_key: {
-            let state_clone_refresh = state.clone();
-            let provider_name = model.provider.clone();
-            Some(Box::new(move |stale: Option<&str>| {
-                let st = state_clone_refresh.lock().expect("state mutex poisoned");
-                resolve_api_key_excluding(&st.auth, &st.config, &provider_name, stale)
-                    .ok()
-                    .flatten()
-            }))
-        },
-        idle_timeout_secs: std::env::var("TAU_STREAM_IDLE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(crate::agent::AgentConfig::default().idle_timeout_secs),
-        ..Default::default()
-    };
+                })
+                .detach();
+            }
+        })
+        .detach();
 
-    let registry_clone = {
-        let st = lock_state(state);
-        st.registry.clone()
-    };
-    let (child_budget, project_name) = {
-        let st = lock_state(state);
-        st.db
-            .get_session(session_id)
-            .ok()
-            .flatten()
-            .map(|s| (s.child_budget, s.project_name))
-            .unwrap_or((0, None))
-    };
-    let plugin_tools = if !test_overrides.mock_tools.is_empty() {
-        test_overrides.mock_tools.clone()
-    } else {
-        let pm = plugins.lock().expect("plugins mutex poisoned");
-        pm.tool_schemas(session_id, child_budget)
-    };
+        let agent_handle = {
+            async move {
+                in_flight.enter();
+                let mut executor: Box<dyn crate::worker::ToolExecutor> =
+                    if let Some(ref factory) = test_overrides_clone.tool_executor_factory {
+                        factory()
+                    } else {
+                        Box::new(PluginExecutor {
+                            plugins: plugins_clone,
+                            state: state_clone_exec,
+                            session_locks: session_locks_clone,
+                            chat_spawn_tx,
+                            shutdown: shutdown_clone,
+                            throttle: throttle_clone,
+                            session_id: session_id_for_executor,
+                            cwd: cwd_clone,
+                            project_name,
+                            test_overrides: test_overrides_clone.clone(),
+                        })
+                    };
+                let result = crate::agent::run(
+                    &registry_clone,
+                    &model_clone,
+                    &mut context_clone,
+                    &mut *executor,
+                    &options_clone,
+                    &agent_config,
+                    &plugin_tools,
+                    event_tx,
+                )
+                .await;
+                in_flight.leave();
+                result
+            }
+        };
 
-    let model_clone = model.clone();
-    let options_clone = options;
-    let cwd_clone = cwd.to_string();
-    let mut context_clone = context.clone();
-
-    let plugins_clone = plugins.clone();
-    let state_clone_exec = state.clone();
-    let session_locks_clone = session_locks.clone();
-    let in_flight = shutdown.clone();
-    let shutdown_clone = shutdown.clone();
-    let throttle_clone = throttle.clone();
-    let session_id_for_executor = session_id.to_string();
-    let test_overrides_clone = test_overrides.clone();
-
-    // Channel for child Chat requests spawned by orchestration tools.
-    // The receiver task spawns async agent turns for each queued chat.
-    let (chat_spawn_tx, chat_spawn_rx) = smol::channel::unbounded::<super::state::ChatSpawn>();
-
-    // Spawn a task that processes queued child chats.
-    let spawn_state = state.clone();
-    let spawn_plugins = plugins.clone();
-    let spawn_shutdown = shutdown.clone();
-    let spawn_session_locks = session_locks.clone();
-    let spawn_throttle = throttle.clone();
-    let spawn_overrides = test_overrides.clone();
-    smol::spawn(async move {
-        while let Ok(spawn) = chat_spawn_rx.recv().await {
-            // Each child chat gets its own async task (fire-and-forget).
-            let s = spawn_state.clone();
-            let p = spawn_plugins.clone();
-            let sh = spawn_shutdown.clone();
-            let sl = spawn_session_locks.clone();
-            let th = spawn_throttle.clone();
-            let ov = spawn_overrides.clone();
-            smol::spawn(async move {
-                let super::state::ChatSpawn {
-                    session_id,
-                    text,
-                    attachments,
-                } = spawn;
-                let sid = session_id;
-                if let Err(e) =
-                    run_child_chat(s, p, sh, sl, th, sid.clone(), text, attachments, ov).await
-                {
-                    tracing::warn!(session_id = %sid, %e, "child chat error");
+        let state_clone = state.clone();
+        let session_id_owned = session_id.to_string();
+        let forward_handle = async {
+            let mut writer_alive = true;
+            while let Ok(event) = event_rx.recv().await {
+                // Broadcast steering messages as UserMessage (persistence handled by on_message)
+                if let StreamEvent::SteerMessage { ref message } = event {
+                    let text = message
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            UserContent::Text(t) => Some(t.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    let user_resp = Response::UserMessage { text };
+                    broadcast_to_subscribers(&state_clone, &session_id_owned, &user_resp);
+                    if writer_alive && send(writer, &user_resp).await.is_err() {
+                        writer_alive = false;
+                    }
+                    continue;
                 }
-            })
-            .detach();
-        }
-    })
-    .detach();
-
-    let agent_handle = {
-        async move {
-            in_flight.enter();
-            let mut executor: Box<dyn crate::worker::ToolExecutor> =
-                if let Some(ref factory) = test_overrides_clone.tool_executor_factory {
-                    factory()
-                } else {
-                    Box::new(PluginExecutor {
-                        plugins: plugins_clone,
-                        state: state_clone_exec,
-                        session_locks: session_locks_clone,
-                        chat_spawn_tx,
-                        shutdown: shutdown_clone,
-                        throttle: throttle_clone,
-                        session_id: session_id_for_executor,
-                        cwd: cwd_clone,
-                        project_name,
-                        test_overrides: test_overrides_clone.clone(),
-                    })
+                // Update stored phase from implicit stream events and, for
+                // explicit `Phase` events emitted by the engine, rebuild the
+                // event with a server-stamped `turn_started_at_ms` anchor.
+                let event = match event {
+                    StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
+                        super::notifications::set_phase_and_stamp(
+                            &state_clone,
+                            &session_id_owned,
+                            crate::types::AgentPhase::Thinking,
+                        );
+                        event
+                    }
+                    StreamEvent::TextStart { .. }
+                    | StreamEvent::TextDelta { .. }
+                    | StreamEvent::ToolcallStart { .. } => {
+                        super::notifications::set_phase_and_stamp(
+                            &state_clone,
+                            &session_id_owned,
+                            crate::types::AgentPhase::Responding,
+                        );
+                        event
+                    }
+                    StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
+                        super::notifications::set_phase_and_stamp(
+                            &state_clone,
+                            &session_id_owned,
+                            crate::types::AgentPhase::ToolExec,
+                        );
+                        event
+                    }
+                    StreamEvent::Phase { phase, .. } => {
+                        // Engine-emitted phase events don't carry a timestamp
+                        // (engine is wire-agnostic). Stamp on forward.
+                        let (turn_ts, phase_ts) = super::notifications::set_phase_and_stamp(
+                            &state_clone,
+                            &session_id_owned,
+                            phase,
+                        );
+                        StreamEvent::Phase {
+                            phase,
+                            turn_started_at_ms: turn_ts,
+                            phase_started_at_ms: phase_ts,
+                        }
+                    }
+                    other => other,
                 };
-            let result = crate::agent::run(
-                &registry_clone,
-                &model_clone,
-                &mut context_clone,
-                &mut *executor,
-                &options_clone,
-                &agent_config,
-                &plugin_tools,
-                event_tx,
-            )
-            .await;
-            in_flight.leave();
-            result
-        }
-    };
-
-    let state_clone = state.clone();
-    let session_id_owned = session_id.to_string();
-    let forward_handle = async {
-        let mut writer_alive = true;
-        while let Ok(event) = event_rx.recv().await {
-            // Broadcast steering messages as UserMessage (persistence handled by on_message)
-            if let StreamEvent::SteerMessage { ref message } = event {
-                let text = message
-                    .content
-                    .iter()
-                    .filter_map(|c| match c {
-                        UserContent::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-                let user_resp = Response::UserMessage { text };
-                broadcast_to_subscribers(&state_clone, &session_id_owned, &user_resp);
-                if writer_alive && send(writer, &user_resp).await.is_err() {
+                let resp = Response::Stream {
+                    event: Box::new(event),
+                };
+                broadcast_to_subscribers(&state_clone, &session_id_owned, &resp);
+                // Keep broadcasting even if the direct writer disconnected
+                // (fire-and-forget clients close immediately).
+                if writer_alive && send(writer, &resp).await.is_err() {
                     writer_alive = false;
                 }
-                continue;
             }
-            // Update stored phase from implicit stream events and, for
-            // explicit `Phase` events emitted by the engine, rebuild the
-            // event with a server-stamped `turn_started_at_ms` anchor.
-            let event = match event {
-                StreamEvent::ThinkingStart { .. } | StreamEvent::ThinkingDelta { .. } => {
-                    super::notifications::set_phase_and_stamp(
-                        &state_clone,
-                        &session_id_owned,
-                        crate::types::AgentPhase::Thinking,
-                    );
-                    event
-                }
-                StreamEvent::TextStart { .. }
-                | StreamEvent::TextDelta { .. }
-                | StreamEvent::ToolcallStart { .. } => {
-                    super::notifications::set_phase_and_stamp(
-                        &state_clone,
-                        &session_id_owned,
-                        crate::types::AgentPhase::Responding,
-                    );
-                    event
-                }
-                StreamEvent::ToolcallEnd { .. } | StreamEvent::ToolResult { .. } => {
-                    super::notifications::set_phase_and_stamp(
-                        &state_clone,
-                        &session_id_owned,
-                        crate::types::AgentPhase::ToolExec,
-                    );
-                    event
-                }
-                StreamEvent::Phase { phase, .. } => {
-                    // Engine-emitted phase events don't carry a timestamp
-                    // (engine is wire-agnostic). Stamp on forward.
-                    let (turn_ts, phase_ts) = super::notifications::set_phase_and_stamp(
-                        &state_clone,
-                        &session_id_owned,
-                        phase,
-                    );
-                    StreamEvent::Phase {
-                        phase,
-                        turn_started_at_ms: turn_ts,
-                        phase_started_at_ms: phase_ts,
-                    }
-                }
-                other => other,
-            };
-            let resp = Response::Stream {
-                event: Box::new(event),
-            };
-            broadcast_to_subscribers(&state_clone, &session_id_owned, &resp);
-            // Keep broadcasting even if the direct writer disconnected
-            // (fire-and-forget clients close immediately).
-            if writer_alive && send(writer, &resp).await.is_err() {
-                writer_alive = false;
-            }
+            Ok::<(), crate::Error>(())
+        };
+
+        let (agent_result, forward_result) = futures::future::join(agent_handle, forward_handle).await;
+        if let Err(e) = forward_result {
+            tracing::warn!(%e, "event forward error");
         }
-        Ok::<(), crate::Error>(())
-    };
 
-    let (agent_result, forward_result) = futures::future::join(agent_handle, forward_handle).await;
-    if let Err(e) = forward_result {
-        tracing::warn!(%e, "event forward error");
-    }
+        let agent_result = agent_result?;
 
-    let agent_result = agent_result?;
-
-        Ok(agent_result)
+            Ok(agent_result)
     })
     .catch_unwind()
     .await;

@@ -1023,12 +1023,6 @@ pub(super) async fn handle_client(
                 // Without this guarantee the TUI gets stuck in Streaming
                 // mode forever when an internal error (e.g. DB write)
                 // causes the handler to bail out early via `?`.
-                // Run the Chat handler body inside a closure so that any
-                // error is caught and we *always* broadcast a terminal
-                // response (AgentDone / Cancelled / Error) to subscribers.
-                // Without this guarantee the TUI gets stuck in Streaming
-                // mode forever when an internal error (e.g. DB write)
-                // causes the handler to bail out early via `?`.
                 //
                 // Wrap in `catch_unwind` so a panic anywhere along the
                 // path (engine, providers, plugins, executor) flows into
