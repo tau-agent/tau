@@ -1201,6 +1201,7 @@ mod tests {
                 assert_eq!(target_session_id, "s-worker");
                 assert_eq!(text, &expected);
             }
+            other => panic!("unexpected post-persist action: {:?}", other),
         }
     }
 

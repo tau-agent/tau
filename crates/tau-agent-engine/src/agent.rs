@@ -1242,6 +1242,7 @@ mod tests {
                     assert_eq!(target_session_id, "caller");
                     assert_eq!(text, "hello");
                 }
+                other => panic!("unexpected post-persist action: {:?}", other),
             }
         });
     }
@@ -1341,6 +1342,7 @@ mod tests {
                             } => {
                                 s.push((target_session_id.clone(), text.clone()));
                             }
+                            PostPersistAction::StopAgentLoop { .. } => {}
                         }
                     }
                 })),
@@ -1369,6 +1371,94 @@ mod tests {
     }
 
     #[test]
+    /// `PostPersistAction::StopAgentLoop` flips a flag whose `should_stop`
+    /// callback returns true, so the agent loop exits after persisting the
+    /// tool result without consulting the LLM for another turn.  This is
+    /// the load-bearing piece behind `session_succeed` (task 915).
+    #[test]
+    fn stop_agent_loop_action_terminates_loop_after_tool_result() {
+        smol::block_on(async {
+            // Three queued LLM responses: tool-call, then two text replies
+            // the agent must NOT consume because the loop should stop
+            // after the first tool result.
+            let registry = setup_registry(vec![
+                MockResponse::ToolCalls(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "mock".into(),
+                    arguments: serde_json::json!({}),
+                }]),
+                MockResponse::Text("should not be reached 1".into()),
+                MockResponse::Text("should not be reached 2".into()),
+            ]);
+            let model = mock_model();
+            let mut context = basic_context();
+            let mut worker = MockToolExecutor::new();
+            let actions = vec![PostPersistAction::StopAgentLoop {
+                reason: "test".into(),
+            }];
+            worker.handle().on_tool(
+                "mock",
+                MockToolResponse::SuccessWithActions("ok".into(), actions.clone()),
+            );
+
+            // The user wires a `should_stop` callback that reads a shared
+            // flag flipped from inside `post_persist_callback`.  This
+            // mirrors the production wiring in `agent_runner.rs`.
+            let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_flag_pp = stop_flag.clone();
+            let stop_flag_check = stop_flag.clone();
+            let config = AgentConfig {
+                should_stop: Some(Box::new(move || {
+                    stop_flag_check.load(std::sync::atomic::Ordering::Relaxed)
+                })),
+                post_persist_callback: Some(Box::new(move |actions: &[PostPersistAction]| {
+                    for a in actions {
+                        if let PostPersistAction::StopAgentLoop { .. } = a {
+                            stop_flag_pp.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                })),
+                ..Default::default()
+            };
+
+            let (tx, _rx) = smol::channel::unbounded();
+            let result = run(
+                &registry,
+                &model,
+                &mut context,
+                &mut worker,
+                &StreamOptions::default(),
+                &config,
+                &[],
+                tx,
+            )
+            .await
+            .expect("run");
+
+            // Loop ended cleanly (not via max_turns).  The tool result is
+            // the last message; no follow-up assistant text from the
+            // queued mock responses.
+            assert!(!result.max_turns_reached, "loop must NOT hit max_turns");
+            let last = context.messages.last().expect("at least one message");
+            match last {
+                Message::ToolResult(_) => {}
+                other => panic!("last message must be the tool result, got: {:?}", other),
+            }
+            // Defensive: ensure no Assistant message was appended after
+            // the tool result — the agent must not consult the LLM again.
+            let assistant_after_tool = context
+                .messages
+                .iter()
+                .rev()
+                .take_while(|m| !matches!(m, Message::ToolResult(_)))
+                .any(|m| matches!(m, Message::Assistant(_)));
+            assert!(
+                !assistant_after_tool,
+                "no assistant message must follow the StopAgentLoop tool result"
+            );
+        });
+    }
+
     fn loop_review_progress_continues() {
         // review_interval=3: 3 tool-call turns, then review says PROGRESS,
         // then 1 more turn that ends with Text (natural stop).

@@ -291,6 +291,45 @@ pub fn orchestration_tools() -> Vec<PluginToolDef> {
             prompt_snippet: None,
             prompt_guidelines: vec![],
         },
+        PluginToolDef {
+            name: "session_succeed".into(),
+            description: concat!(
+                "Create a fresh successor session and hand off to it. The current ",
+                "session is retired (notifications and new task dispatches ",
+                "forward to the successor) but message history is preserved ",
+                "and remains readable. Use when context has grown large enough ",
+                "that further turns will be expensive due to prompt-cache ",
+                "misses, or when reaching a natural seam in a long-running ",
+                "plan. The current agent loop terminates immediately after this ",
+                "tool returns; do not plan further tool calls in the same turn."
+            ).into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "Self-contained handoff message that becomes the first user message in the successor session. Capture: what was accomplished, what remains, open questions, key files / identifiers. The successor has no access to this session's history beyond what you put here."
+                    },
+                    "carry_files": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional file paths to mention in the handoff message. The successor will re-read them fresh; no attachment forwarding (the point is to start with a clean prompt cache)."
+                    },
+                    "new_tagline": {
+                        "type": "string",
+                        "description": "Optional tagline for the successor session. Defaults to the predecessor's tagline."
+                    }
+                },
+                "required": ["summary"]
+            }),
+            prompt_snippet: Some("Use session_succeed to hand off to a fresh session when context bloat is making further turns expensive. The summary arg becomes the first user message in the successor.".into()),
+            prompt_guidelines: vec![
+                "Call when context has grown large enough that further turns will be expensive due to prompt-cache misses, or at a natural seam in a long-running plan.".into(),
+                "The summary arg becomes the first user message in the successor and is the only context the successor sees — make it self-contained.".into(),
+                "This tool ends the current agent loop. Do not plan further tool calls in the same turn.".into(),
+            ],
+        },
+
     ]
 }
 
@@ -367,6 +406,50 @@ mod tests {
                 .any(|g| g.contains("auto_archive")),
             "session_archive guidelines should mention auto_archive, got {:?}",
             archive.prompt_guidelines,
+        );
+    }
+
+    #[test]
+    fn session_succeed_has_summary_required_and_loop_terminates_guideline() {
+        let tools = orchestration_tools();
+        let succeed = find_tool(&tools, "session_succeed");
+
+        // Schema lists `summary` as required and exposes `carry_files` /
+        // `new_tagline` as optional.
+        let required = succeed
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required field");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("summary")),
+            "`summary` should be required: {:?}",
+            required,
+        );
+        let props = succeed
+            .parameters
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("properties field");
+        assert!(props.contains_key("summary"));
+        assert!(props.contains_key("carry_files"));
+        assert!(props.contains_key("new_tagline"));
+
+        // Description and guidelines must warn the model that this tool
+        // ends the loop — otherwise the agent will keep trying to chat.
+        assert!(
+            succeed.description.to_lowercase().contains("terminates"),
+            "description should mention loop termination, got: {}",
+            succeed.description,
+        );
+        assert!(
+            succeed
+                .prompt_guidelines
+                .iter()
+                .any(|g| g.to_lowercase().contains("ends the current agent loop")
+                    || g.to_lowercase().contains("loop will end")),
+            "a guideline should warn the loop ends, got: {:?}",
+            succeed.prompt_guidelines,
         );
     }
 

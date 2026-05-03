@@ -25,6 +25,14 @@ pub(super) struct State {
     pub(super) usage_cache: Option<(crate::auth::SubscriptionUsage, u64)>,
     /// Per-session cancel flags.  Set by CancelChat, cleared on Chat start.
     pub(super) cancel_flags: HashMap<String, Arc<AtomicBool>>,
+    /// Per-session "stop the agent loop after the next tool result" flag.
+    /// Set by tools whose `ToolResultMessage` carries
+    /// [`crate::types::PostPersistAction::StopAgentLoop`] (today: only
+    /// `session_succeed`). Cleared on Chat start. The Chat handler reads
+    /// this flag to distinguish "agent succeeded itself out" from
+    /// `cancel_flag`-driven "agent was cancelled by the user" so it can
+    /// emit `AgentDone` (not `Cancelled`) with `exit_status = "succeeded"`.
+    pub(super) stop_after_tool_flags: HashMap<String, Arc<AtomicBool>>,
     /// Per-session flag indicating queued messages are pending.
     pub(super) has_queued: HashMap<String, Arc<AtomicBool>>,
     /// Per-session broadcast subscribers.

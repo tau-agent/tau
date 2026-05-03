@@ -147,6 +147,25 @@ pub enum Request {
     /// the tasks plugin) to redirect notifications away from retired
     /// sessions.  See task 914.
     ResolveSuccessor { session_id: String },
+    /// Atomically create a new session inheriting `session_id`'s
+    /// `model` / `cwd` / `system_prompt` / `project_name` / `child_budget`,
+    /// then mark `session_id` as retired by setting its `successor_id`
+    /// to the new session's id.
+    ///
+    /// The new session is always **top-level** (`parent_id = None`) so
+    /// succession does not change the predecessor's place in the session
+    /// tree.  Returns [`Response::SessionCreated`] with the successor id
+    /// on success and broadcasts [`Response::SessionSucceeded`] on the
+    /// predecessor's subscriber channel.  See task 915.
+    SucceedSession {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tagline: Option<String>,
+        /// Session id of the caller when invoked via an orchestration tool
+        /// (e.g. `session_succeed`).  `None` when invoked via the TUI/CLI.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller_session_id: Option<String>,
+    },
     /// Start OAuth login for a provider.
     Login { provider: String },
     /// Query authentication status.
@@ -526,6 +545,11 @@ pub enum Response {
     /// unchanged when no successor is set or the chain dead-ends at an
     /// archived / missing successor.  See task 914.
     ResolvedSuccessor { session_id: String },
+    /// Broadcast on the predecessor's subscriber channel when the session
+    /// has been retired in favour of `successor_id`.  Subscribed clients
+    /// (e.g. the TUI) typically react by switching their view to the
+    /// successor.  See task 915.
+    SessionSucceeded { successor_id: String },
     /// Error.
     Error { message: String },
 }
@@ -1287,6 +1311,16 @@ mod tests {
             Request::ResolveSuccessor {
                 session_id: "s1".into(),
             },
+            Request::SucceedSession {
+                session_id: "s1".into(),
+                tagline: Some("continued".into()),
+                caller_session_id: Some("caller".into()),
+            },
+            Request::SucceedSession {
+                session_id: "s1".into(),
+                tagline: None,
+                caller_session_id: None,
+            },
         ];
         for req in &requests {
             let json = serde_json::to_string(req).expect("serialize request");
@@ -1359,6 +1393,9 @@ mod tests {
             Response::ProjectInfo { project: None },
             Response::ResolvedSuccessor {
                 session_id: "s1".into(),
+            },
+            Response::SessionSucceeded {
+                successor_id: "s2".into(),
             },
         ];
         for resp in &responses {

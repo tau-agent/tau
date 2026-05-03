@@ -90,6 +90,156 @@ pub(super) fn validate_successor_link(
     Ok(())
 }
 
+/// Atomically create a successor session inheriting the predecessor's
+/// model / cwd / system_prompt / project / child_budget, link the
+/// predecessor to it, and broadcast `Response::SessionSucceeded` on the
+/// predecessor's subscriber channel.
+///
+/// On success returns `Response::SessionCreated { session_id }` carrying
+/// the new session id. The new session is always top-level (`parent_id = None`).
+/// See task 915.
+pub(super) async fn succeed_session_impl(
+    state: &SharedState,
+    plugins: &Arc<Mutex<crate::plugin::PluginManager>>,
+    session_id: &str,
+    tagline: Option<&str>,
+    caller_session_id: Option<&str>,
+) -> crate::protocol::Response {
+    use crate::protocol::Response;
+
+    // Pre-flight: load predecessor and confirm it isn't already succeeded.
+    let pred = {
+        let st = lock_state(state);
+        match st.db.get_session(session_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                return Response::Error {
+                    message: format!("session not found: {session_id}"),
+                };
+            }
+            Err(e) => {
+                return Response::Error {
+                    message: format!("lookup predecessor: {e}"),
+                };
+            }
+        }
+    };
+    if let Some(existing) = pred.successor_id.as_deref() {
+        // Walk to the live tip so the error message points the caller at
+        // the right session to act on.
+        let tip = {
+            let st = lock_state(state);
+            st.db.resolve_successor(session_id)
+        };
+        return Response::Error {
+            message: format!(
+                "session {session_id} is already succeeded by {existing} (live tip: {tip}). \
+                 Call succeed_session on the live tip instead."
+            ),
+        };
+    }
+
+    // Inherit predecessor config.  The successor is always top-level
+    // (`parent_id = None`) so retiring a child does not move the
+    // predecessor in the session tree.
+    let inherited_tagline = tagline.map(String::from).or_else(|| pred.tagline.clone());
+    let create_resp = create_session_impl(
+        state,
+        &Some(pred.model.id.clone()),
+        &Some(pred.model.provider.clone()),
+        &pred.system_prompt,
+        &pred.cwd,
+        &None, // top-level
+        pred.child_budget,
+        &inherited_tagline,
+        false, // auto_archive
+        true,  // notify_parent (irrelevant; top-level)
+        &pred.project_name,
+    );
+    let new_id = match create_resp {
+        Response::SessionCreated { ref session_id } => session_id.clone(),
+        other => return other,
+    };
+
+    // Bring up plugins for the successor and synthesise its system prompt
+    // when the predecessor didn't carry an explicit one (mirrors the
+    // CreateSession dispatch arm).
+    if pred.system_prompt.is_none() {
+        let (cwd_resolved, project_resolved) = {
+            let st = lock_state(state);
+            let stored = st.db.get_session(&new_id).ok().flatten();
+            (
+                stored.as_ref().and_then(|s| s.cwd.clone()),
+                stored.as_ref().and_then(|s| s.project_name.clone()),
+            )
+        };
+        let cwd_str = cwd_resolved.as_deref().unwrap_or("/tmp");
+        let mut pm = plugins.lock().expect("plugins mutex poisoned");
+        match pm.ensure_session_plugins(&new_id, cwd_str, project_resolved.as_deref(), None) {
+            Ok(failures) => {
+                for msg in &failures {
+                    super::notifications::queue_info_to_session(state, &new_id, msg);
+                }
+            }
+            Err(e) => tracing::warn!(%e, "failed to spawn successor session plugins"),
+        }
+        let tool_prompts = pm.tool_prompts(&new_id, pred.child_budget);
+        let prompt = crate::system_prompt::build(&crate::system_prompt::PromptOptions {
+            cwd: cwd_resolved,
+            tools: tool_prompts,
+            ..Default::default()
+        });
+        let st = lock_state(state);
+        if let Err(e) = st.db.update_system_prompt(&new_id, &prompt) {
+            tracing::warn!(%e, "failed to update successor system prompt");
+        }
+    }
+
+    // Validate + write the successor link under a single lock acquisition
+    // (same single-writer discipline as `Request::SetSessionSuccessor`).
+    let link_result: Result<(), String> = {
+        let st = lock_state(state);
+        match validate_successor_link(&st.db, session_id, Some(&new_id)) {
+            Ok(()) => st
+                .db
+                .set_successor(session_id, Some(&new_id))
+                .map_err(|e| e.to_string()),
+            Err(msg) => Err(msg),
+        }
+    };
+    if let Err(message) = link_result {
+        // Couldn't link — leave the orphan successor in place rather than
+        // try to clean up; the caller can archive it manually.  Surface
+        // the error so the caller knows something went wrong.
+        return Response::Error {
+            message: format!("successor created ({new_id}) but link failed: {message}"),
+        };
+    }
+
+    // Persist an info message in the predecessor explaining the handoff.
+    let info = match caller_session_id {
+        Some(caller) => format!(
+            "Session retired by {caller}; succeeded by {new_id}. Future notifications forwarded."
+        ),
+        None => format!("Session retired; succeeded by {new_id}. Future notifications forwarded."),
+    };
+    super::notifications::queue_info_to_session(state, session_id, &info);
+
+    // Broadcast SessionSucceeded on the predecessor's subscriber channel
+    // so attached TUIs auto-switch.  Use the awaiting variant so the
+    // event reaches every live subscriber before this RPC returns.
+    super::notifications::broadcast_to_subscribers_and_wait(
+        state,
+        session_id,
+        &Response::SessionSucceeded {
+            successor_id: new_id.clone(),
+        },
+    )
+    .await;
+
+    Response::SessionCreated { session_id: new_id }
+}
+
 /// Create a session (pure DB logic, no plugin setup).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn create_session_impl(
@@ -724,6 +874,19 @@ pub(super) async fn handle_client(
                     flag.store(false, Ordering::Relaxed);
                     flag.clone()
                 };
+                // Reset (and create) the "stop after tool" flag for this
+                // session.  Tools that need to terminate the agent loop
+                // (today: only `session_succeed`) flip this flag via
+                // `PostPersistAction::StopAgentLoop`.  See task 915.
+                let stop_after_tool_flag: Arc<AtomicBool> = {
+                    let mut st = lock_state(&state);
+                    let flag = st
+                        .stop_after_tool_flags
+                        .entry(session_id.clone())
+                        .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+                    flag.store(false, Ordering::Relaxed);
+                    flag.clone()
+                };
 
                 // Mark session as live (turn actively running).
                 {
@@ -739,7 +902,7 @@ pub(super) async fn handle_client(
                 // Without this guarantee the TUI gets stuck in Streaming
                 // mode forever when an internal error (e.g. DB write)
                 // causes the handler to bail out early via `?`.
-                let chat_result: Result<(bool, bool), crate::Error> = async {
+                let chat_result: Result<(bool, bool, bool), crate::Error> = async {
                     // Load session
                     let session_data = {
                         let st = lock_state(&state);
@@ -947,7 +1110,8 @@ pub(super) async fn handle_client(
 
                     // Check compaction
                     let was_cancelled = cancel_flag.load(Ordering::Relaxed);
-                    if !was_cancelled {
+                    let was_succeeded = stop_after_tool_flag.load(Ordering::Relaxed);
+                    if !was_cancelled && !was_succeeded {
                         let should = {
                             let st = lock_state(&state);
                             let messages = st.db.get_messages(&session_id).unwrap_or_default();
@@ -966,7 +1130,7 @@ pub(super) async fn handle_client(
                         }
                     }
 
-                    Ok((was_cancelled, max_turns_reached))
+                    Ok((was_cancelled, max_turns_reached, was_succeeded))
                 }
                 .await;
 
@@ -977,8 +1141,10 @@ pub(super) async fn handle_client(
                 // session can appear idle via another code path. See the
                 // module-level comment in notifications.rs.
                 match chat_result {
-                    Ok((true, _)) => {
-                        // Cancelled
+                    Ok((true, _, _)) => {
+                        // Cancelled (cancellation takes priority over
+                        // "succeeded" if both flags somehow fire racily —
+                        // user intent wins).
                         {
                             let st = lock_state(&state);
                             let _ = st.db.update_exit_status(&session_id, "cancelled");
@@ -987,7 +1153,22 @@ pub(super) async fn handle_client(
                         broadcast_to_subscribers_and_wait(&state, &session_id, &resp).await;
                         send(&mut writer, &resp).await.ok();
                     }
-                    Ok((false, max_turns_reached)) => {
+                    Ok((false, _, true)) => {
+                        // Agent loop ended because a tool returned
+                        // `PostPersistAction::StopAgentLoop` (today:
+                        // `session_succeed`). Emit AgentDone (NOT
+                        // Cancelled) so subscribers know the turn ended
+                        // cleanly. The successor broadcast has already
+                        // been emitted by the SucceedSession handler.
+                        {
+                            let st = lock_state(&state);
+                            let _ = st.db.update_exit_status(&session_id, "succeeded");
+                        }
+                        let resp = Response::AgentDone;
+                        broadcast_to_subscribers_and_wait(&state, &session_id, &resp).await;
+                        send(&mut writer, &resp).await.ok();
+                    }
+                    Ok((false, max_turns_reached, false)) => {
                         // Normal completion (or max turns reached)
                         {
                             let st = lock_state(&state);
@@ -1697,6 +1878,22 @@ pub(super) async fn handle_client(
                     }
                 }
             }
+            crate::protocol::Request::SucceedSession {
+                session_id,
+                tagline,
+                caller_session_id,
+            } => {
+                let resp = succeed_session_impl(
+                    &state,
+                    &plugins,
+                    &session_id,
+                    tagline.as_deref(),
+                    caller_session_id.as_deref(),
+                )
+                .await;
+                send(&mut writer, &resp).await?;
+            }
+
             crate::protocol::Request::ResolveSuccessor { session_id } => {
                 let resolved = {
                     let st = lock_state(&state);
@@ -2608,6 +2805,7 @@ mod tests {
             all_models: vec![mk_model()],
             usage_cache: None,
             cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
             has_queued: HashMap::new(),
             subscribers: HashMap::new(),
             phases: HashMap::new(),
@@ -2929,5 +3127,183 @@ mod tests {
         let err = validate_successor_link(&st.db, "s_a", Some("s_b"))
             .expect_err("cycle must be rejected");
         assert!(err.contains("cycle"));
+    }
+
+    // -----------------------------------------------------------------
+    // Task 915: succeed_session_impl
+    // -----------------------------------------------------------------
+
+    fn mk_plugins() -> Arc<Mutex<crate::plugin::PluginManager>> {
+        Arc::new(Mutex::new(crate::plugin::PluginManager::new(
+            crate::plugin::PluginsConfig {
+                no_default_worker: true,
+                ..Default::default()
+            },
+        )))
+    }
+
+    /// Happy path: succeeding a session creates a top-level successor
+    /// inheriting model/cwd/project, links the predecessor, and
+    /// broadcasts SessionSucceeded exactly once.
+    #[test]
+    fn succeed_session_creates_top_level_successor_and_broadcasts() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = mk_plugins();
+            // Insert predecessor with a parent + project_name + tagline so
+            // we can verify each is propagated correctly.
+            make_link_session(&state, "s_parent", Some("p"), false);
+            make_link_session(&state, "s_pred", Some("p"), false);
+            {
+                let st = lock_state(&state);
+                let mut row = st
+                    .db
+                    .get_session("s_pred")
+                    .expect("db ok")
+                    .expect("row exists");
+                row.parent_id = Some("s_parent".into());
+                row.tagline = Some("original tagline".into());
+                // Use raw db update through delete + create to set parent_id.
+                st.db.delete_session("s_pred").expect("delete pred");
+                st.db.create_session(&row).expect("recreate pred");
+            }
+
+            // Subscribe to the predecessor so we can observe the broadcast.
+            let (tx, rx) = smol::channel::unbounded::<crate::protocol::Response>();
+            {
+                let mut st = lock_state(&state);
+                st.subscribers
+                    .entry("s_pred".to_string())
+                    .or_default()
+                    .push(tx);
+            }
+
+            let resp = succeed_session_impl(&state, &plugins, "s_pred", None, None).await;
+            let new_id = match resp {
+                crate::protocol::Response::SessionCreated { session_id } => session_id,
+                other => panic!("expected SessionCreated, got {other:?}"),
+            };
+
+            // Successor inherited model/project, has parent_id = None, and
+            // the predecessor's tagline by default.
+            let st = lock_state(&state);
+            let succ = st
+                .db
+                .get_session(&new_id)
+                .expect("db ok")
+                .expect("successor row");
+            assert!(succ.parent_id.is_none(), "successor must be top-level");
+            assert_eq!(succ.project_name.as_deref(), Some("p"));
+            assert_eq!(succ.tagline.as_deref(), Some("original tagline"));
+
+            // Predecessor.successor_id now points at the new session.
+            let pred = st
+                .db
+                .get_session("s_pred")
+                .expect("db ok")
+                .expect("pred row");
+            assert_eq!(pred.successor_id.as_deref(), Some(new_id.as_str()));
+            drop(st);
+
+            // Exactly one SessionSucceeded broadcast on the predecessor's channel.
+            let mut succeeded_count = 0;
+            while let Ok(resp) = rx.try_recv() {
+                if let crate::protocol::Response::SessionSucceeded { successor_id } = resp
+                    && successor_id == new_id
+                {
+                    succeeded_count += 1;
+                }
+            }
+            assert_eq!(
+                succeeded_count, 1,
+                "expected exactly one SessionSucceeded broadcast, saw {succeeded_count}",
+            );
+        });
+    }
+
+    /// Rejects: the predecessor is already retired (has a successor_id).
+    /// The error message should point at the live tip of the chain so the
+    /// caller knows where to re-issue the call.
+    #[test]
+    fn succeed_session_rejects_already_succeeded_predecessor() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = mk_plugins();
+            make_link_session(&state, "s_pred", Some("p"), false);
+            make_link_session(&state, "s_existing_succ", Some("p"), false);
+            {
+                let st = lock_state(&state);
+                st.db
+                    .set_successor("s_pred", Some("s_existing_succ"))
+                    .expect("set succ");
+            }
+            let resp = succeed_session_impl(&state, &plugins, "s_pred", None, None).await;
+            match resp {
+                crate::protocol::Response::Error { message } => {
+                    assert!(
+                        message.contains("already succeeded"),
+                        "error should mention already-succeeded: {message}",
+                    );
+                    assert!(
+                        message.contains("s_existing_succ"),
+                        "error should name the live tip: {message}",
+                    );
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        });
+    }
+
+    /// Rejects: the predecessor session id is unknown.
+    #[test]
+    fn succeed_session_rejects_missing_predecessor() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = mk_plugins();
+            let resp = succeed_session_impl(&state, &plugins, "s_does_not_exist", None, None).await;
+            match resp {
+                crate::protocol::Response::Error { message } => {
+                    assert!(
+                        message.contains("session not found"),
+                        "error should mention session not found: {message}",
+                    );
+                }
+                other => panic!("expected Error, got {other:?}"),
+            }
+        });
+    }
+
+    /// `new_tagline` arg overrides the predecessor's tagline.
+    #[test]
+    fn succeed_session_honours_new_tagline_override() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = mk_plugins();
+            make_link_session(&state, "s_pred", Some("p"), false);
+            {
+                let st = lock_state(&state);
+                let mut row = st
+                    .db
+                    .get_session("s_pred")
+                    .expect("db ok")
+                    .expect("row exists");
+                row.tagline = Some("old tagline".into());
+                st.db.delete_session("s_pred").expect("delete pred");
+                st.db.create_session(&row).expect("recreate pred");
+            }
+            let resp =
+                succeed_session_impl(&state, &plugins, "s_pred", Some("new tagline"), None).await;
+            let new_id = match resp {
+                crate::protocol::Response::SessionCreated { session_id } => session_id,
+                other => panic!("expected SessionCreated, got {other:?}"),
+            };
+            let st = lock_state(&state);
+            let succ = st
+                .db
+                .get_session(&new_id)
+                .expect("db ok")
+                .expect("successor row");
+            assert_eq!(succ.tagline.as_deref(), Some("new tagline"));
+        });
     }
 }

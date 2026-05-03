@@ -287,7 +287,7 @@ fn session_info_includes_tree_fields() {
 #[test]
 fn orchestration_tool_definitions() {
     let tools = tau_agent_lib::orchestration::orchestration_tools();
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"session_spawn"));
@@ -302,6 +302,7 @@ fn orchestration_tool_definitions() {
     assert!(names.contains(&"session_message"));
     assert!(names.contains(&"session_reply"));
     assert!(names.contains(&"session_id"));
+    assert!(names.contains(&"session_succeed"));
 
     // session_spawn has prompt snippet
     let spawn = tools.iter().find(|t| t.name == "session_spawn").unwrap();

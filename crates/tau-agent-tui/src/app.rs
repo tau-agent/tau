@@ -2389,9 +2389,28 @@ impl App {
             }
             "/fork" => Some(Action::ForkSession),
             "/new" => Some(Action::NewSession),
+            "/succeed" | "/handoff" => {
+                // Mid-turn guard: same UX as /compact — reject locally so
+                // the user gets immediate feedback.  Succession during an
+                // in-flight turn would race the agent runner's exit
+                // handling and is not worth the complexity.
+                if matches!(self.mode, AppMode::Streaming) {
+                    self.messages.push(MessageItem::Error {
+                        text: "can't succeed while a turn is running. Cancel it first (Ctrl+C)."
+                            .into(),
+                    });
+                    return None;
+                }
+                let tagline = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
+                Some(Action::SucceedSession { tagline })
+            }
             "/help" => {
                 self.messages.push(MessageItem::Status {
-                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /compact [keep hint] /task [list|get|create|search|claim|approve|ready|status|mq] /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /help /quit"
+                    text: "Commands: /status /model [id] /theme [name] /cwd [path] /compact [keep hint] /task [list|get|create|search|claim|approve|ready|status|mq] /project stats [name] /reload /config [reload|show] /sessions /session <id> /back /fork /new /archive /succeed [tagline] /help /quit"
                         .into(),
                 });
                 None
@@ -3158,6 +3177,20 @@ impl App {
                 self.set_mode(AppMode::Input);
                 self.pending_steer = None;
             }
+            Response::SessionSucceeded { successor_id } => {
+                // Another client (or the agent itself, via the
+                // session_succeed tool) retired the session we're
+                // attached to.  Surface a status message and ask the
+                // event loop to switch us to the successor.  See task 915.
+                self.messages.push(MessageItem::Status {
+                    text: format!(
+                        "Session succeeded \u{2192} {}",
+                        &successor_id[..successor_id.len().min(8)]
+                    ),
+                });
+                return Some(Action::SwitchSession(successor_id));
+            }
+
             Response::Cancelled => {
                 self.finalize_in_flight();
                 // Replace "cancelling" status with "cancelled"
@@ -3847,6 +3880,11 @@ pub enum Action {
     ForkSession,
     /// Create a fresh session with default settings.
     NewSession,
+    /// Retire the current session in favour of a fresh successor and
+    /// switch the TUI to the new session.  See task 915.
+    SucceedSession {
+        tagline: Option<String>,
+    },
     /// Fire a hook on the server (best-effort, e.g. after TUI task state changes).
     FireHook {
         name: String,
@@ -7210,6 +7248,84 @@ mod tests {
                 MessageItem::Error { text } if text.contains("turn is running")
             )),
             "expected an Error message about a running turn"
+        );
+    }
+
+    /// `/succeed` with no args parses to a `SucceedSession` action with no tagline.
+    #[test]
+    fn slash_succeed_no_args_emits_succeed_action_with_none() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_slash_command("/succeed");
+        match action {
+            Some(Action::SucceedSession { tagline: None }) => {}
+            other => panic!("expected Action::SucceedSession{{None}}, got {other:?}"),
+        }
+    }
+
+    /// `/handoff` is an alias for `/succeed`.
+    #[test]
+    fn slash_handoff_is_alias_for_succeed() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_slash_command("/handoff");
+        match action {
+            Some(Action::SucceedSession { tagline: None }) => {}
+            other => panic!("expected Action::SucceedSession from /handoff, got {other:?}"),
+        }
+    }
+
+    /// `/succeed <tagline>` preserves the free-form remainder verbatim.
+    #[test]
+    fn slash_succeed_with_args_emits_succeed_action_with_tagline() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_slash_command("/succeed continued: refactor stage 2");
+        match action {
+            Some(Action::SucceedSession { tagline: Some(t) }) => {
+                assert_eq!(t, "continued: refactor stage 2");
+            }
+            other => panic!("expected Action::SucceedSession{{Some(_)}}, got {other:?}"),
+        }
+    }
+
+    /// `/succeed` while a turn is streaming is rejected client-side and
+    /// surfaces a local Error message.  Mirrors the `/compact` guard.
+    #[test]
+    fn slash_succeed_during_streaming_is_rejected() {
+        let mut app = make_app();
+        app.mode = AppMode::Streaming;
+        let action = app.handle_slash_command("/succeed");
+        assert!(action.is_none(), "no action emitted while streaming");
+        assert!(
+            app.messages.iter().any(|m| matches!(
+                m,
+                MessageItem::Error { text } if text.contains("turn is running")
+            )),
+            "expected an Error message about a running turn"
+        );
+    }
+
+    /// `Response::SessionSucceeded` from a subscribe broadcast emits a
+    /// `SwitchSession` action so the TUI follows the successor.
+    #[test]
+    fn response_session_succeeded_emits_switch_session_action() {
+        let mut app = make_app();
+        app.mode = AppMode::Input;
+        let action = app.handle_server_response(Response::SessionSucceeded {
+            successor_id: "successor-abc".into(),
+        });
+        match action {
+            Some(Action::SwitchSession(id)) => assert_eq!(id, "successor-abc"),
+            other => panic!("expected SwitchSession action, got {other:?}"),
+        }
+        // A status message records the auto-switch in the predecessor's view.
+        assert!(
+            app.messages.iter().any(|m| matches!(
+                m,
+                MessageItem::Status { text } if text.contains("succeeded")
+            )),
+            "expected a Status message recording the succession"
         );
     }
 

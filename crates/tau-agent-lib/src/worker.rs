@@ -1438,6 +1438,217 @@ async fn handle_session_tool(
             }
         }
 
+        "session_succeed" => {
+            let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            if summary.is_empty() {
+                return ToolResultMessage::error(
+                    tcid,
+                    "",
+                    "summary is required (a self-contained handoff message for the successor)",
+                );
+            }
+            let new_tagline = args
+                .get("new_tagline")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let carry_files: Vec<String> = args
+                .get("carry_files")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let caller_sid = match session_id {
+                Some(sid) => sid.to_string(),
+                None => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        "session_succeed: caller session id unavailable (cannot succeed)",
+                    );
+                }
+            };
+
+            // Pre-flight: refuse if this session is already retired.
+            // The server enforces this too — we mirror it client-side so
+            // the agent gets a fast, descriptive error.
+            let resolve_req = crate::protocol::Request::ResolveSuccessor {
+                session_id: caller_sid.clone(),
+            };
+            match server_request(msg_tx, pending, resolve_req).await {
+                Ok(crate::protocol::Response::ResolvedSuccessor { session_id: tip }) => {
+                    if tip != caller_sid {
+                        return ToolResultMessage::error(
+                            tcid,
+                            "",
+                            &format!(
+                                "session is already succeeded; live tip is {tip}. \
+                                 Call session_succeed on the live tip instead."
+                            ),
+                        );
+                    }
+                }
+                Ok(crate::protocol::Response::Error { message }) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("session_succeed pre-flight failed: {message}"),
+                    );
+                }
+                Ok(other) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("unexpected response: {:?}", other),
+                    );
+                }
+                Err(e) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("session_succeed pre-flight failed: {e}"),
+                    );
+                }
+            }
+
+            // Atomic create + link via the new SucceedSession request.
+            let succ_req = crate::protocol::Request::SucceedSession {
+                session_id: caller_sid.clone(),
+                tagline: new_tagline,
+                caller_session_id: Some(caller_sid.clone()),
+            };
+            let new_id = match server_request(msg_tx, pending, succ_req).await {
+                Ok(crate::protocol::Response::SessionCreated { session_id }) => session_id,
+                Ok(crate::protocol::Response::Error { message }) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("session_succeed failed: {message}"),
+                    );
+                }
+                Ok(other) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("unexpected response: {:?}", other),
+                    );
+                }
+                Err(e) => {
+                    return ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("session_succeed failed: {e}"),
+                    );
+                }
+            };
+
+            // Compose the handoff message and queue it on the successor.
+            // The successor's agent loop is NOT woken — the message lands
+            // in the queued_messages table and will be drained on the
+            // user's next prompt (or the next forwarded notification).
+            let composed = if carry_files.is_empty() {
+                summary.to_string()
+            } else {
+                let mut buf = String::with_capacity(summary.len() + 64);
+                buf.push_str(summary);
+                buf.push_str("\n\nFiles referenced in handoff:\n");
+                for path in &carry_files {
+                    buf.push_str("- ");
+                    buf.push_str(path);
+                    buf.push('\n');
+                }
+                buf
+            };
+            let queue_req = crate::protocol::Request::QueueMessage {
+                target_session_id: new_id.clone(),
+                content: composed,
+                sender_info: format!("session_succeed from {caller_sid}"),
+                await_reply: false,
+                reply_to: None,
+            };
+            match server_request(msg_tx, pending, queue_req).await {
+                Ok(crate::protocol::Response::Ok)
+                | Ok(crate::protocol::Response::OkWithNote { .. }) => {}
+                Ok(crate::protocol::Response::Error { message }) => {
+                    // The successor exists but we couldn't queue the
+                    // handoff. Surface the error but don't fall through
+                    // — the loop must still terminate so the predecessor
+                    // doesn't keep spending context.
+                    let mut result = ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!(
+                            "successor created ({new_id}) but failed to queue summary: {message}"
+                        ),
+                    );
+                    result.summary = Some(format!(
+                        "session_succeed: created {} but summary queue failed",
+                        &new_id[..new_id.len().min(8)]
+                    ));
+                    result.post_persist_actions.push(
+                        crate::types::PostPersistAction::StopAgentLoop {
+                            reason: format!(
+                                "succeeded by tool, successor={new_id} (summary queue failed)"
+                            ),
+                        },
+                    );
+                    return result;
+                }
+                Ok(other) => {
+                    let mut result = ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!(
+                            "successor created ({new_id}) but unexpected queue response: {:?}",
+                            other
+                        ),
+                    );
+                    result.summary = Some(format!(
+                        "session_succeed: created {} (unexpected queue response)",
+                        &new_id[..new_id.len().min(8)]
+                    ));
+                    result.post_persist_actions.push(
+                        crate::types::PostPersistAction::StopAgentLoop {
+                            reason: format!("succeeded by tool, successor={new_id}"),
+                        },
+                    );
+                    return result;
+                }
+                Err(e) => {
+                    let mut result = ToolResultMessage::error(
+                        tcid,
+                        "",
+                        &format!("successor created ({new_id}) but failed to queue summary: {e}"),
+                    );
+                    result.summary = Some(format!(
+                        "session_succeed: created {} (queue err)",
+                        &new_id[..new_id.len().min(8)]
+                    ));
+                    result.post_persist_actions.push(
+                        crate::types::PostPersistAction::StopAgentLoop {
+                            reason: format!("succeeded by tool, successor={new_id}"),
+                        },
+                    );
+                    return result;
+                }
+            };
+
+            // Success: structured payload + human-readable summary, plus
+            // the `StopAgentLoop` post-persist action that ends the
+            // calling loop after this result is persisted.
+            let payload = serde_json::json!({ "successor_session_id": new_id }).to_string();
+            let mut result = ToolResultMessage::success(tcid, "", &payload);
+            result.summary = Some(format!("Succeeded → {}", &new_id[..new_id.len().min(8)]));
+            result
+                .post_persist_actions
+                .push(crate::types::PostPersistAction::StopAgentLoop {
+                    reason: format!("succeeded by tool, successor={new_id}"),
+                });
+            result
+        }
+
         "session_id" => match session_id {
             Some(sid) => ToolResultMessage::success(
                 tcid,

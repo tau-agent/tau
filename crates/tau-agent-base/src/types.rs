@@ -263,6 +263,19 @@ pub enum PostPersistAction {
         target_session_id: String,
         text: String,
     },
+    /// Signal the agent runner that the current turn should end after this
+    /// tool result is persisted. The runner exits cleanly with `AgentDone`
+    /// (not `Cancelled`) and does not call the LLM again.
+    ///
+    /// Use sparingly: this is intended for tools that semantically retire
+    /// the calling session (e.g. `session_succeed` from task 915). Other
+    /// tools should let the agent decide when to stop on its own.
+    StopAgentLoop {
+        /// Free-form reason recorded in tracing logs. Not surfaced to the
+        /// model or the client — the tool itself is responsible for
+        /// returning a human-meaningful result.
+        reason: String,
+    },
 }
 
 /// Tier-3 actions the server performs after the calling session's lock is

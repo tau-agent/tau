@@ -375,8 +375,26 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
             .clone()
     };
 
+    // Per-session "stop after next tool result" flag — set by
+    // PostPersistAction::StopAgentLoop and read by `should_stop` so the
+    // agent loop exits cleanly without consulting the LLM again.  Reset
+    // here for each Chat turn (a previous turn that succeeded would have
+    // left the predecessor session retired, but a defensive reset keeps
+    // the flag honest if the row is somehow re-used in tests).
+    let stop_after_tool_flag: Arc<AtomicBool> = {
+        let mut st = lock_state(state);
+        let flag = st
+            .stop_after_tool_flags
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone();
+        flag.store(false, Ordering::Relaxed);
+        flag
+    };
+
     let shutdown_flag = shutdown.flag.clone();
     let cancel_flag_clone = cancel_flag.clone();
+    let stop_after_tool_clone = stop_after_tool_flag.clone();
     let state_clone_persist = state.clone();
     let session_id_persist = session_id.to_string();
     let state_clone_drain = state.clone();
@@ -384,7 +402,9 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     let has_queued_clone = has_queued_flag.clone();
     let agent_config = crate::agent::AgentConfig {
         should_stop: Some(Box::new(move || {
-            shutdown_flag.load(Ordering::Relaxed) || cancel_flag_clone.load(Ordering::Relaxed)
+            shutdown_flag.load(Ordering::Relaxed)
+                || cancel_flag_clone.load(Ordering::Relaxed)
+                || stop_after_tool_clone.load(Ordering::Relaxed)
         })),
         cancel_token: Some(tau_agent_base::types::CancelToken::from_flag(
             cancel_flag.clone(),
@@ -420,6 +440,13 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
                                     target_session_id,
                                     text,
                                 );
+                            }
+                            tau_agent_base::types::PostPersistAction::StopAgentLoop { reason } => {
+                                tracing::info!(
+                                    %reason,
+                                    "PostPersistAction::StopAgentLoop set; agent loop will exit after this tool result"
+                                );
+                                stop_after_tool_flag.store(true, Ordering::Relaxed);
                             }
                         }
                     }
@@ -677,7 +704,18 @@ pub(super) async fn run_child_chat(
         flag
     };
 
-    let chat_result: Result<(bool, bool), crate::Error> = async {
+    // Per-session "stop after tool" flag (see task 915 / dispatch.rs).
+    let stop_after_tool_flag: Arc<AtomicBool> = {
+        let mut st = lock_state(&state);
+        let flag = st
+            .stop_after_tool_flags
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(false, Ordering::Relaxed);
+        flag.clone()
+    };
+
+    let chat_result: Result<(bool, bool, bool), crate::Error> = async {
         // Load session
         let (stored, mut messages, cwd) = {
             let st = lock_state(&state);
@@ -783,7 +821,11 @@ pub(super) async fn run_child_chat(
             Err(e) => return Err(e),
         };
 
-        Ok((cancel_flag.load(Ordering::Relaxed), max_turns_reached))
+        Ok((
+            cancel_flag.load(Ordering::Relaxed),
+            max_turns_reached,
+            stop_after_tool_flag.load(Ordering::Relaxed),
+        ))
     }
     .await;
 
@@ -791,7 +833,7 @@ pub(super) async fn run_child_chat(
     // the awaiting variant so subscribers observe them before the session
     // transitions to idle via another code path.
     match chat_result {
-        Ok((true, _)) => {
+        Ok((true, _, _)) => {
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::Cancelled).await;
             // Notify parent about cancellation.
             notify_parent_of_child_completion(
@@ -806,7 +848,7 @@ pub(super) async fn run_child_chat(
                 &test_overrides,
             );
         }
-        Ok((false, max_turns_reached)) => {
+        Ok((false, max_turns_reached, _was_succeeded)) => {
             if max_turns_reached {
                 // Notify the parent session that this child hit its step limit.
                 let parent_id = {
@@ -940,7 +982,18 @@ pub(super) async fn resume_child_session(
         flag
     };
 
-    let chat_result: Result<(bool, bool), crate::Error> = async {
+    // Per-session "stop after tool" flag (see task 915 / dispatch.rs).
+    let stop_after_tool_flag: Arc<AtomicBool> = {
+        let mut st = lock_state(&state);
+        let flag = st
+            .stop_after_tool_flags
+            .entry(session_id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)));
+        flag.store(false, Ordering::Relaxed);
+        flag.clone()
+    };
+
+    let chat_result: Result<(bool, bool, bool), crate::Error> = async {
         // Load session
         let (stored, mut messages, cwd) = {
             let st = lock_state(&state);
@@ -1042,14 +1095,18 @@ pub(super) async fn resume_child_session(
             Err(e) => return Err(e),
         };
 
-        Ok((cancel_flag.load(Ordering::Relaxed), max_turns_reached))
+        Ok((
+            cancel_flag.load(Ordering::Relaxed),
+            max_turns_reached,
+            stop_after_tool_flag.load(Ordering::Relaxed),
+        ))
     }
     .await;
 
     // Broadcast terminal response and notify parent (same as run_child_chat).
     // Terminal broadcasts are awaited; see module comment in notifications.rs.
     match chat_result {
-        Ok((true, _)) => {
+        Ok((true, _, _)) => {
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::Cancelled).await;
             notify_parent_of_child_completion(
                 &state,
@@ -1063,7 +1120,7 @@ pub(super) async fn resume_child_session(
                 &test_overrides,
             );
         }
-        Ok((false, max_turns_reached)) => {
+        Ok((false, max_turns_reached, _was_succeeded)) => {
             if max_turns_reached {
                 let parent_id = {
                     let st = lock_state(&state);
@@ -1323,6 +1380,7 @@ mod compaction_tests {
             all_models: vec![model],
             usage_cache: None,
             cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
             has_queued: HashMap::new(),
             subscribers: HashMap::new(),
             phases: HashMap::new(),

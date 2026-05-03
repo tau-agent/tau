@@ -7250,6 +7250,7 @@ mod tests {
                 let expected_line = format!("[task #{}] Emit test: ready → active", task.id);
                 assert_eq!(text, &expected_line);
             }
+            other => panic!("unexpected post-persist action: {:?}", other),
         }
     }
 
