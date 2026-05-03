@@ -556,8 +556,6 @@ Respond with EXACTLY one word:
 /// Number of recent messages to include in the loop review context.
 const LOOP_REVIEW_MESSAGE_COUNT: usize = 6;
 
-/// Run an inline LLM call to review whether the session is stuck.
-/// Returns `true` if the session appears stuck.
 /// Build the user-message text used for a loop-review LLM call from the
 /// supplied (already-trimmed) messages.
 ///
@@ -628,6 +626,8 @@ fn build_loop_review_text(recent: &[Message]) -> String {
     review_text
 }
 
+/// Run an inline LLM call to review whether the session is stuck.
+/// Returns `true` if the session appears stuck.
 async fn run_loop_review(
     registry: &ProviderRegistry,
     review_model: &Model,
