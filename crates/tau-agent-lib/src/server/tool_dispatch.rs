@@ -775,8 +775,135 @@ pub(super) async fn handle_server_request(
             super::task_handlers::handle_task_merge_queue(project)
         }
         Request::ProjectStats { project_name } => project_stats_impl(state, project_name),
+        Request::GetTaskSessionRole { session_id } => {
+            // Mirrors the TCP dispatcher (see `dispatch.rs`'s
+            // `Request::GetTaskSessionRole` arm). Used by
+            // `session_succeed`'s pre-flight check (worker.rs) which
+            // routes through this plugin-context dispatcher when the
+            // tool runs inside a plugin executor — without this arm
+            // the catch-all error below makes every `session_succeed`
+            // call fail. See task #939.
+            super::dispatch::get_task_session_role_impl(session_id)
+        }
         _ => Response::Error {
             message: "request not supported in plugin context".into(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the plugin-context request dispatcher.
+    //!
+    //! These exist primarily to prevent #939 from recurring: prior to
+    //! that fix, `Request::GetTaskSessionRole` fell through to the
+    //! catch-all `"request not supported in plugin context"` error,
+    //! which made every `session_succeed` call from a tool/plugin
+    //! context fail at the pre-flight check.
+
+    use super::*;
+    use crate::db::Db;
+    use crate::provider::ProviderRegistry;
+    use crate::server::state::State;
+    use crate::types::{Model, ModelCost, ThinkingStyle};
+    use std::collections::{HashMap, HashSet};
+
+    fn mk_model() -> Model {
+        Model {
+            id: "test/test".into(),
+            name: "test".into(),
+            api: "anthropic".into(),
+            provider: "test".into(),
+            base_url: "".into(),
+            thinking: ThinkingStyle::default(),
+            cost: ModelCost::default(),
+            context_window: 100_000,
+            max_tokens: 4096,
+            headers: HashMap::new(),
+        }
+    }
+
+    fn mk_state() -> SharedState {
+        let db = Db::open_memory().expect("open memory db");
+        Arc::new(Mutex::new(State {
+            db,
+            registry: ProviderRegistry::new(),
+            auth: crate::auth::AuthStorage::open_default(),
+            config: crate::config::Config::default(),
+            global_aliases: HashMap::new(),
+            default_model: mk_model(),
+            all_models: vec![mk_model()],
+            usage_cache: None,
+            cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
+            has_queued: HashMap::new(),
+            subscribers: HashMap::new(),
+            phases: HashMap::new(),
+            live_sessions: HashSet::new(),
+            waited_sessions: HashSet::new(),
+            session_done_waiters: Vec::new(),
+            reply_waiters: HashMap::new(),
+            next_msg_id: 0,
+            bg_after_idle: HashMap::new(),
+            bg_scheduler: None,
+        }))
+    }
+
+    /// Regression for #939: `Request::GetTaskSessionRole` must be
+    /// handled by the plugin-context dispatcher rather than falling
+    /// through to the "request not supported in plugin context"
+    /// catch-all. `session_succeed`'s pre-flight check routes through
+    /// this dispatcher, and the catch-all error caused every call to
+    /// fail with "session_succeed pre-flight (task role) failed".
+    #[test]
+    fn plugin_dispatcher_handles_get_task_session_role() {
+        smol::block_on(async {
+            let state = mk_state();
+            let plugins = Arc::new(Mutex::new(crate::plugin::PluginManager::new(
+                crate::plugin::PluginsConfig {
+                    no_default_worker: true,
+                    ..Default::default()
+                },
+            )));
+            let shutdown = ShutdownHandle::new();
+            let session_locks: SessionLocks = Arc::new(Mutex::new(HashMap::new()));
+            let throttle = crate::throttle::ProviderThrottle::new();
+            let test_overrides: SharedTestOverrides =
+                Arc::new(super::super::TestOverrides::default());
+            let (chat_spawn_tx, _chat_spawn_rx) =
+                smol::channel::unbounded::<crate::server::state::ChatSpawn>();
+
+            let req = crate::protocol::Request::GetTaskSessionRole {
+                session_id: "s_unknown".into(),
+            };
+            let resp = handle_server_request(
+                &state,
+                &session_locks,
+                &plugins,
+                &shutdown,
+                &throttle,
+                &chat_spawn_tx,
+                &test_overrides,
+                &req,
+                "s_caller",
+            )
+            .await;
+            match resp {
+                crate::protocol::Response::TaskSessionRole {
+                    is_worker,
+                    task_id,
+                    role,
+                } => {
+                    assert!(!is_worker);
+                    assert_eq!(task_id, None);
+                    assert_eq!(role, None);
+                }
+                crate::protocol::Response::Error { message } => panic!(
+                    "plugin dispatcher returned Error for GetTaskSessionRole \
+                     — #939 regression. message: {message}"
+                ),
+                other => panic!("expected TaskSessionRole, got {other:?}"),
+            }
+        });
     }
 }

@@ -573,6 +573,50 @@ pub(super) fn project_stats_impl(
     }
 }
 
+/// Look up the active task role (if any) for a session, returning a
+/// [`Response::TaskSessionRole`] suitable for sending straight back
+/// over the wire. Best-effort: if the tasks DB can't be opened or the
+/// query fails we report "no task linkage" and let the caller proceed
+/// rather than 500'ing a setup that doesn't have the tasks plugin.
+///
+/// Shared between the TCP dispatcher (`Request::GetTaskSessionRole`
+/// arm above) and the plugin-context dispatcher (see
+/// `tool_dispatch::handle_server_request`) so both paths agree on the
+/// pre-flight semantics used by `session_succeed`.
+pub(super) fn get_task_session_role_impl(session_id: &str) -> crate::protocol::Response {
+    use crate::protocol::Response;
+    match crate::tasks_db::TasksDb::open_default() {
+        Ok(db) => match db.find_active_task_role_for_session(session_id) {
+            Ok(Some((task_id, role))) => Response::TaskSessionRole {
+                is_worker: role == "worker",
+                task_id: Some(task_id),
+                role: Some(role),
+            },
+            Ok(None) => Response::TaskSessionRole {
+                is_worker: false,
+                task_id: None,
+                role: None,
+            },
+            Err(e) => {
+                tracing::warn!(%e, %session_id, "GetTaskSessionRole DB query failed");
+                Response::TaskSessionRole {
+                    is_worker: false,
+                    task_id: None,
+                    role: None,
+                }
+            }
+        },
+        Err(e) => {
+            tracing::debug!(%e, "GetTaskSessionRole: tasks DB unavailable");
+            Response::TaskSessionRole {
+                is_worker: false,
+                task_id: None,
+                role: None,
+            }
+        }
+    }
+}
+
 /// Look up a project's metadata by name. Returns
 /// [`Response::ProjectInfo`] with `project = None` when the project
 /// doesn't exist (so callers don't have to distinguish "missing" from
@@ -1909,40 +1953,7 @@ pub(super) async fn handle_client(
             }
 
             crate::protocol::Request::GetTaskSessionRole { session_id } => {
-                // Open the tasks DB best-effort — a setup without the
-                // tasks plugin should not 500 here.  When the DB can't be
-                // opened we report "no task linkage" and let the caller
-                // proceed.
-                let resp = match crate::tasks_db::TasksDb::open_default() {
-                    Ok(db) => match db.find_active_task_role_for_session(&session_id) {
-                        Ok(Some((task_id, role))) => Response::TaskSessionRole {
-                            is_worker: role == "worker",
-                            task_id: Some(task_id),
-                            role: Some(role),
-                        },
-                        Ok(None) => Response::TaskSessionRole {
-                            is_worker: false,
-                            task_id: None,
-                            role: None,
-                        },
-                        Err(e) => {
-                            tracing::warn!(%e, %session_id, "GetTaskSessionRole DB query failed");
-                            Response::TaskSessionRole {
-                                is_worker: false,
-                                task_id: None,
-                                role: None,
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        tracing::debug!(%e, "GetTaskSessionRole: tasks DB unavailable");
-                        Response::TaskSessionRole {
-                            is_worker: false,
-                            task_id: None,
-                            role: None,
-                        }
-                    }
-                };
+                let resp = get_task_session_role_impl(&session_id);
                 send(&mut writer, &resp).await?;
             }
 
@@ -3343,5 +3354,39 @@ mod tests {
                 .expect("successor row");
             assert_eq!(succ.tagline.as_deref(), Some("new tagline"));
         });
+    }
+
+    /// Regression for #939: `get_task_session_role_impl` must return a
+    /// `Response::TaskSessionRole` (not a generic `Error`) for sessions
+    /// with no task linkage. Both the TCP dispatcher and the
+    /// plugin-context dispatcher (`tool_dispatch::handle_server_request`)
+    /// share this helper, so this also exercises the plugin path used
+    /// by `session_succeed`'s pre-flight check.
+    ///
+    /// We don't seed the tasks DB here — the helper is best-effort and
+    /// reports "no task linkage" when the DB is unavailable or the
+    /// session isn't a task session, which is the case the bug hit.
+    #[test]
+    fn get_task_session_role_impl_returns_role_response_for_unknown_session() {
+        let resp = get_task_session_role_impl("s_does_not_exist");
+        match resp {
+            crate::protocol::Response::TaskSessionRole {
+                is_worker,
+                task_id,
+                role,
+            } => {
+                assert!(
+                    !is_worker,
+                    "unknown session must not be reported as a worker"
+                );
+                assert_eq!(task_id, None);
+                assert_eq!(role, None);
+            }
+            other => panic!(
+                "expected TaskSessionRole for unknown session, got {other:?} \
+                 — plugin-context dispatcher would fall through to the \
+                 catch-all `request not supported in plugin context` error"
+            ),
+        }
     }
 }
