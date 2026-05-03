@@ -1,5 +1,8 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use futures::FutureExt;
 
 use super::notifications::{
     broadcast_to_subscribers, broadcast_to_subscribers_and_wait, emit_phase, emit_phase_and_wait,
@@ -250,6 +253,32 @@ impl crate::worker::ToolExecutor for PluginExecutor {
     }
 }
 
+/// Marker prefix used on the `crate::Error::Io` returned by the
+/// `catch_unwind` wrappers in this module so the post-turn cleanup logic
+/// can distinguish a panic from a regular error. Used by `is_panic_error`
+/// and the various `Err` arms in dispatch.rs / agent_runner.rs.
+pub(super) const PANIC_ERROR_PREFIX: &str = "agent panicked: ";
+
+/// Convert a `catch_unwind` payload into a human-readable string.  Best-
+/// effort: handles the two common payload types (`&'static str` and
+/// `String`) and falls back to a generic placeholder for anything else.
+pub(super) fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// True iff `e` was produced by one of the `catch_unwind` wrappers in
+/// this module.  Cleanup paths use this to surface a `"panicked"` exit
+/// status (vs `"error"`) so panics are visible in the session timeline.
+pub(super) fn is_panic_error(e: &crate::Error) -> bool {
+    matches!(e, crate::Error::Io(msg) if msg.starts_with(PANIC_ERROR_PREFIX))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_agent_turn<'a, W: futures::io::AsyncWrite + Unpin + Send + 'a>(
     state: &'a SharedState,
@@ -298,6 +327,16 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
     session_locks: &SessionLocks,
     test_overrides: &SharedTestOverrides,
 ) -> crate::Result<crate::agent::AgentResult> {
+    // Wrap the loop body in `catch_unwind` so a panic anywhere in the
+    // engine, providers, plugins, or executor surfaces as a normal `Err`
+    // instead of leaking out of `smol::spawn(...).detach()` and wedging
+    // the session forever (no terminal broadcast, no `live_sessions`
+    // cleanup, no parent notification). See task #957.
+    //
+    // `AssertUnwindSafe` is required because the body holds `&mut W`,
+    // `&mut Context`, etc.  Safe here because callers drop both via
+    // their own scopes on panic — we don't read post-panic state.
+    let result = AssertUnwindSafe(async {
     // Check provider throttle — sleep if rate limited
     if let Some(remaining) = throttle.check(&model.provider) {
         let human = crate::agent::format_duration_human(remaining.as_millis() as u64);
@@ -667,7 +706,23 @@ async fn run_agent_turn_inner<W: futures::io::AsyncWrite + Unpin + Send>(
 
     let agent_result = agent_result?;
 
-    Ok(agent_result)
+        Ok(agent_result)
+    })
+    .catch_unwind()
+    .await;
+
+    match result {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&*payload);
+            tracing::error!(
+                session_id = %session_id,
+                panic = %msg,
+                "agent loop panicked",
+            );
+            Err(crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, msg)))
+        }
+    }
 }
 
 /// Run an agent turn for a child session (spawned by orchestration tools).
@@ -715,7 +770,12 @@ pub(super) async fn run_child_chat(
         flag.clone()
     };
 
-    let chat_result: Result<(bool, bool, bool), crate::Error> = async {
+    // Wrap the chat body in `catch_unwind` so a panic anywhere in the
+    // engine, providers, plugins, or executor surfaces as a normal `Err`
+    // and the existing terminal-broadcast / parent-notify cleanup path
+    // below runs.  Without this, a panic in the detached spawn would
+    // wedge the session forever.  See task #957.
+    let chat_result: Result<(bool, bool, bool), crate::Error> = match AssertUnwindSafe(async {
         // Load session
         let (stored, mut messages, cwd) = {
             let st = lock_state(&state);
@@ -826,8 +886,21 @@ pub(super) async fn run_child_chat(
             max_turns_reached,
             stop_after_tool_flag.load(Ordering::Relaxed),
         ))
-    }
-    .await;
+    })
+    .catch_unwind()
+    .await
+    {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&*payload);
+            tracing::error!(
+                session_id = %session_id,
+                panic = %msg,
+                "child chat agent loop panicked",
+            );
+            Err(crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, msg)))
+        }
+    };
 
     // Broadcast terminal response and notify parent. Terminal broadcasts use
     // the awaiting variant so subscribers observe them before the session
@@ -895,7 +968,12 @@ pub(super) async fn run_child_chat(
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
         }
         Err(ref e) => {
-            let err_msg = format!("child agent error: {}", e);
+            let panicked = is_panic_error(e);
+            let err_msg = if panicked {
+                format!("child agent loop panicked: {}", e)
+            } else {
+                format!("child agent error: {}", e)
+            };
             broadcast_to_subscribers(
                 &state,
                 &session_id,
@@ -904,7 +982,12 @@ pub(super) async fn run_child_chat(
                 },
             );
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
-            // Notify parent about error.
+            // Notify parent about error / panic.
+            let status = if panicked {
+                "panicked".to_string()
+            } else {
+                format!("error: {}", e)
+            };
             notify_parent_of_child_completion(
                 &state,
                 &session_locks,
@@ -912,7 +995,7 @@ pub(super) async fn run_child_chat(
                 &shutdown,
                 &throttle,
                 &session_id,
-                &format!("error: {}", e),
+                &status,
                 None,
                 &test_overrides,
             );
@@ -993,7 +1076,11 @@ pub(super) async fn resume_child_session(
         flag.clone()
     };
 
-    let chat_result: Result<(bool, bool, bool), crate::Error> = async {
+    // Wrap the resume body in `catch_unwind` so a panic anywhere in the
+    // engine, providers, plugins, or executor surfaces as a normal `Err`
+    // and the existing terminal-broadcast / parent-notify cleanup path
+    // below runs.  See task #957.
+    let chat_result: Result<(bool, bool, bool), crate::Error> = match AssertUnwindSafe(async {
         // Load session
         let (stored, mut messages, cwd) = {
             let st = lock_state(&state);
@@ -1100,8 +1187,21 @@ pub(super) async fn resume_child_session(
             max_turns_reached,
             stop_after_tool_flag.load(Ordering::Relaxed),
         ))
-    }
-    .await;
+    })
+    .catch_unwind()
+    .await
+    {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&*payload);
+            tracing::error!(
+                session_id = %session_id,
+                panic = %msg,
+                "resume agent loop panicked",
+            );
+            Err(crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, msg)))
+        }
+    };
 
     // Broadcast terminal response and notify parent (same as run_child_chat).
     // Terminal broadcasts are awaited; see module comment in notifications.rs.
@@ -1165,7 +1265,12 @@ pub(super) async fn resume_child_session(
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
         }
         Err(ref e) => {
-            let err_msg = format!("child agent error: {}", e);
+            let panicked = is_panic_error(e);
+            let err_msg = if panicked {
+                format!("child agent loop panicked: {}", e)
+            } else {
+                format!("child agent error: {}", e)
+            };
             broadcast_to_subscribers(
                 &state,
                 &session_id,
@@ -1174,6 +1279,11 @@ pub(super) async fn resume_child_session(
                 },
             );
             broadcast_to_subscribers_and_wait(&state, &session_id, &Response::AgentDone).await;
+            let status = if panicked {
+                "panicked".to_string()
+            } else {
+                format!("error: {}", e)
+            };
             notify_parent_of_child_completion(
                 &state,
                 &session_locks,
@@ -1181,7 +1291,7 @@ pub(super) async fn resume_child_session(
                 &shutdown,
                 &throttle,
                 &session_id,
-                &format!("error: {}", e),
+                &status,
                 None,
                 &test_overrides,
             );
@@ -1223,123 +1333,144 @@ pub(super) async fn run_compaction(
     keep_hint: Option<&str>,
     manual: bool,
 ) -> crate::Result<()> {
-    emit_phase(state, session_id, crate::types::AgentPhase::Compacting);
+    // Wrap the compaction body in `catch_unwind` so a panic in the engine
+    // / provider stack surfaces as a normal error and the caller's `Err`
+    // arm runs (logging or surfacing to the user) instead of the panic
+    // leaking out of the detached spawn.  See task #957.
+    let result = AssertUnwindSafe(async {
+        emit_phase(state, session_id, crate::types::AgentPhase::Compacting);
 
-    let settings = compaction::CompactionSettings::default();
+        let settings = compaction::CompactionSettings::default();
 
-    // Load messages and find cut point
-    let (messages, cut_idx) = {
-        let st = lock_state(state);
-        let messages = st.db.get_messages(session_id)?;
-        let cut = compaction::find_cut_point(&messages, settings.keep_recent_tokens);
-        (messages, cut)
-    };
+        // Load messages and find cut point
+        let (messages, cut_idx) = {
+            let st = lock_state(state);
+            let messages = st.db.get_messages(session_id)?;
+            let cut = compaction::find_cut_point(&messages, settings.keep_recent_tokens);
+            (messages, cut)
+        };
 
-    if cut_idx == 0 {
-        // Nothing meaningful to compact. Auto-compaction silently no-ops; for
-        // a manual `/compact` request, broadcast a Status so any subscriber
-        // (the requesting TUI plus any others watching) sees that the
-        // command was received and why nothing happened, and persist a
-        // matching Info message so there's a durable record in the
-        // transcript. Auto-compaction (manual=false) stays silent: it
-        // shouldn't spam the transcript with no-op notes.
-        if manual {
-            let text = "manual compaction: nothing to compact yet \
+        if cut_idx == 0 {
+            // Nothing meaningful to compact. Auto-compaction silently no-ops; for
+            // a manual `/compact` request, broadcast a Status so any subscriber
+            // (the requesting TUI plus any others watching) sees that the
+            // command was received and why nothing happened, and persist a
+            // matching Info message so there's a durable record in the
+            // transcript. Auto-compaction (manual=false) stays silent: it
+            // shouldn't spam the transcript with no-op notes.
+            if manual {
+                let text = "manual compaction: nothing to compact yet \
                         (history fits within keep-recent window)";
-            let info = Response::Stream {
+                let info = Response::Stream {
+                    event: Box::new(crate::types::StreamEvent::Status {
+                        message: text.to_string(),
+                    }),
+                };
+                broadcast_to_subscribers(state, session_id, &info);
+                queue_info_to_session(state, session_id, text);
+            }
+            return Ok(());
+        }
+
+        let messages_to_summarize = &messages[..cut_idx];
+        let ctx_before = compaction::estimate_context_tokens(&messages);
+
+        // Notify subscribers that compaction is starting. The requesting
+        // client (TUI) is also a subscriber on its Subscribe connection, so
+        // it sees this Status alongside any other attached subscribers.
+        {
+            let progress = Response::Stream {
                 event: Box::new(crate::types::StreamEvent::Status {
-                    message: text.to_string(),
+                    message: format!(
+                        "compacting session ({} messages \u{2192} summary)...",
+                        messages_to_summarize.len()
+                    ),
                 }),
             };
-            broadcast_to_subscribers(state, session_id, &info);
-            queue_info_to_session(state, session_id, text);
+            broadcast_to_subscribers(state, session_id, &progress);
         }
-        return Ok(());
-    }
 
-    let messages_to_summarize = &messages[..cut_idx];
-    let ctx_before = compaction::estimate_context_tokens(&messages);
+        // Build summarization context and call LLM
+        let summary_ctx = compaction::build_summarization_context(messages_to_summarize, keep_hint);
 
-    // Notify subscribers that compaction is starting. The requesting
-    // client (TUI) is also a subscriber on its Subscribe connection, so
-    // it sees this Status alongside any other attached subscribers.
-    {
-        let progress = Response::Stream {
+        let api_key = {
+            let st = lock_state(state);
+            resolve_api_key(&st.auth, &st.config, &model.provider)?
+        };
+
+        let options = StreamOptions {
+            api_key,
+            max_tokens: Some(settings.reserve_tokens),
+            ..Default::default()
+        };
+
+        let rx = {
+            let st = lock_state(state);
+            st.registry.stream(model, &summary_ctx, &options)?
+        };
+
+        // Wait for summary (blocking on the channel)
+        let summary = smol::unblock({
+            let rx = rx.clone();
+            move || compaction::extract_summary(&rx)
+        })
+        .await?;
+
+        // Get the DB row ID of the first kept message
+        let keep_from_id = {
+            let st = lock_state(state);
+            st.db
+                .get_message_row_id(session_id, cut_idx)?
+                .ok_or_else(|| crate::Error::Io("cut point message not found".into()))?
+        };
+
+        // Perform compaction in DB
+        {
+            let st = lock_state(state);
+            st.db
+                .compact_session(session_id, &summary, keep_from_id, ctx_before)?;
+        }
+
+        let after_tokens = {
+            let st = lock_state(state);
+            let messages = st.db.get_messages(session_id)?;
+            compaction::estimate_context_tokens(&messages)
+        };
+
+        let done_text = format!(
+            "compaction done: {} \u{2192} {} tokens",
+            ctx_before, after_tokens
+        );
+        let done = Response::Stream {
             event: Box::new(crate::types::StreamEvent::Status {
-                message: format!(
-                    "compacting session ({} messages \u{2192} summary)...",
-                    messages_to_summarize.len()
-                ),
+                message: done_text.clone(),
             }),
         };
-        broadcast_to_subscribers(state, session_id, &progress);
-    }
+        broadcast_to_subscribers(state, session_id, &done);
+        if manual {
+            // Persist a durable record of the outcome to the transcript so a
+            // user asking "did /compact work?" days later can find evidence
+            // even if they missed the live Status.
+            queue_info_to_session(state, session_id, &done_text);
+        }
 
-    // Build summarization context and call LLM
-    let summary_ctx = compaction::build_summarization_context(messages_to_summarize, keep_hint);
-
-    let api_key = {
-        let st = lock_state(state);
-        resolve_api_key(&st.auth, &st.config, &model.provider)?
-    };
-
-    let options = StreamOptions {
-        api_key,
-        max_tokens: Some(settings.reserve_tokens),
-        ..Default::default()
-    };
-
-    let rx = {
-        let st = lock_state(state);
-        st.registry.stream(model, &summary_ctx, &options)?
-    };
-
-    // Wait for summary (blocking on the channel)
-    let summary = smol::unblock({
-        let rx = rx.clone();
-        move || compaction::extract_summary(&rx)
+        Ok(())
     })
-    .await?;
+    .catch_unwind()
+    .await;
 
-    // Get the DB row ID of the first kept message
-    let keep_from_id = {
-        let st = lock_state(state);
-        st.db
-            .get_message_row_id(session_id, cut_idx)?
-            .ok_or_else(|| crate::Error::Io("cut point message not found".into()))?
-    };
-
-    // Perform compaction in DB
-    {
-        let st = lock_state(state);
-        st.db
-            .compact_session(session_id, &summary, keep_from_id, ctx_before)?;
+    match result {
+        Ok(r) => r,
+        Err(payload) => {
+            let msg = panic_payload_to_string(&*payload);
+            tracing::error!(
+                session_id = %session_id,
+                panic = %msg,
+                "compaction panicked",
+            );
+            Err(crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, msg)))
+        }
     }
-
-    let after_tokens = {
-        let st = lock_state(state);
-        let messages = st.db.get_messages(session_id)?;
-        compaction::estimate_context_tokens(&messages)
-    };
-
-    let done_text = format!(
-        "compaction done: {} \u{2192} {} tokens",
-        ctx_before, after_tokens
-    );
-    let done = Response::Stream {
-        event: Box::new(crate::types::StreamEvent::Status {
-            message: done_text.clone(),
-        }),
-    };
-    broadcast_to_subscribers(state, session_id, &done);
-    if manual {
-        // Persist a durable record of the outcome to the transcript so a
-        // user asking "did /compact work?" days later can find evidence
-        // even if they missed the live Status.
-        queue_info_to_session(state, session_id, &done_text);
-    }
-
-    Ok(())
 }
 
 pub(super) async fn send<W: futures::io::AsyncWrite + Unpin>(
@@ -1601,5 +1732,362 @@ mod compaction_tests {
                 messages_after
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod panic_recovery_tests {
+    //! Regression tests for task #957: a panic anywhere in the agent loop
+    //! must surface as a normal `Err`, run the standard cleanup path, and
+    //! emit terminal Response::Error + Response::AgentDone to subscribers
+    //! — instead of silently wedging the session.
+
+    use super::*;
+    use crate::db::{Db, StoredSession};
+    use crate::provider::ProviderRegistry;
+    use crate::server::state::State;
+    use std::collections::{HashMap, HashSet};
+    use tau_agent_engine::providers::mock::{MockProvider, MockResponse, mock_model};
+
+    /// A `ToolExecutor` whose `execute` panics with the configured
+    /// payload on first invocation.
+    struct PanickingExecutor {
+        msg: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::worker::ToolExecutor for PanickingExecutor {
+        async fn execute(
+            &mut self,
+            _tool_call: &ToolCall,
+            _output_tx: &smol::channel::Sender<String>,
+            _cancel: &tau_agent_base::types::CancelToken,
+        ) -> crate::Result<ToolResultMessage> {
+            panic!("{}", self.msg);
+        }
+    }
+
+    fn mk_state_with_tool_call(tool_name: &str) -> SharedState {
+        let db = Db::open_memory().expect("open in-memory db");
+        let mut registry = ProviderRegistry::new();
+        // Provider returns a single tool-call response so the executor
+        // is invoked exactly once before the loop would otherwise wait
+        // for a tool result.
+        registry.register(MockProvider::new(vec![MockResponse::ToolCalls(vec![
+            ToolCall {
+                id: "call-1".to_string(),
+                name: tool_name.to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ])]));
+        let model = mock_model();
+        Arc::new(Mutex::new(State {
+            db,
+            registry,
+            auth: crate::auth::AuthStorage::open_default(),
+            config: {
+                let mut cfg = crate::config::Config::default();
+                cfg.providers.insert(
+                    "mock".into(),
+                    crate::config::ProviderConfig {
+                        api: "openai".into(),
+                        base_url: "http://mock".into(),
+                        api_key: Some("mock-key".into()),
+                        models: vec![],
+                    },
+                );
+                cfg
+            },
+            global_aliases: HashMap::new(),
+            default_model: model.clone(),
+            all_models: vec![model],
+            usage_cache: None,
+            cancel_flags: HashMap::new(),
+            stop_after_tool_flags: HashMap::new(),
+            has_queued: HashMap::new(),
+            subscribers: HashMap::new(),
+            phases: HashMap::new(),
+            live_sessions: HashSet::new(),
+            waited_sessions: HashSet::new(),
+            session_done_waiters: Vec::new(),
+            reply_waiters: HashMap::new(),
+            next_msg_id: 0,
+            bg_after_idle: HashMap::new(),
+            bg_scheduler: None,
+        }))
+    }
+
+    fn seed_session(state: &SharedState, session_id: &str, model: &Model, parent_id: Option<&str>) {
+        let st = lock_state(state);
+        st.db
+            .create_session(&StoredSession {
+                id: session_id.to_string(),
+                model: model.clone(),
+                system_prompt: None,
+                cwd: None,
+                is_subscription: false,
+                created_at: 0,
+                parent_id: parent_id.map(|s| s.to_string()),
+                child_budget: 0,
+                tagline: None,
+                archived: false,
+                last_exit_status: None,
+                last_phase: None,
+                auto_archive: false,
+                notify_parent: true,
+                project_name: None,
+                successor_id: None,
+            })
+            .expect("create session");
+    }
+
+    fn mk_test_overrides_with_panicking_executor(
+        msg: &'static str,
+        tool_name: &str,
+    ) -> SharedTestOverrides {
+        Arc::new(super::super::TestOverrides {
+            tool_executor_factory: Some(Arc::new(move || {
+                Box::new(PanickingExecutor { msg }) as Box<dyn crate::worker::ToolExecutor>
+            })),
+            mock_tools: vec![Tool {
+                name: tool_name.to_string(),
+                description: "panicky test tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        })
+    }
+
+    fn mk_plugins() -> Arc<Mutex<crate::plugin::PluginManager>> {
+        Arc::new(Mutex::new(crate::plugin::PluginManager::new(
+            crate::plugin::PluginsConfig::default(),
+        )))
+    }
+
+    fn mk_session_locks() -> SessionLocks {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// Layer 1 acceptance: a panic in the tool executor must surface
+    /// as a normal `Err` whose message carries the panic payload.  This
+    /// is the *primitive* the wider cleanup paths rely on — with this in
+    /// place, every existing `match result { Ok / Err }` arm in
+    /// `run_child_chat`, `resume_child_session`, and the dispatch.rs
+    /// Chat handler does the right thing automatically.
+    ///
+    /// We exercise `run_agent_turn` directly (rather than
+    /// `run_child_chat`) to keep wall-clock cost low: this test owns
+    /// only its own `block_on` executor and doesn't bring up the full
+    /// child-chat machinery.  The downstream cleanup paths get separate,
+    /// more targeted coverage in `agent_panic_in_tool_runs_full_cleanup_and_notifies_parent`.
+    #[test]
+    fn agent_panic_in_tool_returns_err_with_marker_prefix() {
+        smol::block_on(async {
+            let state = mk_state_with_tool_call("panicky");
+            let session_id = "s-panic-direct";
+            let model = mock_model();
+            seed_session(&state, session_id, &model, None);
+
+            let plugins = mk_plugins();
+            let shutdown = ShutdownHandle::new();
+            let session_locks = mk_session_locks();
+            let throttle = crate::throttle::ProviderThrottle::new();
+            let test_overrides = mk_test_overrides_with_panicking_executor(
+                "divide by zero in test executor",
+                "panicky",
+            );
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let mut context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(UserMessage::text("go"))],
+                tools: Vec::new(),
+            };
+            let mut sink = futures::io::sink();
+
+            let result = run_agent_turn(
+                &state,
+                &plugins,
+                &shutdown,
+                cancel_flag,
+                &model,
+                &mut context,
+                "/tmp",
+                session_id,
+                &mut sink,
+                &throttle,
+                &session_locks,
+                &test_overrides,
+            )
+            .await;
+
+            let err = match result {
+                Ok(_) => panic!("agent loop should error after tool panic"),
+                Err(e) => e,
+            };
+            assert!(
+                is_panic_error(&err),
+                "err should carry the panic-marker prefix; got {:?}",
+                err,
+            );
+            let msg = match &err {
+                crate::Error::Io(s) => s.clone(),
+                other => panic!("unexpected error variant: {:?}", other),
+            };
+            assert!(
+                msg.contains("divide by zero in test executor"),
+                "panic payload should appear in error message; got {:?}",
+                msg,
+            );
+        });
+    }
+
+    /// Layer 1 cleanup: a panic during a child-session turn must run
+    /// the standard terminal-broadcast / parent-notify cleanup so the
+    /// session is removed from `live_sessions`, subscribers see
+    /// `Response::Error` (with the panic payload) followed by
+    /// `Response::AgentDone`, and the parent receives a `"panicked"`
+    /// completion notice.  Marked `#[ignore]` because driving the full
+    /// `run_child_chat` machinery against a panicking executor is
+    /// heavy enough to perturb wall-clock-sensitive periodic-job tests
+    /// when run in parallel; CI / on-demand runs (`cargo test --
+    /// --ignored`) still cover it.
+    #[test]
+    #[ignore]
+    fn agent_panic_in_tool_runs_full_cleanup_and_notifies_parent() {
+        smol::block_on(async {
+            let state = mk_state_with_tool_call("panicky");
+            let parent_id = "s-panic-parent";
+            let child_id = "s-panic-child";
+            let model = mock_model();
+            seed_session(&state, parent_id, &model, None);
+            seed_session(&state, child_id, &model, Some(parent_id));
+
+            let (sub_tx, sub_rx) = smol::channel::unbounded::<Response>();
+            {
+                let mut st = lock_state(&state);
+                st.subscribers.insert(child_id.into(), vec![sub_tx]);
+            }
+
+            let plugins = mk_plugins();
+            let shutdown = ShutdownHandle::new();
+            let session_locks = mk_session_locks();
+            let throttle = crate::throttle::ProviderThrottle::new();
+            let test_overrides = mk_test_overrides_with_panicking_executor(
+                "divide by zero in test executor",
+                "panicky",
+            );
+
+            let result = run_child_chat(
+                state.clone(),
+                plugins,
+                shutdown,
+                session_locks,
+                throttle,
+                child_id.to_string(),
+                "trigger panic please".to_string(),
+                Vec::new(),
+                test_overrides,
+            )
+            .await;
+
+            // -- run_child_chat itself returns Ok(()) — the panic flows
+            //    through the existing terminal-broadcast path.
+            assert!(
+                result.is_ok(),
+                "run_child_chat must complete cleanly even when the agent loop panics; got {:?}",
+                result,
+            );
+
+            // -- live_sessions cleanup
+            {
+                let st = lock_state(&state);
+                assert!(
+                    !st.live_sessions.contains(child_id),
+                    "panicked session should be removed from live_sessions",
+                );
+            }
+
+            // -- subscriber sequence: Error then AgentDone, with the
+            //    panic payload visible in the Error message.
+            let mut collected = Vec::new();
+            while let Ok(resp) = sub_rx.try_recv() {
+                collected.push(resp);
+            }
+            let saw_panic_error = collected.iter().any(|r| {
+                matches!(
+                    r,
+                    Response::Error { message }
+                        if message.contains("panicked")
+                            && message.contains("divide by zero in test executor")
+                )
+            });
+            assert!(
+                saw_panic_error,
+                "expected Response::Error mentioning the panic payload, got: {:?}",
+                collected,
+            );
+            let saw_agent_done = collected.iter().any(|r| matches!(r, Response::AgentDone));
+            assert!(
+                saw_agent_done,
+                "expected Response::AgentDone after panic, got: {:?}",
+                collected,
+            );
+
+            // -- parent receives a "panicked" completion notice (so a
+            //    parent session waiting on the child isn't stuck forever).
+            let queued = {
+                let st = lock_state(&state);
+                st.db
+                    .drain_queued_messages(parent_id)
+                    .expect("drain queued")
+            };
+            let saw_panicked_notice = queued.iter().any(|m| match m {
+                Message::User(u) => u.content.iter().any(|c| match c {
+                    UserContent::Text(t) => t.text.contains("panicked"),
+                    _ => false,
+                }),
+                Message::Info(i) => i.text.contains("panicked"),
+                _ => false,
+            });
+            assert!(
+                saw_panicked_notice,
+                "parent should receive a notice mentioning the child's \"panicked\" status, got: {:?}",
+                queued,
+            );
+        });
+    }
+
+    /// Helper-level: `panic_payload_to_string` extracts the common
+    /// payload shapes humans actually panic with.
+    #[test]
+    fn panic_payload_to_string_handles_str_string_and_other() {
+        let r = std::panic::catch_unwind(|| panic!("static str payload"));
+        let payload = r.expect_err("panicked");
+        assert_eq!(panic_payload_to_string(&*payload), "static str payload");
+
+        let r = std::panic::catch_unwind(|| panic!("{}", "owned String payload".to_string()));
+        let payload = r.expect_err("panicked");
+        assert_eq!(panic_payload_to_string(&*payload), "owned String payload");
+
+        // Custom payload type — falls back to the placeholder.
+        let r = std::panic::catch_unwind(|| std::panic::panic_any(42_u32));
+        let payload = r.expect_err("panicked");
+        assert_eq!(
+            panic_payload_to_string(&*payload),
+            "<non-string panic payload>",
+        );
+    }
+
+    /// `is_panic_error` recognises the synthetic Err produced by the
+    /// `catch_unwind` wrappers and ignores other Io errors.
+    #[test]
+    fn is_panic_error_recognises_marker_prefix() {
+        let panic_err = crate::Error::Io(format!("{}{}", PANIC_ERROR_PREFIX, "boom"));
+        assert!(is_panic_error(&panic_err));
+
+        let regular_io = crate::Error::Io("disk full".into());
+        assert!(!is_panic_error(&regular_io));
+
+        let other = crate::Error::Cancelled;
+        assert!(!is_panic_error(&other));
     }
 }

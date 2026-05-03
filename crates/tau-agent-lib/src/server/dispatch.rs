@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::io::{AsyncBufReadExt, BufReader};
 use smol::Async;
@@ -1022,7 +1023,19 @@ pub(super) async fn handle_client(
                 // Without this guarantee the TUI gets stuck in Streaming
                 // mode forever when an internal error (e.g. DB write)
                 // causes the handler to bail out early via `?`.
-                let chat_result: Result<(bool, bool, bool), crate::Error> = async {
+                // Run the Chat handler body inside a closure so that any
+                // error is caught and we *always* broadcast a terminal
+                // response (AgentDone / Cancelled / Error) to subscribers.
+                // Without this guarantee the TUI gets stuck in Streaming
+                // mode forever when an internal error (e.g. DB write)
+                // causes the handler to bail out early via `?`.
+                //
+                // Wrap in `catch_unwind` so a panic anywhere along the
+                // path (engine, providers, plugins, executor) flows into
+                // the existing `Err` arm rather than wedging the session.
+                // See task #957.
+                let chat_result: Result<(bool, bool, bool), crate::Error> =
+                    match std::panic::AssertUnwindSafe(async {
                     // Load session
                     let session_data = {
                         let st = lock_state(&state);
@@ -1251,8 +1264,24 @@ pub(super) async fn handle_client(
                     }
 
                     Ok((was_cancelled, max_turns_reached, was_succeeded))
-                }
-                .await;
+                })
+                .catch_unwind()
+                .await
+                {
+                    Ok(r) => r,
+                    Err(payload) => {
+                        let msg = super::agent_runner::panic_payload_to_string(&*payload);
+                        tracing::error!(
+                            session_id = %session_id,
+                            panic = %msg,
+                            "agent loop panicked (Chat handler)",
+                        );
+                        Err(crate::Error::Io(format!(
+                            "{}{}",
+                            super::agent_runner::PANIC_ERROR_PREFIX, msg
+                        )))
+                    }
+                };
 
                 // Always broadcast a terminal response so subscribers
                 // (especially the TUI) never get stuck in Streaming mode.
@@ -1315,12 +1344,18 @@ pub(super) async fn handle_client(
                         send(&mut writer, &resp).await.ok();
                     }
                     Err(e) => {
+                        let panicked = super::agent_runner::is_panic_error(&e);
+                        let exit_status = if panicked { "panicked" } else { "error" };
                         {
                             let st = lock_state(&state);
-                            let _ = st.db.update_exit_status(&session_id, "error");
+                            let _ = st.db.update_exit_status(&session_id, exit_status);
                         }
                         let err_resp = Response::Error {
-                            message: format!("agent error: {}", e),
+                            message: if panicked {
+                                format!("agent loop panicked: {}", e)
+                            } else {
+                                format!("agent error: {}", e)
+                            },
                         };
                         let done_resp = Response::AgentDone;
                         broadcast_to_subscribers(&state, &session_id, &err_resp);

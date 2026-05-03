@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 
 use super::bg_tasks::{BgJob, bg_scheduler};
 use super::state::{SharedState, lock_state};
@@ -104,12 +105,34 @@ pub(super) async fn enqueue_and_maybe_drain(
 /// after the agent loop has exited and the session's lock has been
 /// released.
 pub(super) async fn drain(state: &SharedState, session_id: &str) {
-    if let Some(sched) = bg_scheduler(state) {
-        sched.drain_for_session(session_id).await;
-    } else {
-        tracing::warn!(
+    // Wrap the drain body in `catch_unwind` so a panic during post-turn
+    // cleanup (e.g. an archive job) is logged and swallowed instead of
+    // shadowing the original panic that triggered the cleanup.  See
+    // task #957 (Edge case 4).
+    let result = std::panic::AssertUnwindSafe(async {
+        if let Some(sched) = bg_scheduler(state) {
+            sched.drain_for_session(session_id).await;
+        } else {
+            tracing::warn!(
+                session_id = %session_id,
+                "bg scheduler not initialised; nothing to drain"
+            );
+        }
+    })
+    .catch_unwind()
+    .await;
+    if let Err(payload) = result {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        tracing::error!(
             session_id = %session_id,
-            "bg scheduler not initialised; nothing to drain"
+            panic = %msg,
+            "post_idle::drain panicked; swallowing to preserve original error",
         );
     }
 }
