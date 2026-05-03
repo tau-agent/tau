@@ -3929,7 +3929,6 @@ mod tests {
         assert!(empty.is_empty());
     }
 
-    #[test]
     /// `find_active_task_role_for_session` returns `Some((task_id, role))`
     /// only when the session is recorded against a non-terminal task.
     /// Sessions tied to merged / closed / failed tasks must come back as
@@ -4015,6 +4014,8 @@ mod tests {
         let row = db.find_active_task_role_for_session("s-nobody").unwrap();
         assert_eq!(row, None);
     }
+
+    #[test]
 
     fn test_list_protected_session_ids() {
         use std::collections::HashSet;

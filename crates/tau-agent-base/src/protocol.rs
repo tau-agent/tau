@@ -157,16 +157,6 @@ pub enum Request {
     /// tree.  Returns [`Response::SessionCreated`] with the successor id
     /// on success and broadcasts [`Response::SessionSucceeded`] on the
     /// predecessor's subscriber channel.  See task 915.
-    /// Look up whether `session_id` is recorded as a session of any
-    /// non-terminal task and, if so, return the `(task_id, role)` it
-    /// plays.  Used by orchestration tools (today: `session_succeed`)
-    /// that must refuse to disturb a task-managed session lifecycle.
-    ///
-    /// Returns [`Response::TaskWorkerSession`] always — a non-task
-    /// session yields `is_worker = false` with `task_id` / `role` set
-    /// to `None`.  See task 915.
-    GetTaskSessionRole { session_id: String },
-
     SucceedSession {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +166,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller_session_id: Option<String>,
     },
+    /// Look up whether `session_id` is recorded as a session of any
+    /// non-terminal task and, if so, return the `(task_id, role)` it
+    /// plays.  Used by orchestration tools (today: `session_succeed`)
+    /// that must refuse to disturb a task-managed session lifecycle.
+    ///
+    /// Returns [`Response::TaskSessionRole`] always — a non-task session
+    /// yields `is_worker = false` with `task_id` / `role` set to `None`.
+    /// See task 915.
+    GetTaskSessionRole { session_id: String },
     /// Start OAuth login for a provider.
     Login { provider: String },
     /// Query authentication status.
