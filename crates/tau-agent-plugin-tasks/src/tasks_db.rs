@@ -57,6 +57,15 @@ pub struct Task {
     /// investigations, audits, design discussions, coordination, etc.
     /// Default `false` for tasks created before this flag existed.
     pub no_merge: bool,
+    /// Number of consecutive auto-dispatch failures since the last
+    /// successful dispatch (#949). The auto-scheduler increments this
+    /// after each failed dispatch attempt and resets it to 0 on success.
+    /// When the counter reaches `MAX_DISPATCH_FAILURES`, or when
+    /// `tasks_git::is_permanent_dispatch_error` classifies the most
+    /// recent failure as permanent, the task is transitioned to
+    /// `failed` instead of being reverted to `ready` for another retry.
+    /// Defaults to 0 for tasks created before #949.
+    pub dispatch_failure_count: i64,
     /// Project the task was *filed from* — i.e. the calling session's
     /// project at the time `task_create` ran. Distinct from
     /// [`Task::project_name`], which is the project the task targets
@@ -189,8 +198,8 @@ const TASK_COLUMNS: &str = "id, project_name, title, state, priority, \
     parent_id, tags, affected_files, branch, merge_target, worktree_path, \
     session_id, skip_review, require_approval, sandbox_profile, held, \
     placeholder_session_id, auto_downgraded_from_ready, \
-    filed_by_project, filed_by_session_id, no_merge, created_at, \
-    updated_at";
+    filed_by_project, filed_by_session_id, no_merge, \
+    dispatch_failure_count, created_at, updated_at";
 
 // The canonical valid-state set and transition predicates now live in
 // `crate::tasks_state` as exhaustive enum matches.  They are imported
@@ -283,6 +292,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     filed_by_project TEXT,
     filed_by_session_id TEXT,
     no_merge INTEGER NOT NULL DEFAULT 0,
+    dispatch_failure_count INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -581,6 +591,26 @@ impl TasksDb {
         if !has_no_merge {
             conn.execute_batch("ALTER TABLE tasks ADD COLUMN no_merge INTEGER NOT NULL DEFAULT 0;")
                 .map_err(plugin_io_err("migrate no_merge"))?;
+        }
+
+        // Add dispatch_failure_count column if it doesn't exist.
+        // Introduced by task #949: the auto-scheduler tracks consecutive
+        // dispatch failures so it can transition stuck tasks to `failed`
+        // instead of retrying forever (e.g. when a project's `.git`
+        // directory was deleted out from under it).
+        let has_dispatch_failure_count: bool = conn
+            .prepare(
+                "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'dispatch_failure_count'",
+            )
+            .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
+            .map(|count| count > 0)
+            .unwrap_or(false);
+
+        if !has_dispatch_failure_count {
+            conn.execute_batch(
+                "ALTER TABLE tasks ADD COLUMN dispatch_failure_count INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(plugin_io_err("migrate dispatch_failure_count"))?;
         }
 
         // Legacy migration: pre-#942 there was a transient `done` state
@@ -1315,7 +1345,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.dispatch_failure_count, t.created_at,
                         t.updated_at
                  FROM task_relations r
                  JOIN tasks t ON t.id = r.to_task
@@ -1345,7 +1375,7 @@ impl TasksDb {
             .prepare(
                 "SELECT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                         t.tags, t.affected_files, t.branch, t.merge_target,
-                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.created_at,
+                        t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.dispatch_failure_count, t.created_at,
                         t.updated_at
                  FROM tasks t
                  WHERE t.project_name = ?1 AND t.state IN ('ready', 'planning')
@@ -2009,7 +2039,7 @@ impl TasksDb {
         if let Some(state) = state_filter {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.dispatch_failure_count, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1 AND t.state = ?2
@@ -2028,7 +2058,7 @@ impl TasksDb {
         } else {
             let sql = "SELECT DISTINCT t.id, t.project_name, t.title, t.state, t.priority, t.parent_id,
                     t.tags, t.affected_files, t.branch, t.merge_target,
-                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.created_at, t.updated_at
+                    t.worktree_path, t.session_id, t.skip_review, t.require_approval, t.sandbox_profile, t.held, t.placeholder_session_id, t.auto_downgraded_from_ready, t.filed_by_project, t.filed_by_session_id, t.no_merge, t.dispatch_failure_count, t.created_at, t.updated_at
              FROM tasks t
              LEFT JOIN task_messages m ON m.task_id = t.id
              WHERE t.project_name = ?1
@@ -2349,6 +2379,46 @@ impl TasksDb {
         }
         Ok(())
     }
+
+    /// Increment the task's `dispatch_failure_count` by one and return the
+    /// new value. Atomic via SQLite's `RETURNING` clause.
+    ///
+    /// Used by the auto-scheduler (#949) to track consecutive dispatch
+    /// failures so it can transition stuck tasks to `failed` after
+    /// `MAX_DISPATCH_FAILURES` attempts instead of retrying forever.
+    pub fn increment_dispatch_failure(&self, task_id: i64) -> tau_agent_plugin::Result<i64> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
+        let count: Option<i64> = self
+            .conn
+            .query_row(
+                "UPDATE tasks SET dispatch_failure_count = dispatch_failure_count + 1, \
+                 updated_at = ?1 WHERE id = ?2 \
+                 RETURNING dispatch_failure_count",
+                params![now, task_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(plugin_io_err("increment_dispatch_failure"))?;
+        count.ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} not found", task_id)))
+    }
+
+    /// Reset the task's `dispatch_failure_count` to 0. Idempotent — if
+    /// the task has already been deleted (concurrent merge etc.) the
+    /// `UPDATE` simply matches no rows and returns `Ok(())`.
+    ///
+    /// Called from the auto-scheduler after a successful dispatch (#949)
+    /// so transient-failure counters don't accumulate across retries.
+    pub fn reset_dispatch_failure_count(&self, task_id: i64) -> tau_agent_plugin::Result<()> {
+        let now = tau_agent_plugin::timestamp_ms() as i64;
+        self.conn
+            .execute(
+                "UPDATE tasks SET dispatch_failure_count = 0, updated_at = ?1 \
+                 WHERE id = ?2 AND dispatch_failure_count > 0",
+                params![now, task_id],
+            )
+            .map_err(plugin_io_err("reset_dispatch_failure_count"))?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2384,8 +2454,9 @@ fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         filed_by_project: row.get(18)?,
         filed_by_session_id: row.get(19)?,
         no_merge: row.get::<_, i32>(20)? != 0,
-        created_at: row.get(21)?,
-        updated_at: row.get(22)?,
+        dispatch_failure_count: row.get(21)?,
+        created_at: row.get(22)?,
+        updated_at: row.get(23)?,
     })
 }
 
@@ -6860,6 +6931,7 @@ mod tests {
             filed_by_project: None,
             filed_by_session_id: None,
             no_merge: false,
+            dispatch_failure_count: 0,
             created_at: 0,
             updated_at: 0,
         }

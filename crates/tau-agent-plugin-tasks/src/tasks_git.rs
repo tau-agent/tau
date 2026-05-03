@@ -251,6 +251,41 @@ pub fn abort_partial_rebase(worktree_path: &str) -> tau_agent_plugin::Result<()>
     Ok(())
 }
 
+/// Patterns that mark a dispatch failure as permanent — retrying without
+/// user intervention will hit the same error every time.
+///
+/// All checks are case-insensitive substring matches against the
+/// stringified [`tau_agent_plugin::Error`]. The list is intentionally
+/// short and conservative: anything not on this list is treated as a
+/// transient failure (worktree busy, disk full, RPC timeout, child-budget
+/// exhausted, ...) and is allowed to retry up to `MAX_DISPATCH_FAILURES`.
+///
+/// Out-of-scope refactor (per #949 spec): replace this with a structured
+/// error enum surfaced by the call sites in this module. The string match
+/// is good enough for now — the surface area is tiny (this module is the
+/// only producer of these messages).
+const PERMANENT_DISPATCH_ERROR_FRAGMENTS: &[&str] = &[
+    // `git rev-parse --show-toplevel` failure, e.g. when the project
+    // directory was deleted or had its `.git/` removed.
+    "not a git repository",
+    // `git worktree remove` refusing to delete the main worktree — a
+    // programming error in the caller, not a transient state.
+    "refusing to remove main worktree",
+];
+
+/// Classify a dispatch error as permanent (no retry will help) or
+/// transient (worth retrying).
+///
+/// See [`PERMANENT_DISPATCH_ERROR_FRAGMENTS`] for the patterns. Used by
+/// the auto-scheduler (#949) to skip the retry loop for known-permanent
+/// failures and transition the task straight to `failed`.
+pub fn is_permanent_dispatch_error(err: &tau_agent_plugin::Error) -> bool {
+    let s = err.to_string().to_lowercase();
+    PERMANENT_DISPATCH_ERROR_FRAGMENTS
+        .iter()
+        .any(|frag| s.contains(frag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +341,47 @@ mod tests {
         let expected = std::fs::canonicalize(dir.path()).unwrap();
         let actual = std::fs::canonicalize(&root).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_is_permanent_dispatch_error_recognises_non_git_repo() {
+        // The exact error string `get_repo_root` produces when the dir
+        // isn't a git working tree.
+        let err = tau_agent_plugin::Error::Io(
+            "git rev-parse --show-toplevel in /tmp/x: fatal: not a git repository \
+             (or any of the parent directories): .git"
+                .to_string(),
+        );
+        assert!(is_permanent_dispatch_error(&err));
+    }
+
+    #[test]
+    fn test_is_permanent_dispatch_error_recognises_main_worktree() {
+        let err = tau_agent_plugin::Error::Io(
+            "git worktree remove /repo: fatal: refusing to remove main worktree".into(),
+        );
+        assert!(is_permanent_dispatch_error(&err));
+    }
+
+    #[test]
+    fn test_is_permanent_dispatch_error_treats_unknown_as_transient() {
+        let err = tau_agent_plugin::Error::Io(
+            "child budget exceeded: 16 active children, budget is 16".into(),
+        );
+        assert!(!is_permanent_dispatch_error(&err));
+
+        let err2 = tau_agent_plugin::Error::Io(
+            "git worktree add /tmp/x: fatal: '/tmp/x' already exists".into(),
+        );
+        assert!(!is_permanent_dispatch_error(&err2));
+    }
+
+    #[test]
+    fn test_is_permanent_dispatch_error_case_insensitive() {
+        // `Error` Display is `kind: msg`; the case-insensitive match on
+        // the stringified form keeps us robust to capitalisation drift.
+        let err = tau_agent_plugin::Error::Io("NOT A GIT REPOSITORY".into());
+        assert!(is_permanent_dispatch_error(&err));
     }
 
     #[test]

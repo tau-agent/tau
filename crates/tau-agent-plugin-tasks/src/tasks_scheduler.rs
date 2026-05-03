@@ -2994,6 +2994,7 @@ mod tests {
             filed_by_project: None,
             filed_by_session_id: None,
             no_merge: false,
+            dispatch_failure_count: 0,
             created_at: 0,
             updated_at: 0,
         }

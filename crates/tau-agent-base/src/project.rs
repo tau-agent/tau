@@ -128,6 +128,56 @@ pub fn slugify(name: &str) -> String {
 // Discovery
 // ---------------------------------------------------------------------------
 
+/// Verify that `path` is inside a git working tree by running
+/// `git -C <path> rev-parse --show-toplevel`.
+///
+/// Returns `Ok(())` if `path` is part of a (non-bare) git repository, and
+/// `Err(Error::Io(...))` with a user-facing remediation hint otherwise. The
+/// caller is expected to surface the error verbatim — the message is the
+/// only signal users see in CLI / tool-call output.
+///
+/// Used at project-init time to refuse projects that cannot host task
+/// worktrees. Tasks that don't need a worktree (`no_merge` tasks, see
+/// task #942) still run fine in a non-git directory once the project is
+/// registered, but registering a project requires a real working tree —
+/// the validation runs at init only, not at task-create.
+//
+// TODO(#942 follow-up): once `tau project init --no-git` lands, gate this
+// check on a `git_required` flag in `ProjectConfig` (default true) and
+// only refuse when the flag is set.
+pub fn check_git_repo(path: &Path) -> crate::Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output();
+
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(crate::Error::Io(format!(
+                "failed to run `git rev-parse` in {}: {}. \
+                 tau projects require a git repository at the project root; \
+                 install git and run `git init` here, then retry.",
+                path.display(),
+                e,
+            )));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::Error::Io(format!(
+            "tau projects require a git repository at the project root \
+             ({}). Run `git init` in this directory first, then retry \
+             `tau project init` (git said: {}).",
+            path.display(),
+            stderr.trim(),
+        )));
+    }
+
+    Ok(())
+}
+
 /// Walk up from `start` looking for `.tau/project.toml`.
 ///
 /// Returns `(project_name, canonicalized_project_root)` if found.
@@ -196,6 +246,13 @@ pub fn discover_project(start: &Path) -> Option<(String, PathBuf)> {
 /// Returns the canonicalized project root path.
 pub fn init_project(path: &Path, name: &str) -> crate::Result<PathBuf> {
     validate_project_name(name)?;
+
+    // Refuse to register a project unless its root is inside a real git
+    // working tree (#949). Without a worktree we cannot create the
+    // per-task branches/worktrees the scheduler relies on, and the
+    // failure mode (silent retry storm in the auto-scheduler) is much
+    // worse than refusing up front.
+    check_git_repo(path)?;
 
     let tau_dir = path.join(".tau");
     let config_path = tau_dir.join("project.toml");
@@ -475,6 +532,18 @@ mod tests {
 
     // -- init_project ---------------------------------------------------------
 
+    /// Run `git init -q -b main` in `path` so `init_project` (which now
+    /// requires a real working tree) accepts it. Best-effort: tests that
+    /// don't care about git state can call this once and forget.
+    fn git_init(path: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(path)
+            .status()
+            .expect("spawn git init");
+        assert!(status.success(), "git init failed in {}", path.display());
+    }
+
     #[test]
     fn init_creates_files() {
         let _lock = crate::TEST_ENV_MUTEX
@@ -483,6 +552,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();
+        git_init(root);
 
         // Override config dir so we don't touch the real home.
         let config_tmp = tempfile::tempdir().expect("create config tempdir");
@@ -512,8 +582,73 @@ mod tests {
     }
 
     #[test]
+    fn init_rejects_non_git_dir() {
+        let _lock = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path();
+        // No `git init` here — the directory is not a git working tree.
+
+        let config_tmp = tempfile::tempdir().expect("create config tempdir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", config_tmp.path()) };
+
+        let err = init_project(root, "non-git")
+            .expect_err("init_project should refuse a non-git directory");
+        let msg = format!("{}", err);
+        assert!(
+            msg.to_lowercase().contains("git"),
+            "error should mention git, got: {msg}"
+        );
+        assert!(
+            msg.contains("git init"),
+            "error should hint at `git init`, got: {msg}"
+        );
+
+        // The init_project call must not leave any artifacts behind.
+        assert!(
+            !root.join(".tau").exists(),
+            "failed init must not create .tau/",
+        );
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
+    fn init_rejects_bare_repo() {
+        let _lock = crate::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let root = tmp.path();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .current_dir(root)
+            .status()
+            .expect("spawn git init --bare");
+        assert!(status.success(), "git init --bare failed");
+
+        let config_tmp = tempfile::tempdir().expect("create config tempdir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", config_tmp.path()) };
+
+        // Bare repos have no working tree — `rev-parse --show-toplevel`
+        // exits non-zero, so init_project must refuse them.
+        let err = init_project(root, "bare-repo").expect_err("bare repos should be rejected");
+        assert!(
+            format!("{}", err).to_lowercase().contains("git"),
+            "error should mention git"
+        );
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    #[test]
     fn init_rejects_invalid_name() {
         let tmp = tempfile::tempdir().expect("create tempdir");
+        // Note: invalid name should be rejected before the git check
+        // even fires, so an init-less tempdir is fine here.
         assert!(init_project(tmp.path(), "Bad Name!").is_err());
     }
 
@@ -525,6 +660,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();
+        git_init(root);
 
         let config_tmp = tempfile::tempdir().expect("create config tempdir");
         unsafe { std::env::set_var("XDG_CONFIG_HOME", config_tmp.path()) };
@@ -545,6 +681,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("create tempdir");
         let root = tmp.path();
+        git_init(root);
 
         // Pre-create .tau/.gitignore with the line already present.
         let tau_dir = root.join(".tau");

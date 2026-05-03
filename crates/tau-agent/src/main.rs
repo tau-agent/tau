@@ -801,8 +801,15 @@ fn maybe_auto_init() {
         return;
     }
 
-    // No .git? Not a project candidate.
+    // Reject candidates that are not inside a real git working tree.
+    // The cheap `.git` existence check is the common-case fast path; the
+    // canonical `git rev-parse --show-toplevel` probe (#949) catches the
+    // remaining edge cases (bare repos, broken `.git` files, etc.) so we
+    // never prompt the user only to fail later in `init_project`.
     if !cwd.join(".git").exists() {
+        return;
+    }
+    if tau_agent_lib::project::check_git_repo(&cwd).is_err() {
         return;
     }
 
