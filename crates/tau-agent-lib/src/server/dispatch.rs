@@ -718,6 +718,104 @@ pub(super) fn get_project_info_impl(
     }
 }
 
+/// Update a session's `cwd` and queue a synthetic info-message describing
+/// the change.
+///
+/// Shared between the TCP dispatcher (`Request::SetCwd` arm) and the
+/// plugin-context dispatcher (see `tool_dispatch::handle_server_request`)
+/// so the post-merge cwd fixups in the tasks plugin reach the same impl
+/// regardless of which transport carried the request. See task 1019.
+pub(super) fn set_cwd_impl(
+    state: &SharedState,
+    session_id: &str,
+    cwd: &str,
+    caller_session_id: Option<&str>,
+) -> crate::protocol::Response {
+    use crate::protocol::Response;
+    let result = {
+        let st = lock_state(state);
+        st.db.update_cwd(session_id, cwd)
+    };
+    match result {
+        Ok(()) => {
+            let info = match caller_session_id {
+                Some(caller) => format!("cwd changed by {caller} to {cwd}."),
+                None => format!("cwd changed to {cwd}."),
+            };
+            queue_info_to_session(state, session_id, &info);
+            Response::Ok
+        }
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+/// Re-parent every direct child of `old_parent_id` to `new_parent_id`
+/// and queue an info-message on each affected child.
+///
+/// Shared between the TCP dispatcher (`Request::ReparentChildren` arm)
+/// and the plugin-context dispatcher (see
+/// `tool_dispatch::handle_server_request`) so the tasks plugin's
+/// reparent calls reach the same impl on either transport. See task 1019.
+pub(super) fn reparent_children_impl(
+    state: &SharedState,
+    old_parent_id: &str,
+    new_parent_id: &str,
+) -> crate::protocol::Response {
+    use crate::protocol::Response;
+    // Capture the affected children *before* the DB update so we know
+    // which sessions to annotate (the reparent query changes the parent
+    // pointer in-place, so after it runs a lookup by `old_parent_id`
+    // would return nothing).
+    let children: Vec<String> = {
+        let st = lock_state(state);
+        st.db
+            .get_children(old_parent_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
+    };
+    let result = {
+        let st = lock_state(state);
+        st.db.reparent_children(old_parent_id, new_parent_id)
+    };
+    match result {
+        Ok(()) => {
+            let info = format!("Parent session changed from {old_parent_id} to {new_parent_id}.");
+            for child_id in &children {
+                queue_info_to_session(state, child_id, &info);
+            }
+            Response::Ok
+        }
+        Err(e) => Response::Error {
+            message: e.to_string(),
+        },
+    }
+}
+
+/// Resolve the live tip of `session_id`'s successor chain.
+///
+/// Shared between the TCP dispatcher (`Request::ResolveSuccessor` arm)
+/// and the plugin-context dispatcher (see
+/// `tool_dispatch::handle_server_request`) so plugin code (notably the
+/// tasks plugin's notification redirect) doesn't silently fall back to
+/// the unresolved id when the request travels through the in-process
+/// tunnel. See task 1019.
+pub(super) fn resolve_successor_impl(
+    state: &SharedState,
+    session_id: &str,
+) -> crate::protocol::Response {
+    let resolved = {
+        let st = lock_state(state);
+        st.db.resolve_successor(session_id)
+    };
+    crate::protocol::Response::ResolvedSuccessor {
+        session_id: resolved,
+    }
+}
+
 pub(super) fn list_sessions_impl(
     state: &SharedState,
     include_archived: bool,
@@ -1918,71 +2016,15 @@ pub(super) async fn handle_client(
                 cwd,
                 caller_session_id,
             } => {
-                let result = {
-                    let st = lock_state(&state);
-                    st.db.update_cwd(&session_id, &cwd)
-                };
-                match result {
-                    Ok(()) => {
-                        let info = match caller_session_id.as_deref() {
-                            Some(caller) => format!("cwd changed by {caller} to {cwd}."),
-                            None => format!("cwd changed to {cwd}."),
-                        };
-                        queue_info_to_session(&state, &session_id, &info);
-                        send(&mut writer, &Response::Ok).await?;
-                    }
-                    Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                let resp = set_cwd_impl(&state, &session_id, &cwd, caller_session_id.as_deref());
+                send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::ReparentChildren {
                 old_parent_id,
                 new_parent_id,
             } => {
-                // Capture the affected children *before* the DB update so we
-                // know which sessions to annotate (the reparent query changes
-                // the parent pointer in-place, so after it runs a lookup by
-                // `old_parent_id` would return nothing).
-                let children: Vec<String> = {
-                    let st = lock_state(&state);
-                    st.db
-                        .get_children(&old_parent_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|s| s.id)
-                        .collect()
-                };
-                let result = {
-                    let st = lock_state(&state);
-                    st.db.reparent_children(&old_parent_id, &new_parent_id)
-                };
-                match result {
-                    Ok(()) => {
-                        let info = format!(
-                            "Parent session changed from {old_parent_id} to {new_parent_id}."
-                        );
-                        for child_id in &children {
-                            queue_info_to_session(&state, child_id, &info);
-                        }
-                        send(&mut writer, &Response::Ok).await?;
-                    }
-                    Err(e) => {
-                        send(
-                            &mut writer,
-                            &Response::Error {
-                                message: e.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                let resp = reparent_children_impl(&state, &old_parent_id, &new_parent_id);
+                send(&mut writer, &resp).await?;
             }
             crate::protocol::Request::SetSessionSuccessor {
                 session_id,
@@ -2044,17 +2086,8 @@ pub(super) async fn handle_client(
             }
 
             crate::protocol::Request::ResolveSuccessor { session_id } => {
-                let resolved = {
-                    let st = lock_state(&state);
-                    st.db.resolve_successor(&session_id)
-                };
-                send(
-                    &mut writer,
-                    &Response::ResolvedSuccessor {
-                        session_id: resolved,
-                    },
-                )
-                .await?;
+                let resp = resolve_successor_impl(&state, &session_id);
+                send(&mut writer, &resp).await?;
             }
 
             crate::protocol::Request::GetTaskSessionRole { session_id } => {
