@@ -478,6 +478,61 @@ fn record_skip_reason(db: &TasksDb, task: &Task, reason: &SkipReason) {
     }
 }
 
+/// Resolve a task's `merge_target` against the live repository.
+///
+/// `TasksDb::get_merge_target` is a DB-only view: for an *implicit* merge
+/// target (no explicit override) it returns the parent task's branch as
+/// recorded in the tasks DB. That branch may have been deleted by a
+/// post-merge cleanup, leaving the value pointing at a phantom ref. This
+/// helper covers that gap by walking up the ancestor chain when the
+/// candidate branch is missing, returning the first ancestor whose branch
+/// still exists in the repo, or `"main"` as the final fallback.
+///
+/// An **explicit** `merge_target` override is returned verbatim — if a
+/// user/agent set the value deliberately we don't second-guess it. The
+/// downstream `branch_exists` check in `prepare_task` still surfaces a
+/// helpful error in the typo / deleted-named-branch case.
+fn resolve_merge_target_against_repo(
+    db: &TasksDb,
+    task: &Task,
+    repo_root: &str,
+) -> tau_agent_plugin::Result<String> {
+    // Explicit override: honour it verbatim.
+    if let Some(target) = task.merge_target.as_deref() {
+        return Ok(target.to_string());
+    }
+
+    // Implicit: ask the DB for the candidate (parent.branch or "main").
+    let candidate = db.get_merge_target(task.id)?;
+    if tasks_git::branch_exists(repo_root, &candidate)? {
+        return Ok(candidate);
+    }
+
+    // Candidate branch is missing — likely a post-merge cleanup of an
+    // ancestor. Walk up the chain looking for a still-extant branch.
+    let mut cur_parent_id = task.parent_id;
+    let mut hops = 0u32;
+    const MAX_HOPS: u32 = 64; // defensive: pathological cycles
+    while let Some(pid) = cur_parent_id {
+        if hops >= MAX_HOPS {
+            break;
+        }
+        hops += 1;
+        let parent = match db.get_task(pid)? {
+            Some(p) => p,
+            None => break,
+        };
+        if let Some(br) = parent.branch.as_deref() {
+            if tasks_git::branch_exists(repo_root, br)? {
+                return Ok(br.to_string());
+            }
+        }
+        cur_parent_id = parent.parent_id;
+    }
+
+    Ok("main".to_string())
+}
+
 /// Prepare a single task for dispatch: create branch, worktree, update DB.
 fn prepare_task(
     db: &TasksDb,
@@ -519,8 +574,10 @@ fn prepare_task(
     let branch = tasks_git::task_branch_name(task.id, task.parent_id);
 
     // Determine the base branch: merge target (explicit override, parent's
-    // branch, or "main").
-    let base_branch = db.get_merge_target(task.id)?;
+    // branch, or "main"). Resolves implicit targets against the live repo
+    // so a post-merge cleanup of an ancestor's branch falls back to the
+    // nearest still-extant ancestor (or "main") instead of stalling.
+    let base_branch = resolve_merge_target_against_repo(db, task, repo_root)?;
 
     // Create branch (skip if it already exists — idempotent).
     if !tasks_git::branch_exists(repo_root, &branch)? {
@@ -1054,9 +1111,13 @@ pub(crate) fn dispatch_task_phase(
     )?;
 
     // --- 6. Initial chat --------------------------------------------------
-    let merge_target = db
-        .get_merge_target(task_id)
-        .unwrap_or_else(|_| "main".into());
+    // Resolve against the live repo so the worker prompt names a branch
+    // that actually exists when the parent has already been cleaned up.
+    let merge_target = tasks_git::get_repo_root(project_path)
+        .ok()
+        .and_then(|repo_root| resolve_merge_target_against_repo(db, task, &repo_root).ok())
+        .or_else(|| db.get_merge_target(task_id).ok())
+        .unwrap_or_else(|| "main".into());
     let project_instructions = tasks_config::load_project_instructions(
         project_path,
         Some(&task.project_name),
@@ -1545,7 +1606,12 @@ pub fn is_rebased_on_target(db: &TasksDb, task: &Task) -> tau_agent_plugin::Resu
         .as_ref()
         .ok_or_else(|| tau_agent_plugin::Error::Io(format!("task {} has no worktree", task.id)))?;
 
-    let merge_target = db.get_merge_target(task.id)?;
+    // Resolve against the live repo: if the target branch was cleaned up
+    // (e.g. an ancestor task merged and its branch was deleted) we fall
+    // back to the nearest still-extant ancestor (or "main") so the rebase
+    // check produces a sensible answer instead of erroring on a phantom
+    // ref.
+    let merge_target = resolve_merge_target_against_repo(db, task, worktree)?;
 
     // Use git merge-base --is-ancestor to check if merge_target is an
     // ancestor of the task's branch.
@@ -2594,10 +2660,18 @@ pub fn get_status(
                 // Check merge_target branch existence (only for ready tasks).
                 if task.state == TaskState::Ready {
                     if let Some(path) = project_path {
-                        let merge_target = db
-                            .get_merge_target(task.id)
-                            .unwrap_or_else(|_| "main".into());
                         if let Ok(repo_root) = tasks_git::get_repo_root(path) {
+                            // Use the live-repo resolver so implicit
+                            // merge_targets that point at a now-deleted
+                            // ancestor branch fall back to a still-extant
+                            // ancestor (or "main"). MergeTargetNotFound
+                            // is only surfaced when even the fallback
+                            // walk can't find a branch — in practice that
+                            // means the user/agent set an explicit
+                            // override that names a missing branch.
+                            let merge_target =
+                                resolve_merge_target_against_repo(db, &task, &repo_root)
+                                    .unwrap_or_else(|_| "main".into());
                             if let Ok(false) = tasks_git::branch_exists(&repo_root, &merge_target) {
                                 wait_reasons.push(WaitReason::MergeTargetNotFound {
                                     branch: merge_target,
@@ -7203,6 +7277,237 @@ mod tests {
             "expected at least 4 dispatch_task_phase(...) call sites \
              (one per wrapper), found {}",
             call_sites
+        );
+    }
+    // -----------------------------------------------------------------
+    // resolve_merge_target_against_repo
+    // -----------------------------------------------------------------
+
+    /// Initialise a temp git repo with `main` and one commit — mirrors
+    /// `tasks_git::tests::init_test_repo`, kept private to this module so
+    /// the merge_target tests can drive branch creation/deletion against
+    /// a real on-disk repo.
+    fn init_test_repo() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path();
+        std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(path)
+            .output()
+            .expect("git init");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(path)
+            .output()
+            .expect("git config email");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .expect("git config name");
+        std::fs::write(path.join("README.md"), "# test\n").expect("write readme");
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .expect("git add");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(path)
+            .output()
+            .expect("git commit");
+        dir
+    }
+
+    /// Create a ready, no-files DB task and return it. Convenience wrapper
+    /// around `create_task` that picks sane defaults for the merge_target
+    /// tests.
+    fn make_merge_target_task(
+        db: &TasksDb,
+        title: &str,
+        parent_id: Option<i64>,
+        merge_target: Option<&str>,
+    ) -> Task {
+        db.create_task(
+            "test-project",
+            title,
+            None,
+            parent_id,
+            None,
+            false,
+            "ready",
+            false,
+            merge_target,
+            None,
+            false,
+            None,
+            false,
+            false,
+            crate::tasks_db::FiledBy::default(),
+        )
+        .expect("create_task")
+    }
+
+    #[test]
+    fn test_resolve_merge_target_root_task_returns_main() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+        let root = make_merge_target_task(&db, "root", None, None);
+
+        let target = resolve_merge_target_against_repo(&db, &root, repo).expect("resolve");
+        assert_eq!(target, "main");
+    }
+
+    #[test]
+    fn test_resolve_merge_target_returns_parent_branch_when_extant() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        let parent = make_merge_target_task(&db, "parent", None, None);
+        // Create a real `task-{parent.id}` branch in the repo and record
+        // it on the parent row to mirror what `prepare_task` does.
+        let parent_branch = format!("task-{}", parent.id);
+        tasks_git::create_branch(repo, &parent_branch, "main").expect("create parent branch");
+        db.set_branch(parent.id, &parent_branch)
+            .expect("set_branch");
+        let parent = db
+            .get_task(parent.id)
+            .expect("get parent")
+            .expect("parent exists");
+
+        let child = make_merge_target_task(&db, "child", Some(parent.id), None);
+
+        let target = resolve_merge_target_against_repo(&db, &child, repo).expect("resolve");
+        assert_eq!(target, parent_branch);
+    }
+
+    #[test]
+    fn test_resolve_merge_target_falls_back_to_main_when_parent_branch_deleted() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        let parent = make_merge_target_task(&db, "parent", None, None);
+        let parent_branch = format!("task-{}", parent.id);
+        // Record the branch on the parent row WITHOUT creating the
+        // matching ref — simulates the post-merge-cleanup scenario where
+        // the branch ref has been deleted but `tasks.branch` retains the
+        // historical record.
+        db.set_branch(parent.id, &parent_branch)
+            .expect("set_branch");
+
+        let child = make_merge_target_task(&db, "child", Some(parent.id), None);
+
+        let target = resolve_merge_target_against_repo(&db, &child, repo).expect("resolve");
+        assert_eq!(
+            target, "main",
+            "missing parent branch must fall back to main"
+        );
+    }
+
+    #[test]
+    fn test_resolve_merge_target_falls_back_to_grandparent_when_parent_branch_deleted() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        // Grandparent: branch exists.
+        let grandparent = make_merge_target_task(&db, "grandparent", None, None);
+        let g_branch = format!("task-{}", grandparent.id);
+        tasks_git::create_branch(repo, &g_branch, "main").expect("create gp branch");
+        db.set_branch(grandparent.id, &g_branch)
+            .expect("set_branch gp");
+
+        // Parent: branch recorded but ref missing (post-cleanup).
+        let parent = make_merge_target_task(&db, "parent", Some(grandparent.id), None);
+        let p_branch = format!("task-{}-{}", grandparent.id, parent.id);
+        db.set_branch(parent.id, &p_branch)
+            .expect("set_branch parent");
+
+        // Child: implicit merge_target.
+        let child = make_merge_target_task(&db, "child", Some(parent.id), None);
+
+        let target = resolve_merge_target_against_repo(&db, &child, repo).expect("resolve");
+        assert_eq!(
+            target, g_branch,
+            "walk past missing parent branch to extant grandparent branch"
+        );
+    }
+
+    #[test]
+    fn test_resolve_merge_target_honours_explicit_override_even_when_missing() {
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        let task = make_merge_target_task(&db, "override", None, Some("does-not-exist"));
+
+        let target = resolve_merge_target_against_repo(&db, &task, repo).expect("resolve");
+        assert_eq!(
+            target, "does-not-exist",
+            "explicit override is returned verbatim; downstream branch_exists check is what surfaces the error"
+        );
+    }
+
+    #[test]
+    fn test_prepare_task_succeeds_after_parent_branch_deletion() {
+        // End-to-end regression for the original report: child task with
+        // implicit merge_target whose parent's branch was deleted by
+        // post-merge cleanup must still dispatch (landing on "main" in
+        // the absence of any other extant ancestor branch).
+        let dir = init_test_repo();
+        let repo = dir.path().to_str().expect("utf8 tempdir");
+        let db = TasksDb::open_memory().expect("open db");
+
+        // Parent: prepare_task creates `task-{parent.id}` rooted on main.
+        let parent = make_merge_target_task(&db, "parent", None, None);
+        let scheduled = prepare_task(&db, &parent, repo).expect("prepare parent");
+        assert_eq!(scheduled.branch, format!("task-{}", parent.id));
+
+        // Simulate the post-merge cleanup: drop the worktree row first
+        // so `git worktree remove` doesn't get in the way, then delete
+        // the branch ref via `tasks_git::delete_branch`. The DB still
+        // remembers `tasks.branch` as `task-{parent.id}`.
+        let parent_after = db
+            .get_task(parent.id)
+            .expect("get parent")
+            .expect("parent exists");
+        if let Some(wt) = parent_after.worktree_path.as_deref() {
+            tasks_git::remove_worktree(repo, wt).expect("remove worktree");
+        }
+        tasks_git::delete_branch(repo, &format!("task-{}", parent.id))
+            .expect("delete parent branch");
+        assert!(
+            !tasks_git::branch_exists(repo, &format!("task-{}", parent.id)).expect("branch_exists"),
+            "parent branch must actually be gone for this test to be meaningful"
+        );
+
+        // Child: implicit merge_target. Pre-fix this would error out;
+        // post-fix it should fall back to "main".
+        let child = make_merge_target_task(&db, "child", Some(parent.id), None);
+        let scheduled = prepare_task(&db, &child, repo).expect("prepare child must succeed");
+        let expected_branch = format!("task-{}-{}", parent.id, child.id);
+        assert_eq!(scheduled.branch, expected_branch);
+
+        // Confirm the child branch was rooted on `main`, not on a phantom
+        // ancestor: `main` should be an ancestor of the new child branch.
+        let merge_base = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", "main", &expected_branch])
+            .current_dir(repo)
+            .output()
+            .expect("git merge-base");
+        assert!(
+            merge_base.status.success(),
+            "new child branch must be rooted on main when the parent branch is gone"
+        );
+
+        // And the parent branch must not have been re-created as a side
+        // effect of the dispatch.
+        assert!(
+            !tasks_git::branch_exists(repo, &format!("task-{}", parent.id)).expect("branch_exists"),
+            "parent branch must not be resurrected by the fallback"
         );
     }
 }
