@@ -265,6 +265,116 @@ fn find_creator_session(db: &TasksDb, task: &Task) -> Option<String> {
         .map(|ts| ts.session_id)
 }
 
+/// Resolve `target` to the live session that should actually receive
+/// a "task done" wake. Walks two axes in alternation:
+///
+/// 1. The session-succeed chain via [`resolve_successor_via_server`]
+///    (this already covers the `session_succeed` mid-flight subset of
+///    task 1050).
+/// 2. The task-creator chain: when the resolved tip is archived **or**
+///    is a session whose downstream task (the one it ran for) has
+///    reached a terminal state, hop "up" to that task's `creator` row
+///    and recurse from there.
+///
+/// This is the same idea as [`resolve_successor_via_server`] but along
+/// the task-creator axis instead of the session-succeed axis. It
+/// closes the case where session A (working on task A) creates
+/// subtask B and then A's agent loop exits naturally without calling
+/// `session_succeed`: a wake addressed at A would otherwise stall in
+/// A's queue. Walking up to A's creator (the orchestrator that filed
+/// A) lands the wake on a session that *is* still alive.
+///
+/// Returns `None` when no live anchor is reachable (every link in the
+/// chain is dead or archived). Bounded to 16 hops as a defence against
+/// pathological data.
+///
+/// Note we deliberately don't gate on `is_live` / `last_exit_status`
+/// — those are transient signals that can flip during scheduler
+/// pauses. Task terminal-state is the durable signal that "this
+/// session is done with its task and won't be resumed by the
+/// scheduler". A pure orchestrator session (one with only `creator`
+/// rows in `task_sessions`) is never classified as dead by this
+/// helper; only sessions that actually ran for a now-terminal task
+/// are skipped.
+pub(crate) fn resolve_done_recipient(
+    db: &TasksDb,
+    target: &str,
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+) -> Option<String> {
+    const MAX_HOPS: usize = 16;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut current = target.to_string();
+
+    for _ in 0..MAX_HOPS {
+        // Step 1: follow the session_succeed chain.
+        let resolved = resolve_successor_via_server(&current, writer, reader);
+        if !seen.insert(resolved.clone()) {
+            // Cycle on the resolved tip — stop.
+            return None;
+        }
+
+        let archived = is_session_archived(&resolved, writer, reader);
+        let terminal_worker = if archived {
+            false
+        } else {
+            session_is_terminal_worker(db, &resolved)
+        };
+
+        if !archived && !terminal_worker {
+            return Some(resolved);
+        }
+
+        // Step 2: hop up the task-creator axis.
+        // The tip is unreachable (archived) or its task is done
+        // (terminal_worker). Find the task whose row records this
+        // session in a non-creator role and walk to that task's
+        // creator.
+        let task_id = match db.find_task_for_running_session(&resolved) {
+            Ok(Some(id)) => id,
+            _ => {
+                // No downstream link to walk; chain dies here.
+                return None;
+            }
+        };
+        let creator_sid = match db.get_sessions(task_id) {
+            Ok(rows) => rows
+                .into_iter()
+                .find(|ts| ts.role == "creator")
+                .map(|ts| ts.session_id),
+            Err(_) => None,
+        };
+        let next = match creator_sid {
+            Some(sid) => sid,
+            None => return None,
+        };
+        if seen.contains(&next) {
+            // Cycle guard against pathological self-creator data.
+            return None;
+        }
+        current = next;
+    }
+
+    None
+}
+
+/// Returns `true` when `session_id` appears in `task_sessions` for a
+/// task in a terminal state (`merged | closed | done | failed`) in any
+/// role *other than* `creator`. "Done with the work the scheduler
+/// will ever ask of this session" — such sessions are unsafe wake
+/// targets because there's no agent loop to resume the work, and
+/// respawn-resume of a dead worker is wrong.
+fn session_is_terminal_worker(db: &TasksDb, session_id: &str) -> bool {
+    let task_id = match db.find_task_for_running_session(session_id) {
+        Ok(Some(id)) => id,
+        _ => return false,
+    };
+    match db.get_task(task_id) {
+        Ok(Some(task)) => task.state.is_terminal(),
+        _ => false,
+    }
+}
+
 /// Resolve the root session for root-broadcast transitions.  Tries the
 /// task's current session first, then the `creator` row on the task, then
 /// the parent task's session.  Returns `None` if none of the anchors
@@ -434,28 +544,39 @@ pub fn notify_state_change_split(
             }
         }
 
-        // Task #658: LLM-visible wake to the creator so the session
-        // that spawned the task can react to completion in-context.
-        // Other recipients continue to receive only the zero-token
-        // QueueInfo line from the loop above — this extra message is
-        // creator-only.
-        if let Some(creator_sid) = find_creator_session(db, task) {
-            // Archived creator: the user has dismissed that session.
-            // Waking it would resurrect it in listings and burn tokens
-            // — skip. (The QueueInfo line is already suppressed for
-            // archived recipients by `collect_recipients` above.)
-            if !is_session_archived(&creator_sid, writer, reader) {
+        // Task #658 / #1050: LLM-visible wake to the creator so the
+        // session that spawned the task can react to completion
+        // in-context. Other recipients continue to receive only the
+        // zero-token QueueInfo line from the loop above — this extra
+        // message is creator-only.
+        //
+        // The creator id from `task_sessions` is routed through
+        // `resolve_done_recipient` so the wake forwards past:
+        //   - sessions that have called `session_succeed` (the
+        //     successor-chain case),
+        //   - sessions that are archived,
+        //   - sessions whose own task has reached a terminal state
+        //     and whose agent loop has therefore stopped
+        //     (the case task 1050 fixes — walk up the task-creator
+        //     axis to find a still-live anchor).
+        if let Some(creator_sid_raw) = find_creator_session(db, task) {
+            if let Some(creator_sid) = resolve_done_recipient(db, &creator_sid_raw, writer, reader)
+            {
                 // Dedup with `tasks_merge::notify_parent_of_subtask_done`:
                 // that notifier already sends a QueueMessage to the
                 // parent task's current `session_id` on every terminal
-                // transition. If this subtask's creator IS the parent's
-                // current session, skip here so that session only gets
-                // one LLM-visible wake per event.
-                let parent_session = task
+                // transition. If this subtask's creator (resolved)
+                // IS the parent's current session (also resolved), skip
+                // here so that session only gets one LLM-visible wake
+                // per event.
+                let parent_session_raw = task
                     .parent_id
                     .and_then(|pid| db.get_task(pid).ok().flatten())
                     .and_then(|p| p.session_id);
-                let dedup = parent_session.as_deref() == Some(creator_sid.as_str());
+                let parent_session_resolved = parent_session_raw
+                    .as_deref()
+                    .and_then(|sid| resolve_done_recipient(db, sid, writer, reader));
+                let dedup = parent_session_resolved.as_deref() == Some(creator_sid.as_str());
                 if !dedup {
                     let content = format_terminal_llm_message(task, context);
                     let _ = server_request(
@@ -2098,6 +2219,320 @@ mod tests {
             !content.contains("Subtask #"),
             "top-level task should not say 'Subtask': {:?}",
             content
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // resolve_done_recipient (task 1050)
+    // -----------------------------------------------------------------
+
+    /// Helper: stamp a task to a state via raw SQL so we can produce
+    /// terminal states without walking the full state machine.
+    fn force_state(db: &TasksDb, task_id: i64, state: &str) {
+        db.conn
+            .execute(
+                "UPDATE tasks SET state = ?1 WHERE id = ?2",
+                rusqlite::params![state, task_id],
+            )
+            .expect("force state");
+    }
+
+    /// Baseline: `resolve_done_recipient` returns its target unchanged
+    /// when the target is alive (not archived) and not the worker of a
+    /// terminal task.
+    #[test]
+    fn resolve_done_recipient_returns_target_when_alive() {
+        let db = TasksDb::open_memory().expect("db");
+        let (_shared, mut w, mut r) = make_io();
+        let resolved = resolve_done_recipient(&db, "s-orchestrator", &mut w, &mut r);
+        assert_eq!(resolved.as_deref(), Some("s-orchestrator"));
+    }
+
+    /// Successor chain alone: when the immediate target has been
+    /// retired via `session_succeed`, the resolver follows the chain.
+    #[test]
+    fn resolve_done_recipient_follows_successor_chain() {
+        let db = TasksDb::open_memory().expect("db");
+        let (shared, mut w, mut r) = make_io();
+        shared
+            .lock()
+            .expect("mock shared lock")
+            .successors
+            .insert("s-old".into(), "s-new".into());
+        let resolved = resolve_done_recipient(&db, "s-old", &mut w, &mut r);
+        assert_eq!(resolved.as_deref(), Some("s-new"));
+    }
+
+    /// Archived target with no upstream creator-row: chain dies,
+    /// returns `None`.
+    #[test]
+    fn resolve_done_recipient_returns_none_when_archived_with_no_creator() {
+        let db = TasksDb::open_memory().expect("db");
+        let (shared, mut w, mut r) = make_io();
+        shared
+            .lock()
+            .expect("mock shared lock")
+            .archived_sessions
+            .insert("s-dead".into());
+        let resolved = resolve_done_recipient(&db, "s-dead", &mut w, &mut r);
+        assert_eq!(resolved, None);
+    }
+
+    /// Target is alive but is the worker of a task in a terminal
+    /// state. The resolver hops to that task's `creator` row.
+    #[test]
+    fn resolve_done_recipient_skips_terminated_worker_session() {
+        let db = TasksDb::open_memory().expect("db");
+        let task_a = create_task(&db, "Task A", None, "ready");
+        // s-orchestrator filed task A; s-worker ran for task A.
+        db.record_session(task_a.id, "s-orchestrator", "creator")
+            .expect("creator");
+        db.record_session(task_a.id, "s-worker", "worker")
+            .expect("worker");
+        // Task A reaches a terminal state — s-worker's agent loop is
+        // done and won't be resumed.
+        force_state(&db, task_a.id, "merged");
+
+        let (_shared, mut w, mut r) = make_io();
+        let resolved = resolve_done_recipient(&db, "s-worker", &mut w, &mut r);
+        assert_eq!(
+            resolved.as_deref(),
+            Some("s-orchestrator"),
+            "should hop from terminated worker to its task's creator"
+        );
+    }
+
+    /// Two-level walk: A's worker is dead because task A is merged.
+    /// A's creator (the orchestrator's session) is *also* the worker
+    /// of an outer task that is itself merged. The resolver should
+    /// hop twice and land on the outer task's creator (the root
+    /// orchestrator).
+    #[test]
+    fn resolve_done_recipient_walks_two_levels() {
+        let db = TasksDb::open_memory().expect("db");
+        let outer = create_task(&db, "Outer", None, "ready");
+        db.record_session(outer.id, "s-root", "creator")
+            .expect("outer creator");
+        db.record_session(outer.id, "s-mid", "worker")
+            .expect("outer worker");
+        force_state(&db, outer.id, "merged");
+
+        let inner = create_task(&db, "Inner", Some(outer.id), "ready");
+        db.record_session(inner.id, "s-mid", "creator")
+            .expect("inner creator");
+        db.record_session(inner.id, "s-worker", "worker")
+            .expect("inner worker");
+        force_state(&db, inner.id, "merged");
+
+        let (_shared, mut w, mut r) = make_io();
+        let resolved = resolve_done_recipient(&db, "s-worker", &mut w, &mut r);
+        assert_eq!(
+            resolved.as_deref(),
+            Some("s-root"),
+            "resolver should walk two task-creator levels"
+        );
+    }
+
+    /// Cycle guard: two creator rows point at each other (pathological
+    /// data). The resolver must terminate without infinite looping.
+    #[test]
+    fn resolve_done_recipient_cycle_guard() {
+        let db = TasksDb::open_memory().expect("db");
+        let t_a = create_task(&db, "A", None, "ready");
+        let t_b = create_task(&db, "B", None, "ready");
+        // s-x ran for task A; task A's creator is s-y.
+        db.record_session(t_a.id, "s-y", "creator")
+            .expect("a creator");
+        db.record_session(t_a.id, "s-x", "worker")
+            .expect("a worker");
+        force_state(&db, t_a.id, "merged");
+        // s-y ran for task B; task B's creator is s-x. Cycle.
+        db.record_session(t_b.id, "s-x", "creator")
+            .expect("b creator");
+        db.record_session(t_b.id, "s-y", "worker")
+            .expect("b worker");
+        force_state(&db, t_b.id, "merged");
+
+        let (_shared, mut w, mut r) = make_io();
+        // Should terminate (return None when the cycle is detected
+        // before finding a live anchor).
+        let resolved = resolve_done_recipient(&db, "s-x", &mut w, &mut r);
+        assert_eq!(resolved, None);
+    }
+
+    /// Pure orchestrator: a session with only `creator` rows on tasks
+    /// (never ran for one) must NOT be classified as a terminated
+    /// worker, even when those tasks are themselves terminal.
+    #[test]
+    fn resolve_done_recipient_does_not_skip_pure_orchestrator() {
+        let db = TasksDb::open_memory().expect("db");
+        let t = create_task(&db, "T", None, "ready");
+        db.record_session(t.id, "s-orch", "creator")
+            .expect("creator");
+        force_state(&db, t.id, "merged");
+
+        let (_shared, mut w, mut r) = make_io();
+        let resolved = resolve_done_recipient(&db, "s-orch", &mut w, &mut r);
+        assert_eq!(
+            resolved.as_deref(),
+            Some("s-orch"),
+            "orchestrator with only creator-rows is alive"
+        );
+    }
+
+    /// Integration: `notify_state_change_split` forwards the terminal
+    /// QueueMessage past a dead creator session and lands it on the
+    /// upstream orchestrator. Reproduces the task-1050 stall.
+    #[test]
+    fn notify_state_change_split_forwards_terminal_wake_past_dead_creator() {
+        let db = TasksDb::open_memory().expect("db");
+        // Outer task A: orchestrator O created A, A had a worker
+        // session s-A-worker which has now finished (A is merged).
+        let task_a = create_task(&db, "A", None, "ready");
+        db.record_session(task_a.id, "s-orch", "creator")
+            .expect("a creator");
+        db.record_session(task_a.id, "s-A-worker", "worker")
+            .expect("a worker");
+        force_state(&db, task_a.id, "merged");
+
+        // Subtask B: created by A's worker session, currently
+        // transitioning to merged.
+        let mut task_b = create_task(&db, "B", Some(task_a.id), "ready");
+        db.record_session(task_b.id, "s-A-worker", "creator")
+            .expect("b creator");
+        // No worker session recorded for B — we just want to fire the
+        // creator-wake. (collect_recipients will still resolve
+        // s-A-worker via the successor map; we leave it without one.)
+        task_b.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        let mut post_persist = Vec::new();
+        notify_state_change_split(
+            &db,
+            &task_b,
+            TaskState::Merging,
+            None,
+            None,
+            &mut w,
+            &mut r,
+            &mut post_persist,
+        );
+
+        let msg_calls = captured_messages_sorted(&shared);
+        let targets: Vec<&str> = msg_calls.iter().map(|(s, _, _, _)| s.as_str()).collect();
+        assert!(
+            targets.contains(&"s-orch"),
+            "creator wake must forward to live orchestrator: {:?}",
+            targets
+        );
+        assert!(
+            !targets.contains(&"s-A-worker"),
+            "creator wake must NOT land on dead worker: {:?}",
+            targets
+        );
+    }
+
+    /// Sibling case: the subtask's parent is not the orchestrator's
+    /// task — there's no `parent_id` on B. The resolver path through
+    /// `notify_state_change_split` is the only one that fires for
+    /// root tasks, so this exercises the same forwarding without the
+    /// `notify_parent_of_subtask_done` dedup interaction.
+    #[test]
+    fn notify_state_change_split_forwards_terminal_wake_for_root_task() {
+        let db = TasksDb::open_memory().expect("db");
+        // s-A-worker ran for an outer (now merged) task.
+        let outer = create_task(&db, "Outer", None, "ready");
+        db.record_session(outer.id, "s-orch", "creator")
+            .expect("outer creator");
+        db.record_session(outer.id, "s-A-worker", "worker")
+            .expect("outer worker");
+        force_state(&db, outer.id, "merged");
+
+        // Root task B: no parent, creator is s-A-worker (now dead).
+        let mut task_b = create_task(&db, "B", None, "ready");
+        db.record_session(task_b.id, "s-A-worker", "creator")
+            .expect("b creator");
+        task_b.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        let mut post_persist = Vec::new();
+        notify_state_change_split(
+            &db,
+            &task_b,
+            TaskState::Merging,
+            None,
+            None,
+            &mut w,
+            &mut r,
+            &mut post_persist,
+        );
+
+        let msg_calls = captured_messages_sorted(&shared);
+        let targets: Vec<&str> = msg_calls.iter().map(|(s, _, _, _)| s.as_str()).collect();
+        assert!(
+            targets.contains(&"s-orch"),
+            "creator wake must forward to live orchestrator: {:?}",
+            targets
+        );
+        assert!(
+            !targets.contains(&"s-A-worker"),
+            "creator wake must NOT land on dead worker: {:?}",
+            targets
+        );
+    }
+
+    /// After forwarding, the dedup against the parent's `session_id`
+    /// must compare *resolved* tips. If A's worker is parent.session_id
+    /// AND is also B's creator (raw), both forward to the same
+    /// orchestrator; we expect exactly one wake to land on the
+    /// orchestrator (from this notifier) — the other QueueMessage path
+    /// (`notify_parent_of_subtask_done`) is independent.
+    #[test]
+    fn notify_state_change_split_dedups_resolved_parent_and_creator() {
+        let db = TasksDb::open_memory().expect("db");
+        // Parent task A with the dead worker as both its session_id
+        // (parent.session_id) AND as B's creator. Both should resolve
+        // to s-orch.
+        let task_a = create_task(&db, "A", None, "ready");
+        db.record_session(task_a.id, "s-orch", "creator")
+            .expect("a creator");
+        db.record_session(task_a.id, "s-A-worker", "worker")
+            .expect("a worker");
+        db.set_session_id(task_a.id, "s-A-worker")
+            .expect("set parent session");
+        force_state(&db, task_a.id, "merged");
+
+        let mut task_b = create_task(&db, "B", Some(task_a.id), "ready");
+        db.record_session(task_b.id, "s-A-worker", "creator")
+            .expect("b creator");
+        task_b.state = TaskState::Merged;
+
+        let (shared, mut w, mut r) = make_io();
+        let mut post_persist = Vec::new();
+        notify_state_change_split(
+            &db,
+            &task_b,
+            TaskState::Merging,
+            None,
+            None,
+            &mut w,
+            &mut r,
+            &mut post_persist,
+        );
+
+        let msg_calls = captured_messages_sorted(&shared);
+        let to_orch: Vec<&(String, String, String, bool)> = msg_calls
+            .iter()
+            .filter(|(sid, _, _, _)| sid == "s-orch")
+            .collect();
+        assert_eq!(
+            to_orch.len(),
+            0,
+            "resolved-tip dedup: when parent_session and creator both \
+             resolve to the same orchestrator, the creator-wake from \
+             notify_state_change_split is suppressed (parent-side \
+             notifier owns it). Got: {:?}",
+            msg_calls
         );
     }
 

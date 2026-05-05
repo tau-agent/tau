@@ -38,6 +38,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::tasks_db::{TaskSession, TasksDb};
+use crate::tasks_notify::resolve_done_recipient;
 use crate::tasks_state::TaskState;
 use tau_agent_plugin::{Request, Response};
 
@@ -908,19 +909,26 @@ pub fn notify_parent_if_all_done(
     );
     let _ = db.add_message(parent_id, &msg, Some("system"));
 
-    // If parent has a session_id, send QueueMessage to notify the agent
+    // If parent has a session_id, send QueueMessage to notify the
+    // agent. Route through `resolve_done_recipient` so the wake
+    // forwards past: a parent session that called `session_succeed`,
+    // an archived parent, or a parent whose own task has reached a
+    // terminal state and whose agent loop has therefore stopped
+    // (task 1050).
     if let Some(ref session_id) = parent.session_id {
-        let _ = server_request(
-            writer,
-            reader,
-            Request::QueueMessage {
-                target_session_id: session_id.clone(),
-                content: msg,
-                sender_info: format!("task-system (task {})", task_id),
-                await_reply: false,
-                reply_to: None,
-            },
-        );
+        if let Some(target) = resolve_done_recipient(db, session_id, writer, reader) {
+            let _ = server_request(
+                writer,
+                reader,
+                Request::QueueMessage {
+                    target_session_id: target,
+                    content: msg,
+                    sender_info: format!("task-system (task {})", task_id),
+                    await_reply: false,
+                    reply_to: None,
+                },
+            );
+        }
     }
 
     Ok(())
@@ -951,20 +959,24 @@ pub fn notify_parent_of_subtask_done(
         _ => return,
     };
 
-    // Only notify if the parent has an active session
+    // Only notify if the parent has a session. Route through
+    // `resolve_done_recipient` so the wake forwards past dead /
+    // succeeded / archived parent sessions (task 1050).
     if let Some(ref session_id) = parent.session_id {
-        let content = format!("✓ Subtask #{} {}: {}", task_id, task.state, task.title);
-        let _ = server_request(
-            writer,
-            reader,
-            Request::QueueMessage {
-                target_session_id: session_id.clone(),
-                content,
-                sender_info: format!("task-system (task {})", task_id),
-                await_reply: false,
-                reply_to: None,
-            },
-        );
+        if let Some(target) = resolve_done_recipient(db, session_id, writer, reader) {
+            let content = format!("✓ Subtask #{} {}: {}", task_id, task.state, task.title);
+            let _ = server_request(
+                writer,
+                reader,
+                Request::QueueMessage {
+                    target_session_id: target,
+                    content,
+                    sender_info: format!("task-system (task {})", task_id),
+                    await_reply: false,
+                    reply_to: None,
+                },
+            );
+        }
     }
 }
 

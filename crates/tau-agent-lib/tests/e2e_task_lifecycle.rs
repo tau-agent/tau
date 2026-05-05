@@ -1972,3 +1972,241 @@ fn no_merge_task_coexists_with_code_task() {
 
     server.shutdown();
 }
+
+// ---------------------------------------------------------------------------
+// Task 1050: terminal-subtask wake forwards past dead creator session
+// ---------------------------------------------------------------------------
+
+/// Helper: open the tasks plugin's sqlite DB and run a SQL statement
+/// directly. Used to forge scenarios that the plugin's own RPC paths
+/// won't produce naturally — e.g. swapping a `creator` row from one
+/// session to another, or stamping a task to `merged` without walking
+/// the full state machine.
+fn tasks_db_execute(repo_path: &std::path::Path, sql: &str, params: &[&dyn rusqlite::ToSql]) {
+    let tasks_db_path = repo_path
+        .parent()
+        .expect("repo has parent")
+        .join("xdg_data")
+        .join("tau")
+        .join("tasks.db");
+    let conn = rusqlite::Connection::open(&tasks_db_path)
+        .expect("open plugin tasks.db for direct mutation");
+    conn.execute(sql, rusqlite::params_from_iter(params))
+        .expect("tasks.db direct execute");
+}
+
+/// Regression for task 1050: when the session that filed a subtask
+/// has terminated (its own task is in a terminal state, agent loop
+/// gone), the terminal-state wake for the subtask must be forwarded
+/// up the task-creator chain to a still-live ancestor.
+///
+/// Scenario:
+///   * Orchestrator session O files task A as ready. The scheduler
+///     dispatches a worker session W_A.
+///   * Task A is force-stamped `merged` (W_A is now "the worker of a
+///     terminal task"; its agent loop will not be resumed).
+///   * Subtask B is filed under A; we then rewrite B's `creator` row
+///     in `task_sessions` to point at W_A (modelling the case where
+///     A's worker filed B before terminating).
+///   * B is transitioned to `failed` (a terminal state), which fires
+///     `notify_state_change_split`'s creator-wake branch.
+///
+/// Assertion: O's session message history (via `GetMessages`) contains
+/// the QueueMessage for B's terminal transition. Without the
+/// task-1050 fix the wake would have landed on W_A and stalled there.
+#[test]
+fn terminal_subtask_wakes_orchestrator_past_dead_creator() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(tmp.path());
+    let repo_str = repo.to_string_lossy().to_string();
+
+    let server = start_server_with_tasks(
+        &repo,
+        (0..16)
+            .map(|_| MockResponse::Text("acknowledged".into()))
+            .collect(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+
+    // O = orchestrator / controller session.
+    let sid = create_session(&server, Some(&repo_str), Some("e2e-test"));
+
+    // 1. File task A as ready and wait for the scheduler to dispatch
+    //    a worker session W_A.
+    let task_a = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "A (orchestrator-filed)",
+            "initial_state": "ready",
+            "affected_files": ["a.txt"],
+            "message": "task A",
+        }),
+    );
+    let task_a_id = task_a["id"].as_i64().unwrap();
+    let _ = wait_for_task_state(&server, &sid, task_a_id, "active", Duration::from_secs(10));
+    let task_a_payload =
+        wait_for_task_session_id(&server, &sid, task_a_id, Duration::from_secs(10));
+    let w_a_session = task_a_payload["task"]["session_id"]
+        .as_str()
+        .expect("task A should have a worker session_id")
+        .to_string();
+
+    // 2. Force task A's state to `merged` directly. This makes W_A
+    //    appear as "the worker of a terminal task" — the durable
+    //    signal `resolve_done_recipient` keys off.
+    tasks_db_execute(
+        &repo,
+        "UPDATE tasks SET state = 'merged' WHERE id = ?1",
+        &[&task_a_id],
+    );
+
+    // 3. File subtask B from O. The plugin records O as B's creator.
+    let task_b = exec_tool_ok(
+        &server,
+        &sid,
+        "task_create",
+        serde_json::json!({
+            "title": "B (subtask)",
+            "parent_id": task_a_id,
+            "initial_state": "ready",
+            "affected_files": ["b.txt"],
+            "message": "task B",
+        }),
+    );
+    let task_b_id = task_b["id"].as_i64().unwrap();
+
+    // 4. Rewrite B's creator row from O → W_A. This models the
+    //    scenario where W_A (now-terminated) filed B before its agent
+    //    loop ended. We do it via raw SQL because the plugin doesn't
+    //    expose a "reassign creator" RPC — the row is normally a
+    //    one-shot insert at task-creation time.
+    tasks_db_execute(
+        &repo,
+        "UPDATE task_sessions SET session_id = ?1 \
+         WHERE task_id = ?2 AND role = 'creator'",
+        &[&w_a_session, &task_b_id],
+    );
+
+    // Sanity: B's creator row is now W_A.
+    {
+        let tasks_db_path = repo
+            .parent()
+            .unwrap()
+            .join("xdg_data")
+            .join("tau")
+            .join("tasks.db");
+        let conn = rusqlite::Connection::open(&tasks_db_path).unwrap();
+        let creator: String = conn
+            .query_row(
+                "SELECT session_id FROM task_sessions \
+                 WHERE task_id = ?1 AND role = 'creator'",
+                rusqlite::params![task_b_id],
+                |row| row.get(0),
+            )
+            .expect("B should have a creator row");
+        assert_eq!(creator, w_a_session);
+    }
+
+    // 5. Transition B to a terminal state. `failed` is reachable from
+    //    any non-terminal state via the universal-override rule, so
+    //    we don't have to walk through review/approved/merging.
+    //    This fires `notify_state_change_split` with `task.state` =
+    //    `Failed` (terminal), which dispatches the creator wake.
+    let task = exec_tool_ok(
+        &server,
+        &sid,
+        "task_update",
+        serde_json::json!({
+            "id": task_b_id,
+            "state": "failed",
+        }),
+    );
+    assert_eq!(task["state"].as_str().unwrap(), "failed");
+
+    // Helper: extract concatenated text from a UserMessage's content.
+    let user_text = |u: &tau_agent_lib::UserMessage| -> String {
+        u.content
+            .iter()
+            .filter_map(|c| match c {
+                tau_agent_lib::types::UserContent::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // 6. Wait for the queued message to land on O's history.
+    //    The notifier is best-effort and runs synchronously inside
+    //    the plugin's task_update handler, but the message ride is
+    //    queue → server → history; allow a generous deadline.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut o_received_b_wake = false;
+    let mut w_a_received_b_wake = false;
+    while Instant::now() < deadline {
+        let conn = server.connect();
+        let resp = send_recv(
+            &conn,
+            &Request::GetMessages {
+                session_id: sid.clone(),
+            },
+        );
+        if let Response::Messages { messages } = resp {
+            for m in &messages {
+                if let tau_agent_lib::types::Message::User(u) = m {
+                    let text = user_text(u);
+                    // The QueueMessage from `notify_state_change_split`
+                    // carries the task title and id; sender_info
+                    // ("task notifier") is metadata only and may or
+                    // may not be embedded in the persisted user
+                    // message depending on drain path. Match on the
+                    // task identifier instead.
+                    if text.contains(&format!("#{}", task_b_id)) || text.contains("B (subtask)") {
+                        o_received_b_wake = true;
+                    }
+                }
+            }
+        }
+
+        // Also peek at W_A's inbox to confirm the wake did NOT land
+        // there (the bug being fixed).
+        let conn2 = server.connect();
+        let resp2 = send_recv(
+            &conn2,
+            &Request::GetMessages {
+                session_id: w_a_session.clone(),
+            },
+        );
+        if let Response::Messages { messages } = resp2 {
+            for m in &messages {
+                if let tau_agent_lib::types::Message::User(u) = m {
+                    let text = user_text(u);
+                    if text.contains(&format!("#{}", task_b_id)) || text.contains("B (subtask)") {
+                        w_a_received_b_wake = true;
+                    }
+                }
+            }
+        }
+
+        if o_received_b_wake {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(
+        o_received_b_wake,
+        "orchestrator session must receive B's terminal wake \
+         (forwarded past dead worker session {})",
+        w_a_session
+    );
+    assert!(
+        !w_a_received_b_wake,
+        "creator wake must NOT land on the dead worker {} \
+         (the bug task 1050 fixes)",
+        w_a_session
+    );
+
+    server.shutdown();
+}

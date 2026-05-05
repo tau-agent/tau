@@ -1937,6 +1937,41 @@ impl TasksDb {
         }
     }
 
+    /// Find the task this session was *recorded as running for* — i.e.
+    /// the task whose `task_sessions` row records `session_id` in any
+    /// role *other than* `creator`. The `creator` row is the upstream
+    /// link ("this session filed the task") and never indicates
+    /// agent-loop work was done on behalf of the task; we want the
+    /// downstream link (worker / planner / reviewer / refiner /
+    /// interactive) for terminal-state forwarding.
+    ///
+    /// Returns `Some(task_id)` for the earliest such row by
+    /// `task_sessions.created_at`. In practice a session belongs to at
+    /// most one task in a non-creator role over its lifetime, so this
+    /// is unambiguous. Returns `None` when the session has no such
+    /// row (a pure orchestrator that only filed tasks but never
+    /// itself ran for one).
+    pub fn find_task_for_running_session(
+        &self,
+        session_id: &str,
+    ) -> tau_agent_plugin::Result<Option<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT task_id FROM task_sessions \
+                 WHERE session_id = ?1 AND role != 'creator' \
+                 ORDER BY created_at LIMIT 1",
+            )
+            .map_err(plugin_io_err("prepare find_task_for_running_session"))?;
+        let mut rows = stmt
+            .query_map(params![session_id], |row| row.get::<_, i64>(0))
+            .map_err(plugin_io_err("find_task_for_running_session"))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(plugin_io_err("read task_session row"))?)),
+            None => Ok(None),
+        }
+    }
+
     /// Get all sessions for a task.
     pub fn get_sessions(&self, task_id: i64) -> tau_agent_plugin::Result<Vec<TaskSession>> {
         let mut stmt = self
@@ -4191,6 +4226,77 @@ mod tests {
         // Unknown session id: None.
         let row = db.find_active_task_role_for_session("s-nobody").unwrap();
         assert_eq!(row, None);
+    }
+
+    /// `find_task_for_running_session` returns the task whose row
+    /// records this session in any role *except* `creator`. The
+    /// `creator` row is the upstream filing link and must be ignored
+    /// here so notification forwarding doesn't conflate "filed task"
+    /// with "ran for task".
+    #[test]
+    fn find_task_for_running_session_skips_creator_role() {
+        let db = TasksDb::open_memory().unwrap();
+
+        let t1 = db
+            .create_task(
+                "p",
+                "t1",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+        let t2 = db
+            .create_task(
+                "p",
+                "t2",
+                None,
+                None,
+                None,
+                false,
+                "ready",
+                false,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                crate::tasks_db::FiledBy::default(),
+            )
+            .unwrap();
+
+        // s-orchestrator filed t1 (creator) but never ran for it.
+        db.record_session(t1.id, "s-orchestrator", "creator")
+            .unwrap();
+        // s-worker is the worker session for t1.
+        db.record_session(t1.id, "s-worker", "worker").unwrap();
+        // s-orchestrator also reviewed t2.
+        db.record_session(t2.id, "s-orchestrator", "reviewer")
+            .unwrap();
+
+        // Worker session: returns its task.
+        assert_eq!(
+            db.find_task_for_running_session("s-worker").unwrap(),
+            Some(t1.id)
+        );
+        // Orchestrator: skips creator row on t1, finds reviewer on t2.
+        assert_eq!(
+            db.find_task_for_running_session("s-orchestrator").unwrap(),
+            Some(t2.id)
+        );
+        // Unknown session.
+        assert_eq!(db.find_task_for_running_session("s-nobody").unwrap(), None);
     }
 
     #[test]
